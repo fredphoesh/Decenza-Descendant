@@ -36,7 +36,7 @@
 #include <QAtomicInt>
 #include <QThread>
 
-const QString UpdateChecker::GITHUB_REPO = "Kulitorum/Decenza";
+const QString UpdateChecker::GITHUB_REPO = "fredphoesh/Decenza-Descendant";
 
 // File-scope so background QFile::remove threads can read it without capturing
 // `this`. Bumped by startDownload() after a successful QFile::open() — any

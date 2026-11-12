@@ -1616,7 +1616,7 @@ jobs:
           #define VersionNumber "$VERSION"
           #define TargetName "Decenza"
           #define TargetArch "x64"
-          #define TargetProduct "Decenza"
+          #define TargetProduct "Decenza-Descendant"
           #define TargetCompany "Decenza"
           "@ | Out-File -FilePath "installer\version.iss" -Encoding ASCII
 

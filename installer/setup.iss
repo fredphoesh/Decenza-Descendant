@@ -28,7 +28,7 @@
 
 [Setup]
 ; Application identity
-AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+AppId={{7C1E4B9A-3D52-4F86-A0E7-5B2D9C8F1A64}
 AppName={#TargetProduct}
 AppVersion={#VersionNumber}
 AppVerName={#TargetProduct} v{#VersionNumber}
