@@ -1959,47 +1959,85 @@ QVariantMap geniusSuggestionFor(QSqlDatabase& db, qint64 packageId, const QStrin
                                                 : ShotSummarizer::ugsForKbId(targetKb);
     if (std::isnan(targetUgs)) return refuse("profileNotOnChart");
 
-    if (!ensureGeniusReferenceTable(db)) return refuse("noReference");
-    qint64 refId = 0;
-    {
+    // A baseline shot usable for the arithmetic: on this package, a parsable
+    // setting, a profile on the chart.
+    struct Baseline { CalibShot shot; double setting = 0.0; double ugs = 0.0; QString kbId; };
+    const auto usable = [&](qint64 id) -> std::optional<Baseline> {
+        const std::optional<CalibShot> shot = id > 0 ? loadCalibShot(db, id) : std::nullopt;
+        if (!shot || shot->equipmentId != packageId || shot->grinderModel.isEmpty())
+            return std::nullopt;
+        const std::optional<double> setting = GrinderAliases::parseGrinderSetting(
+            geniusGrinderEntry(shot->grinderModel), shot->grinderSetting.trimmed());
+        const QString kb = geniusShotKbId(*shot);
+        const double ugs = kb.isEmpty() ? std::numeric_limits<double>::quiet_NaN()
+                                        : ShotSummarizer::ugsForKbId(kb);
+        if (!setting || std::isnan(ugs)) return std::nullopt;
+        return Baseline{*shot, *setting, ugs, kb};
+    };
+
+    // 1. The shot the user marked as this bean's reference.
+    std::optional<Baseline> base;
+    QString basis;
+    if (ensureGeniusReferenceTable(db)) {
         QSqlQuery q(db);
         q.prepare(QStringLiteral("SELECT shot_id FROM genius_bean_references "
                                  "WHERE package_id = :pkg AND bean_key = :key"));
         q.bindValue(QStringLiteral(":pkg"), packageId);
         q.bindValue(QStringLiteral(":key"), geniusBeanKey(beanBrand, beanType, roastDate));
-        if (q.exec() && q.next()) refId = q.value(0).toLongLong();
+        if (q.exec() && q.next()) {
+            base = usable(q.value(0).toLongLong());
+            if (base) basis = QStringLiteral("reference");
+        }
     }
-    const std::optional<CalibShot> ref = refId > 0 ? loadCalibShot(db, refId) : std::nullopt;
-    if (!ref || ref->equipmentId != packageId || ref->grinderModel.isEmpty())
-        return refuse("noReference");
+    // 2. Else the bean's best-rated shot (newest wins a tie).
+    if (!base) {
+        const QString roast = roastDate.trimmed();
+        const bool dated = !roast.isEmpty() && roast != QLatin1String("--");
+        QSqlQuery q(db);
+        q.prepare(QStringLiteral(
+            "SELECT id FROM shots WHERE equipment_id = :pkg AND COALESCE(enjoyment, 0) > 0 "
+            "AND LOWER(TRIM(COALESCE(bean_brand, ''))) = LOWER(TRIM(COALESCE(:brand, ''))) "
+            "AND LOWER(TRIM(COALESCE(bean_type, ''))) = LOWER(TRIM(COALESCE(:type, ''))) ")
+            + (dated ? QStringLiteral("AND TRIM(roast_date) = TRIM(:roast) ") : QString())
+            + QStringLiteral("ORDER BY enjoyment DESC, timestamp DESC LIMIT 20"));
+        q.bindValue(QStringLiteral(":pkg"), packageId);
+        q.bindValue(QStringLiteral(":brand"), beanBrand);
+        q.bindValue(QStringLiteral(":type"), beanType);
+        if (dated) q.bindValue(QStringLiteral(":roast"), roast);
+        if (q.exec()) {
+            while (!base && q.next()) base = usable(q.value(0).toLongLong());
+            if (base) basis = QStringLiteral("rating");
+        }
+    }
+    // 3. Else Decenza's own automatic choice, flagged as unconfirmed.
+    if (!base) {
+        QVariantMap autoPick = grindSuggestionFor(db, packageId, beanBrand, beanType, roastDate,
+                                                  profileTitle);
+        if (autoPick.value(QStringLiteral("setting")).toString().isEmpty())
+            return refuse("noReference");
+        autoPick.insert(QStringLiteral("basis"), QStringLiteral("auto"));
+        return autoPick;
+    }
 
-    const GrinderAliases::GrinderEntry& gEntry = geniusGrinderEntry(ref->grinderModel);
-    const std::optional<double> refSetting =
-        GrinderAliases::parseGrinderSetting(gEntry, ref->grinderSetting.trimmed());
-    const QString refKb = geniusShotKbId(*ref);
-    const double refUgs = refKb.isEmpty() ? std::numeric_limits<double>::quiet_NaN()
-                                          : ShotSummarizer::ugsForKbId(refKb);
-    if (!refSetting || std::isnan(refUgs)) return refuse("noReference");
-
-    double value = *refSetting;
-    if (std::abs(targetUgs - refUgs) > 1e-9) {
+    double value = base->setting;
+    if (std::abs(targetUgs - base->ugs) > 1e-9) {
         GrindCalibrationStatus st;
-        buildGrinderCalibrationBlock(db, ref->grinderModel, AdviceScope(packageId),
-                                     QStringLiteral("espresso"), ref->id, nullptr, &st);
+        buildGrinderCalibrationBlock(db, base->shot.grinderModel, AdviceScope(packageId),
+                                     QStringLiteral("espresso"), base->shot.id, nullptr, &st);
         if (!st.keyPublished || std::isnan(st.conversionKey)) return refuse("notCalibrated");
         if (targetUgs < st.validLo - kCalibCap - 1e-9 || targetUgs > st.validHi + kCalibCap + 1e-9)
             return refuse("outsideRange");
-        value = *refSetting + (targetUgs - refUgs) * st.conversionKey;
+        value = base->setting + (targetUgs - base->ugs) * st.conversionKey;
     }
     return QVariantMap{
-        {QStringLiteral("setting"), GrinderAliases::formatGrinderSetting(gEntry, value)},
-        {QStringLiteral("source"), QStringLiteral("reference")},
-        {QStringLiteral("anchorProfileName"), ShotSummarizer::canonicalNameForKbId(refKb)},
-        {QStringLiteral("anchorSetting"), ref->grinderSetting.trimmed()},
-        {QStringLiteral("referenceShotId"), ref->id},
-        {QStringLiteral("referenceTimestamp"), ref->timestamp},
+        {QStringLiteral("setting"), GrinderAliases::formatGrinderSetting(
+                                        geniusGrinderEntry(base->shot.grinderModel), value)},
+        {QStringLiteral("basis"), basis},
+        {QStringLiteral("anchorProfileName"), ShotSummarizer::canonicalNameForKbId(base->kbId)},
+        {QStringLiteral("anchorSetting"), base->shot.grinderSetting.trimmed()},
+        {QStringLiteral("referenceShotId"), base->shot.id},
+        {QStringLiteral("referenceTimestamp"), base->shot.timestamp},
     };
 }
-
 
 } // namespace DialingBlocks

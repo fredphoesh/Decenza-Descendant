@@ -2501,9 +2501,9 @@ private slots:
         });
     }
 
-    // Genius Grind: only the bean's marked reference shot sets its baseline; the
-    // package's anchors supply the span.
-    void geniusSuggestion_usesOnlyTheMarkedReference()
+    // Genius Grind: a rated shot is the baseline until the bean's reference is
+    // marked, which then wins; the package's anchors supply the span.
+    void geniusSuggestion_referenceThenRating()
     {
         const QString path = freshDbPath();
         initAndClose(path);
@@ -2522,9 +2522,17 @@ private slots:
                 return DialingBlocks::geniusSuggestionFor(db, pkg, QString(), QStringLiteral("TestBean"),
                                                           QString(), title);
             };
-            QCOMPARE(genius(QStringLiteral("Londinium")).value(QStringLiteral("reason")).toString(),
-                     QStringLiteral("noReference"));
+            QSqlQuery rate(db);
+            QVERIFY(rate.exec(QStringLiteral("UPDATE shots SET enjoyment = 80, grinder_setting = '6' "
+                                             "WHERE id = %1").arg(ref)));
+            const QVariantMap rated = genius(QStringLiteral("Londinium"));
+            QCOMPARE(rated.value(QStringLiteral("basis")).toString(), QStringLiteral("rating"));
+            QCOMPARE(rated.value(QStringLiteral("setting")).toString().toDouble(), 6.0);
+            QVERIFY(rate.exec(QStringLiteral("UPDATE shots SET enjoyment = 0, grinder_setting = '4' "
+                                             "WHERE id = %1").arg(ref)));
             QCOMPARE(DialingBlocks::markBeanReferenceShot(db, ref, nullptr, pkg), QString());
+            QCOMPARE(genius(QStringLiteral("Londinium")).value(QStringLiteral("basis")).toString(),
+                     QStringLiteral("reference"));
             QCOMPARE(genius(QStringLiteral("Londinium")).value(QStringLiteral("setting")).toString().toDouble(), 4.0);
             QCOMPARE(genius(QStringLiteral("Rao Allongé")).value(QStringLiteral("setting")).toString().toDouble(), 20.0);
         });

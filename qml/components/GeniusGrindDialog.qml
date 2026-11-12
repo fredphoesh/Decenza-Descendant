@@ -40,6 +40,9 @@ DecenzaDialog {
         return null
     }
     readonly property string suggestedSetting: String(root.suggestion.setting || "")
+    // A star marks a number not backed by a reference or rated shot.
+    readonly property string displaySetting: root.suggestedSetting.length === 0 ? "—"
+        : root.suggestedSetting + (root.suggestion.basis === "auto" ? "*" : "")
 
     function bagLabel(bag: var): string {
         if (!bag) return ""
@@ -115,10 +118,17 @@ DecenzaDialog {
         }
         const anchorName = String(root.suggestion.anchorProfileName || "")
         const anchorSetting = String(root.suggestion.anchorSetting || "")
-        if (anchorName.length > 0 && anchorSetting.length > 0)
-            return TranslationManager.translate("geniusGrind.basedOn", "Based on your reference shot: %1 at %2")
-                .arg(anchorName).arg(anchorSetting)
-        return ""
+        const shot = anchorName.length > 0 && anchorSetting.length > 0 ? anchorName + " @ " + anchorSetting : ""
+        switch (String(root.suggestion.basis || "")) {
+        case "reference":
+            return TranslationManager.translate("geniusGrind.basis.reference", "Based on your reference shot: %1").arg(shot)
+        case "rating":
+            return TranslationManager.translate("geniusGrind.basis.rating",
+                "Based on your best-rated shot: %1. No reference shot for this bean yet.").arg(shot)
+        default:
+            return TranslationManager.translate("geniusGrind.basis.auto",
+                "* There is no reference shot for this bean. Based on Decenza's automatic choice: %1").arg(shot)
+        }
     }
 
     function startApply(): void {
@@ -252,7 +262,7 @@ DecenzaDialog {
         Text {
             Layout.fillWidth: true
             horizontalAlignment: Text.AlignHCenter
-            text: root.suggestedSetting.length > 0 ? root.suggestedSetting : "—"
+            text: root.displaySetting
             font.pixelSize: Theme.scaled(56)
             font.bold: true
             color: root.suggestedSetting.length > 0 ? Theme.primaryColor : Theme.textSecondaryColor
