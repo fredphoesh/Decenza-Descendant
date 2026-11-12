@@ -85,7 +85,6 @@ LayoutWidgetItem {
             elide: Text.ElideRight
             text: root.valueText
             color: root.zoneTextColor
-            font.families: Theme.fontFamilies
             font.pixelSize: Theme.scaled(root.isCompact ? 21 : 32)
             font.bold: true
         }
