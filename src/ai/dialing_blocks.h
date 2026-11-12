@@ -509,12 +509,12 @@ QVariantMap grindSuggestionFor(QSqlDatabase& db, qint64 packageId, const QString
                                const QString& beanType, const QString& roastDate,
                                const QString& profileTitle);
 
-// Genius Grind (Decenza-Descendant): the grind for `profileTitle` on this bean,
-// computed only from the shot the user marked as the bean's reference:
-// reference setting + (profile UGS - reference UGS) x the package's conversion key.
-// {setting, source "reference", anchorProfileName, anchorSetting, referenceShotId,
-// referenceTimestamp}, or {reason} with noEquipment, profileNotOnChart,
-// noReference, notCalibrated or outsideRange.
+// Genius Grind (Decenza-Descendant): the grind for `profileTitle` on this bean:
+// baseline setting + (profile UGS - baseline UGS) x the package's conversion key.
+// The baseline is the bean's marked reference shot, else its best-rated shot, else
+// grindSuggestionFor's automatic choice. {setting, basis ("reference" | "rating" |
+// "auto"), anchorProfileName, anchorSetting, ...}, or {reason} with noEquipment,
+// profileNotOnChart, noReference, notCalibrated or outsideRange.
 QVariantMap geniusSuggestionFor(QSqlDatabase& db, qint64 packageId, const QString& beanBrand,
                                 const QString& beanType, const QString& roastDate,
                                 const QString& profileTitle);

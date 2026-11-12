@@ -13,7 +13,11 @@ LayoutWidgetItem {
 
     readonly property string labelText: TranslationManager.translate("geniusGrind.label", "Genius Grind")
     readonly property string profileTitle: String(ProfileService.currentProfileSummary.title || "")
-    readonly property string valueText: String(root.suggestion.setting || "") || "—"
+    readonly property string valueText: {
+        const setting = String(root.suggestion.setting || "")
+        if (setting.length === 0) return "—"
+        return setting + (root.suggestion.basis === "auto" ? "*" : "")
+    }
     readonly property string requestKey: EquipmentService.activePackageId + "|" + BagService.activeBagId
                                           + "|" + root.profileTitle
 
