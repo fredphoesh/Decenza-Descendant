@@ -156,6 +156,16 @@ void EquipmentService::requestGrindSuggestion(qint64 packageId, const QString& b
         {QStringLiteral("profileTitle"), profileTitle}});
 }
 
+void EquipmentService::requestGeniusSuggestion(qint64 packageId, const QString& beanBrand,
+                                               const QString& beanType, const QString& roastDate,
+                                               const QString& profileTitle)
+{
+    requestGrindContext(QStringLiteral("genius"), {
+        {QStringLiteral("packageId"), packageId}, {QStringLiteral("beanBrand"), beanBrand},
+        {QStringLiteral("beanType"), beanType}, {QStringLiteral("roastDate"), roastDate},
+        {QStringLiteral("profileTitle"), profileTitle}});
+}
+
 void EquipmentService::requestGrindContext(const QString& kind, const QVariantMap& query)
 {
     QVariantMap context = query;
@@ -179,9 +189,10 @@ void EquipmentService::reportGrindContext(const QVariantMap& query, QVariantMap 
         emit grindCalibrationReady(query.value(QStringLiteral("packageId")).toLongLong(), result);
     } else {
         QVariantMap echo = query;
-        echo.remove(QStringLiteral("kind"));
+        const bool genius = echo.take(QStringLiteral("kind")).toString() == QLatin1String("genius");
         result.insert(echo);
-        emit grindSuggestionReady(result);
+        if (genius) emit geniusSuggestionReady(result);
+        else emit grindSuggestionReady(result);
     }
 }
 

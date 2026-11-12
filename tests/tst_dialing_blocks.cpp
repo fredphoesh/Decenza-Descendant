@@ -2477,7 +2477,12 @@ private slots:
                 return DialingBlocks::markGrindCalibrationAnchor(db, id, QString::fromLatin1(side));
             };
             QCOMPARE(mark(fine, "fine"), QString());
-            QCOMPARE(mark(otherBag, "coarse"), QStringLiteral("differentCoffee"));
+            // Another bag replaces the old pair instead of refusing: the other side
+            // is cleared so the new bag's second anchor can follow.
+            QCOMPARE(mark(otherBag, "coarse"), QString());
+            QCOMPARE(EquipmentStorage::loadCalibrationAnchorsStatic(
+                         db, projectionForShot(db, fine).equipmentId).fineShotId, qint64(0));
+            QCOMPARE(mark(fine, "fine"), QString());
             QCOMPARE(mark(tooClose, "coarse"), QStringLiteral("tooClose"));
             QCOMPARE(mark(light, "coarse"), QStringLiteral("tooLight"));
             QCOMPARE(mark(unplaced, "coarse"), QStringLiteral("noUgs"));
@@ -2486,13 +2491,42 @@ private slots:
             const CalibrationAnchors stored = EquipmentStorage::loadCalibrationAnchorsStatic(
                 db, projectionForShot(db, fine).equipmentId);
             QCOMPARE(stored.fineShotId, fine);
-            QCOMPARE(stored.coarseShotId, qint64(0));  // every refusal wrote nothing
+            QCOMPARE(stored.coarseShotId, qint64(0));  // re-marking fine cleared otherBag; refusals wrote nothing
 
             // Migration 46's trigger: deleting an anchor shot clears its side.
             QSqlQuery del(db);
             QVERIFY(del.exec(QStringLiteral("DELETE FROM shots WHERE id = %1").arg(fine)));
             QCOMPARE(EquipmentStorage::loadCalibrationAnchorsStatic(
                          db, projectionForShot(db, tooClose).equipmentId).fineShotId, qint64(0));
+        });
+    }
+
+    // Genius Grind: only the bean's marked reference shot sets its baseline; the
+    // package's anchors supply the span.
+    void geniusSuggestion_usesOnlyTheMarkedReference()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("genius_reference"), [&](QSqlDatabase& db) {
+            const qint64 fine = anchorSeed(db, QStringLiteral("g-fine"), 1000,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("2"));
+            const qint64 coarse = anchorSeed(db, QStringLiteral("g-coarse"), 1100,
+                    QStringLiteral("Rao Allongé"), QStringLiteral("allonge"), QStringLiteral("18"));
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, fine, QStringLiteral("fine")), QString());
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, coarse, QStringLiteral("coarse")), QString());
+            const qint64 pkg = projectionForShot(db, fine).equipmentId;
+            const qint64 ref = anchorSeed(db, QStringLiteral("g-ref"), 1200,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("4"),
+                    QString());
+            const auto genius = [&](const QString& title) {
+                return DialingBlocks::geniusSuggestionFor(db, pkg, QString(), QStringLiteral("TestBean"),
+                                                          QString(), title);
+            };
+            QCOMPARE(genius(QStringLiteral("Londinium")).value(QStringLiteral("reason")).toString(),
+                     QStringLiteral("noReference"));
+            QCOMPARE(DialingBlocks::markBeanReferenceShot(db, ref, nullptr, pkg), QString());
+            QCOMPARE(genius(QStringLiteral("Londinium")).value(QStringLiteral("setting")).toString().toDouble(), 4.0);
+            QCOMPARE(genius(QStringLiteral("Rao Allongé")).value(QStringLiteral("setting")).toString().toDouble(), 20.0);
         });
     }
 

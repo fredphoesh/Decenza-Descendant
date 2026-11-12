@@ -27,7 +27,7 @@ bool positiveSafeId(const QVariant& value, qint64* result)
 
 bool validGrindQuery(const QString& kind, const QVariantMap& query, qint64* packageId)
 {
-    const bool suggestion = kind == QLatin1String("suggestion");
+    const bool suggestion = kind == QLatin1String("suggestion") || kind == QLatin1String("genius");
     if ((!suggestion && kind != QLatin1String("calibration"))
         || query.size() != (suggestion ? 5 : 1)
         || !positiveSafeId(query.value(QStringLiteral("packageId")), packageId))
@@ -284,7 +284,8 @@ void NativeEquipmentServiceSource::execute(QString requestId, QString operation,
             || positiveSafeId(fields.value(QStringLiteral("expectedPackageId")), &expectedPackageId);
         if (packageId <= 0 || !noExpected || makeActive
             || fields.value(QStringLiteral("side")).metaType().id() != QMetaType::QString
-            || (side != QLatin1String("fine") && side != QLatin1String("coarse"))
+            || (side != QLatin1String("fine") && side != QLatin1String("coarse")
+                && (clear || side != QLatin1String("reference")))
             || fields.size() != (clear ? 1 : 2)
             || !validId) {
             reject(packageId, QStringLiteral("invalidRequest"));
@@ -388,6 +389,7 @@ void NativeEquipmentServiceSource::requestGrindContext(
     }
     qint64 packageId = 0;
     const bool suggestion = kind == QLatin1String("suggestion");
+    const bool genius = kind == QLatin1String("genius");
     if (!validGrindQuery(kind, query, &packageId)) {
         m_requests.finish(requestId);
         emit grindContextResult(requestId, {}, QStringLiteral("invalidRequest"));
@@ -403,12 +405,18 @@ void NativeEquipmentServiceSource::requestGrindContext(
         return;
     }
     const QPointer<NativeEquipmentServiceSource> self(this);
-    QThread* thread = QThread::create([self, requestId, dbPath, query, packageId, suggestion] {
+    QThread* thread = QThread::create([self, requestId, dbPath, query, packageId, suggestion, genius] {
         QVariantMap result;
         bool opened = false;
         withTempDb(dbPath, "equipment_grind_read", [&](QSqlDatabase& db) {
             opened = true;
-            result = suggestion
+            result = genius
+                ? DialingBlocks::geniusSuggestionFor(db, packageId,
+                    query.value(QStringLiteral("beanBrand")).toString(),
+                    query.value(QStringLiteral("beanType")).toString(),
+                    query.value(QStringLiteral("roastDate")).toString(),
+                    query.value(QStringLiteral("profileTitle")).toString())
+                : suggestion
                 ? DialingBlocks::grindSuggestionFor(db, packageId,
                     query.value(QStringLiteral("beanBrand")).toString(),
                     query.value(QStringLiteral("beanType")).toString(),
@@ -443,8 +451,10 @@ void NativeEquipmentServiceSource::writeGrindAnchor(
             reason = clear
                 ? EquipmentStorage::setCalibrationAnchorStatic(db, id, side, 0)
                     ? QString() : QStringLiteral("writeFailed")
-                : DialingBlocks::markGrindCalibrationAnchor(db, id, side, &packageId,
-                                                           expectedPackageId);
+                : side == QLatin1String("reference")
+                    ? DialingBlocks::markBeanReferenceShot(db, id, &packageId, expectedPackageId)
+                    : DialingBlocks::markGrindCalibrationAnchor(db, id, side, &packageId,
+                                                               expectedPackageId);
         });
         QMetaObject::invokeMethod(qApp, [self, requestId, packageId, reason] {
             if (!self) return;

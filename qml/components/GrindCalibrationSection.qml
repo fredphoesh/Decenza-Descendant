@@ -284,6 +284,15 @@ ColumnLayout {
             accessibleName: text
             onClicked: root.markRequested("coarse")
         }
+        AccessibleButton {
+            Layout.preferredHeight: Theme.scaled(32)
+            _customFontSize: Theme.captionFont.pixelSize
+            enabled: root.serviceReady && (root.calib.error || "") === ""
+            text: TranslationManager.translate("geniusGrind.markReference", "Use as bean reference")
+            accessibleName: TranslationManager.translate("geniusGrind.markReferenceAccessible",
+                "Use this shot as the reference for its bean in Genius Grind")
+            onClicked: root.markRequested("reference")
+        }
         Item { Layout.fillWidth: true }
         AccessibleButton {
             Layout.preferredHeight: Theme.scaled(32)
