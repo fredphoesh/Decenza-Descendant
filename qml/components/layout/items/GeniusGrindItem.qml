@@ -36,7 +36,7 @@ LayoutWidgetItem {
         function onInventoryReady(bags) {
             let found = null
             for (let i = 0; i < bags.length; ++i) {
-                if (bags[i].id === BagService.activeBagId) found = bags[i]
+                if (Number(bags[i].id) === Number(BagService.activeBagId)) found = bags[i]
             }
             root._activeBag = found
             root.requestSuggestion()
@@ -93,7 +93,7 @@ LayoutWidgetItem {
     AccessibleMouseArea {
         anchors.fill: parent
         accessibleName: root.labelText + ": " + root.valueText
-        onAccessibleClicked: geniusDialog.openFor(BagService.activeBagId, root.profileTitle)
+        onAccessibleClicked: geniusDialog.openFor(Number(BagService.activeBagId), root.profileTitle)
     }
 
     GeniusGrindDialog {
