@@ -26,9 +26,9 @@ LayoutWidgetItem {
         const packageId = EquipmentService.activePackageId
         if (!bag || root.profileTitle.length === 0 || packageId <= 0 || !EquipmentService.ready)
             return
-        EquipmentService.requestGrindSuggestion(packageId, String(bag.roasterName || ""),
-                                                String(bag.coffeeName || ""),
-                                                String(bag.roastDate || ""), root.profileTitle)
+        EquipmentService.requestGeniusSuggestion(packageId, String(bag.roasterName || ""),
+                                                  String(bag.coffeeName || ""),
+                                                  String(bag.roastDate || ""), root.profileTitle)
     }
 
     Connections {
@@ -48,7 +48,7 @@ LayoutWidgetItem {
 
     Connections {
         target: EquipmentService
-        function onGrindSuggestionReady(suggestion) {
+        function onGeniusSuggestionReady(suggestion) {
             const bag = root._activeBag
             if (!bag || suggestion.packageId !== EquipmentService.activePackageId
                 || suggestion.beanBrand !== String(bag.roasterName || "")

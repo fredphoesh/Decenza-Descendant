@@ -5,7 +5,7 @@ import Decenza
 
 // Genius Grind (Decenza-Descendant): the UGS grind suggestion for a chosen bean and
 // profile on the active equipment, with Apply to load both and set the grind.
-// The suggestion itself is EquipmentService.requestGrindSuggestion — the same
+// The suggestion itself is EquipmentService.requestGeniusSuggestion, built on the same
 // calibrated UGS engine the recipe wizard uses.
 DecenzaDialog {
     id: root
@@ -85,9 +85,9 @@ DecenzaDialog {
             return
         }
         root.suggestionPending = true
-        EquipmentService.requestGrindSuggestion(packageId, String(bag.roasterName || ""),
-                                                String(bag.coffeeName || ""),
-                                                String(bag.roastDate || ""), root.profileTitle)
+        EquipmentService.requestGeniusSuggestion(packageId, String(bag.roasterName || ""),
+                                                  String(bag.coffeeName || ""),
+                                                  String(bag.roastDate || ""), root.profileTitle)
     }
 
     function statusText(): string {
@@ -97,13 +97,26 @@ DecenzaDialog {
             return TranslationManager.translate("geniusGrind.noEquipment", "Set up your grinder under Equipment first")
         if (!root.selectedBag)
             return TranslationManager.translate("geniusGrind.noBean", "Choose a bean")
-        if (root.suggestedSetting.length === 0)
-            return TranslationManager.translate("geniusGrind.noSuggestion",
-                "No suggestion yet. Pull a shot of this bean and mark it as a grind anchor on the shot review screen.")
+        if (root.suggestedSetting.length === 0) {
+            switch (String(root.suggestion.reason || "")) {
+            case "profileNotOnChart":
+                return TranslationManager.translate("geniusGrind.reason.profileNotOnChart",
+                    "This profile is not on the UGS chart.")
+            case "notCalibrated":
+                return TranslationManager.translate("geniusGrind.reason.notCalibrated",
+                    "Your grinder's span is not calibrated yet. Mark a fine and a coarse anchor shot of one bean.")
+            case "outsideRange":
+                return TranslationManager.translate("geniusGrind.reason.outsideRange",
+                    "This profile is outside the range your anchors cover.")
+            default:
+                return TranslationManager.translate("geniusGrind.reason.noReference",
+                    "No reference shot for this bean yet. On the review screen of a shot you are happy with, tap \"Use as bean reference\".")
+            }
+        }
         const anchorName = String(root.suggestion.anchorProfileName || "")
         const anchorSetting = String(root.suggestion.anchorSetting || "")
         if (anchorName.length > 0 && anchorSetting.length > 0)
-            return TranslationManager.translate("geniusGrind.basedOn", "Based on %1 at %2")
+            return TranslationManager.translate("geniusGrind.basedOn", "Based on your reference shot: %1 at %2")
                 .arg(anchorName).arg(anchorSetting)
         return ""
     }
@@ -200,7 +213,7 @@ DecenzaDialog {
 
     Connections {
         target: EquipmentService
-        function onGrindSuggestionReady(suggestion) {
+        function onGeniusSuggestionReady(suggestion) {
             const bag = root.selectedBag
             if (!bag || suggestion.packageId !== EquipmentService.activePackageId
                 || suggestion.beanBrand !== String(bag.roasterName || "")

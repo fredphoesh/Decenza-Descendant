@@ -478,6 +478,8 @@ struct GrindCalibrationStatus {
     QString basis;                      // "", history, anchors, both
     QString rangeFromProfile;           // KB profiles at the ends of the numeric window
     QString rangeToProfile;
+    double validLo = std::numeric_limits<double>::quiet_NaN();  // validated UGS window
+    double validHi = std::numeric_limits<double>::quiet_NaN();
     QVariantMap toVariantMap() const;
 };
 
@@ -506,6 +508,22 @@ QVariantMap grindCalibrationForPackage(QSqlDatabase& db, qint64 packageId);
 QVariantMap grindSuggestionFor(QSqlDatabase& db, qint64 packageId, const QString& beanBrand,
                                const QString& beanType, const QString& roastDate,
                                const QString& profileTitle);
+
+// Genius Grind (Decenza-Descendant): the grind for `profileTitle` on this bean,
+// computed only from the shot the user marked as the bean's reference:
+// reference setting + (profile UGS - reference UGS) x the package's conversion key.
+// {setting, source "reference", anchorProfileName, anchorSetting, referenceShotId,
+// referenceTimestamp}, or {reason} with noEquipment, profileNotOnChart,
+// noReference, notCalibrated or outsideRange.
+QVariantMap geniusSuggestionFor(QSqlDatabase& db, qint64 packageId, const QString& beanBrand,
+                                const QString& beanType, const QString& roastDate,
+                                const QString& profileTitle);
+
+// Mark `shotId` as the reference shot for its bean on its package, replacing any
+// earlier one. Empty on success, else notFound, noPackage, notInPackage,
+// notEspresso, noGrinder, noSetting, noUgs, noBean or writeFailed.
+QString markBeanReferenceShot(QSqlDatabase& db, qint64 shotId, qint64* packageIdOut,
+                              qint64 expectedPackageId);
 
 // Mark `shotId` as its package's `side` anchor. Returns an empty string on
 // success, else the refusal code (the per-shot codes above, notFound, noPackage,

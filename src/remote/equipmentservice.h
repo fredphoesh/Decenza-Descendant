@@ -47,6 +47,9 @@ public:
     Q_INVOKABLE void requestGrindSuggestion(qint64 packageId, const QString& beanBrand,
                                            const QString& beanType, const QString& roastDate,
                                            const QString& profileTitle);
+    Q_INVOKABLE void requestGeniusSuggestion(qint64 packageId, const QString& beanBrand,
+                                             const QString& beanType, const QString& roastDate,
+                                             const QString& profileTitle);
     Q_INVOKABLE void requestSetGrindAnchor(qint64 shotId, const QString& side,
                                           qint64 expectedPackageId);
     Q_INVOKABLE void requestClearGrindAnchor(qint64 packageId, const QString& side);
@@ -67,6 +70,7 @@ signals:
     void archivedFailed(const QString& reason);
     void grindCalibrationReady(qint64 packageId, const QVariantMap& calibration);
     void grindSuggestionReady(const QVariantMap& suggestion);
+    void geniusSuggestionReady(const QVariantMap& suggestion);
     void grindAnchorMarked(qint64 shotId, const QString& side, const QString& error);
     void grindAnchorCleared(qint64 packageId, const QString& side, bool ok);
     void grindCalibrationChanged(qint64 packageId);

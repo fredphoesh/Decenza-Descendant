@@ -1480,7 +1480,9 @@ T.Page {
         function onGrindAnchorMarked(shotId, side, error) {
             if (shotId !== postShotReviewPage.editShotId) return
             var msg = error === ""
-                ? (side === "fine"
+                ? (side === "reference"
+                   ? TranslationManager.translate("geniusGrind.markedReference", "Set as this bean's reference shot")
+                   : side === "fine"
                    ? TranslationManager.translate("grindcalibration.markedFine", "Marked as the fine anchor")
                    : TranslationManager.translate("grindcalibration.markedCoarse", "Marked as the coarse anchor"))
                 : TranslationManager.translate("grindcalibration.markRefused", "Not marked: %1")

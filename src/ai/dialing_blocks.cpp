@@ -1705,6 +1705,8 @@ QJsonObject buildGrinderCalibrationBlock(QSqlDatabase& db,
     st.keyPublished = keyValid;
     if (keyValid) {
         st.conversionKey = conversionKey;
+        st.validLo = validLo;
+        st.validHi = validHi;
         for (const ShotSummarizer::KbUgsEntry& e : entries) {
             if (e.ugs < validLo - kCalibCap - 1e-9 || e.ugs > validHi + kCalibCap + 1e-9) continue;
             if (st.rangeFromProfile.isEmpty()) st.rangeFromProfile = e.name;
@@ -1848,8 +1850,15 @@ QString markGrindCalibrationAnchor(QSqlDatabase& db, qint64 shotId, const QStrin
     // replacing this one.
     static const QStringList kPairRefusals{QStringLiteral("sameShot"), QStringLiteral("differentCoffee"),
                                            QStringLiteral("differentRpm"), QStringLiteral("tooClose")};
-    if (kPairRefusals.contains(st.pairStatus))
+    // A pair on a different bean is an old pair being replaced (Decenza-Descendant):
+    // clear the other side so the new bean's second anchor can be marked next.
+    if (st.pairStatus == QLatin1String("differentCoffee")) {
+        const QString other = side == QLatin1String("fine") ? QStringLiteral("coarse") : QStringLiteral("fine");
+        if (!EquipmentStorage::setCalibrationAnchorStatic(db, shot.equipmentId, other, 0))
+            return QStringLiteral("writeFailed");
+    } else if (kPairRefusals.contains(st.pairStatus)) {
         return st.pairStatus;
+    }
 
     if (!EquipmentStorage::setCalibrationAnchorStatic(db, shot.equipmentId, side, shotId)
         || !txn.commit())
@@ -1862,6 +1871,134 @@ QString markGrindCalibrationAnchor(QSqlDatabase& db, qint64 shotId, const QStrin
                                                                        : QStringLiteral(", DISAGREES with history"))
                                                : QString()));
     return {};
+}
+
+
+namespace {
+
+QString geniusBeanKey(const QString& brand, const QString& type, const QString& roastDate)
+{
+    const QString roast = roastDate.trimmed();
+    const bool dated = !roast.isEmpty() && roast != QLatin1String("--");
+    return brand.trimmed().toLower() + QLatin1Char('|') + type.trimmed().toLower()
+        + QLatin1Char('|') + (dated ? roast : QString());
+}
+
+// Additive and created on first use, so the shared schema version is untouched
+// and an unmodified Decenza on the same database simply ignores it.
+bool ensureGeniusReferenceTable(QSqlDatabase& db)
+{
+    QSqlQuery q(db);
+    return q.exec(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS genius_bean_references ("
+        " package_id INTEGER NOT NULL, bean_key TEXT NOT NULL, shot_id INTEGER NOT NULL,"
+        " updated_at INTEGER DEFAULT (strftime('%s','now')),"
+        " PRIMARY KEY (package_id, bean_key))"));
+}
+
+const GrinderAliases::GrinderEntry& geniusGrinderEntry(const QString& grinderModel)
+{
+    static const GrinderAliases::GrinderEntry kDefaultGrinder{};
+    const GrinderAliases::GrinderEntry* e = GrinderAliases::findEntryByAlias(grinderModel);
+    return e ? *e : kDefaultGrinder;
+}
+
+QString geniusShotKbId(const CalibShot& shot)
+{
+    QString id = ShotSummarizer::resolveKbId(shot.profileKbId);
+    if (id.isEmpty())
+        id = ShotSummarizer::computeProfileKbId(shot.profileName);
+    return id;
+}
+
+} // namespace
+
+QString markBeanReferenceShot(QSqlDatabase& db, qint64 shotId, qint64* packageIdOut,
+                              qint64 expectedPackageId)
+{
+    DbWriteTxn txn = DbWriteTxn::begin(db, "genius bean reference");
+    if (!txn.ok()) return QStringLiteral("writeFailed");
+    const std::optional<CalibShot> found = loadCalibShot(db, shotId);
+    if (!found) return QStringLiteral("notFound");
+    const CalibShot& shot = *found;
+    if (packageIdOut) *packageIdOut = shot.equipmentId;
+    if (shot.equipmentId <= 0) return QStringLiteral("noPackage");
+    if (expectedPackageId > 0 && shot.equipmentId != expectedPackageId)
+        return QStringLiteral("notInPackage");
+    const QString bev = shot.beverageType.toLower();
+    if (!bev.isEmpty() && bev != QLatin1String("espresso")) return QStringLiteral("notEspresso");
+    if (shot.grinderModel.isEmpty()) return QStringLiteral("noGrinder");
+    if (!GrinderAliases::parseGrinderSetting(geniusGrinderEntry(shot.grinderModel),
+                                             shot.grinderSetting.trimmed()))
+        return QStringLiteral("noSetting");
+    if (std::isnan(ShotSummarizer::ugsForKbId(geniusShotKbId(shot)))) return QStringLiteral("noUgs");
+    if (shot.beanBrand.trimmed().isEmpty() && shot.beanType.trimmed().isEmpty())
+        return QStringLiteral("noBean");
+    if (!ensureGeniusReferenceTable(db)) return QStringLiteral("writeFailed");
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO genius_bean_references (package_id, bean_key, shot_id, updated_at) "
+        "VALUES (:pkg, :key, :shot, strftime('%s','now'))"));
+    q.bindValue(QStringLiteral(":pkg"), shot.equipmentId);
+    q.bindValue(QStringLiteral(":key"), geniusBeanKey(shot.beanBrand, shot.beanType, shot.roastDate));
+    q.bindValue(QStringLiteral(":shot"), shotId);
+    if (!q.exec() || !txn.commit()) return QStringLiteral("writeFailed");
+    return {};
+}
+
+QVariantMap geniusSuggestionFor(QSqlDatabase& db, qint64 packageId, const QString& beanBrand,
+                                const QString& beanType, const QString& roastDate,
+                                const QString& profileTitle)
+{
+    const auto refuse = [](const char* reason) {
+        return QVariantMap{{QStringLiteral("reason"), QString::fromLatin1(reason)}};
+    };
+    if (packageId <= 0) return refuse("noEquipment");
+    const QString targetKb = ShotSummarizer::computeProfileKbId(profileTitle);
+    const double targetUgs = targetKb.isEmpty() ? std::numeric_limits<double>::quiet_NaN()
+                                                : ShotSummarizer::ugsForKbId(targetKb);
+    if (std::isnan(targetUgs)) return refuse("profileNotOnChart");
+
+    if (!ensureGeniusReferenceTable(db)) return refuse("noReference");
+    qint64 refId = 0;
+    {
+        QSqlQuery q(db);
+        q.prepare(QStringLiteral("SELECT shot_id FROM genius_bean_references "
+                                 "WHERE package_id = :pkg AND bean_key = :key"));
+        q.bindValue(QStringLiteral(":pkg"), packageId);
+        q.bindValue(QStringLiteral(":key"), geniusBeanKey(beanBrand, beanType, roastDate));
+        if (q.exec() && q.next()) refId = q.value(0).toLongLong();
+    }
+    const std::optional<CalibShot> ref = refId > 0 ? loadCalibShot(db, refId) : std::nullopt;
+    if (!ref || ref->equipmentId != packageId || ref->grinderModel.isEmpty())
+        return refuse("noReference");
+
+    const GrinderAliases::GrinderEntry& gEntry = geniusGrinderEntry(ref->grinderModel);
+    const std::optional<double> refSetting =
+        GrinderAliases::parseGrinderSetting(gEntry, ref->grinderSetting.trimmed());
+    const QString refKb = geniusShotKbId(*ref);
+    const double refUgs = refKb.isEmpty() ? std::numeric_limits<double>::quiet_NaN()
+                                          : ShotSummarizer::ugsForKbId(refKb);
+    if (!refSetting || std::isnan(refUgs)) return refuse("noReference");
+
+    double value = *refSetting;
+    if (std::abs(targetUgs - refUgs) > 1e-9) {
+        GrindCalibrationStatus st;
+        buildGrinderCalibrationBlock(db, ref->grinderModel, AdviceScope(packageId),
+                                     QStringLiteral("espresso"), ref->id, nullptr, &st);
+        if (!st.keyPublished || std::isnan(st.conversionKey)) return refuse("notCalibrated");
+        if (targetUgs < st.validLo - kCalibCap - 1e-9 || targetUgs > st.validHi + kCalibCap + 1e-9)
+            return refuse("outsideRange");
+        value = *refSetting + (targetUgs - refUgs) * st.conversionKey;
+    }
+    return QVariantMap{
+        {QStringLiteral("setting"), GrinderAliases::formatGrinderSetting(gEntry, value)},
+        {QStringLiteral("source"), QStringLiteral("reference")},
+        {QStringLiteral("anchorProfileName"), ShotSummarizer::canonicalNameForKbId(refKb)},
+        {QStringLiteral("anchorSetting"), ref->grinderSetting.trimmed()},
+        {QStringLiteral("referenceShotId"), ref->id},
+        {QStringLiteral("referenceTimestamp"), ref->timestamp},
+    };
 }
 
 
