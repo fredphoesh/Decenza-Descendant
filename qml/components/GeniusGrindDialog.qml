@@ -35,7 +35,7 @@ DecenzaDialog {
 
     readonly property var selectedBag: {
         for (let i = 0; i < root.bags.length; ++i) {
-            if (root.bags[i].id === root.bagId) return root.bags[i]
+            if (Number(root.bags[i].id) === root.bagId) return root.bags[i]
         }
         return null
     }
@@ -164,6 +164,8 @@ DecenzaDialog {
         target: BagService
         function onInventoryReady(bags) {
             root.bags = bags
+            // No active bean, or it is gone: start from the most recently used one.
+            if (!root.selectedBag && bags.length > 0) root.bagId = Number(bags[0].id)
             if (root.visible && !root.suggestionPending && root.suggestedSetting.length === 0)
                 root.requestSuggestion()
         }
@@ -331,13 +333,13 @@ DecenzaDialog {
         options: root.bags.map(function(b) { return root.bagLabel(b) })
         currentIndex: {
             for (let i = 0; i < root.bags.length; ++i) {
-                if (root.bags[i].id === root.bagId) return i
+                if (Number(root.bags[i].id) === root.bagId) return i
             }
             return -1
         }
         onSelected: function(index, value) {
             if (index < 0 || index >= root.bags.length) return
-            root.bagId = root.bags[index].id
+            root.bagId = Number(root.bags[index].id)
             root.requestSuggestion()
         }
     }
