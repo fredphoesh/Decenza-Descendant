@@ -324,6 +324,9 @@ DecenzaDialog {
 
     SelectionDialog {
         id: beanPicker
+        // Above the Genius popup: equal-z popups can stack in creation order,
+        // which put the pickers underneath it.
+        z: root.z + 1
         title: TranslationManager.translate("geniusGrind.chooseBean", "Choose a bean")
         options: root.bags.map(function(b) { return root.bagLabel(b) })
         currentIndex: {
@@ -341,6 +344,7 @@ DecenzaDialog {
 
     SelectionDialog {
         id: profilePicker
+        z: root.z + 1
         title: TranslationManager.translate("geniusGrind.chooseProfile", "Choose a profile")
         options: root.profileTitles
         currentValue: root.profileTitle
