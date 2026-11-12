@@ -59,6 +59,8 @@ android {
     }
 
     defaultConfig {
+        // Decenza-Descendant: own install identity so it sits beside the official app.
+        applicationId = "io.github.fredphoesh.descendant"
         minSdk = qtMinSdkVersion.toInteger()
         targetSdk = qtTargetSdkVersion.toInteger()
         ndk {
