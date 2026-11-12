@@ -238,7 +238,6 @@ DecenzaDialog {
             Layout.fillWidth: true
             horizontalAlignment: Text.AlignHCenter
             text: root.suggestedSetting.length > 0 ? root.suggestedSetting : "—"
-            font.families: Theme.fontFamilies
             font.pixelSize: Theme.scaled(56)
             font.bold: true
             color: root.suggestedSetting.length > 0 ? Theme.primaryColor : Theme.textSecondaryColor
