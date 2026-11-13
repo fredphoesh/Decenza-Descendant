@@ -530,8 +530,10 @@ QString markBeanReferenceShot(QSqlDatabase& db, qint64 shotId, qint64* packageId
 // noGrinder, writeFailed, or a pair status). Nothing is written on refusal.
 // `expectedPackageId` > 0 refuses ("notInPackage") a shot that now belongs to
 // another package.
+// `replacePair` clears the other side first (recreating the pair from this shot).
 QString markGrindCalibrationAnchor(QSqlDatabase& db, qint64 shotId, const QString& side,
-                                   qint64* packageIdOut = nullptr, qint64 expectedPackageId = 0);
+                                   qint64* packageIdOut = nullptr, qint64 expectedPackageId = 0,
+                                   bool replacePair = false);
 
 // SAW (Stop-at-Weight) prediction for the resolved shot. Returns an
 // empty `QJsonObject` when any of the following hold:

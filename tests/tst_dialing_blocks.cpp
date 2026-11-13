@@ -2419,9 +2419,9 @@ private slots:
         });
     }
 
-    // History's three pairs say 2 steps/UGS; the anchors say 4. The anchor joins
-    // the median rather than replacing it, and the disagreement is reported.
-    void calibrationAnchors_combineWithHistoryAndReportDisagreement()
+    // History's three pairs say 2 steps/UGS; the anchors say 4. A marked pair
+    // defines the span outright (Decenza-Descendant), and the disagreement is reported.
+    void calibrationAnchors_overrideHistoryAndReportDisagreement()
     {
         const QString path = freshDbPath();
         initAndClose(path);
@@ -2444,8 +2444,8 @@ private slots:
             const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
                 db, QStringLiteral("Niche Zero"), AdviceScope(projectionForShot(db, coarse).equipmentId),
                 QStringLiteral("espresso"), coarse);
-            QCOMPARE(r.value(QStringLiteral("basis")).toString(), QStringLiteral("both"));
-            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 2.0);  // median of 2, 2, 2, 4
+            QCOMPARE(r.value(QStringLiteral("basis")).toString(), QStringLiteral("anchors"));
+            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 4.0);
             const QJsonObject marked = r.value(QStringLiteral("markedAnchors")).toObject();
             QCOMPARE(marked.value(QStringLiteral("status")).toString(), QStringLiteral("valid"));
             QCOMPARE(marked.value(QStringLiteral("agreesWithHistory")).toBool(), false);
