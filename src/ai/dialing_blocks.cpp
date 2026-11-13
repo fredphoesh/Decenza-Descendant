@@ -1529,13 +1529,13 @@ QJsonObject buildGrinderCalibrationBlock(QSqlDatabase& db,
                 st.agreesWithHistory = (st.anchorSlope > 0) == (historyKey > 0)
                     && std::abs(st.anchorSlope - historyKey) <= kCalibMaxSpreadRatio * std::abs(historyKey);
             }
-            QList<double> all = slopes;
-            all.append(st.anchorSlope);
-            conversionKey = computeMedian(all);
+            // Decenza-Descendant: the user's own pair defines the span outright;
+            // history only stands in when no valid pair is marked.
+            conversionKey = st.anchorSlope;
             keyValid = std::abs(conversionKey) > 1e-9;
-            validLo = std::min({validLo, f->ugs, c->ugs});
-            validHi = std::max({validHi, f->ugs, c->ugs});
-            st.basis = slopes.isEmpty() ? QStringLiteral("anchors") : QStringLiteral("both");
+            validLo = std::isnan(validLo) ? std::min(f->ugs, c->ugs) : std::min({validLo, f->ugs, c->ugs});
+            validHi = std::isnan(validHi) ? std::max(f->ugs, c->ugs) : std::max({validHi, f->ugs, c->ugs});
+            st.basis = QStringLiteral("anchors");
         }
     }
     if (st.basis.isEmpty() && keyValid)
@@ -1817,7 +1817,8 @@ QVariantMap grindSuggestionFor(QSqlDatabase& db, qint64 packageId, const QString
 }
 
 QString markGrindCalibrationAnchor(QSqlDatabase& db, qint64 shotId, const QString& side,
-                                   qint64* packageIdOut, qint64 expectedPackageId)
+                                   qint64* packageIdOut, qint64 expectedPackageId,
+                                   bool replacePair)
 {
     if (side != QLatin1String("fine") && side != QLatin1String("coarse"))
         return QStringLiteral("badSide");
@@ -1835,6 +1836,13 @@ QString markGrindCalibrationAnchor(QSqlDatabase& db, qint64 shotId, const QStrin
     const QString bev = shot.beverageType.toLower();
     if (!bev.isEmpty() && bev != QLatin1String("espresso")) return QStringLiteral("notEspresso");
     if (shot.grinderModel.isEmpty()) return QStringLiteral("noGrinder");
+    // Recreating the pair: drop the other side inside this transaction, so a
+    // refusal below rolls the clear back with it.
+    if (replacePair) {
+        const QString other = side == QLatin1String("fine") ? QStringLiteral("coarse") : QStringLiteral("fine");
+        if (!EquipmentStorage::setCalibrationAnchorStatic(db, shot.equipmentId, other, 0))
+            return QStringLiteral("writeFailed");
+    }
 
     // Evaluate the package as if this shot already held the side: the same
     // computation the block and the equipment card use.

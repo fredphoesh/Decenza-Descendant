@@ -120,7 +120,17 @@ ColumnLayout {
     }
 
     // The page owns saving pending edits before a mark, so it handles this.
+    // A full pair already exists and this shot is in neither side: marking would
+    // start a new pair, so ask first (shown in place, below the mark buttons).
+    readonly property bool _fullPair: !!calib.fine && !!calib.coarse
+                                      && calib.fine.shotId > 0 && calib.coarse.shotId > 0
+    property string pendingFreshSide: ""
+
     signal markRequested(string side)
+    function requestMark(side: string): void {
+        if (root._fullPair && !root._isAnchorShot(root.shotId)) root.pendingFreshSide = side
+        else root.markRequested(side)
+    }
 
     ExternalUrlOpener { id: guideUrlOpener }
 
@@ -274,7 +284,7 @@ ColumnLayout {
             enabled: root.serviceReady && (root.calib.error || "") === ""
             text: TranslationManager.translate("grindcalibration.markFine", "Mark as fine anchor")
             accessibleName: text
-            onClicked: root.markRequested("fine")
+            onClicked: root.requestMark("fine")
         }
         AccessibleButton {
             Layout.preferredHeight: Theme.scaled(32)
@@ -282,7 +292,7 @@ ColumnLayout {
             enabled: root.serviceReady && (root.calib.error || "") === ""
             text: TranslationManager.translate("grindcalibration.markCoarse", "Mark as coarse anchor")
             accessibleName: text
-            onClicked: root.markRequested("coarse")
+            onClicked: root.requestMark("coarse")
         }
         AccessibleButton {
             Layout.preferredHeight: Theme.scaled(32)
@@ -300,6 +310,41 @@ ColumnLayout {
             text: TranslationManager.translate("grindcalibration.openEquipment", "Equipment")
             accessibleName: TranslationManager.translate("grindcalibration.openEquipmentAccessible", "Open the Equipment page to see the full grind calibration")
             onClicked: AppShell.equipmentRequested()
+        }
+    }
+
+    ColumnLayout {
+        visible: root.pendingFreshSide !== ""
+        Layout.fillWidth: true
+        spacing: Theme.scaled(6)
+        Text {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            text: TranslationManager.translate("geniusGrind.recreateAnchors",
+                "You already have anchor points set for your grinder's range. Would you like to recreate them?")
+            color: Theme.textColor
+            font: Theme.bodyFont
+        }
+        RowLayout {
+            spacing: Theme.scaled(6)
+            AccessibleButton {
+                Layout.preferredHeight: Theme.scaled(32)
+                text: TranslationManager.translate("common.button.no", "No")
+                accessibleName: TranslationManager.translate("geniusGrind.recreateNo", "No, keep the current anchor points")
+                onClicked: root.pendingFreshSide = ""
+            }
+            AccessibleButton {
+                Layout.preferredHeight: Theme.scaled(32)
+                primary: true
+                text: TranslationManager.translate("common.button.yes", "Yes")
+                accessibleName: TranslationManager.translate("geniusGrind.recreateYes",
+                    "Yes, clear the current anchor points and start again from this shot")
+                onClicked: {
+                    const side = root.pendingFreshSide
+                    root.pendingFreshSide = ""
+                    root.markRequested(side + "Fresh")
+                }
+            }
         }
     }
 }

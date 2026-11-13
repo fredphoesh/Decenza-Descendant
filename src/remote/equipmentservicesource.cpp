@@ -285,7 +285,8 @@ void NativeEquipmentServiceSource::execute(QString requestId, QString operation,
         if (packageId <= 0 || !noExpected || makeActive
             || fields.value(QStringLiteral("side")).metaType().id() != QMetaType::QString
             || (side != QLatin1String("fine") && side != QLatin1String("coarse")
-                && (clear || side != QLatin1String("reference")))
+                && (clear || (side != QLatin1String("reference") && side != QLatin1String("fineFresh")
+                              && side != QLatin1String("coarseFresh"))))
             || fields.size() != (clear ? 1 : 2)
             || !validId) {
             reject(packageId, QStringLiteral("invalidRequest"));
@@ -453,6 +454,9 @@ void NativeEquipmentServiceSource::writeGrindAnchor(
                     ? QString() : QStringLiteral("writeFailed")
                 : side == QLatin1String("reference")
                     ? DialingBlocks::markBeanReferenceShot(db, id, &packageId, expectedPackageId)
+                    : side.endsWith(QLatin1String("Fresh"))
+                    ? DialingBlocks::markGrindCalibrationAnchor(db, id, side.chopped(5), &packageId,
+                                                               expectedPackageId, true)
                     : DialingBlocks::markGrindCalibrationAnchor(db, id, side, &packageId,
                                                                expectedPackageId);
         });
