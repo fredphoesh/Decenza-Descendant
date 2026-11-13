@@ -25,6 +25,8 @@ DecenzaDialog {
     property string profileTitle: ""
     property var suggestion: ({})
     property bool suggestionPending: false
+    // Which choice list is open in place: "", "bean" or "profile".
+    property string expanded: ""
 
     // Apply runs bag activation, then profile load, then the grind write.
     property bool applying: false
@@ -74,6 +76,7 @@ DecenzaDialog {
         root.profileTitles = root.chartedProfileTitles()
         root.suggestion = ({})
         root.applying = false
+        root.expanded = ""
         BagService.requestInventory()
         root.open()
         root.requestSuggestion()
@@ -302,7 +305,7 @@ DecenzaDialog {
                                        : TranslationManager.translate("geniusGrind.chooseBean", "Choose a bean")
                 accessibleName: TranslationManager.translate("geniusGrind.changeBean", "Change bean") + ": " + text
                 enabled: !root.applying
-                onClicked: beanPicker.open()
+                onClicked: root.expanded = root.expanded === "bean" ? "" : "bean"
             }
 
             Text {
@@ -316,7 +319,40 @@ DecenzaDialog {
                                                    : TranslationManager.translate("geniusGrind.chooseProfile", "Choose a profile")
                 accessibleName: TranslationManager.translate("geniusGrind.changeProfile", "Change profile") + ": " + text
                 enabled: !root.applying
-                onClicked: profilePicker.open()
+                onClicked: root.expanded = root.expanded === "profile" ? "" : "profile"
+            }
+        }
+
+        // The choices open in place: a picker popup over this popup did not reach
+        // the screen on the user's Windows build.
+        ListView {
+            id: choiceList
+            Layout.fillWidth: true
+            Layout.leftMargin: Theme.scaled(20)
+            Layout.rightMargin: Theme.scaled(20)
+            Layout.preferredHeight: Math.min(contentHeight, Theme.scaled(260))
+            visible: root.expanded !== ""
+            clip: true
+            spacing: Theme.scaled(4)
+            model: root.expanded === "bean" ? root.bags
+                 : root.expanded === "profile" ? root.profileTitles : []
+            delegate: AccessibleButton {
+                id: choice
+                required property var modelData
+                width: choiceList.width
+                readonly property bool isBean: root.expanded === "bean"
+                readonly property bool isCurrent: choice.isBean
+                    ? Number(choice.modelData.id) === root.bagId
+                    : String(choice.modelData) === root.profileTitle
+                text: choice.isBean ? root.bagLabel(choice.modelData) : String(choice.modelData)
+                accessibleName: choice.text
+                primary: choice.isCurrent
+                onClicked: {
+                    if (choice.isBean) root.bagId = Number(choice.modelData.id)
+                    else root.profileTitle = String(choice.modelData)
+                    root.expanded = ""
+                    root.requestSuggestion()
+                }
             }
         }
 
@@ -344,39 +380,6 @@ DecenzaDialog {
                     "Apply this bean, profile and grind")
                 onClicked: root.startApply()
             }
-        }
-    }
-
-    SelectionDialog {
-        id: beanPicker
-        // Above the Genius popup: equal-z popups can stack in creation order,
-        // which put the pickers underneath it.
-        z: root.z + 1
-        title: TranslationManager.translate("geniusGrind.chooseBean", "Choose a bean")
-        options: root.bags.map(function(b) { return root.bagLabel(b) })
-        currentIndex: {
-            for (let i = 0; i < root.bags.length; ++i) {
-                if (Number(root.bags[i].id) === root.bagId) return i
-            }
-            return -1
-        }
-        onSelected: function(index, value) {
-            if (index < 0 || index >= root.bags.length) return
-            root.bagId = Number(root.bags[index].id)
-            root.requestSuggestion()
-        }
-    }
-
-    SelectionDialog {
-        id: profilePicker
-        z: root.z + 1
-        title: TranslationManager.translate("geniusGrind.chooseProfile", "Choose a profile")
-        options: root.profileTitles
-        currentValue: root.profileTitle
-        onSelected: function(index, value) {
-            if (value.length === 0) return
-            root.profileTitle = value
-            root.requestSuggestion()
         }
     }
 }
