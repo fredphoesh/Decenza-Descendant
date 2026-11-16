@@ -1835,7 +1835,7 @@ QString markGrindCalibrationAnchor(QSqlDatabase& db, qint64 shotId, const QStrin
     if (!bev.isEmpty() && bev != QLatin1String("espresso")) return QStringLiteral("notEspresso");
     if (shot.grinderModel.isEmpty()) return QStringLiteral("noGrinder");
     // Inside the transaction, so a refusal below rolls the clear back too.
-    if (replacePair
+    if (false && replacePair
         && !EquipmentStorage::setCalibrationAnchorStatic(
                db, shot.equipmentId,
                side == QLatin1String("fine") ? QStringLiteral("coarse") : QStringLiteral("fine"), 0))
