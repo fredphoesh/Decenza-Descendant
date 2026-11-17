@@ -12,6 +12,7 @@ import QtQuick.Layouts
 import QtQuick.Effects
 import QtQuick.Window
 import Decenza
+import QtCore as QC
 
 T.Page {
     id: steamPage
@@ -2109,6 +2110,20 @@ T.Page {
                             : TranslationManager.translate("steam.view.chart", "Steam view: Chart")
                         accessibleName: text
                         onClicked: steamPage.toggleSteamView()
+                    }
+
+                    // Decenza-Lab: skip the Done/Purge screen after steaming.
+                    QC.Settings { id: labSteamSettings; category: "lab" }
+                    StyledSwitch {
+                        Layout.fillWidth: true
+                        text: TranslationManager.translate("lab.steam.hidePurgeScreen", "Hide post Steaming purge screen")
+                        accessibleName: text
+                        checked: labSteamSettings.value("hidePostSteamPurgeScreen", false) === true
+                                 || labSteamSettings.value("hidePostSteamPurgeScreen", false) === "true"
+                        onToggled: {
+                            labSteamSettings.setValue("hidePostSteamPurgeScreen", checked)
+                            labSteamSettings.sync()
+                        }
                     }
 
                     ColumnLayout {

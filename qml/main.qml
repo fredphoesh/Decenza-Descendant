@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import QtQuick.Templates as T
 import QtQuick.Window
 import Decenza
+import QtCore as QC
 import "components/OperationNavigationPolicy.js" as OperationNavigationPolicy
 
 // Rooted at QtQuick.Templates.ApplicationWindow for the same reason the pages and the
@@ -2079,6 +2080,8 @@ T.ApplicationWindow {
     Tr { id: trHotWaterComplete; key: "main.completion.hotwater"; fallback: "Hot Water Complete"; visible: false }
     Tr { id: trFlushComplete; key: "main.completion.flush"; fallback: "Flush Complete"; visible: false }
 
+    QC.Settings { id: labSettings; category: "lab" }
+
     OperationCompletionOverlay {
         id: completionOverlay
         onFinished: navigation.leaveOperationPage()
@@ -3070,7 +3073,12 @@ T.ApplicationWindow {
                 WebDebugLogger.debug("App", "main", ["Phase Idle/Ready: currentPage=" + currentPage + " completionOverlay.opacity=" + completionOverlay.opacity].map(String).join(" "))
 
                 if (currentPage === "steamPage") {
-                    root.showCompletion(trSteamComplete.text, "steam")
+                    // Decenza-Lab: "Hide post Steaming purge screen" goes straight home.
+                    const v = labSettings.value("hidePostSteamPurgeScreen", false)
+                    if (v === true || v === "true")
+                        navigation.leaveOperationPage()
+                    else
+                        root.showCompletion(trSteamComplete.text, "steam")
                 } else if (currentPage === "hotWaterPage"
                            || (currentPage === "espressoPage" && wasHotWater)) {
                     // A long black's water may have run on the espresso page (cup
