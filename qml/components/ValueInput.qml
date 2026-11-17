@@ -1,0 +1,1176 @@
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Decenza
+
+Item {
+    id: root
+
+    // Value properties
+    property real value: 0
+
+    // The value this widget displays and steps from, which is `value` except
+    // while an interaction is outrunning the consumer.
+    //
+    // Nothing here ever assigns `value` — that would destroy the consumer's
+    // binding — so an adjustment is a REQUEST: valueModified is emitted and the
+    // consumer is expected to write the new value back through its binding.
+    // Consumers bound to non-notifying data cannot do that synchronously: a
+    // plain JS object, or a C++ value behind a manual version bump, leaves
+    // `value` frozen for the whole gesture. Every drag step then recomputed
+    // frozenValue + one step and overwrote the last, so a drag of ANY length
+    // moved the value exactly one step (#1894, the frame fields in
+    // ProfileEditorPage). Holding +/- froze the same way, less visibly.
+    //
+    // So the widget carries the value itself until the consumer catches up. An
+    // echo clears the flag in onValueChanged, which is why a consumer that does
+    // echo — BrewDialog and most others — behaves exactly as it did before.
+    property real _pendingValue: 0
+    property bool _hasPending: false
+    readonly property real effectiveValue: _hasPending ? _pendingValue : value
+
+    // Authority returns to `value` the moment the consumer reports one, whether
+    // that is the value we asked for or a different one it clamped to.
+    onValueChanged: {
+        _hasPending = false
+        AccessibleValueChange.notifyNumericValueChanged(root)
+    }
+
+    // Qt connects value notifications before this Item receives its Slider role
+    // (qtdeclarative/src/quick/items/qquickaccessibleattached.cpp:349–394).
+    // Wasm resyncs its numeric DOM value only on ValueChanged
+    // (qtbase/src/plugins/platforms/wasm/qwasmaccessibility.cpp:1102–1116).
+    // Completion also covers host values bound before the role was established.
+    Component.onCompleted: AccessibleValueChange.notifyNumericValueChanged(root)
+
+    // Hand authority back to `value`. Called wherever an interaction starts or
+    // ends — press, popup open, commit, and every cancel. A cancel neither
+    // commits nor rolls back (valueModified has no undo), so all it can do is
+    // stop carrying a number the consumer was never told to keep.
+    function _dropPending() {
+        _hasPending = false
+    }
+
+    property real from: 0
+    property real to: 100
+    property real stepSize: 1
+    property real fineStepSize: 0  // Optional lower gear (e.g., 1 when stepSize is 10). 0 = disabled.
+    // Where a TYPED 0 lands. Only the typed path needs it — every other path (+/-, drag,
+    // scrubber) goes through adjustValueWithStep(), which already floors at `from`.
+    property real snapZeroTo: 0
+    property int decimals: stepSize >= 1 ? 0 : (stepSize >= 0.1 ? 1 : 2)
+    readonly property bool hasFineGear: fineStepSize > 0 && fineStepSize < stepSize
+
+    // Display
+    property string suffix: ""
+    property string displayText: ""  // Optional override for value display
+
+    // displayText is computed by the consumer FROM `value` — a unit conversion
+    // ("2.4 mL/s" for an internal 24), or a sentinel label ("off" at 0). Either
+    // way it describes `value`, so it is only usable while `value` is what the
+    // widget is showing. While _hasPending it is describing a number the user
+    // has already dragged away from, which is how a field sitting at "off" went
+    // on reading "off" for the whole gesture. Falling back to the raw number
+    // costs an echoing consumer nothing: its echo clears _hasPending inside the
+    // emit, so displayText is in force at every repaint.
+    readonly property string effectiveDisplayText: _hasPending ? "" : displayText
+    property string rangeText: ""   // Optional override for range display in popup
+    property string accessibleName: ""  // Optional override for accessibility announcement
+    property color valueColor: Theme.textColor
+    property color accentColor: Theme.primaryColor
+
+    // Scale mode - when true, uses Theme.scaledBase() for consistent size across pages
+    property bool useBaseScale: false
+
+    // Helper to use either scaled or scaledBase based on useBaseScale property
+    function sc(value) {
+        return useBaseScale ? Theme.scaledBase(value) : Theme.scaled(value)
+    }
+
+    // Font size for the inline value text and +/- glyphs. Defaults to sc(16) to
+    // preserve previous appearance; compact callers (e.g. status strips) can
+    // lower it so the inline value matches surrounding label text. Only affects
+    // the inline display — the full-screen popup keeps its own larger sizes.
+    property int valueFontPixelSize: sc(16)
+
+    // Internal dirty flag: set when valueModified is emitted, cleared by
+    // commitValue(). Ensures valueCommitted only fires when the interaction
+    // actually changed the value (e.g. tapping + when already at max emits
+    // neither signal, rather than firing an expensive BLE-write commit for a
+    // no-op adjustment).
+    property bool _dirtySinceCommit: false
+
+    // Signals
+    //
+    // valueModified fires on every adjustment step — every +/- click, every
+    // hold-timer tick, every drag pixel-step. Use for cheap reactions
+    // (updating local state, saving to Settings).
+    //
+    // valueCommitted fires at the END of a user interaction — release of a
+    // hold, end of a drag, single click, text-entry commit. Use for expensive
+    // actions (BLE writes, file saves) that shouldn't fire on every tick.
+    // A single tap emits both signals; a held adjustment emits valueModified
+    // per tick and valueCommitted once on release.
+    signal valueModified(real newValue)
+    signal valueCommitted(real newValue)
+
+    // Internal helper used in place of raw root.valueModified() emission so
+    // the dirty flag is kept consistent.
+    function _emitValueModified(newVal) {
+        // Take the value BEFORE emitting, so an echoing consumer's write lands
+        // on top of it (onValueChanged clears the flag) rather than racing it.
+        _pendingValue = newVal
+        _hasPending = true
+        root.valueModified(newVal)
+        _dirtySinceCommit = true
+    }
+
+    // Emit valueCommitted if the interaction changed the value. Called by
+    // every release/click/drag-end/text-entry handler. No-op when nothing
+    // changed (e.g. a tap on a pinned-at-max button).
+    function commitValue() {
+        if (_dirtySinceCommit) {
+            _dirtySinceCommit = false
+            root.valueCommitted(root.effectiveValue)
+        }
+        // Interaction over — `value` is authoritative again, so whatever the
+        // consumer actually stored shows through instead of the widget going on
+        // displaying a number nobody kept.
+        _dropPending()
+    }
+
+    // Enable keyboard focus without claiming it when the page opens.
+    activeFocusOnTab: true
+
+    // Accessibility - expose as a slider with contextual label
+    Accessible.role: Accessible.Slider
+    Accessible.name: (root.accessibleName ? root.accessibleName + " " : "") +
+                     (root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + root.suffix))
+    Accessible.description: TranslationManager.translate("valueinput.accessibility.description", "Use plus and minus buttons to adjust. Tap center for full-screen editor. Double-tap value to type a number.")
+    Accessible.focusable: true
+    // Qt's default slider action writes value directly (qtdeclarative/src/quick/
+    // accessible/qaccessiblequickitem.cpp:554–622,759–761); reuse request/commit.
+    Accessible.onIncreaseAction: { root.adjustValue(1); root.commitValue() }
+    Accessible.onDecreaseAction: { root.adjustValue(-1); root.commitValue() }
+
+    // Keyboard handling. Press fires adjustValue per key-press (including
+    // auto-repeat while held); release fires commitValue once when the
+    // physical key lifts — same contract as the +/- button MouseAreas, so
+    // BLE-bound consumers that migrated to onValueCommitted don't miss
+    // hardware-keyboard adjustments.
+    Keys.onUpPressed: adjustValue(1)
+    Keys.onDownPressed: adjustValue(-1)
+    Keys.onLeftPressed: adjustValue(-1)
+    Keys.onRightPressed: adjustValue(1)
+
+    Keys.onReturnPressed: root.openEditor()
+    Keys.onEnterPressed: root.openEditor()
+    Keys.onSpacePressed: root.openEditor()
+
+    function openEditor() {
+        (scrubberLoader.ensure() as DecenzaDialog)?.open()
+    }
+
+    // Page up/down for larger steps
+    Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_PageUp) {
+            adjustValue(10)
+            event.accepted = true
+        } else if (event.key === Qt.Key_PageDown) {
+            adjustValue(-10)
+            event.accepted = true
+        }
+    }
+
+    Keys.onReleased: function(event) {
+        if (event.isAutoRepeat) return
+        switch (event.key) {
+            case Qt.Key_Up: case Qt.Key_Down: case Qt.Key_Left: case Qt.Key_Right:
+            case Qt.Key_PageUp: case Qt.Key_PageDown:
+                commitValue()
+                event.accepted = true
+                break
+        }
+    }
+
+    // Announce value when focused (for accessibility)
+    onActiveFocusChanged: {
+        if (activeFocus && typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+            let text = root.accessibleName || root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + " " + root.suffix)
+            AccessibilityManager.announce(text)
+        }
+    }
+
+    // Auto-size based on content
+    // Buttons: 24 each, margins: 2 each side, spacing: 2 each side = 56 total fixed
+    implicitWidth: sc(56) + textMetrics.width + sc(16)
+    implicitHeight: sc(36)
+
+    // Measure the text width for auto-sizing
+    TextMetrics {
+        id: textMetrics
+        font.pixelSize: root.valueFontPixelSize
+        font.bold: true
+        text: root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + root.suffix)
+    }
+
+    // Focus indicator around the entire control
+    Rectangle {
+        anchors.fill: valueDisplay
+        anchors.margins: -Theme.focusMargin
+        visible: root.activeFocus
+        color: "transparent"
+        border.width: Theme.focusBorderWidth
+        border.color: Theme.focusColor
+        radius: valueDisplay.radius + Theme.focusMargin
+        z: -1
+    }
+
+    // Compact value display
+    Rectangle {
+        id: valueDisplay
+        anchors.fill: parent
+        radius: root.sc(8)
+        color: Theme.cardBackgroundColor
+        border.width: 1
+        border.color: Theme.textSecondaryColor
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.margins: root.sc(2)
+            spacing: root.sc(2)
+
+            // Minus button - immediate response, Flickable handles scroll detection
+            Rectangle {
+                Layout.preferredWidth: root.sc(24)
+                Layout.fillHeight: true
+                radius: root.sc(6)
+                color: minusArea.pressed ? Qt.darker(Theme.surfaceColor, 1.3) : "transparent"
+
+                Accessible.role: Accessible.Button
+                Accessible.name: TranslationManager.translate("valueinput.button.decrease", "Decrease")
+                Accessible.focusable: true
+                Accessible.onPressAction: minusArea.clicked(null)
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "\u2212"
+                    font.pixelSize: root.valueFontPixelSize
+                    font.bold: true
+                    color: root.effectiveValue <= root.from ? Theme.textSecondaryColor : Theme.textColor
+                    Accessible.ignored: true
+                }
+
+                MouseArea {
+                    id: minusArea
+                    anchors.fill: parent
+                    // Tap: adjust once and commit. Hold: pressAndHold starts the
+                    // repeat timer; on release we stop the timer and commit.
+                    // onCanceled means user dragged off the button — stop without
+                    // committing since the hold repeats are what they wanted to cancel.
+                    onClicked: { root.adjustValue(-1); root.commitValue() }
+                    onPressAndHold: decrementTimer.start()
+                    onReleased: {
+                        if (decrementTimer.running) {
+                            decrementTimer.stop()
+                            root.commitValue()
+                        }
+                    }
+                    onCanceled: { decrementTimer.stop(); root._dropPending() }
+                }
+
+                Timer {
+                    id: decrementTimer
+                    interval: 80
+                    repeat: true
+                    onTriggered: root.adjustValue(-1)
+                }
+            }
+
+            // Value display - drag to adjust, tap to open scrubber
+            Item {
+                id: valueContainer
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                Text {
+                    id: valueText
+                    anchors.centerIn: parent
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    text: root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + root.suffix)
+                    font.pixelSize: root.valueFontPixelSize
+                    font.bold: true
+                    color: root.valueColor
+                    elide: Text.ElideRight
+                }
+
+                MouseArea {
+                    id: valueDragArea
+                    anchors.fill: parent
+                    preventStealing: dragReady
+
+                    property real startX: 0
+                    property real startY: 0
+                    property bool isDragging: false
+                    // Direction commitment flag: set when horizontal movement
+                    // dominates vertical past a threshold, meaning the user
+                    // intends a value drag rather than a scroll.
+                    property bool dragReady: false
+                    // Tracks any significant finger movement (horiz or vert)
+                    // so we don't open the popup for swipe gestures.
+                    property bool hasMoved: false
+                    property int currentGear: 0
+
+                    onPressed: function(mouse) {
+                        startX = mouse.x
+                        startY = mouse.y
+                        isDragging = false
+                        dragReady = false
+                        hasMoved = false
+                        currentGear = 0
+                        root._dropPending()
+
+                        // Announce parameter name when touched (accessibility)
+                        if (root.accessibleName && typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+                            let valueStr = root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + " " + root.suffix.trim())
+                            AccessibilityManager.announce(root.accessibleName + ": " + valueStr)
+                        }
+                    }
+
+                    onPositionChanged: function(mouse) {
+                        var deltaX = mouse.x - startX
+                        var deltaY = mouse.y - startY
+
+                        // Direction commitment: require horizontal movement to
+                        // dominate before activating drag. Vertical-dominant
+                        // movement passes through to ScrollView for scrolling
+                        // (preventStealing is false while dragReady is false).
+                        if (!dragReady) {
+                            let absX = Math.abs(deltaX)
+                            let absY = Math.abs(deltaY)
+                            if (absX > root.sc(15) && absX > absY) {
+                                dragReady = true
+                                isDragging = true
+                                startX = mouse.x
+                                startY = mouse.y
+                                return
+                            } else {
+                                // Track any movement so we don't open popup
+                                // for vertical swipes (which should scroll).
+                                if (absX > root.sc(5) || absY > root.sc(5)) {
+                                    hasMoved = true
+                                }
+                                return
+                            }
+                        }
+
+                        // Vertical distance from drag-start selects gear (50 px per level).
+                        // Dragging down = higher gears (x10, x100).
+                        // Dragging up = fine gear (fineStepSize) when available.
+                        var vertDist = mouse.y - startY
+                        var gear
+                        if (root.hasFineGear && vertDist < -root.sc(50)) {
+                            gear = -1  // Fine gear (drag up)
+                        } else {
+                            gear = Math.min(2, Math.floor(Math.max(0, vertDist) / root.sc(50)))
+                        }
+                        if (gear !== currentGear) {
+                            currentGear = gear
+                            root.announceGearChange(gear)
+                        }
+
+                        var effectiveStep = root.gearToStep(gear)
+                        var steps = Math.round(deltaX / root.sc(20))
+                        if (steps !== 0) {
+                            root.adjustValueWithStep(steps, effectiveStep)
+                            startX = mouse.x
+                            // Do NOT reset startY — it is the gear reference point
+                        }
+                    }
+
+                    onReleased: {
+                        // Only open popup for taps (no significant movement).
+                        // Before the dragReady guard was added, isDragging was
+                        // set for any 5px movement; now vertical-only swipes
+                        // leave isDragging false, so we also check hasMoved.
+                        if (!isDragging && !hasMoved) {
+                            root.openEditor()
+                        }
+                        // Commit on drag release. PR Kulitorum/Decenza#782 added the
+                        // valueCommitted contract for the +/- buttons but
+                        // missed this MouseArea, so drags were updating
+                        // _dirtySinceCommit during onPositionChanged
+                        // (via _emitValueModified) without ever firing
+                        // commitValue() — silently dropping the BLE write
+                        // for every consumer that migrated to onValueCommitted.
+                        if (isDragging) {
+                            root.commitValue()
+                        }
+                        isDragging = false
+                        dragReady = false
+                        hasMoved = false
+                    }
+
+                    onCanceled: {
+                        // Drag canceled (e.g. finger left the screen edge,
+                        // or another gesture stole focus). Don't commit —
+                        // this matches the +/- button onCanceled semantics
+                        // (treat cancel as "user changed their mind").
+                        isDragging = false
+                        dragReady = false
+                        hasMoved = false
+                        root._dropPending()
+                    }
+                }
+
+                // Anchor point for bubble positioning (centered)
+                Item {
+                    id: bubbleAnchor
+                    anchors.centerIn: parent
+                    width: root.sc(1)
+                    height: root.sc(1)
+                }
+
+                // Floating speech bubble - rendered in overlay to be always on top
+                Loader {
+                    id: bubbleLoader
+                    active: valueDragArea.isDragging
+                    sourceComponent: Item {
+                        id: speechBubble
+                        parent: Overlay.overlay
+                        visible: valueDragArea.isDragging
+
+                        property point anchorPos: bubbleAnchor.mapToItem(Overlay.overlay, 0, 0)
+                        x: anchorPos.x - width / 2
+                        y: anchorPos.y - height - root.sc(15)
+                        width: bubbleRect.width
+                        height: bubbleRect.height + bubbleTail.height - root.sc(3)
+
+                        // Pop-in animation
+                        scale: valueDragArea.isDragging ? 1.0 : 0.5
+                        opacity: valueDragArea.isDragging ? 1.0 : 0
+                        transformOrigin: Item.Bottom
+                        Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutBack; easing.overshoot: 2 } }
+                        Behavior on opacity { NumberAnimation { duration: 100 } }
+
+                        // Bubble body - 1.5x larger
+                        Rectangle {
+                            id: bubbleRect
+                            width: bubbleText.width + root.sc(36)
+                            height: root.sc(66)
+                            radius: height / 2
+                            color: root.valueColor
+
+                            // Subtle gradient shine
+                            Rectangle {
+                                anchors.fill: parent
+                                anchors.margins: root.sc(3)
+                                radius: parent.radius - root.sc(3)
+                                gradient: Gradient {
+                                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.3) }
+                                    GradientStop { position: 0.5; color: Qt.rgba(1, 1, 1, 0) }
+                                }
+                            }
+
+                            Text {
+                                id: bubbleText
+                                anchors.centerIn: parent
+                                text: root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + root.suffix)
+                                font.pixelSize: root.sc(30)
+                                font.bold: true
+                                color: Theme.contrastColorFor(root.valueColor)
+                            }
+                        }
+
+                        // Cartoon tail (triangle pointing down)
+                        Canvas {
+                            id: bubbleTail
+                            anchors.horizontalCenter: bubbleRect.horizontalCenter
+                            anchors.top: bubbleRect.bottom
+                            anchors.topMargin: -root.sc(3)
+                            width: root.sc(30)
+                            height: root.sc(21)
+
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.reset()
+                                ctx.fillStyle = root.valueColor
+                                ctx.beginPath()
+                                ctx.moveTo(0, 0)
+                                ctx.lineTo(width, 0)
+                                ctx.lineTo(width / 2, height)
+                                ctx.closePath()
+                                ctx.fill()
+                            }
+
+                            // Redraw when color changes
+                            Connections {
+                                target: root
+                                function onValueColorChanged() { bubbleTail.requestPaint() }
+                            }
+                            Component.onCompleted: requestPaint()
+                        }
+                    }
+                }
+            }
+
+            // Gear selector — rendered in overlay to the right of the widget while dragging
+            Loader {
+                active: valueDragArea.isDragging
+                sourceComponent: Item {
+                    parent: Overlay.overlay
+                    visible: valueDragArea.isDragging
+
+                    property point widgetPos: valueContainer.mapToItem(Overlay.overlay, valueContainer.width, valueContainer.height / 2)
+                    x: widgetPos.x + root.sc(8)
+                    y: widgetPos.y - height / 2
+                    width: gearCol.width
+                    height: gearCol.height
+
+                    Column {
+                        id: gearCol
+                        spacing: root.sc(2)
+
+                        Repeater {
+                            model: root.gearLabels()
+                            Text {
+                                required property int index
+                                required property string modelData
+                                property int gear: root.labelIndexToGear(index)
+                                text: modelData
+                                font.pixelSize: root.sc(13)
+                                font.bold: valueDragArea.currentGear === gear
+                                color: valueDragArea.currentGear === gear ? Theme.primaryColor : Theme.textSecondaryColor
+                                opacity: valueDragArea.currentGear === gear ? 1.0 : 0.35
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Plus button - immediate response, Flickable handles scroll detection
+            Rectangle {
+                Layout.preferredWidth: root.sc(24)
+                Layout.fillHeight: true
+                radius: root.sc(6)
+                color: plusArea.pressed ? Qt.darker(Theme.surfaceColor, 1.3) : "transparent"
+
+                Accessible.role: Accessible.Button
+                Accessible.name: TranslationManager.translate("valueinput.button.increase", "Increase")
+                Accessible.focusable: true
+                Accessible.onPressAction: plusArea.clicked(null)
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "+"
+                    font.pixelSize: root.valueFontPixelSize
+                    font.bold: true
+                    color: root.effectiveValue >= root.to ? Theme.textSecondaryColor : Theme.textColor
+                    Accessible.ignored: true
+                }
+
+                MouseArea {
+                    id: plusArea
+                    anchors.fill: parent
+                    onClicked: { root.adjustValue(1); root.commitValue() }
+                    onPressAndHold: incrementTimer.start()
+                    onReleased: {
+                        if (incrementTimer.running) {
+                            incrementTimer.stop()
+                            root.commitValue()
+                        }
+                    }
+                    onCanceled: { incrementTimer.stop(); root._dropPending() }
+                }
+
+                Timer {
+                    id: incrementTimer
+                    interval: 80
+                    repeat: true
+                    onTriggered: root.adjustValue(1)
+                }
+            }
+        }
+    }
+
+    // Full-width dialog with blur - same as compact but bigger. Built on first open: every
+    // ValueInput on a page carried one, built with the page (#1976).
+    OnDemandLoader {
+        id: scrubberLoader
+        sourceComponent: Component {
+            DecenzaDialog {
+                id: scrubberPopup
+                parent: Overlay.overlay
+                anchors.centerIn: parent
+                width: parent.width
+                height: parent.height
+                modal: true
+                dim: false
+                closePolicy: Dialog.CloseOnPressOutside
+                header: null
+                footer: null
+                padding: 0
+
+                onOpened: {
+                    root._dropPending()
+                    popupContent.currentGear = 0
+                    popupContent.editMode = false
+                    popupValueContainer.forceActiveFocus()
+                    if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+                        let announcement = root.accessibleName ? root.accessibleName + ". " : ""
+                        let valueStr = root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + " " + root.suffix.trim())
+                        announcement += TranslationManager.translate("valueinput.editor.announce", "Value editor. Current value:") + " " + valueStr
+                        AccessibilityManager.announce(announcement, true)
+                    }
+                }
+
+                background: Rectangle {
+                    color: "#80000000"
+                }
+
+                // Content
+                Item {
+                    id: popupContent
+                    anchors.fill: parent
+                    property int currentGear: 0
+                    property bool editMode: false
+                    // Popup +/- and keyboard: honor the persisted gear
+                    function adjust(steps) {
+                        root.adjustValueWithStep(steps, root.gearToStep(currentGear))
+                    }
+
+                    Accessible.name: TranslationManager.translate("valueinput.editor.title", "Value editor")
+
+                    // Tap outside to close (exit edit mode first). When the TextInput
+                    // is in edit mode, commit the typed value instead of silently
+                    // discarding it — tapping elsewhere is a common tablet "done"
+                    // gesture. Escape in the TextInput remains an explicit discard.
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (popupContent.editMode) {
+                                popupTextInput.commitText()
+                            } else {
+                                scrubberPopup.close()
+                            }
+                        }
+                    }
+
+                    // Full-width value control - same as compact but larger
+                    Rectangle {
+                        id: popupControl
+                        anchors.centerIn: parent
+                        width: parent.width - root.sc(40)
+                        height: root.sc(80)
+                        radius: root.sc(16)
+                        color: Theme.surfaceColor
+                        border.width: 1
+                        border.color: Theme.textSecondaryColor
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: root.sc(6)
+                            spacing: root.sc(4)
+
+                            // Minus button
+                            Rectangle {
+                                Layout.preferredWidth: root.sc(70)
+                                Layout.fillHeight: true
+                                radius: root.sc(12)
+                                color: popupMinusArea.pressed ? Qt.darker(Theme.surfaceColor, 1.3) : "transparent"
+
+                                Accessible.role: Accessible.Button
+                                Accessible.name: TranslationManager.translate("valueinput.button.decrease", "Decrease")
+                                Accessible.focusable: true
+                                Accessible.onPressAction: popupMinusArea.clicked(null)
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "\u2212"
+                                    font.pixelSize: root.sc(32)
+                                    font.bold: true
+                                    color: root.effectiveValue <= root.from ? Theme.textSecondaryColor : Theme.textColor
+                                    Accessible.ignored: true
+                                }
+
+                                MouseArea {
+                                    id: popupMinusArea
+                                    anchors.fill: parent
+                                    onClicked: { popupContent.adjust(-1); root.commitValue() }
+                                    onPressAndHold: popupDecrementTimer.start()
+                                    onReleased: {
+                                        if (popupDecrementTimer.running) {
+                                            popupDecrementTimer.stop()
+                                            root.commitValue()
+                                        }
+                                    }
+                                    onCanceled: { popupDecrementTimer.stop(); root._dropPending() }
+                                }
+
+                                Timer {
+                                    id: popupDecrementTimer
+                                    interval: 80
+                                    repeat: true
+                                    onTriggered: popupContent.adjust(-1)
+                                }
+                            }
+
+                            // Value display - draggable, double-tap to type
+                            Item {
+                                id: popupValueContainer
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                focus: !popupContent.editMode
+
+                                Accessible.role: Accessible.Slider
+                                Accessible.name: root.accessibleName || (root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + root.suffix))
+                                Accessible.description: TranslationManager.translate("valueinput.popup.hint", "Double-tap to type a number.")
+                                Accessible.focusable: true
+
+                                // Expose the authoritative value, as on the inline control.
+                                readonly property real value: root.value
+                                readonly property real from: root.from
+                                readonly property real to: root.to
+                                readonly property real stepSize: root.gearToStep(popupContent.currentGear)
+                                onValueChanged: AccessibleValueChange.notifyNumericValueChanged(popupValueContainer)
+                                Component.onCompleted: AccessibleValueChange.notifyNumericValueChanged(popupValueContainer)
+                                Accessible.onIncreaseAction: { popupContent.adjust(1); root.commitValue() }
+                                Accessible.onDecreaseAction: { popupContent.adjust(-1); root.commitValue() }
+
+                                // Keyboard navigation — honors the selected gear.
+                                // Release fires commitValue once when the key lifts,
+                                // mirroring the +/- button contract.
+                                Keys.onEscapePressed: scrubberPopup.close()
+                                Keys.onUpPressed: popupContent.adjust(1)
+                                Keys.onDownPressed: popupContent.adjust(-1)
+                                Keys.onLeftPressed: popupContent.adjust(-1)
+                                Keys.onRightPressed: popupContent.adjust(1)
+                                Keys.onReturnPressed: scrubberPopup.close()
+                                Keys.onEnterPressed: scrubberPopup.close()
+                                Keys.onReleased: function(event) {
+                                    if (event.isAutoRepeat) return
+                                    switch (event.key) {
+                                        case Qt.Key_Up: case Qt.Key_Down: case Qt.Key_Left: case Qt.Key_Right:
+                                            root.commitValue()
+                                            event.accepted = true
+                                            break
+                                    }
+                                }
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    visible: !popupContent.editMode
+                                    text: root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + root.suffix)
+                                    font.pixelSize: root.sc(40)
+                                    font.bold: true
+                                    color: root.valueColor
+                                }
+
+                                // Keyboard entry field — shown on double-tap
+                                TextInput {
+                                    id: popupTextInput
+                                    anchors.centerIn: parent
+                                    width: parent.width - root.sc(12)
+                                    visible: popupContent.editMode
+                                    font.pixelSize: root.sc(40)
+                                    font.bold: true
+                                    color: root.valueColor
+                                    horizontalAlignment: Text.AlignHCenter
+                                    inputMethodHints: Qt.ImhFormattedNumbersOnly
+                                    selectByMouse: true
+
+                                    // Rename from commitValue to commitText to avoid clashing
+                                    // with root.commitValue() used by release handlers above.
+                                    function commitText() {
+                                        var parsed = parseFloat(text)
+                                        if (!isNaN(parsed)) {
+                                            if (parsed === 0 && root.snapZeroTo > 0) parsed = root.snapZeroTo
+                                            parsed = Math.max(root.from, Math.min(root.to, parsed))
+                                            let roundTo = root.hasFineGear ? root.fineStepSize : root.stepSize
+                                            parsed = Math.round(parsed / roundTo) * roundTo
+                                            if (parsed !== root.effectiveValue) {
+                                                root._emitValueModified(parsed)
+                                            }
+                                            // Typing a number is a deliberate, final adjustment.
+                                            // commitValue() only fires valueCommitted if the
+                                            // typed value differed from the prior value — typing
+                                            // the same number back is a no-op.
+                                            root.commitValue()
+                                            if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+                                                AccessibilityManager.announce(root.effectiveDisplayText || (parsed.toFixed(root.decimals) + (root.suffix.trim() ? " " + root.suffix.trim() : "")))
+                                            }
+                                        }
+                                        popupContent.editMode = false
+                                        popupValueContainer.forceActiveFocus()
+                                    }
+
+                                    Keys.onReturnPressed: commitText()
+                                    Keys.onEnterPressed: commitText()
+                                    Keys.onEscapePressed: {
+                                        popupContent.editMode = false
+                                        popupValueContainer.forceActiveFocus()
+                                    }
+
+                                    Accessible.role: Accessible.EditableText
+                                    Accessible.name: root.accessibleName || TranslationManager.translate("valueinput.editor.title", "Value editor")
+                                    Accessible.description: text
+                                    Accessible.focusable: true
+                                }
+
+                                // Underline cursor for text input
+                                Rectangle {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    anchors.top: popupTextInput.bottom
+                                    anchors.topMargin: root.sc(2)
+                                    width: popupTextInput.contentWidth + root.sc(20)
+                                    height: root.sc(2)
+                                    color: root.valueColor
+                                    visible: popupContent.editMode
+                                }
+
+                                MouseArea {
+                                    id: popupDragArea
+                                    anchors.fill: parent
+                                    visible: !popupContent.editMode
+                                    preventStealing: isDragging
+
+                                    property real startX: 0
+                                    property real startY: 0
+                                    property bool isDragging: false
+
+                                    onPressed: function(mouse) {
+                                        startX = mouse.x
+                                        // Offset startY so the current gear is preserved when drag begins.
+                                        // Works for all gears: gear=0 → mouse.y, gear=1 → mouse.y-50,
+                                        // gear=-1 → mouse.y+50 (because -(-1)*50 = +50).
+                                        startY = mouse.y - popupContent.currentGear * root.sc(50)
+                                        isDragging = false
+                                        root._dropPending()
+
+                                        // Announce parameter name when bubble appears (accessibility)
+                                        if (root.accessibleName && typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+                                            let valueStr = root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + " " + root.suffix.trim())
+                                            AccessibilityManager.announce(root.accessibleName + ": " + valueStr)
+                                        }
+                                    }
+
+                                    onPositionChanged: function(mouse) {
+                                        var deltaX = mouse.x - startX
+
+                                        if (!isDragging && (Math.abs(deltaX) > root.sc(5) || Math.abs(mouse.y - startY) > root.sc(5))) {
+                                            isDragging = true
+                                        }
+
+                                        if (isDragging) {
+                                            let vertDist = mouse.y - startY
+                                            let gear
+                                            if (root.hasFineGear && vertDist < -root.sc(50)) {
+                                                gear = -1
+                                            } else {
+                                                gear = Math.min(2, Math.floor(Math.max(0, vertDist) / root.sc(50)))
+                                            }
+                                            if (gear !== popupContent.currentGear) {
+                                                popupContent.currentGear = gear
+                                                root.announceGearChange(gear)
+                                            }
+
+                                            let effectiveStep = root.gearToStep(gear)
+                                            let steps = Math.round(deltaX / root.sc(20))
+                                            if (steps !== 0) {
+                                                root.adjustValueWithStep(steps, effectiveStep)
+                                                startX = mouse.x
+                                                // Do NOT reset startY — it is the gear reference point
+                                            }
+                                        }
+                                    }
+
+                                    onReleased: {
+                                        isDragging = false
+                                        // Keep currentGear — it persists so +/- buttons
+                                        // and subsequent drags use the selected gear.
+                                        // Drag is always a real adjustment, so always commit.
+                                        root.commitValue()
+                                    }
+
+                                    onCanceled: {
+                                        isDragging = false
+                                        root._dropPending()
+                                    }
+
+                                    onDoubleClicked: {
+                                        popupContent.editMode = true
+                                        popupTextInput.text = root.effectiveValue.toFixed(root.decimals)
+                                        popupTextInput.forceActiveFocus()
+                                        popupTextInput.selectAll()
+                                    }
+                                }
+
+                                // Anchor for popup bubble
+                                Item {
+                                    id: popupBubbleAnchor
+                                    anchors.centerIn: parent
+                                    width: root.sc(1)
+                                    height: root.sc(1)
+                                }
+
+                                // Speech bubble for popup
+                                Loader {
+                                    active: popupDragArea.pressed
+                                    sourceComponent: Item {
+                                        id: dragBubble
+
+                                        parent: Overlay.overlay
+                                        visible: popupDragArea.pressed
+
+                                        property point anchorPos: popupBubbleAnchor.mapToItem(Overlay.overlay, 0, 0)
+                                        x: anchorPos.x - width / 2
+                                        y: anchorPos.y - height - root.sc(15)
+                                        width: popupBubbleRect.width
+                                        height: popupBubbleRect.height + popupBubbleTail.height - root.sc(3)
+
+                                        scale: popupDragArea.pressed ? 1.0 : 0.5
+                                        opacity: popupDragArea.pressed ? 1.0 : 0
+                                        transformOrigin: Item.Bottom
+                                        Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutBack; easing.overshoot: 2 } }
+                                        Behavior on opacity { NumberAnimation { duration: 100 } }
+
+                                        Rectangle {
+                                            id: popupBubbleRect
+                                            width: popupBubbleText.width + root.sc(36)
+                                            height: root.sc(66)
+                                            radius: height / 2
+                                            color: root.valueColor
+
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                anchors.margins: root.sc(3)
+                                                radius: parent.radius - root.sc(3)
+                                                gradient: Gradient {
+                                                    GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.3) }
+                                                    GradientStop { position: 0.5; color: Qt.rgba(1, 1, 1, 0) }
+                                                }
+                                            }
+
+                                            Text {
+                                                id: popupBubbleText
+                                                anchors.centerIn: parent
+                                                text: root.effectiveDisplayText || (root.effectiveValue.toFixed(root.decimals) + root.suffix)
+                                                font.pixelSize: root.sc(30)
+                                                font.bold: true
+                                                color: Theme.contrastColorFor(root.valueColor)
+                                            }
+                                        }
+
+                                        Canvas {
+                                            id: popupBubbleTail
+                                            anchors.horizontalCenter: popupBubbleRect.horizontalCenter
+                                            anchors.top: popupBubbleRect.bottom
+                                            anchors.topMargin: -root.sc(3)
+                                            width: root.sc(30)
+                                            height: root.sc(21)
+
+                                            onPaint: {
+                                                var ctx = getContext("2d")
+                                                ctx.reset()
+                                                ctx.fillStyle = root.valueColor
+                                                ctx.beginPath()
+                                                ctx.moveTo(0, 0)
+                                                ctx.lineTo(width, 0)
+                                                ctx.lineTo(width / 2, height)
+                                                ctx.closePath()
+                                                ctx.fill()
+                                            }
+
+                                            Component.onCompleted: requestPaint()
+                                            Connections {
+                                                target: root
+                                                function onValueColorChanged() { popupBubbleTail.requestPaint() }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Plus button
+                            Rectangle {
+                                Layout.preferredWidth: root.sc(70)
+                                Layout.fillHeight: true
+                                radius: root.sc(12)
+                                color: popupPlusArea.pressed ? Qt.darker(Theme.surfaceColor, 1.3) : "transparent"
+
+                                Accessible.role: Accessible.Button
+                                Accessible.name: TranslationManager.translate("valueinput.button.increase", "Increase")
+                                Accessible.focusable: true
+                                Accessible.onPressAction: popupPlusArea.clicked(null)
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "+"
+                                    font.pixelSize: root.sc(32)
+                                    font.bold: true
+                                    color: root.effectiveValue >= root.to ? Theme.textSecondaryColor : Theme.textColor
+                                    Accessible.ignored: true
+                                }
+
+                                MouseArea {
+                                    id: popupPlusArea
+                                    anchors.fill: parent
+                                    onClicked: { popupContent.adjust(1); root.commitValue() }
+                                    onPressAndHold: popupIncrementTimer.start()
+                                    onReleased: {
+                                        if (popupIncrementTimer.running) {
+                                            popupIncrementTimer.stop()
+                                            root.commitValue()
+                                        }
+                                    }
+                                    onCanceled: { popupIncrementTimer.stop(); root._dropPending() }
+                                }
+
+                                Timer {
+                                    id: popupIncrementTimer
+                                    interval: 80
+                                    repeat: true
+                                    onTriggered: popupContent.adjust(1)
+                                }
+                            }
+                        }
+                    }
+
+                    // Gear selector — tappable column of multipliers to the left of the control
+                    Column {
+                        anchors.right: popupControl.left
+                        anchors.rightMargin: root.sc(12)
+                        anchors.verticalCenter: popupControl.verticalCenter
+                        spacing: root.sc(8)
+
+                        Repeater {
+                            model: root.gearLabels()
+                            Text {
+                                id: gearLabel
+
+                                required property int index
+                                required property string modelData
+                                property int gear: root.labelIndexToGear(gearLabel.index)
+                                text: modelData
+                                font.pixelSize: root.sc(16)
+                                font.bold: popupContent.currentGear === gear
+                                color: popupContent.currentGear === gear ? Theme.primaryColor : Theme.textSecondaryColor
+                                opacity: popupContent.currentGear === gear ? 1.0 : 0.35
+
+                                Accessible.role: Accessible.Button
+                                Accessible.name: modelData + " " + TranslationManager.translate("valueinput.gear.label", "step multiplier")
+                                Accessible.focusable: true
+                                Accessible.onPressAction: gearArea.clicked(null)
+
+                                MouseArea {
+                                    id: gearArea
+                                    anchors.fill: parent
+                                    anchors.margins: -root.sc(4)
+                                    onClicked: {
+                                        popupContent.currentGear = gearLabel.gear
+                                        root.announceGearChange(gearLabel.gear)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Step size indicator — shown while dragging or when a non-default gear is selected
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        y: popupControl.y + popupControl.height + root.sc(20)
+                        visible: popupDragArea.isDragging || popupContent.currentGear !== 0
+                        text: {
+                            var effectiveStep = root.gearToStep(popupContent.currentGear)
+                            var d = Math.max(0, -Math.floor(Math.log10(effectiveStep) + 0.0001))
+                            return TranslationManager.translate("valueinput.step", "step") + ": " + effectiveStep.toFixed(d)
+                        }
+                        font.pixelSize: root.sc(24)
+                        font.bold: true
+                        color: Theme.primaryColor
+                    }
+
+                    // Usage hint — shown when not dragging and at default gear
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        y: popupControl.y + popupControl.height + root.sc(20)
+                        visible: !popupDragArea.isDragging && popupContent.currentGear === 0 && !popupContent.editMode
+                        text: TranslationManager.translate("valueinput.hint.full", "← drag  ↕ gear  ×2 type")
+                        font.pixelSize: root.sc(16)
+                        color: Theme.textSecondaryColor
+                    }
+
+                    // Range display — positioned below the step indicator / hint text to avoid overlap.
+                    // The step/hint sits at popupControl.bottom + sc(20) with up to sc(30) height,
+                    // so sc(56) keeps a clear gap below the tallest element.
+                    Text {
+                        anchors.top: popupControl.bottom
+                        anchors.topMargin: root.sc(56)
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: root.rangeText || (root.from.toFixed(root.decimals) + root.suffix + " \u2014 " + root.to.toFixed(root.decimals) + root.suffix)
+                        font: Theme.bodyFont
+                        color: Theme.textSecondaryColor
+                    }
+                }
+            }
+        }
+    }
+
+    function gearToStep(gear) {
+        if (gear === -1 && root.hasFineGear)
+            return root.fineStepSize
+        return root.stepSize * Math.pow(10, Math.max(0, gear))
+    }
+
+    function gearLabels() {
+        var labels = ["×1", "×10", "×100"]
+        if (root.hasFineGear) {
+            let ratio = root.fineStepSize / root.stepSize
+            // Show as fraction: e.g., fineStepSize=1, stepSize=10 → "×0.1"
+            labels.unshift("×" + ratio.toFixed(ratio < 0.1 ? 2 : 1))
+        }
+        return labels
+    }
+
+    // Convert gear label index (from Repeater) to internal gear number.
+    // With fineGear: index 0 = gear -1, index 1 = gear 0, etc.
+    // Without fineGear: index 0 = gear 0, index 1 = gear 1, etc.
+    function labelIndexToGear(index) {
+        return root.hasFineGear ? index - 1 : index
+    }
+
+    function gearToLabelIndex(gear) {
+        return root.hasFineGear ? gear + 1 : gear
+    }
+
+    function announceGearChange(gear) {
+        if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+            let effectiveStep = gearToStep(gear)
+            let d = Math.max(0, -Math.floor(Math.log10(effectiveStep) + 0.0001))
+            AccessibilityManager.announce(TranslationManager.translate("valueinput.gear.step", "Step") + " " + effectiveStep.toFixed(d))
+        }
+    }
+
+    function adjustValue(steps) {
+        adjustValueWithStep(steps, root.stepSize)
+    }
+
+    function adjustValueWithStep(steps, effectiveStep) {
+        var newVal = root.effectiveValue + (steps * effectiveStep)
+        newVal = Math.max(root.from, Math.min(root.to, newVal))
+        // Round to fineStepSize if available (allows sub-stepSize precision),
+        // otherwise round to stepSize
+        var roundTo = root.hasFineGear ? root.fineStepSize : root.stepSize
+        newVal = Math.round(newVal / roundTo) * roundTo
+        if (newVal !== root.effectiveValue) {
+            _emitValueModified(newVal)
+            if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+                AccessibilityManager.announce(root.effectiveDisplayText || (newVal.toFixed(root.decimals) + (root.suffix.trim() ? " " + root.suffix.trim() : "")))
+            }
+        }
+    }
+}

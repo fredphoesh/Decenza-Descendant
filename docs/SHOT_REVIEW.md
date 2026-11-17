@@ -1,0 +1,979 @@
+# Shot Review: Current State
+
+This is a snapshot of how the post-shot review and shot detail pages work today,
+focused on the quality-badge / detector system and the Shot Summary dialog that
+share the same underlying analysis. It is the source of truth for anyone modifying
+detectors, persistence, the badge UI, or the summary text; the `git log` for
+`docs/SHOT_REVIEW.md` (and its prior name `SHOT_REVIEW_IMPROVEMENTS.md`) is the
+source of truth for the path that got us here.
+
+The detectors are still under active iteration — expect this doc to drift, and
+prefer reading the code (`src/ai/shotanalysis.h` is heavily commented) when in
+doubt.
+
+---
+
+## 1. What the user sees
+
+### Pages
+
+One page, **PostShotReviewPage**, shows and edits a shot however it is reached:
+after a shot (auto-close applies), from Shot History (stepping newer/older
+through the list), the last-shot widget or the layout action. Advanced mode
+(`Settings.graph.advancedMode`) toggles information density. One column at every
+width, graph full width (side by side made the plot too small, as on the compare
+page). The web `/shot/<id>` page mirrors it, beside-the-graph from 1300 px.
+
+### Basic mode (default)
+
+- Graph: pressure, flow, temperature, weight, weight flow rate.
+- Goal overlays for pressure / flow / temperature (dashed).
+- Phase markers (frame boundaries) without label text.
+- Quality badges (one or more chips below the graph).
+- "Shot results" (`ShotResultsCard`): the comparison's metrics, worded by
+  `ComparisonText`, default rows plus "Show more", and how the shot stopped.
+  With a previous shot on the profile it first names that shot (Compare opens
+  the comparison), then the comparison summary, changed inputs and profile
+  settings, and each metric carries its Δ
+  (`ShotHistoryStorage::requestShotOutcome`).
+- **Added water**, beside Shot results for Americano/long-black records: net scale-measured grams or estimated flow volume, plus **Water temp (set)** captured at water start. Interrupted amounts are partial; skipped/refused water says Not dispensed; old snapshots say Amount not recorded. A late result updates this read-only block without replacing an editing draft. The recipe card retains vessel identity; espresso yield, ratio and extraction analysis remain espresso-only. Comparison uses the same result/source fields, with amount differences only between complete results on the same scale of units.
+- Rating, taste, notes, measurements, bean / recipe / equipment cards.
+
+### Advanced mode adds
+
+- Resistance (P/F), Darcy resistance (P/F²), conductance (F²/P), dC/dt, mix
+  temperature curves (toggleable in the legend).
+- Phase marker label text (frame boundaries with transition reasons —
+  `[W]` weight, `[P]` pressure, `[F]` flow, `[T]` time).
+- Phase summary panel — collapsible per-phase metrics table.
+- TDS / EY fields, barista, and the debug log button.
+
+### Recorded-shot downloads
+
+Shot data exports use `ShotFileExport` and the canonical Visualizer serializer over the
+persisted `ShotRecord`. Profile exports use its recorded profile JSON, never the active
+profile; the separate log export uses its recorded debug text. Shared QML requests these
+through `ShotReviewActions` and saves through `LocalFileDownload` on the requesting client.
+
+### Quality badges
+
+Four flags, surfaced via `qml/components/QualityBadges.qml`. When any fire,
+those chips show; when none fire, a single green "Clean extraction" chip
+shows. A tappable "Shot Summary" chip always sits at the end of the row —
+it's the entry point to the analysis dialog described in §3.
+
+| Flag                       | Color  | Label                  | Source                       |
+| -------------------------- | ------ | ---------------------- | ---------------------------- |
+| `pourTruncatedDetected`    | red    | "Puck failed"          | `detectPourTruncated`        |
+| `channelingDetected`       | red    | "Channeling detected"  | `detectChannelingFromDerivative` |
+| `grindIssueDetected`       | orange | "Grind issue"          | `detectGrindIssue` (`analyzeFlowVsGoal`) |
+| `skipFirstFrameDetected`   | red    | "First step skipped"   | `detectSkipFirstFrame`       |
+
+(A fifth flag, `temperatureUnstable`, was retired — see openspec change
+`remove-temperature-unstable-badge`. The detector measured average
+deviation from goal but was labeled "Temp unstable"; in practice, the
+deviation it caught was profile-design intent on D-Flow / Extractamundo /
+TurboBloom and 9+ other built-in profiles whose temperature gap is by
+design.)
+
+**Suppression cascade.** `pourTruncatedDetected` is dominant: when it fires,
+`channelingDetected` / `grindIssueDetected` are forced to false. The
+cascade is enforced in exactly one place — `ShotAnalysis::analyzeShot` —
+and the boolean badge columns are a deterministic projection of the
+resulting `DetectorResults` struct (see §4 mapping table; helper at
+`src/history/shotbadgeprojection.h`). Save-time, load-time recompute, the
+dialog, the AI advisor, and MCP `shots_get_detail` all share that one
+pipeline and projection. The puck failed to build pressure, so the curves
+the other detectors read off don't mean what they normally mean
+(conductance saturates → derivative flat, flow tracks preinfusion goal →
+grind delta ≈ 0). `skipFirstFrameDetected` is **not** suppressed — it's a
+machine/profile issue orthogonal to puck integrity. The clean-extraction
+green chip's visibility gate also includes `!pourTruncatedDetected` so a
+suppressed puck-failure shot can't fall through to the wrong all-clear.
+
+The badges are recomputed on every shot load (see §4) so detector improvements
+take effect on existing shots without a manual re-analyze.
+
+---
+
+## 2. Detector internals
+
+All four detectors live in `src/ai/shotanalysis.{h,cpp}` as static methods on
+`ShotAnalysis`. Tuning constants are defined at the top of the header so they
+can be tweaked in one place. The header is heavily commented — read it
+alongside this section.
+
+### 2.1 Channeling
+
+Single source of truth for channeling severity is `detectChannelingFromDerivative`,
+operating on the Gaussian-smoothed conductance derivative `dC/dt`. The badge
+fires on the **Sustained** severity tier; the **Transient** tier surfaces only
+in the Shot Analysis dialog popup.
+
+**Severity tiers** (`ChannelingSeverity`):
+
+- **None** — no sample's `|dC/dt|` exceeds `CHANNELING_DC_TRANSIENT_PEAK` (5.0).
+- **Transient** — a single peak above 5.0 (a self-healed channel).
+- **Sustained** — more than `CHANNELING_DC_SUSTAINED_COUNT` (10) samples above
+  `CHANNELING_DC_ELEVATED` (3.0) **inside the inclusion windows**.
+
+**Inclusion windows** are built by `buildChannelingWindows`. Without windowing
+the detector flags every lever-style preinfusion as channeling because the
+natural pressure-rise dynamic drives `dC/dt` strongly negative. A sample is
+included only when, at that time:
+
+1. The active control goal (flow goal during flow-mode phases, pressure goal
+   during pressure-mode phases) is **stationary**: `|goal(t±0.75 s) − goal(t)|
+   / goal(t) ≤ 0.15` on both sides.
+2. The actual value has **converged** onto the goal: `|actual − goal| / goal ≤
+   0.15`.
+3. Actual pressure is not rising fast in either mode: when
+   `pressureNow > 0.5` bar AND `pressureFut > pressureNow * 1.15` over 0.75 s
+   ahead, the sample is disqualified. Two ramp dynamics produce the same
+   conductance-drop signature and are both gated here:
+   - Flow-mode lever rise (Cremina, Damian LRv3, 80's Espresso preinfusion):
+     flow goal stationary while the puck builds pressure under a pressure-
+     ceiling exit.
+   - Pressure-mode rise-and-hold final leg: pressure goal locked at target
+     but actual pressure still ramping toward it. The 15 %-of-goal
+     convergence check admits these samples because actual is close enough
+     to goal, even though it is still climbing fast — `dC/dt` clamps at the
+     negative floor as conductance drops with pressure. (Shot 889 on 80's
+     Espresso was the motivating false positive.)
+   Falling pressure is always allowed — bloom transitions and
+   pressure-mode → flow-mode handoffs are legitimate channeling signals,
+   and the dC/dt detector counts both signs of conductance change as
+   diagnostic. The 0.5 bar precondition gates out the near-atmospheric
+   window where small absolute jitter would otherwise read as a 15 %
+   relative rise.
+
+Contiguous qualifying times collapse into windows; gaps ≤
+`WINDOW_GAP_MERGE_SEC` (0.3 s) are merged.
+
+**Fallback semantics** are deliberate:
+
+- Empty `phases` → emits a single whole-pour window (legacy shots predating
+  phase markers run unrestricted, preserving coverage).
+- Non-empty `phases` but no qualifying window → returns empty, and
+  `detectChannelingFromDerivative` reports `None` (not unrestricted). This is
+  the "all-ramp shot, nothing reliable to analyze" path; better to be silent
+  than to false-positive.
+
+**Pour-window trim**: the first `CHANNELING_DC_POUR_SKIP_SEC` (2.0 s) and last
+`CHANNELING_DC_POUR_SKIP_END_SEC` (1.5 s) of the pour are excluded from the
+detector's time grid — they cover the pressure-ramp / flow-catchup transient
+at start and the natural tail acceleration at end. `buildChannelingWindows`
+applies the same trim to its output bounds.
+
+**Hard skips** (`shouldSkipChannelingCheck` returns true → `channelingDetected`
+forced to false):
+
+- Beverage type is `filter`, `pourover`, `tea`, `steam`, or `cleaning`.
+- Average flow during the pour exceeds `CHANNELING_MAX_AVG_FLOW` (3.0 mL/s) —
+  turbo / very-coarse shots have no diagnostic dC/dt signal.
+
+**Profile-level skip**: a `channeling_expected` flag in `ProfileKnowledge`
+(reached via `ShotSummarizer::getAnalysisFlags(profileKbId)`) suppresses
+channeling detection for profiles where channeling-shaped curves are intentional.
+
+### 2.2 Grind issue
+
+Implemented by `detectGrindIssue`, which delegates to `analyzeFlowVsGoal` and
+returns true when either arm fires. Two arms run **additively**, not as
+fallback — a clean flow-mode preinfusion can hide a pressure-mode choke and
+vice versa.
+
+**Profile-context gate (Arm 1 only).** `analyzeFlowVsGoal` takes a
+`bool profileKbResolved` parameter. When `false` — i.e. `resolveProfileKb()`
+returned an empty candidate set: no exact alias hit, no #1198
+longest-boundary-prefix hit, no editor-type default hit, and no shape match
+either — Arm 1 is **skipped entirely**: the flow-mode
+range builder doesn't run, `sampleCount`/`delta` stay zero, and Arm 1
+contributes nothing to `hasData`. Arm 2 (choked-puck + yield-shortfall
++ yield-overshoot) still runs unconditionally — those arms read
+physics-level signals (mean pressurized flow, yield ratio) that don't
+depend on profile shape. The result
+projects through the existing `grindCoverage="notAnalyzable"` path when
+Arm 2 also has no data, or `"verified"` when it does. `skipped` stays
+`false`, distinct from the `grind_check_skip` flag's `"skipped"`
+coverage. All three storage-layer call sites read `AnalysisInputs::profileKbResolved`
+(`prepareAnalysisInputs`), which is `true` for ANY non-empty candidate set.
+They previously each derived it by hand from `!profileKbId.isEmpty()` on the
+persisted column, which is wrong since `resolve-profile-kb-by-shape`: the
+pipeline re-resolves on every load, and only a TITLE resolution is written to
+that column, so every shape-resolved shot has full KB context and an empty
+column. A fourth site, `ShotSummarizer::runShotAnalysisAndPopulate` (the
+`summarizeFromHistory` slow path for imported shots), sits in the AI module and
+cannot reach `AnalysisInputs`; it takes the resolved id set as a parameter from
+its caller instead. Both routes derive the bit from a resolution rather than
+from the column — that is the property that matters, and neither derives it
+locally. The
+question Arm 1's gate asks ("is this flow goal a real target or a safety
+limiter?") is structural, and a shape match answers it as well as a name does. Direct test callers
+default to `profileKbResolved = true`, preserving the pre-change
+contract. See openspec change `skip-grind-arm1-when-kb-unresolved` for
+the rationale: Arm 1 reads the firmware-reported `flow_goal` series as
+a target the puck should track, but on profiles we have no KB context
+for, that series may be a safety limiter, a ramp-down command, or a
+pump-ramp curve rather than a target — averaging actuals against it
+produces false-positive grind diagnoses. The `grind_check_skip` flag is
+still the way to opt a *known* profile family out of Arm 1 (the
+`advanced-spring-lever` pattern from PR Kulitorum/Decenza#1230); the new gate handles
+*unknown* profiles by inferring "no opinion" from the resolver state.
+
+**Arm 1: flow-vs-goal averaging** (the "primary" path).
+
+For each flow-mode phase, builds an inclusive time range:
+
+- Skip the first `GRIND_PUMP_RAMP_SKIP_SEC` (0.5 s) of the first flow-mode
+  phase that coincides with `pourStart` — pump-ramp lag, not a grind signal.
+- If the phase exits via `transitionReason == "pressure"` **or**
+  `"pressure_unconfirmed"`, skip the trailing `GRIND_LIMITER_TAIL_SKIP_SEC`
+  (1.5 s) — the firmware's pressure ceiling has engaged and the controller is
+  no longer tracking flow goal. The unconfirmed variant (recorded by
+  `MainController` when the exit was configured but the threshold crossing
+  fell between BLE samples — see §2.3's guard for the full vocabulary) is
+  usually a real limiter engagement, and the safe polarity here is to trim:
+  dropping 1.5 s of maybe-clean data is harmless under the ≥ 1 s guard below,
+  while including a limiter-suppressed tail biases the delta toward "too
+  fine". Note this is the opposite polarity from the skip-first-frame guard,
+  which must NOT trust unconfirmed reasons — the two consumers deliberately
+  read the confirmed/unconfirmed split differently.
+- `"flow_unconfirmed"` does **not** trigger this trim — it exists specifically
+  for pressure-limiter engagement.
+- Both trims are gated on the resulting range remaining ≥ 1 s long. Extreme
+  puck-failure shots with sub-second flow-mode phases would otherwise have
+  their entire data trimmed away.
+
+Within those ranges, average actual flow vs. flow goal across all samples
+where `goal ≥ FLOW_GOAL_MIN_AVG` (0.3 mL/s — gates out preinfusion sentinel
+goals) AND `flow_goal` is approximately stationary across the sample (the
+**stationarity gate**: reject when `|goal(t ± FLOW_GOAL_STATIONARY_HALF_SEC)
+− goal(t)| / max(goal(t), FLOW_GOAL_MIN_AVG) > FLOW_GOAL_STATIONARY_REL`,
+with the half-window at 0.75 s and the threshold at 15 %). The stationarity
+gate uses the same numeric thresholds as `WINDOW_STATIONARY_REL` /
+`WINDOW_HALF_SEC` in the channeling detector but **omits** the convergence
+check (the channeling-detector's `|actual − goal| / goal ≤
+WINDOW_CONVERGED_REL` gate has no analog in Arm 1) — both detectors share
+the principle "flow_goal must be roughly flat to be meaningful", but the
+channeling detector additionally requires that the actual curve has
+converged on the goal.
+
+The goal lookups intentionally use `findValueAtTime` (clamps out-of-bounds
+to first/last sample) rather than `lookupOrNaN` (returns NaN out-of-bounds).
+Extreme short puck-failure shots — flow-mode phases under ~1.5 s — have
+legitimate flat-goal signals (puck gushed against a steady flow goal)
+where the stationarity half-window extends past the series start. NaN-on-
+out-of-bounds would silence those genuine gushers; clamping to the real
+first/last value preserves them because the comparison is still against
+the actual stationary value, not a synthetic sentinel.
+
+Requires ≥ 5 qualifying samples to yield a result. The check fires when
+`|delta| > FLOW_DEVIATION_THRESHOLD` (0.4 mL/s); positive delta = coarse,
+negative = fine.
+
+The stationarity gate was added in the issue #1128 fix (see §7) to silence
+a false positive on "dynamic bloom" frames configured `pump=flow, flow=0,
+exit_pressure_under` — frames where the firmware ramps the flow command
+down toward zero so the puck bleeds off preinfusion pressure naturally.
+The frame is `isFlowMode = true` from the firmware's perspective, but its
+flow goal is a ramp-down command rather than a target the puck should
+track. Flat targets (Malabar 1.88 mL/s pin, lever flow preinfusion) pass
+the gate cleanly; rapid monotonic decays fail at every interior sample.
+
+**Arm 2: choked-puck check** (pressure-mode only).
+
+For each pressure-mode phase (or the whole pour window if all phases are
+flow-mode-labeled), accumulate samples where `pressure ≥
+CHOKED_PRESSURE_MIN_BAR` (4.0). Two sub-arms feed `chokedPuck` with
+**split gates**:
+
+- **Severe (flow arm)**: mean pressurized flow `< CHOKED_FLOW_MAX_MLPS` (0.5
+  mL/s). Requires `flowSamples ≥ 5` AND `pressurizedDuration ≥
+  CHOKED_DURATION_MIN_SEC` (15 s) — needs sustained pressure to compute a
+  meaningful mean flow. Catches obvious failures (e.g., 80's Espresso with
+  1.1 g yield and ~0.3 mL/s mean).
+- **Moderate (yield arm)**: `finalWeightG / targetWeightG < CHOKED_YIELD_RATIO_MAX`
+  (0.70 — tightened from a prior 0.85 by the 500-shot audit). Requires only
+  `flowSamples ≥ 5` (puck saw meaningful pressure briefly) — does NOT
+  require sustained `pressurizedDuration` because its diagnosis is
+  yield-based and does not read mean pressurized flow. Catches shots like
+  745 (Adaptive v2, 23 g of 36 g target = 0.64, ~8.8 s pressurized
+  window).
+
+The yield arm decouples from the 15 s flow-arm gate because they answer
+different questions: the flow arm asks "did the puck deliver any flow
+under sustained pressure?" (needs 15 s of pressure to average), the yield
+arm asks "did the puck deliver enough yield, full stop?" (just needs to
+have seen pressure briefly so we know the shot wasn't aborted before
+extraction). The audit found shots that lost both gates simultaneously
+because they shared the duration precondition — fix splits them. See
+openspec change `tighten-grind-yield-shortfall-arm` for the rationale.
+
+The 0.70 threshold is the empirical sweet spot from the 500-shot audit:
+0.85 over-flagged Adaptive v2 fast-pour profiles delivering 71-76% of
+target by design. 0.70 catches the genuine choke shapes (yields under
+~70%) without false-positives on profiles whose normal yield is
+intentionally below target.
+
+The yield arm requires both `targetWeightG > 0` and `finalWeightG > 0` —
+imported shots without target metadata correctly stay silent.
+`finalWeightG` works on either a real BLE scale or Decenza's `FlowScale`
+virtual scale (dose-aware flow integration), so the arm fires headless too.
+
+**`hasData` and `verifiedClean` are independent signals.** `hasData = true`
+fires whenever EITHER arm produced a result: the flow arm's full gates
+passed (≥ 5 samples AND ≥ 15 s pressurized) regardless of whether a choke
+fired, OR the yield arm fired standalone (≥ 5 pressurized samples AND
+yield/target < 0.70). Either path proves the detector saw enough to speak.
+
+`verifiedClean = true` is stricter — it requires the **flow arm's full
+gates** (≥ 5 samples, ≥ 15 s pressurized at ≥ 4 bar) AND none of
+`chokedPuck`, `yieldOvershoot`, or `|delta| > FLOW_DEVIATION_THRESHOLD`
+fires. The 15 s gate is load-bearing here: a healthy sustained pressurized
+pour is what the positive signal actually asserts. The Shot Summary dialog
+emits a `[good]` line on `verifiedClean = true`, distinct from the prior
+implicit "no badge fired ⇒ assume clean" behavior — without it, profiles
+whose Arm 1 windows lie entirely before `pourStart` (simple two-marker
+Preinfusion + Pour shapes) silently pass even when no detector saw any
+data. The line text branches on `GrindCheck.sampleCount`: Arm 1 ran and
+saw qualifying samples (`> 0`) ⇒ "Grind tracked goal during pour"; Arm 1
+saw no samples (`== 0`, either because its windows lay outside the pour
+window or because the new `profileKbResolved` gate skipped it) ⇒ "Puck
+sustained healthy pressure during pour" — the honest wording when Arm 2
+alone supplied the verifiedClean signal.
+
+A shot where `hasData = true` but `verifiedClean = false` means the yield
+arm fired (or, if `chokedPuck=false && yieldOvershoot=false`, the flow
+arm gates passed but the verified-clean criteria didn't hold for some
+other reason). Consumers wanting "verified clean" specifically must read
+`grindVerifiedClean` directly, not just `hasData`.
+
+**Coverage signal.** `DetectorResults.grindCoverage` carries one of:
+
+- `"verified"` — `hasData=true`. The detector ran with enough data to
+  produce a result. Set whether or not the result is healthy: a
+  verified-clean pour AND a chokedPuck/yieldOvershoot/large-delta pour
+  BOTH carry `"verified"`. Coverage signals data availability, not
+  health outcome — the verdict and `grindDirection` carry the specific
+  diagnosis; consumers wanting "verified clean" specifically should
+  read `grindVerifiedClean` directly.
+- `"notAnalyzable"` — espresso shot, non-degenerate pour window, `hasData=false`.
+  Common on simple two-marker profiles (A-Flow, La Pavoni, Malabar,
+  Italian Style) where Arm 1's flow-mode window lies entirely before
+  `pourStart` and Arm 2's pressurized-duration gate isn't met. The dialog
+  emits `[observation]` "Could not analyze grind on this profile shape — …"
+  and the verdict cascade switches to "Clean shot, but grind could not be
+  evaluated for this profile shape." instead of the bare "Clean shot. Puck
+  held well."
+- `"skipped"` — non-espresso beverage or `grind_check_skip` flag.
+- `""` (empty) — pourTruncated cascade is active (the dominator already
+  explains why the grind block was skipped) OR the pour window is
+  degenerate (`pourEnd <= pourStart`).
+
+**Hard skips** (`skipped = true`, both arms suppressed):
+
+- Beverage type is `filter`, `pourover`, `tea`, `steam`, or `cleaning`.
+- `analysisFlags` contains `grind_check_skip`.
+- Pressure data is empty (the arm-2 path early-returns).
+
+### 2.3 Skip first frame
+
+`detectSkipFirstFrame` operates on phase markers only — no curves needed. Two
+distinct branches inside one function, picked from the marker stream.
+
+**Exit-condition guard (checked first).** Before either branch, if the first
+non-zero frame's marker `transitionReason` is `"pressure"`, `"flow"`, or
+`"weight"` (case-insensitive), the detector returns `false` — the preceding
+frame exited on its own confirmed exit condition, so it executed as designed and
+was not skipped. DE1 preinfusion/fill frames routinely exit far earlier than
+their configured max duration (that is their purpose), and without this guard the
+duration checks below flag them as "skipped." These reasons are recorded only for
+a *confirmed* sensor exit. When the exit was configured but the threshold was
+not reached (and time had not expired), `MainController` records
+`"pressure_unconfirmed"`/`"flow_unconfirmed"` instead — a hint, not ground
+truth.
+
+"Reached" is not a bare comparison against the transition sample, and reading it
+as one is what made this detector badge correct shots. The DE1 evaluates its
+exit condition on its own internal cadence, an order of magnitude faster than
+the ~10 Hz BLE stream, so a fast-rising fill frame normally crosses its
+threshold *between* two samples the app can see —
+[#1813](https://github.com/Kulitorum/Decenza/issues/1813): `pressure_over 2.10`,
+transition sample 2.048 bar, preceding sample 1.869 bar, crossing ~60 ms after
+the last visible sample. `FrameExit::inferReason`
+(`src/machine/frameexitreason.h`) therefore confirms when the threshold falls
+within one sample-interval's worth of the *observed* change toward it. The
+tolerance is the measured per-sample delta, never a constant: flat, moving away,
+or no preceding sample in the shot all get none — which is what keeps a
+genuinely skipped frame (no rise to extrapolate from) in the unconfirmed branch
+where this detector can still catch it. The guard intentionally does **not** match the unconfirmed
+variants: a genuinely skipped frame lands in that same unconfirmed branch, so
+trusting the hint would mask the very bug this detector exists to catch.
+Unconfirmed, `"time"`, and empty (old-data) reasons all fall through to the
+branches. This uses the same `transitionReason` signal `analyzeFlowVsGoal`
+(the grind detector, `detectGrindIssue`) reads — but with the opposite
+polarity for unconfirmed values (see §2.2's limiter-tail trim), which is
+deliberate: each consumer defaults to its own safe side.
+
+**FW-bug branch** — frame 0 was never observed before a non-zero frame:
+returns `phase.time < 2.0`. The 2-second window matches the de1app Tcl
+plugin's polling cadence (it can only catch this before t = 2 s), so we use
+the same hard window for parity. This case requires a power-cycle to fix.
+
+**Short-first-step branch** — frame 0 was observed but ended early:
+returns `phase.time < cutoff` where:
+
+```
+cutoff = (firstFrameConfiguredSeconds > 0)
+       ? min(2.0, 0.5 * firstFrameConfiguredSeconds)
+       : 2.0
+```
+
+The configured-aware path avoids false positives on profiles whose first
+frame is configured for 2 seconds — BLE notification jitter routinely lands
+the frame-1 marker a few hundred ms early, and a 1.87 s actual on a 2 s
+configured frame should not flag.
+
+`expectedFrameCount` is honored when known: values < 2 suppress detection
+(no second frame to skip to), and out-of-range frame numbers are skipped as
+malformed.
+
+`firstFrameConfiguredSeconds` is fed in by callers from `ProfileFrameInfo`
+(parsed from the stored profile JSON via `profileFrameInfoFromJson`).
+
+### 2.4 Pour truncated (puck failed)
+
+`detectPourTruncated` returns true when peak pressure inside the pour window
+stays below `PRESSURE_FLOOR_BAR` (2.5). It catches the failure mode where
+conductance saturates at its clamp, `dC/dt` is flat, and flow tracks the
+preinfusion goal perfectly — every other detector goes silent or fires the
+wrong diagnosis. Skipped for filter / pourover / tea / steam / cleaning
+beverages where low pressure is expected.
+
+**Suppression cascade.** When this detector fires, `analyzeShot` (the
+single enforcement point) skips the channeling and grind blocks, leaving
+those `DetectorResults` fields at their `false` defaults. The badge
+projection then reads those defaults so `channelingDetected` /
+`grindIssueDetected` stay `false`. See §1 for the rationale; see §4 for
+the projection mapping.
+
+**Population the badge catches.** A puck-failure shot can come from any of:
+grind way too coarse, distribution failure (massive channel), no/loose
+puck or missing basket, severe underdose, profile misconfigured (high
+flow goal with no pressure cap), or an early abort. The user can't
+discriminate among these from the curve, so the verdict text leads with
+the meta-action ("Don't tune off this shot — peak pressure never built,
+so the other quality signals are unreliable") rather than naming a
+specific fix.
+
+---
+
+## 3. Shot Summary dialog
+
+The badge row is **not** gated on KB resolution: it renders for every shot, so
+the "Shot Summary" chip is always reachable. It used to be hidden unless a
+quality flag fired or the shot carried a `profileKbId`, which in practice hid
+it only on a *clean* shot — the case with the least other information — while
+the dialog's contents come from the shot's own curves and never needed the KB
+at all. The individual chips keep their own conditions: each flag chip on its
+flag, and the clean-extraction chip when none fired **and**
+`verdictCategory !== "insufficientData"`.
+
+That second term is load-bearing. `analyzeShot` short-circuits on
+`pressure.size() < 10` and returns with every detector `false`, so the four
+booleans alone cannot distinguish "nothing was wrong" from "nothing was
+checked" — without it an aborted or curve-less shot claims a clean extraction
+the app never established. (An empty `verdictCategory` still shows the chip:
+that is a legacy row with no serialized analysis, whose behaviour predates
+`detectorResults` and must not change.)
+
+The "Shot Summary" chip at the end of the badge row opens
+`qml/components/ShotAnalysisDialog.qml` — a non-AI, non-modal-blocking
+analysis pane that surfaces a list of observations plus a single verdict
+line. The text is computed entirely in C++ from the captured curves; the
+QML side is a thin display layer.
+
+### Pipeline
+
+There are two consumer paths that share a single detector pass:
+
+- **In-app dialog path** (returns prose only):
+  `ShotAnalysisDialog` (visible) →
+  reads `shotData.summaryLines` directly (populated by
+  `convertShotRecord`'s `analyzeShot` pass). When `summaryLines` is
+  absent, the dialog renders its header with no body — preferable to
+  recomputation through a parallel reconstruction path. The result is
+  a `QVariantList` of `{ text, type }` lines rendered by a `Repeater`
+  with a colored dot per line.
+- **MCP path** (returns prose + structured detectors):
+  `convertShotRecord` → reads `record.cachedAnalysis` populated by
+  `loadShotRecordStatic`'s earlier `analyzeShot` pass (single computation
+  per detail load). Falls back to `ShotAnalysis::analyzeShot(...)` inline
+  only for direct-construction callers (`ShotHistoryExporter`, tests) that
+  bypass `loadShotRecordStatic`. Either way the result is an
+  `AnalysisResult { lines, detectors }` emitted as `summaryLines` plus a
+  nested `detectorResults` JSON object on every shot record served by
+  `shots_get_detail` / `shots_compare`.
+
+Both paths run the same `analyzeShot` body. The dialog discards `detectors`;
+MCP serializes the full struct. The AI advisor's prompt builder
+(`ShotSummarizer::summarize` / `summarizeFromHistory`) reads its prose
+lines through the `generateSummary` wrapper for the live-shot path or
+directly from the pre-computed `shotData.summaryLines` for the
+historical-shot path.
+
+### Line types and rendering
+
+Each line carries a `type`:
+
+| Type          | Dot color                     | Used for                                   |
+| ------------- | ----------------------------- | ------------------------------------------ |
+| `good`        | success (green)               | "Puck stable", happy-path observations     |
+| `caution`     | warning (orange)              | flow drift, grind direction                |
+| `warning`     | error (red)                   | sustained channeling, choked puck, frame skip, pour truncated |
+| `observation` | text-secondary (neutral grey) | preinfusion drip mass / duration           |
+| `verdict`     | no dot, larger font           | always exactly one, last in the list       |
+
+The dialog renders the verdict in subtitle font with no dot to set it apart
+from the observation lines.
+
+### Observations emitted
+
+`analyzeShot` computes `pourTruncated` first; when it fires, the
+channeling / flow-trend / grind blocks below all skip
+emission entirely. The list collapses to a single warning + the
+puck-failed verdict. Order otherwise follows `analyzeShot`
+top-to-bottom:
+
+1. **Channeling status** — uses the same `buildChannelingWindows` +
+   `detectChannelingFromDerivative` path as the badge. Emits **Sustained**
+   ("warning"), **Transient** ("caution") with the spike timestamp, or a
+   "Puck stable" ("good") line. Skipped for filter / pourover / tea /
+   steam / cleaning beverages, turbo shots, profiles with the
+   `channeling_expected` analysis flag, **and when `pourTruncated`
+   fires**.
+2. **Flow trend** — compares mean flow in the first 30% of the pour
+   against the last 30%. ±0.5 mL/s thresholds emit "Flow rose … (puck
+   erosion)" or "Flow dropped … (fines migration or clogging)" as
+   "caution". Suppressed for profiles with the `flow_trend_ok` analysis
+   flag (Cremina lever and similar where declining/rising flow is by
+   design), **and when `pourTruncated` fires**.
+3. **Preinfusion drip** — when preinfusion lasted > 1 s and at least 0.5 g
+   landed during it, emits "Preinfusion: Xg in Ys" as an "observation".
+   Not gated on `pourTruncated` — drip mass is a fact, not a diagnosis.
+4. **Grind direction** — uses the same `analyzeFlowVsGoal` path as the
+   badge. Emits one of: "Pour produced near-zero flow while pressure
+   held — puck choked" ("warning") when `chokedPuck` fires, "Flow
+   averaged X mL/s below target — grind may be too fine" ("caution"),
+   "Flow averaged X mL/s above target — grind may be too coarse"
+   ("caution"), "Grind tracked goal during pour" ("good") when
+   `verifiedClean` is true AND Arm 1 saw samples, "Puck sustained
+   healthy pressure during pour" ("good") when `verifiedClean` is true
+   AND Arm 1 saw no samples (Arm 2 supplied the signal alone), or —
+   when the detector had no analyzable
+   data on a non-degenerate espresso pour — "Could not analyze grind on
+   this profile shape — check flow trend, channeling, and taste
+   instead" ("observation"). **Suppressed when `pourTruncated` fires.**
+5. **Pour truncated** — `detectPourTruncated`. Emits "Pour never
+   pressurized (peak X bar) — puck offered no resistance. Likely
+   causes: grind way too coarse, distribution failure, no/loose puck,
+   severe underdose, or profile without a pressure cap." as "warning"
+   when peak pressure stayed under 2.5 bar. The actual peak value is
+   substituted into the line.
+6. **Skip first frame** — `detectSkipFirstFrame`. Emits "First profile
+   step skipped — likely a DE1 firmware bug…" as "warning". Not gated
+   on `pourTruncated` — frame-skip is orthogonal to puck integrity.
+
+### Verdict precedence
+
+Exactly one verdict line is appended to every summary. The cascade picks
+the first match (more specific failures take precedence over generic
+puck-integrity advice):
+
+1. **Pour truncated** → "Don't tune off this shot — peak pressure never
+   built, so the other quality signals (channeling, grind direction)
+   are unreliable. Check prep (dose, distribution, basket, grind)
+   and pull another." Dominates over channeling / grind since the puck
+   never built any resistance worth analyzing; leads with
+   the meta-action because the shot has no useful tuning signal.
+2. **Skip first frame** → "First profile step was skipped — power-cycle…"
+   Pre-empts choked-puck because a frame-skip can synthesise extraction
+   dynamics that resemble a choke; fix the machine first, then re-evaluate.
+3. **Choked puck** → "Puck choked — grind way too fine. Coarsen
+   significantly." Pre-empts the generic "Puck integrity issue" verdict
+   below.
+4. **Has any "warning"** → "Puck integrity issue — improve distribution."
+   When a directional grind signal is present alongside, it appends
+   "Grind is running fine — try coarser." or "Grind is running coarse —
+   try finer." as a modifier (since channeling alone doesn't tell you
+   which direction grind is off).
+5. **Has any "caution"** → If grind data is directional (`|delta| >
+   FLOW_DEVIATION_THRESHOLD`), names the direction ("Grind appears too
+   fine — try coarser." / "…too coarse — try finer.") regardless of any
+   other cautions also present. Otherwise: "Decent shot with minor
+   issues to watch." (The in-source comment phrases this as "if the
+   only caution is a grind direction," but the implementation does not
+   actually check for uniqueness — a directional grind delta wins over
+   a co-occurring flow-trend caution.)
+6. **Otherwise, grind not analyzable** → "Clean shot, but grind could not
+   be evaluated for this profile shape." Fires when no warnings/cautions
+   were emitted AND `grindCoverage == "notAnalyzable"`. Distinguishes
+   "verified clean pour" from "we silently had no data to speak from"
+   on simple two-marker profiles (Preinfusion + Pour: A-Flow, La Pavoni,
+   Malabar, Italian Style). `verdictCategory == "cleanGrindNotAnalyzable"`.
+7. **Otherwise** → "Clean shot. Puck held well." `verdictCategory == "clean"`.
+   Used when grind was verified or skipped (non-espresso).
+
+### Triggering and lifecycle
+
+The dialog is instantiated declaratively inside `PostShotReviewPage.qml`. The `Shot Summary` chip in `QualityBadges.qml`
+emits `summaryRequested()` on tap, which the host page handles by calling
+`open()` on its `ShotAnalysisDialog` instance. Analysis lines come from
+`shotData.summaryLines`, populated by `convertShotRecord`'s `analyzeShot`
+pass on every shot load, so detector improvements take effect on summary
+text the same way they do on badges — no save-time freeze. There is no
+DB persistence for summary lines; they're regenerated on every load.
+
+### AI advisor consumes the same line list (PR Kulitorum/Decenza#930)
+
+The in-app AI advisor's prompt is built by `ShotSummarizer::buildUserPrompt`,
+which ships the same `analyzeShot` line list under a `## Detector
+Observations` section with a preamble framing the lines as detector
+evidence (severity tags `[warning]` / `[caution]` / `[good]` /
+`[observation]`). The `verdict` line is filtered out so the AI reasons
+from the same observations the verdict was built from rather than
+anchoring on the dialog's pre-cooked conclusion. On historical shots,
+`ShotSummarizer::summarizeFromHistory` prefers the pre-computed
+`shotData.summaryLines` (populated by `convertShotRecord`'s `analyzeShot`
+pass) and only falls back to running the inline detector orchestration
+when that field is absent. Both paths invoke the same `analyzeShot` body,
+so they produce equivalent observation lines. The suppression cascade is enforced in
+exactly one place — `analyzeShot` — so the badge UI, the dialog, and
+the AI advisor cannot drift.
+
+### External MCP agents see structured detectors (PR Kulitorum/Decenza#933, resolved Issue #931)
+
+`ShotHistoryStorage::convertShotRecord` runs `ShotAnalysis::analyzeShot`
+once per shot conversion and emits both `summaryLines` (the prose list
+the dialog renders) and a nested `detectorResults` JSON object on every
+shot record served by `shots_get_detail` / `shots_compare`. The
+`detectorResults` shape is documented in
+[`docs/CLAUDE_MD/MCP_SERVER.md`](CLAUDE_MD/MCP_SERVER.md) under "Shot
+Detector Outputs" and mirrors the `ShotAnalysis::DetectorResults` C++
+struct: channeling severity, flow trend, grind direction (with
+`chokedPuck` / `yieldOvershoot` flags), pour-truncated + peak pressure,
+skip-first-frame, and a stable enum-like `verdictCategory` string.
+
+The struct is a *superset* of what `summaryLines` renders — clean
+signals (`flowTrend = "stable"`, `grindDirection = "onTarget"`) appear
+in `detectorResults` but produce no prose line. The verdict prose is
+intentionally NOT exposed as a separate field; external agents read
+`verdictCategory` and compose their own framing.
+
+The four legacy badge booleans (`channelingDetected`, etc.) on
+`convertShotRecord` remain available for backwards compatibility.
+
+---
+
+## 4. Persistence semantics
+
+### Save-time: stored columns
+
+The `shots` table has four flag columns: `pour_truncated_detected`,
+`channeling_detected`, `grind_issue_detected`,
+`skip_first_frame_detected`. At shot save (or import), the badges are
+computed once from the captured curves and written into these columns
+alongside the rest of the shot record. The historical fifth column
+(`temperature_unstable`) was added in migration 10 and dropped in
+migration 15 — see openspec change `remove-temperature-unstable-badge`.
+
+### Single-pass detector pipeline + projection (post PR Kulitorum/Decenza#934, Kulitorum/Decenza#935, Kulitorum/Decenza#936)
+
+`saveShot` and `loadShotRecordStatic` both compute all four quality
+badges via a single `ShotAnalysis::analyzeShot(...)` call and project the
+booleans from the returned `DetectorResults` struct using the helper in
+`src/history/shotbadgeprojection.h`. The cascade lives in exactly one
+place — `analyzeShot`'s body — and the badge columns are a deterministic
+projection of the typed struct. No more hand-rolled per-detector calls
+or hand-rolled gate conditions in the storage layer.
+
+**Badge ↔ `DetectorResults` mapping:**
+
+| Badge column | `DetectorResults` projection |
+|---|---|
+| `pourTruncatedDetected` | `d.pourTruncated` |
+| `channelingDetected` | `d.channelingSeverity == "sustained"` (Transient does NOT fire the badge) |
+| `grindIssueDetected` | `d.grindHasData && (d.grindChokedPuck \|\| d.grindYieldOvershoot \|\| std::abs(d.grindFlowDeltaMlPerSec) > FLOW_DEVIATION_THRESHOLD)` |
+| `skipFirstFrameDetected` | `d.skipFirstFrame` |
+
+Notes on the projection:
+
+- `channelingDetected` deliberately uses `Sustained`-only. Transient
+  channeling shows in the dialog as a "Transient channel at Xs"
+  caution line and in MCP `detectorResults.channeling.severity` as
+  `"transient"`, but the boolean badge column stays `false`. Carries
+  forward PR Kulitorum/Decenza#922's invariant.
+- `grindIssueDetected` mirrors `ShotAnalysis::detectGrindIssue` exactly.
+  The `grindHasData` conjunct is a defensive zero — it short-circuits
+  the projection if any of the grind sub-flags are set on a struct
+  whose `hasData` is false.
+- `pourTruncated` and `skipFirstFrame` are 1:1 with their struct fields.
+
+The projection is unit-tested via `tst_shotanalysis::badgeProjection_*` —
+each row of the mapping table has at least one regression test, including
+the load-bearing `Transient` carve-out.
+
+### Load-time: always recompute (PR Kulitorum/Decenza#893, extended for the 5th badge in PR Kulitorum/Decenza#922)
+
+`ShotHistoryStorage::loadShotRecordStatic` reads the stored columns, then
+**unconditionally recomputes all four badges** from the loaded curve data
+before returning. The recompute is now a single `analyzeShot` + projection
+call (post PR Kulitorum/Decenza#936), so it cannot diverge from the save-time computation.
+This means the in-memory `ShotRecord` always reflects the current detector
+logic and the cascade is consistent between save and load.
+
+The recompute uses on-the-fly derived curves for legacy shots that lack them:
+`computeDerivedCurves` fills `conductanceDerivative` from `pressure`/`flow`
+when the shot predates migration 10 (the `conductance` column).
+
+The grind coverage signal (`grindCoverage`, `grindVerifiedClean`) is part
+of the `DetectorResults` payload that `analyzeShot` produces; like
+`summaryLines`, it is **not** stored in the database — it is recomputed
+on every load and emitted by `convertShotRecord` as part of the
+structured `detectorResults` JSON for MCP / dialog consumers.
+
+### Lazy persist on view (PR Kulitorum/Decenza#893)
+
+Drift detection and persistence ride the load path: `loadShotRecordStatic`
+recomputes the four flags from the curve data and, when any differs from the
+stored column, issues an `UPDATE` on the same connection; `requestShot` then
+emits `shotBadgesUpdated(shotId, channeling, grindIssue, skipFirstFrame,
+pourTruncated)` so the open page refreshes. When every flag already matches,
+nothing is written and nothing is emitted. The separate
+`requestReanalyzeBadges` invokable had no caller and was removed.
+
+### Yield anchor provenance (add-yield-ratio-anchor, migration 34)
+
+`shots.yield_override` is untouched by the yield-anchor change: it stays
+the **resolved gram target** every detector reads (the yield-overshoot and
+shortfall arms are pure `finalWeightG / targetWeightG` — no ratio ever
+reaches them, because resolution to grams happens upstream of
+`MachineState::setTargetWeight`). Two columns record the anchor that
+*produced* that target: `yield_mode` (`none` | `absolute` | `ratio`) and
+`yield_anchor_value` (grams when absolute, a dose multiplier when ratio).
+They are intent alongside outcome — stored at save time, never derived at
+read time (the dose is post-shot editable, and deriving would mint a ratio
+nobody chose). Promotion (`RecipePromotion::fieldsFromShotRecord`) copies
+them verbatim; legacy rows were backfilled `absolute` from a >0
+`yield_override`, else `none`. The detectors, the badge pipeline, and this
+document's gate semantics are unaffected.
+
+### Residual gap (Issue #894)
+
+`requestShotsFiltered` → `buildFilterQuery()` (around
+`shothistorystorage.cpp:1463-1474`) builds badge filters against the **stored
+columns**, not the recomputed values. The MCP `shots_list` tool reads the
+same stored columns. So a shot whose recomputed badges no longer match the
+stored values is consistent in the detail view (after one open, lazy persist
+catches up) but inconsistent in:
+
+- The history-list filter chips ("Show only channeling shots") for shots not
+  yet viewed under the current detectors.
+- `shots_list` MCP responses for the same.
+
+Tracked in #894. Options on the table: a one-shot bulk resweep (option 1),
+adding a manual "Re-analyze all shots" button (option 2), or both (hybrid).
+Held until the detectors stabilize — the next round of fixes would just
+require another sweep.
+
+---
+
+## 5. Code map
+
+### Detector logic
+
+- `src/ai/shotanalysis.{h,cpp}` — all four detectors, `analyzeFlowVsGoal`,
+  `buildChannelingWindows`, `detectChannelingFromDerivative`,
+  `detectGrindIssue`, `detectSkipFirstFrame`, `detectPourTruncated`,
+  `shouldSkipChannelingCheck`, `analyzeShot` (returns
+  `AnalysisResult { lines, detectors }` — feeds the Shot Summary dialog
+  and MCP; see §3), `generateSummary` (thin wrapper returning
+  `analyzeShot(...).lines`), `DetectorResults` / `AnalysisResult`
+  structs, all tuning constants.
+
+### Persistence
+
+- `src/history/shothistorystorage.{h,cpp}`:
+  - `loadShotRecordStatic` — load + recompute block (the "always recompute
+    every quality badge" comment marks the section).
+  - `requestShotsFiltered` + `buildFilterQuery` — history-list filter that
+    reads the stored columns.
+  - `convertShotRecord` — runs `analyzeShot` once per shot conversion
+    (or reuses `record.cachedAnalysis` populated by `loadShotRecordStatic`);
+    emits `summaryLines` (prose) and a nested `detectorResults` JSON
+    object on every shot record served by MCP / web endpoints. The dialog
+    reads `summaryLines` directly from the resulting `shotData` map.
+  - DB migrations for the four flag columns (10–13; migration 13 adds
+    `pour_truncated_detected`; migration 15 drops the
+    `temperature_unstable` column added by migration 10).
+  - `computeDerivedCurves` — fills conductance / dC/dt for legacy shots that
+    predate migration 10.
+  - `profileFrameInfoFromJson` — extracts `frameCount` and
+    `firstFrameSeconds` for `detectSkipFirstFrame` and the summary path.
+
+### Profile-level analysis flags
+
+- `src/profile/profileknowledge.{h,cpp}` — KB entries that carry per-profile
+  `analysisFlags` (`channeling_expected`, `grind_check_skip`,
+  `bloom_self_heal`, etc.).
+- `ShotSummarizer::getAnalysisFlags(profileKbId)` is the canonical lookup
+  used by both detector callers and `loadShotRecordStatic`.
+
+### UI
+
+- `qml/components/QualityBadges.qml` — chip rendering. One chip per active
+  flag; when none active, a single "Clean extraction" chip; always a
+  trailing "Shot Summary" chip that emits `summaryRequested()`.
+- `qml/components/ShotAnalysisDialog.qml` — Shot Summary dialog. Reads
+  `shotData.summaryLines` directly (populated by `convertShotRecord`)
+  and renders the `{ text, type }` lines via a `Repeater`.
+- `qml/pages/PostShotReviewPage.qml` —
+  consume `shotData.channelingDetected` / `grindIssueDetected` /
+  `skipFirstFrameDetected` / `pourTruncatedDetected`, listen for
+  `shotBadgesUpdated`, host the `ShotAnalysisDialog` instance and wire
+  `summaryRequested` to `open()`.
+- `qml/pages/ShotHistoryPage.qml` — filter chips that consume the stored
+  columns.
+
+### MCP
+
+- `src/mcp/mcptools_shots.cpp` — `shots_list` reads stored columns;
+  `shots_get_detail` runs through `loadShotRecordStatic` and so reflects
+  recomputed badges.
+
+---
+
+## 6. Regression corpus
+
+`tools/shot_eval/` is a CLI harness that runs the live detectors against a
+curated corpus of shot fixtures and prints (or validates) the verdicts.
+
+- **Fixtures**: `tests/data/shots/*.json` — curated real shots covering
+  lever-clean (Cremina, E61, Damian LRv3, classic Italian), lever / E61
+  failure modes (80's Espresso choked moderate / puck failure, classic
+  Italian fast, Londinium gusher, blooming aborted / choker, puck-failure
+  short gusher), grind-fine (Malabar D-Flow), and Adaptive v2 cases (Gagne).
+- **Manifest**: `tests/data/shots/manifest.json` — golden verdicts per
+  fixture.
+- **CTest target**: `shot_corpus_regression` (declared in
+  `tests/CMakeLists.txt`) runs `shot_eval --validate manifest.json`. Linux
+  CI catches detector regressions before merge.
+
+To add a fixture:
+
+1. Drop the captured shot JSON in `tests/data/shots/`.
+2. Add an entry to `manifest.json` with the expected badge / verdict.
+3. Run `shot_eval --validate` locally (or via the ctest target) to confirm.
+4. Commit both files together so the manifest documents the new golden.
+
+---
+
+## 7. References
+
+- PR Kulitorum/Decenza#649 — original Tier 1 diagnostics (badges, dC/dt, phase summary, mix
+  temperature, basic/advanced toggle).
+- PR Kulitorum/Decenza#699 — bloom/soak channeling suppression via per-profile flags.
+- PR Kulitorum/Decenza#811 — mode-aware shot analysis (`buildChannelingWindows` +
+  flow-mode-only `analyzeFlowVsGoal`) plus the `shot_eval` corpus.
+- PR Kulitorum/Decenza#864 — first attempt at lever false-positive suppression
+  (over-aggressive).
+- PR Kulitorum/Decenza#866 — corpus-regression repair (rising-pressure gate in flow-mode
+  windows, ≥ 1 s post-trim guard on grind ranges).
+- PR Kulitorum/Decenza#890 — skip-first-frame uses the configured first-frame seconds, not
+  a hard 2 s constant.
+- PR Kulitorum/Decenza#891 — choked-puck arm on pressure-mode pours.
+- PR Kulitorum/Decenza#892 — moderate grind-too-fine via yield/target ratio.
+- PR Kulitorum/Decenza#893 — recompute every quality badge on shot load + lazy persist on
+  view.
+- Issue #894 — residual stored-column drift (history-list filter and
+  `shots_list` MCP read stored, not recomputed values).
+- PR Kulitorum/Decenza#898 — `temperatureUnstable` gating fix (`reachedExtractionPhase`)
+  — superseded; the badge has since been removed entirely (see
+  `remove-temperature-unstable-badge` openspec change).
+- PR Kulitorum/Decenza#901 — flow/pressure-mode rising-pressure gate fix.
+- PR Kulitorum/Decenza#910 — yield-overshoot ("gusher") arm in `analyzeFlowVsGoal`.
+- PR Kulitorum/Decenza#922 / Issue #903 — fifth badge `pourTruncatedDetected` ("Puck failed"),
+  suppression cascade across save / load / `analyzeShot`,
+  meta-action verdict ("Don't tune off this shot"), migration 13.
+- PR Kulitorum/Decenza#930 / Issue #921 — `ShotSummarizer` (AI advisor prompt path) now
+  shares the suppression cascade. Detector orchestration delegates to
+  `ShotAnalysis::analyzeShot` — the same pipeline `convertShotRecord`
+  uses to populate `summaryLines` for the dialog. The prompt's
+  `## Detector Observations` section
+  emits `analyzeShot`'s line list verbatim with severity tags
+  (`[warning]` / `[caution]` / `[good]` / `[observation]`) under a preamble
+  framing the lines as detector evidence. The `verdict` line is filtered
+  out before emission so the AI reasons from the same observations the
+  user sees in the dialog without anchoring on the dialog's prescriptive
+  conclusion. Cleanup: dropped dead `ShotSummary` fields
+  (`channelingDetected`, `timeToFirstDrip`, `preinfusionDuration`,
+  `mainExtractionDuration`) and the wrapper helpers
+  (`detectChannelingInPhases`) they fed.
+- PR Kulitorum/Decenza#933 / Issue #931 — `convertShotRecord` runs `analyzeShot` once
+  per shot conversion and emits both `summaryLines` (prose) and
+  structured `detectorResults` JSON on `shots_get_detail` /
+  `shots_compare`. Refactored `generateSummary` into a thin wrapper
+  over the new `analyzeShot()` entry point that returns
+  `AnalysisResult { lines, detectors }`. The `DetectorResults` struct
+  is the source for prose; sharing one detector pass keeps both
+  outputs in lockstep. Verdict prose is intentionally NOT exposed —
+  agents read the stable `verdictCategory` enum instead. Field
+  reference: `docs/CLAUDE_MD/MCP_SERVER.md` "Shot Detector Outputs".
+- openspec change `remove-temperature-unstable-badge` / Issue #1128 —
+  retired the `temperatureUnstable` badge end-to-end (detector,
+  projection, badge UI, MCP `detectorResults.tempStability`, history
+  filter, DB column via migration 15). The detector measured average
+  deviation from goal but was labeled "Temp unstable" — and the
+  deviation it caught was, in practice, profile-design intent on
+  D-Flow / Extractamundo / TurboBloom and 9+ other built-in profiles.
+  `analyzeShot` and `generateSummary` lost their `temperature` and
+  `temperatureGoal` parameters; the static helpers
+  `hasIntentionalTempStepping`, `avgTempDeviation`, and
+  `reachedExtractionPhase` were removed. `shotBadgesUpdated` shrank
+  from 6 to 5 args.
+- PR Kulitorum/Decenza#1141 / Issue #1128 (grind half — same issue number, second
+  half of the report) — added the flow-goal stationarity gate to
+  Arm 1 of the grind detector (`FLOW_GOAL_STATIONARY_HALF_SEC = 0.75`,
+  `FLOW_GOAL_STATIONARY_REL = 0.15`, see §2.2). Fixes a false-positive
+  "Grind too coarse" badge on Extractamundo Dos!-style profiles whose
+  "dynamic bloom" frame is `pump=flow, flow=0, exit_pressure_under`:
+  the firmware ramps flow down to zero so the puck bleeds preinfusion
+  pressure naturally; the rapidly-decaying flow goal isn't a target
+  the puck should track, but Arm 1 used to average against it and
+  produce a confident `+3.2 mL/s` over-goal delta on shots the
+  reporter rated 90/100 and 94/100. The new gate rejects samples
+  whose flow_goal moves more than 15 % across ±0.75 s — naturally
+  excluding bloom-decay frames without changing flat-target behavior.
+  Added two regression fixtures: real shot 464 from the field
+  (`extractamundo_dos_dynamic_bloom_clean.json`) and a synthetic
+  puck-failure gusher that exercises the `pourTruncated` +
+  `yieldOvershoot` cascade interaction at the detector level
+  (`synthetic_puck_failure_gusher.json`).
+
+External resources that informed the diagnostic patterns:
+
+- Visualizer.coffee: <https://github.com/miharekar/visualizer> (conductance /
+  resistance formulas, dC/dt smoothing kernel).
+- GaggiMate MCP: <https://github.com/julianleopold/gaggimate-mcp> (Darcy
+  resistance, channeling risk scoring, profile compliance).
+- Coffee ad Astra puck resistance study: <https://coffeeadastra.com/2021/01/16/a-study-of-espresso-puck-resistance-and-how-puck-preparation-affects-it/>.
+- Espresso Compass (Barista Hustle): <https://www.baristahustle.com/the-espresso-compass/>.
+
+### PORTAL estimates
+
+PORTAL integrals and tail contributions are relative raw-EC proxies. Estimated
+TDS/EY uses other refractometer shots from the same bag/bean and mounting mode;
+uncertain measurements are excluded from fitting. Fewer than five references
+remain preliminary. Ratio suggestions use explicit taste feedback and comparable
+rated cups, without estimating unmeasured solids or changing machine control.

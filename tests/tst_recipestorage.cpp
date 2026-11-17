@@ -1,0 +1,3088 @@
+#include <QJsonArray>
+#include <QtTest>
+#include <QRegularExpression>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QSignalSpy>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTemporaryDir>
+
+#include "core/recipeeditfields.h"
+#include "history/recipestorage.h"
+#include "history/coffeebagstorage.h"
+#include "history/equipmentstorage.h"
+#include "shotrowfixtures.h"
+
+// Recipe storage (add-recipes, recipes-bag-links-ui-polish): CRUD statics,
+// variant-map round-trip, inventory MRU + shot-count aggregate + stale flag,
+// the delete-vs-archive lifecycle guard, clone provenance, the hard bag link
+// (activation uses it directly; the resolver survives only as the relink
+// matching helper + migration-29 data pass), and the relink lifecycle
+// (roll-on-finish, wake-on-restock, dup-guard).
+
+using ShotRowFixtures::withRawDb;
+
+// Minimal shots table carrying just the columns the recipe queries read
+// (the shot-count aggregate and the delete guard both key on recipe_id).
+static void createMinimalShots(QSqlDatabase& db) {
+    QSqlQuery(db).exec(R"(
+        CREATE TABLE shots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipe_id INTEGER,
+            steam_json TEXT
+        )
+    )");
+}
+
+static qint64 insertShotForRecipe(QSqlDatabase& db, qint64 recipeId) {
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO shots (recipe_id) VALUES (?)");
+    q.addBindValue(recipeId);
+    q.exec();
+    return q.lastInsertId().toLongLong();
+}
+
+// Two bags of the same bean for the roll scenarios: the first finished (but
+// deliberately MRU — the roll must pick the NEWEST open bag, never the most
+// recently used), the second open and newer.
+static void insertBeanPair(QSqlDatabase& db, qint64* outFinished, qint64* outOpen) {
+    CoffeeBag finished; finished.roasterName = "Roaster"; finished.coffeeName = "Guji";
+    finished.beanBaseId = "bb-uuid-1"; finished.inInventory = false;
+    finished.lastUsedEpoch = 900;
+    *outFinished = CoffeeBagStorage::insertBagStatic(db, finished);
+    CoffeeBag open = finished; open.inInventory = true; open.lastUsedEpoch = 100;
+    *outOpen = CoffeeBagStorage::insertBagStatic(db, open);
+}
+
+static Recipe sampleRecipe() {
+    Recipe r;
+    r.name = "Morning capp";
+    r.profileTitle = "D-Flow / default";
+    r.profileJson = "{\"title\":\"D-Flow / default\"}";
+    r.drinkType = "latte";  // migration-28 field; round-trips through COL_STR
+    r.beanBaseId = "bb-uuid-1";
+    r.roasterName = "Roaster";
+    r.coffeeName = "Guji";
+    r.equipmentId = 7;
+    r.doseG = 18.0;
+    r.yieldValue = 40.0;   // yield spec (add-yield-ratio-anchor)
+    r.yieldMode = "absolute";
+    r.tempOffsetC = -2.5;  // SIGNED: negative offsets must survive the bind
+    r.grindPinned = "";  // no grind recorded (a valid state)
+    r.rpmPinned = 90;    // migration-26 field; round-trips through COL_EPOCH
+    // Real steam-block key shape (see MainController::currentSteamSpecJson).
+    r.steamJson = "{\"hasMilk\":true,\"milkWeightG\":150,\"pitcherName\":\"Small\","
+                  "\"durationSec\":40,\"flow\":120,\"temperatureC\":140}";
+    r.createdFromShotId = 42;
+    r.clonedFromRecipeId = 3;
+    return r;
+}
+
+class tst_RecipeStorage : public QObject {
+    Q_OBJECT
+
+private:
+    QTemporaryDir m_dir;
+    int m_seq = 0;
+    QString freshDbPath() { return m_dir.filePath(QString("rec_%1.db").arg(++m_seq)); }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+
+    void waterAmountResolution_data() {
+        QTest::addColumn<QByteArray>("json");
+        QTest::addColumn<double>("target");
+        QTest::addColumn<int>("expected");
+        const QByteArray ratio = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5})";
+        QTest::newRow("ratio") << ratio << 40.0 << 100;
+        QTest::newRow("round") << ratio << 41.0 << 103;
+        QTest::newRow("missing-target") << ratio << 0.0 << 0;
+        QTest::newRow("too-large") << ratio << 300.0 << 0;
+        QTest::newRow("too-small") << ratio << 1.0 << 0;
+        QTest::newRow("fixed-volume") << QByteArray(R"({"hasWater":true,"volume":150,"mode":"volume"})") << 40.0 << 150;
+        QTest::newRow("conflict") << QByteArray(R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5,"volume":100})") << 40.0 << 0;
+        QTest::newRow("negative") << QByteArray(R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":-1})") << 40.0 << 0;
+        QTest::newRow("unknown") << QByteArray(R"({"hasWater":true,"amountMode":"unknown"})") << 40.0 << 0;
+    }
+
+    void waterAmountResolution() {
+        QFETCH(QByteArray, json);
+        QFETCH(double, target);
+        QFETCH(int, expected);
+        const auto water = QJsonDocument::fromJson(json).object();
+        const auto result = WaterAmount::resolve(water, target);
+        QCOMPARE(result.amount, expected);
+        QCOMPARE(result.valid(), expected > 0);
+        if (WaterAmount::isRatio(water))
+            QVERIFY(!WaterAmount::definitionError(water, false).isEmpty());
+    }
+
+    // --- variant map round-trip ---
+
+    void variantMapRoundTrip() {
+        Recipe r = sampleRecipe();
+        r.bagId = 12;
+        r.createdEpoch = 1700000000;  // read-only column still surfaces in the map
+        const Recipe back = Recipe::fromVariantMap(r.toVariantMap());
+        QCOMPARE(back.bagId, r.bagId);
+        QCOMPARE(back.createdEpoch, r.createdEpoch);
+        QCOMPARE(back.name, r.name);
+        QCOMPARE(back.profileTitle, r.profileTitle);
+        QCOMPARE(back.profileJson, r.profileJson);
+        QCOMPARE(back.drinkType, r.drinkType);
+        QCOMPARE(back.beanBaseId, r.beanBaseId);
+        QCOMPARE(back.roasterName, r.roasterName);
+        QCOMPARE(back.coffeeName, r.coffeeName);
+        QCOMPARE(back.equipmentId, r.equipmentId);
+        QCOMPARE(back.doseG, r.doseG);
+        QCOMPARE(back.yieldValue, r.yieldValue);
+        QCOMPARE(back.yieldMode, r.yieldMode);
+        QCOMPARE(back.tempOffsetC, r.tempOffsetC);
+        QCOMPARE(back.grindPinned, r.grindPinned);
+        QCOMPARE(back.rpmPinned, r.rpmPinned);
+        QCOMPARE(back.steamJson, r.steamJson);
+        QCOMPARE(back.archived, r.archived);
+        QCOMPARE(back.createdFromShotId, r.createdFromShotId);
+        QCOMPARE(back.clonedFromRecipeId, r.clonedFromRecipeId);
+    }
+
+    void variantMapAbsentKeysKeepDefaults() {
+        const Recipe r = Recipe::fromVariantMap({{"name", "Only name"}});
+        QCOMPARE(r.name, QString("Only name"));
+        QCOMPARE(r.equipmentId, (qint64)0);
+        QCOMPARE(r.doseG, 0.0);
+        QCOMPARE(r.yieldMode, QString("none"));
+        QCOMPARE(r.archived, false);
+        QVERIFY(r.grindPinned.isEmpty());
+        QVERIFY(r.drinkType.isEmpty());
+    }
+
+    // --- isRecipeStale (recipe-auto-load) ---
+    // Pure decision behind MainController's recipe-auto-load stale check —
+    // lives on RecipeStorage rather than MainController specifically so it
+    // can be tested here without linking MainController's full subsystem
+    // closure.
+
+    void isRecipeStaleEmptyMapIsStale() {
+        QVERIFY(RecipeStorage::isRecipeStale(QVariantMap()));
+    }
+
+    void isRecipeStaleArchivedIsStale() {
+        QVariantMap recipe = sampleRecipe().toVariantMap();
+        recipe["archived"] = true;
+        QVERIFY(RecipeStorage::isRecipeStale(recipe));
+    }
+
+    void isRecipeStaleLiveNonArchivedIsNotStale() {
+        QVariantMap recipe = sampleRecipe().toVariantMap();
+        recipe["archived"] = false;
+        QVERIFY(!RecipeStorage::isRecipeStale(recipe));
+    }
+
+    // --- drink-type derivation + hot-water gate (add-recipe-wizard-tea) ---
+
+    void hotWaterActiveGate() {
+        QVERIFY(!Recipe::hotWaterActive(QString()));
+        QVERIFY(!Recipe::hotWaterActive("not json"));
+        QVERIFY(!Recipe::hotWaterActive("{\"hasWater\":false,\"vesselName\":\"Cup\"}"));
+        QVERIFY(Recipe::hotWaterActive("{\"hasWater\":true,\"vesselName\":\"Cup\"}"));
+    }
+
+    void saveValidationRule() {
+        const QString water = "{\"hasWater\":true,\"vesselName\":\"Cup\"}";
+        // Name + profile: the classic case.
+        QVERIFY(Recipe::saveValidationPasses("Capp", "D-Flow", QString()));
+        // Name + hot-water block, no profile: hot-water tea.
+        QVERIFY(Recipe::saveValidationPasses("Earl Grey", QString(), water));
+        // No profile and no hot water: rejected on every surface.
+        QVERIFY(!Recipe::saveValidationPasses("Broken", QString(), QString()));
+        // hasWater:false does not excuse a missing profile; no name never passes.
+        QVERIFY(!Recipe::saveValidationPasses("Broken", "",
+                                              "{\"hasWater\":false}"));
+        QVERIFY(!Recipe::saveValidationPasses("  ", "D-Flow", QString()));
+    }
+
+    // The predicate three MainController sites share: the profile watcher, the
+    // restored-row reconcile, and the profile-deleted reconcile. It exists as a
+    // pure static precisely so it can be tested — no test constructs a
+    // MainController (the watchers are constructor lambdas needing BLE, every
+    // storage and the QML engine), so a member predicate would ship with the
+    // coverage the original watcher had: none.
+    // Kept separate from profileDivergenceRule deliberately, not as insurance.
+    // The two functions treat whitespace DIFFERENTLY on purpose:
+    // ownsProfileChoice trims (a whitespace-only title names nothing), while
+    // namesProfile compares raw (findProfileByTitle does). That asymmetry is
+    // the kind a later tidy-up "harmonises" in one direction or the other, and
+    // it is only visible when the ownership gate is asserted on its own.
+    void profileOwnershipGate() {
+        // Names a profile: owns the choice.
+        QVERIFY(Recipe::ownsProfileChoice("D-Flow / Q"));
+        // Profile-less (tea, hot water): owns nothing. This is the gate the
+        // original watcher lacked, which is why any profile change dropped a
+        // tea recipe.
+        QVERIFY(!Recipe::ownsProfileChoice(QString()));
+        QVERIFY(!Recipe::ownsProfileChoice(""));
+        // Trimmed HERE, unlike namesProfile. A title of spaces is not a name.
+        QVERIFY(!Recipe::ownsProfileChoice("   "));
+        // ...and a title with real content keeps it, whitespace or not — this
+        // is what stops a "harmonise the trim" change from making a
+        // stray-space recipe look profile-less instead of unresolvable.
+        QVERIFY(Recipe::ownsProfileChoice(" D-Flow / Q "));
+    }
+
+    void profileDivergenceRule() {
+        // The loaded profile is the recipe's: no divergence.
+        QVERIFY(!Recipe::profileDiverged("D-Flow / Q", "D-Flow / Q"));
+        // A different profile is loaded: deactivate. This is the shape that
+        // recorded three shots against a recipe whose profile they never ran.
+        QVERIFY(Recipe::profileDiverged("A-Flow / ZZ Fmt Test aflow", "D-Flow / Q"));
+        // The recipe's profile was deleted, so nothing is loaded under that
+        // title — still divergence, by the same comparison.
+        QVERIFY(Recipe::profileDiverged("A-Flow / ZZ Fmt Test aflow", QString()));
+
+        // A recipe owning no profile never diverges, whatever is loaded. Both
+        // the "no profile loaded" and "some profile loaded" cases, because the
+        // gate must not be an accident of the strings happening to match.
+        QVERIFY(!Recipe::profileDiverged(QString(), "D-Flow / Q"));
+        QVERIFY(!Recipe::profileDiverged("   ", "D-Flow / Q"));
+        QVERIFY(!Recipe::profileDiverged(QString(), QString()));
+
+        // Trimmed: cannot spuriously deactivate on stored whitespace.
+        // Whitespace is NOT forgiven, because findProfileByTitle does not
+        // forgive it either: " D-Flow / Q " resolves to nothing, so the recipe
+        // genuinely cannot activate and diverging is the honest answer. This
+        // assertion was inverted while the predicate trimmed, which let a
+        // stray-space recipe read as fine everywhere and then fail to activate.
+        QVERIFY(Recipe::profileDiverged(" D-Flow / Q ", "D-Flow / Q"));
+        // Case-SENSITIVE, agreeing with ProfileManager::findProfileByTitle —
+        // "d-flow / q" does not resolve, so a recipe naming it cannot activate
+        // and must not be treated as matching the loaded profile.
+        QVERIFY(Recipe::profileDiverged("d-flow / q", "D-Flow / Q"));
+    }
+
+    // The deleted-profile check asks namesProfile, not !profileDiverged. Both
+    // gate on ownership, so a profile-less recipe answers false to BOTH — which
+    // is the whole point: !profileDiverged would be TRUE for it, and deleting
+    // any profile would then drop every tea recipe. The last two assertions are
+    // the ones that catch that inversion.
+    // The count behind the delete-profile warning. Its SQL diverges DELIBERATELY
+    // from the LOWER() comparisons elsewhere in this file — it must agree with
+    // ProfileManager::findProfileByTitle, which decides whether a recipe can
+    // actually activate — so a well-meaning later harmonisation would silently
+    // make the warning count recipes that will keep working, or miss ones that
+    // will not.
+    void countRecipesUsingProfileQuery() {
+        withRawDb(freshDbPath(), "profcount", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            auto add = [&db](const QString& name, const QString& profile, bool archived) {
+                Recipe r = sampleRecipe();
+                r.name = name;
+                r.profileTitle = profile;
+                const qint64 id = RecipeStorage::insertRecipeStatic(db, r);
+                if (archived)
+                    RecipeStorage::updateRecipeFieldsStatic(db, id, {{"archived", true}});
+                return id;
+            };
+            add("A", "D-Flow / Q", false);
+            add("B", "D-Flow / Q", false);
+            add("C", "A-Flow / R", false);
+            add("D", "D-Flow / Q", true);          // archived: not counted
+            add("E", QString(), false);            // profile-less: names nothing
+
+            QCOMPARE(RecipeStorage::countRecipesUsingProfileStatic(db, "D-Flow / Q"), 2);
+            QCOMPARE(RecipeStorage::countRecipesUsingProfileStatic(db, "A-Flow / R"), 1);
+            QCOMPARE(RecipeStorage::countRecipesUsingProfileStatic(db, "Not Installed"), 0);
+            // Case-SENSITIVE, agreeing with findProfileByTitle. A LOWER()
+            // comparison here would return 2 and warn about recipes that would
+            // still activate fine.
+            QCOMPARE(RecipeStorage::countRecipesUsingProfileStatic(db, "d-flow / q"), 0);
+            // A profile-less recipe owns no profile choice, so an empty query
+            // matches nothing rather than sweeping up every such recipe.
+            QCOMPARE(RecipeStorage::countRecipesUsingProfileStatic(db, QString()), 0);
+            QCOMPARE(RecipeStorage::countRecipesUsingProfileStatic(db, "   "), 0);
+        });
+    }
+
+    void recipeNamesProfileRule() {
+        QVERIFY(Recipe::namesProfile("D-Flow / Q", "D-Flow / Q"));
+        // Exact, untrimmed — see profileDivergenceRule for why.
+        QVERIFY(!Recipe::namesProfile(" D-Flow / Q ", "D-Flow / Q"));
+        QVERIFY(!Recipe::namesProfile("D-Flow / Q", "A-Flow / R"));
+        QVERIFY(!Recipe::namesProfile("d-flow / q", "D-Flow / Q"));
+
+        // A profile-less recipe names no profile, so deleting one never
+        // touches it — even when both titles are empty, which is exactly where
+        // a plain equality test would wrongly return true.
+        QVERIFY(!Recipe::namesProfile(QString(), "D-Flow / Q"));
+        QVERIFY(!Recipe::namesProfile(QString(), QString()));
+        QVERIFY(!Recipe::namesProfile("   ", "   "));
+    }
+
+    void drinkSequenceFollowsTheBlocks_data() {
+        QTest::addColumn<QString>("profileTitle");
+        QTest::addColumn<QString>("steamJson");
+        QTest::addColumn<QString>("hotWaterJson");
+        QTest::addColumn<int>("expected");
+        const QString milk = "{\"hasMilk\":true,\"milkWeightG\":150}";
+        const QString after = "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"after\"}";
+        const QString before = "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"before\"}";
+        const int none = int(RecipeEditFields::DrinkSequence::None);
+        QTest::newRow("americano") << "P" << "" << after << int(RecipeEditFields::DrinkSequence::WaterAfter);
+        QTest::newRow("long-black") << "P" << "" << before << int(RecipeEditFields::DrinkSequence::WaterBefore);
+        QTest::newRow("order-missing-is-after")
+            << "P" << "" << "{\"hasWater\":true,\"vesselName\":\"Cup\"}"
+            << int(RecipeEditFields::DrinkSequence::WaterAfter);
+        QTest::newRow("milk-and-water") << "P" << milk << before << none;
+        QTest::newRow("hot-water-tea") << "" << "" << after << none;
+        QTest::newRow("no-water") << "P" << "" << "" << none;
+        QTest::newRow("water-off") << "P" << "" << "{\"hasWater\":false,\"order\":\"before\"}" << none;
+    }
+
+    void drinkSequenceFollowsTheBlocks() {
+        QFETCH(QString, profileTitle);
+        QFETCH(QString, steamJson);
+        QFETCH(QString, hotWaterJson);
+        QFETCH(int, expected);
+        QCOMPARE(int(RecipeEditFields::drinkSequence(profileTitle, steamJson, hotWaterJson)), expected);
+    }
+
+    void deriveDrinkTypeMatrix() {
+        const QString waterAfter  = "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"after\"}";
+        const QString waterBefore = "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"before\"}";
+        const QString milk        = "{\"hasMilk\":true,\"milkWeightG\":150}";
+
+        Recipe r;
+        r.profileTitle = "Some profile";
+
+        // Bare espresso profile; empty beverage_type is espresso.
+        QCOMPARE(Recipe::deriveDrinkType(r, ""), QString("espresso"));
+        QCOMPARE(Recipe::deriveDrinkType(r, "espresso"), QString("espresso"));
+
+        // Profile beverage_type routes filter and tea.
+        QCOMPARE(Recipe::deriveDrinkType(r, "filter"), QString("filter"));
+        QCOMPARE(Recipe::deriveDrinkType(r, "pourover"), QString("filter"));
+        QCOMPARE(Recipe::deriveDrinkType(r, "Tea_Portafilter "), QString("tea"));
+
+        // Hot-water order splits americano / long black; missing order = after.
+        r.hotWaterJson = waterAfter;
+        QCOMPARE(Recipe::deriveDrinkType(r, "espresso"), QString("americano"));
+        r.hotWaterJson = waterBefore;
+        QCOMPARE(Recipe::deriveDrinkType(r, "espresso"), QString("long_black"));
+        r.hotWaterJson = "{\"hasWater\":true,\"vesselName\":\"Cup\"}";
+        QCOMPARE(Recipe::deriveDrinkType(r, "espresso"), QString("americano"));
+
+        // Milk + added water is its own drink: a latte with an Americano-style
+        // water pour derives latte_hotwater (checked before milk-alone).
+        r.steamJson = milk;
+        r.hotWaterJson = waterAfter;
+        QCOMPARE(Recipe::deriveDrinkType(r, "espresso"), QString("latte_hotwater"));
+        r.hotWaterJson = waterBefore;  // order does not matter once milk is present
+        QCOMPARE(Recipe::deriveDrinkType(r, "espresso"), QString("latte_hotwater"));
+        // Milk alone (no water) is a plain latte.
+        r.hotWaterJson.clear();
+        QCOMPARE(Recipe::deriveDrinkType(r, "espresso"), QString("latte"));
+
+        // Tea profile beats milk (the profile type is the strongest signal).
+        r.hotWaterJson = waterAfter;  // even with both blocks, tea profile wins
+        QCOMPARE(Recipe::deriveDrinkType(r, "tea_portafilter"), QString("tea"));
+
+        // Profile-less + hot water = hot-water tea; with a profile it is not.
+        Recipe hw;
+        hw.hotWaterJson = waterAfter;
+        QCOMPARE(Recipe::deriveDrinkType(hw, ""), QString("tea_hotwater"));
+        // The profile-less short-circuit runs BEFORE the milk+water check, so a
+        // profile-less recipe with both blocks is still hot-water tea, never
+        // latte_hotwater (which requires a profile).
+        hw.steamJson = milk;
+        QCOMPARE(Recipe::deriveDrinkType(hw, ""), QString("tea_hotwater"));
+        hw.profileTitle = "Some profile";  // now milk+water with a profile
+        QCOMPARE(Recipe::deriveDrinkType(hw, "espresso"), QString("latte_hotwater"));
+    }
+
+    void lastEquipmentForDrinkType() {
+        withRawDb(freshDbPath(), "lastequip", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            const auto make = [&](const QString& type, qint64 equipId, qint64 lastUsed,
+                                  bool archived = false) {
+                Recipe r;
+                r.name = QString("%1-%2").arg(type).arg(lastUsed);
+                r.profileTitle = "P";
+                r.drinkType = type;
+                r.equipmentId = equipId;
+                r.lastUsedEpoch = lastUsed;
+                r.archived = archived;
+                QVERIFY(RecipeStorage::insertRecipeStatic(db, r) > 0);
+            };
+            make("espresso", 1, 100);
+            make("espresso", 2, 200);          // most recent espresso package
+            make("tea",      5, 300);
+            make("tea",      6, 400, true);    // archived: ignored
+            make("filter",   0, 500);          // no equipment: ignored
+
+            QCOMPARE(RecipeStorage::lastEquipmentForDrinkTypeStatic(db, "espresso"), qint64(2));
+            QCOMPARE(RecipeStorage::lastEquipmentForDrinkTypeStatic(db, "tea"), qint64(5));
+            QCOMPARE(RecipeStorage::lastEquipmentForDrinkTypeStatic(db, "filter"), qint64(0));
+            QCOMPARE(RecipeStorage::lastEquipmentForDrinkTypeStatic(db, "latte"), qint64(0));
+            QCOMPARE(RecipeStorage::lastEquipmentForDrinkTypeStatic(db, ""), qint64(0));
+        });
+    }
+
+    // A grinder edit that forks the package must carry recipes with it, like
+    // bags: activation reads recipe.equipmentId and would otherwise select the
+    // retired package. A write naming the retired id (promotion from an older
+    // shot) stores the fork.
+    void recipeFollowsGrinderFork() {
+        withRawDb(freshDbPath(), "recipe_fork", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(QSqlQuery(db).exec("CREATE TABLE shots (id INTEGER PRIMARY KEY, equipment_id INTEGER)"));
+
+            EquipmentPackage base;
+            const qint64 P = EquipmentStorage::createPackageWithGrinderStatic(db, base, "Turin", "DF83V", "83mm flat steel");
+            QVERIFY(QSqlQuery(db).exec(QString("INSERT INTO shots (equipment_id) VALUES (%1)").arg(P)));
+            Recipe r = sampleRecipe();
+            r.equipmentId = P;
+            const qint64 linked = RecipeStorage::insertRecipeStatic(db, r);
+            QVERIFY(linked > 0);
+
+            const qint64 fork = EquipmentStorage::supersedeOrEditGrinderStatic(db, P, "Turin", "DF83V", "83mm DLC flat");
+            QVERIFY(fork > 0 && fork != P);
+            QSqlQuery stored(db);
+            QVERIFY(stored.exec(QString("SELECT equipment_id FROM recipes WHERE id = %1").arg(linked)));
+            QVERIFY(stored.next());
+            QCOMPARE(stored.value(0).toLongLong(), fork);
+
+            // Write side: insert and update naming the retired id store the fork.
+            r.name = "Promoted from an old shot";
+            r.equipmentId = P;
+            const qint64 promoted = RecipeStorage::insertRecipeStatic(db, r);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, promoted).equipmentId, fork);
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, promoted, {{"equipmentId", P}}));
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, promoted).equipmentId, fork);
+        });
+    }
+
+    // --- active-name uniqueness lookup (block-duplicate-active-names) ---
+    // Two non-archived recipes may not share a name; archiving one frees its name
+    // for reuse. Comparison is trimmed and case-insensitive, and excludes the
+    // recipe being edited.
+    void activeNameUniqueness() {
+        withRawDb(freshDbPath(), "namedup", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe r = sampleRecipe();          // name: "Morning capp"
+            const qint64 id = RecipeStorage::insertRecipeStatic(db, r);
+            QVERIFY(id > 0);
+
+            // Exact, case-insensitive and whitespace-insensitive matches all hit.
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, "Morning capp"), id);
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, "  MORNING CAPP  "), id);
+            // A different name does not.
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, "Evening capp"), (qint64)0);
+            // A blank name never collides.
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, ""), (qint64)0);
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, "   "), (qint64)0);
+            // The recipe being edited is excluded, so renaming it to a casing
+            // variant of its own name is allowed.
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, "morning capp", id), (qint64)0);
+
+            // Archiving frees the name for reuse.
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {{"archived", true}}));
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, "Morning capp"), (qint64)0);
+            // ...and unarchiving makes it collide again.
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {{"archived", false}}));
+            QCOMPARE(RecipeStorage::findRecipeByNameStatic(db, "Morning capp"), id);
+        });
+    }
+
+    // --- shutdown drain contract ---
+
+    // isDbWorkIdle() is what MainController::drainDbWork() waits on before the
+    // storages are destroyed at quit. Nothing else exercises it on this class:
+    // RecipeStorage carried a SerialDbWorker without the accessor until that
+    // drain needed one, and an accessor that simply answered `true` would make
+    // the drain skip recipes with no symptom anywhere — a queued write silently
+    // discarded by ~SerialDbWorker, which is the defect the drain exists to fix.
+    //
+    // The `!isDbWorkIdle()` assertion is what gives this test teeth, and it is
+    // deterministic rather than a race: the counter is decremented by a ticket
+    // whose last holder is the result callback, delivered to the owner thread by
+    // queued connection (SerialDbWorker::roundTripTicket, dbutils.h:347). That
+    // callback cannot run until this function returns to the event loop, so the
+    // count is still non-zero on the line after the request. Stub the accessor
+    // to `return true` and this line fails immediately.
+    void isDbWorkIdleTracksQueuedWork() {
+        const QString path = freshDbPath();
+        withRawDb(path, "idle_seed", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+        });
+
+        qint64 createdId = -1;
+        {
+            RecipeStorage storage;
+            storage.initialize(path);
+            QVERIFY(storage.isDbWorkIdle());          // nothing posted yet
+
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            storage.requestCreateRecipe({{"name", "Drain Me"}, {"profileTitle", "P"}});
+            QVERIFY(!storage.isDbWorkIdle());         // work outstanding
+
+            QTRY_COMPARE(spy.count(), 1);
+            QTRY_VERIFY(storage.isDbWorkIdle());      // and it goes back to idle
+            createdId = spy.at(0).at(0).toLongLong();
+            QVERIFY(createdId > 0);
+        }
+        // Destroyed only after idle, so ~SerialDbWorker has nothing to discard —
+        // failOnWarning() in init() turns its "destroyed with N DB task(s) still
+        // queued" into a failure if that ever stops holding.
+
+        // And the write is actually on disk, which is the point of waiting.
+        int rows = 0;
+        withRawDb(path, "idle_verify", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            QVERIFY(q.exec(QStringLiteral("SELECT COUNT(*) FROM recipes WHERE name = 'Drain Me'")));
+            QVERIFY(q.next());
+            rows = q.value(0).toInt();
+        });
+        QCOMPARE(rows, 1);
+    }
+
+    // --- active-name uniqueness through the async request* paths ---
+    // The helper test above covers the lookup predicate; these cover the guards
+    // that use it, the emitted payloads, and the two new signals.
+
+    // A create/clone colliding with an active recipe is refused, and the refusal
+    // carries error:"nameInUse" WITHOUT dropping the correlation token every
+    // MCP/web listener filters on (losing it would hang them forever).
+    void createAndCloneRejectDuplicateName() {
+        const QString path = freshDbPath();
+        qint64 sourceId = 0;
+        withRawDb(path, "namedup_seed", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            sourceId = RecipeStorage::insertRecipeStatic(db, sampleRecipe());  // "Morning capp"
+        });
+        QVERIFY(sourceId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        {   // Create colliding with an active recipe -> refused, token echoed.
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            storage.requestCreateRecipe({{"name", "  morning CAPP  "}, {"profileTitle", "P"},
+                                         {"requestToken", "tok-create"}});
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(0).toLongLong(), (qint64)-1);
+            const QVariantMap created = spy.at(0).at(1).toMap();
+            QCOMPARE(created.value("error").toString(), QString("nameInUse"));
+            QCOMPARE(created.value("requestToken").toString(), QString("tok-create"));
+        }
+        {   // Clone under the same name -> refused the same way.
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            storage.requestCloneRecipe(sourceId, "Morning capp", "tok-clone");
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(0).toLongLong(), (qint64)-1);
+            QCOMPARE(spy.at(0).at(1).toMap().value("error").toString(), QString("nameInUse"));
+            QCOMPARE(spy.at(0).at(1).toMap().value("requestToken").toString(), QString("tok-clone"));
+        }
+        {   // A free name still creates.
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            storage.requestCreateRecipe({{"name", "Evening capp"}, {"profileTitle", "P"}});
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(spy.at(0).at(0).toLongLong() > 0);
+        }
+        // Exactly one row was added across all three attempts.
+        withRawDb(path, "namedup_count", [](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT COUNT(*) FROM recipes"));
+            QVERIFY(q.next());
+            QCOMPARE(q.value(0).toInt(), 2);
+        });
+        {   // numberNameIfTaken (Bean Search Apply) numbers past every taken name.
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            storage.requestCreateRecipe({{"name", "Morning capp"}, {"profileTitle", "P"},
+                                         {"numberNameIfTaken", true}});
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(spy.at(0).at(0).toLongLong() > 0);
+            QCOMPARE(spy.at(0).at(1).toMap().value("name").toString(), QString("Morning capp 2"));
+            storage.requestCreateRecipe({{"name", "Morning capp"}, {"profileTitle", "P"},
+                                         {"numberNameIfTaken", true}});
+            QTRY_COMPARE(spy.count(), 2);
+            QCOMPARE(spy.at(1).at(1).toMap().value("name").toString(), QString("Morning capp 3"));
+        }
+    }
+
+    // requestRecipe() must emit a terminal signal even when storage was
+    // never initialized (recipe-auto-load), rather than silently dropping
+    // the job the way runAsync() does for every other caller — a caller
+    // waiting on a specific id would otherwise hang on a pending flag
+    // forever with no signal ever arriving.
+    void requestRecipeOnUninitializedStorageEmitsRecipeCheckFailed() {
+        RecipeStorage storage;  // no initialize() call
+        QSignalSpy readySpy(&storage, &RecipeStorage::recipeReady);
+        QSignalSpy failedSpy(&storage, &RecipeStorage::recipeCheckFailed);
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("RecipeStorage.* requestRecipe on uninitialized storage.*"));
+        storage.requestRecipe(42);
+        QCOMPARE(failedSpy.count(), 1);
+        QCOMPARE(failedSpy.at(0).at(0).toLongLong(), (qint64)42);
+        QCOMPARE(readySpy.count(), 0);
+    }
+
+    // Re-saving a recipe under the name it ALREADY has must succeed, even when
+    // another active recipe shares that name. Without this a pre-existing
+    // duplicate could not be edited at all — every save sends `name`, so a guard
+    // testing "is name in the patch" disabled both records permanently.
+    void unchangedNameOnPreExistingDuplicateStillSaves() {
+        const QString path = freshDbPath();
+        qint64 idA = 0, idB = 0;
+        withRawDb(path, "namedup_pre", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe a = sampleRecipe(); a.name = "Twin";
+            Recipe b = sampleRecipe(); b.name = "Twin";   // duplicate predates the rule
+            idA = RecipeStorage::insertRecipeStatic(db, a);
+            idB = RecipeStorage::insertRecipeStatic(db, b);
+        });
+        QVERIFY(idA > 0 && idB > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+        {   // Same name + an unrelated field change -> allowed.
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUpdateRecipe(idB, {{"name", "Twin"}, {"doseG", 21.0}});
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        withRawDb(path, "namedup_pre2", [&](QSqlDatabase& db) {
+            const Recipe b = RecipeStorage::loadRecipeStatic(db, idB);
+            QCOMPARE(b.name, QString("Twin"));
+            QCOMPARE(b.doseG, 21.0);
+        });
+    }
+
+    // A rename into a collision is refused, rolled back whole (so sibling fields
+    // in the same patch are NOT applied), and reports the cause before the
+    // terminal status.
+    void rejectedRenameRollsBackCleanly() {
+        const QString path = freshDbPath();
+        qint64 idA = 0, idB = 0;
+        withRawDb(path, "namedup_rb", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe a = sampleRecipe(); a.name = "Morning capp";
+            Recipe b = sampleRecipe(); b.name = "Evening capp"; b.doseG = 18.0; b.grindPinned = "keep";
+            idA = RecipeStorage::insertRecipeStatic(db, a);
+            idB = RecipeStorage::insertRecipeStatic(db, b);
+        });
+        QVERIFY(idA > 0 && idB > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+        // Order matters to every surface: the reason must precede the status.
+        QStringList order;
+        connect(&storage, &RecipeStorage::recipeUpdateFailed, this,
+                [&order](qint64, const QString& r) { order << ("failed:" + r); });
+        connect(&storage, &RecipeStorage::recipeUpdated, this,
+                [&order](qint64, bool ok) { order << (ok ? "updated:true" : "updated:false"); });
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("already used by another active recipe"));
+        QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(idB, {{"name", "Morning capp"}, {"doseG", 21.0}, {"grindPinned", "changed"}});
+        QTRY_COMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(1).toBool(), false);
+        QCOMPARE(order, QStringList({"failed:nameInUse", "updated:false"}));
+
+        // Nothing from that patch survived — proves the rollback ran.
+        withRawDb(path, "namedup_rb2", [&](QSqlDatabase& db) {
+            const Recipe b = RecipeStorage::loadRecipeStatic(db, idB);
+            QCOMPARE(b.name, QString("Evening capp"));
+            QCOMPARE(b.doseG, 18.0);
+            QCOMPARE(b.grindPinned, QString("keep"));
+        });
+    }
+
+    void expectedNamePreconditionSerializesAndPreservesOtherFields() {
+        const QString path = freshDbPath();
+        qint64 id = 0;
+        qint64 occupiedId = 0;
+        withRawDb(path, "recipe_name_cas", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe = sampleRecipe();
+            recipe.name = "Original name";
+            recipe.doseG = 18.0;
+            id = RecipeStorage::insertRecipeStatic(db, recipe);
+            Recipe occupied = sampleRecipe();
+            occupied.name = "Already taken";
+            occupiedId = RecipeStorage::insertRecipeStatic(db, occupied);
+        });
+        QVERIFY(id > 0 && occupiedId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+        QSignalSpy changed(&storage, &RecipeStorage::recipeChanged);
+        struct Completion {
+            qint64 id = 0;
+            bool success = false;
+            QString reason;
+            QString currentName;
+        };
+        QList<Completion> completed;
+        auto collect = [&completed](qint64 recipeId, bool success,
+                                    const QString& reason, const QString& currentName) {
+            completed.append(Completion{recipeId, success, reason, currentName});
+        };
+
+        // Both requests carry the same initial raw name. Serial writes ensure
+        // only the first rename can commit; the second observes its result
+        // inside its own BEGIN IMMEDIATE transaction and returns that name.
+        storage.requestUpdateRecipeWithCompletion(
+            id, {{"name", "First rename"}}, &storage, collect, QStringLiteral("Original name"));
+        storage.requestUpdateRecipeWithCompletion(
+            id, {{"name", "Second rename"}}, &storage, collect, QStringLiteral("Original name"));
+        // A duplicate remains a distinct nameInUse failure under the same
+        // conditional path.
+        QTest::ignoreMessage(QtWarningMsg,
+                             QRegularExpression("already used by another active recipe"));
+        storage.requestUpdateRecipeWithCompletion(
+            id, {{"name", "Already taken"}}, &storage, collect, QStringLiteral("First rename"));
+
+        QTRY_COMPARE(completed.size(), 3);
+        QCOMPARE(changed.count(), 1);
+        QCOMPARE(changed.at(0).at(0).toLongLong(), id);
+        QCOMPARE(completed.at(0).id, id);
+        QVERIFY(completed.at(0).success);
+        QVERIFY(completed.at(0).reason.isEmpty());
+        QCOMPARE(completed.at(1).id, id);
+        QVERIFY(!completed.at(1).success);
+        QCOMPARE(completed.at(1).reason, QStringLiteral("nameConflict"));
+        QCOMPARE(completed.at(1).currentName, QStringLiteral("First rename"));
+        QVERIFY(!completed.at(2).success);
+        QCOMPARE(completed.at(2).reason, QStringLiteral("nameInUse"));
+
+        withRawDb(path, "recipe_name_cas_verify", [&](QSqlDatabase& db) {
+            const Recipe recipe = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(recipe.name, QStringLiteral("First rename"));
+            QCOMPARE(recipe.doseG, 18.0);
+            QCOMPARE(recipe.profileTitle, sampleRecipe().profileTitle);
+        });
+
+        // Calls without the opt-in expectedName keep the established behavior.
+        QSignalSpy legacy(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id, {{"doseG", 20.0}});
+        QTRY_COMPARE(legacy.count(), 1);
+        QVERIFY(legacy.at(0).at(1).toBool());
+        withRawDb(path, "recipe_name_cas_legacy", [&](QSqlDatabase& db) {
+            const Recipe recipe = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(recipe.name, QStringLiteral("First rename"));
+            QCOMPARE(recipe.doseG, 20.0);
+        });
+    }
+
+    void expectedEditablePreconditionGuardsTheWholeRawRecipe() {
+        const QString path = freshDbPath();
+        qint64 id = 0;
+        withRawDb(path, "recipe_editable_cas", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe = sampleRecipe();
+            recipe.name = QStringLiteral("Snapshot recipe");
+            id = RecipeStorage::insertRecipeStatic(db, recipe);
+        });
+        QVERIFY(id > 0);
+
+        QVariantMap snapshot;
+        withRawDb(path, "recipe_editable_cas_snapshot", [&](QSqlDatabase& db) {
+            snapshot = RecipeStorage::loadRecipeStatic(db, id).editableSnapshot();
+        });
+        QCOMPARE(snapshot.size(), RecipeEditFields::keys().size());
+
+        RecipeStorage storage;
+        storage.initialize(path);
+        struct Result { bool success; QString reason; QString currentName; };
+        QList<Result> results;
+        auto collect = [&results](qint64, bool success, const QString& reason,
+                                  const QString& currentName) {
+            results.append({success, reason, currentName});
+        };
+        QSignalSpy legacyUpdated(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipeWithCompletion(
+            id, {{QStringLiteral("doseG"), 19.0}}, &storage, collect,
+            std::nullopt, snapshot);
+        storage.requestUpdateRecipeWithCompletion(
+            id, {{QStringLiteral("grindPinned"), QStringLiteral("stale edit")}},
+            &storage, collect, std::nullopt, snapshot);
+        QTRY_COMPARE(results.size(), 2);
+        QVERIFY(results.at(0).success);
+        QVERIFY(results.at(0).reason.isEmpty());
+        QVERIFY(!results.at(1).success);
+        QCOMPARE(results.at(1).reason, QStringLiteral("expectedEditableConflict"));
+        QCOMPARE(results.at(1).currentName, QStringLiteral("Snapshot recipe"));
+        QCOMPARE(legacyUpdated.count(), 0);
+
+        QVariantMap malformed = snapshot;
+        malformed.insert(QStringLiteral("lastUsedEpoch"), 0);
+        bool invalidCompleted = false;
+        QString invalidReason;
+        storage.requestUpdateRecipeWithCompletion(
+            id, {{QStringLiteral("doseG"), 20.0}}, &storage,
+            [&invalidCompleted, &invalidReason](qint64, bool success,
+                                                const QString& reason, const QString&) {
+                invalidCompleted = true;
+                QVERIFY(!success);
+                invalidReason = reason;
+            }, std::nullopt, malformed);
+        QTRY_VERIFY(invalidCompleted);
+        QCOMPARE(invalidReason, QStringLiteral("invalidPrecondition"));
+        withRawDb(path, "recipe_editable_cas_verify", [&](QSqlDatabase& db) {
+            const Recipe stored = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(stored.doseG, 19.0);
+            QVERIFY(stored.grindPinned != QStringLiteral("stale edit"));
+        });
+    }
+
+    void scopedUpdatePublishesCommittedRowBeforeCompletion() {
+        const QString path = freshDbPath();
+        qint64 id = 0;
+        withRawDb(path, "recipe_update_snapshot_order", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe = sampleRecipe();
+            recipe.name = QStringLiteral("Snapshot before");
+            id = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(id > 0);
+        });
+
+        RecipeStorage storage;
+        storage.initialize(path);
+        QStringList eventOrder;
+        QVariantMap committedRow;
+        connect(&storage, &RecipeStorage::recipeChangedWithSnapshot, &storage,
+                [&](qint64 changedId, const QVariantMap& row) {
+            QCOMPARE(changedId, id);
+            eventOrder.append(QStringLiteral("row"));
+            committedRow = row;
+        });
+        storage.requestUpdateRecipeWithCompletion(
+            id, {{QStringLiteral("name"), QStringLiteral("Snapshot after")},
+                 {QStringLiteral("doseG"), 20.5}},
+            &storage, [&](qint64 updatedId, bool success, const QString& reason,
+                          const QString& currentName) {
+            QCOMPARE(updatedId, id);
+            QVERIFY(success);
+            QVERIFY(reason.isEmpty());
+            QVERIFY(currentName.isEmpty());
+            eventOrder.append(QStringLiteral("complete"));
+        });
+
+        QTRY_COMPARE(eventOrder.size(), 2);
+        QCOMPARE(eventOrder, QStringList({QStringLiteral("row"),
+                                          QStringLiteral("complete")}));
+        QCOMPARE(committedRow.value(QStringLiteral("name")).toString(),
+                 QStringLiteral("Snapshot after"));
+        QCOMPARE(committedRow.value(QStringLiteral("doseG")).toDouble(), 20.5);
+
+        QSignalSpy changed(&storage, &RecipeStorage::recipeChangedWithSnapshot);
+        QSignalSpy legacyUpdated(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id, {{QStringLiteral("doseG"), 21.0}});
+        QTRY_COMPARE(legacyUpdated.count(), 1);
+        QCOMPARE(changed.count(), 0);
+    }
+
+    void requestScopedRecipeReadsAndCrudDoNotBroadcastCompletions() {
+        const QString path = freshDbPath();
+        qint64 originalId = 0;
+        qint64 referencedId = 0;
+        withRawDb(path, "recipe_scoped_crud", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            Recipe recipe = sampleRecipe();
+            recipe.name = QStringLiteral("Scoped original");
+            originalId = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(originalId > 0);
+            recipe.name = QStringLiteral("Scoped archived");
+            recipe.archived = true;
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, recipe) > 0);
+            recipe.name = QStringLiteral("Scoped referenced");
+            recipe.archived = false;
+            referencedId = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(referencedId > 0);
+            insertShotForRecipe(db, referencedId);
+        });
+
+        RecipeStorage storage;
+        storage.initialize(path);
+        QSignalSpy activeLegacy(&storage, &RecipeStorage::inventoryReady);
+        QSignalSpy archivedLegacy(&storage, &RecipeStorage::archivedReady);
+        QSignalSpy detailLegacy(&storage, &RecipeStorage::recipeReady);
+        QSignalSpy createLegacy(&storage, &RecipeStorage::recipeCreated);
+        QSignalSpy deleteLegacy(&storage, &RecipeStorage::recipeDeleted);
+        QSignalSpy removed(&storage, &RecipeStorage::recipeRemoved);
+
+        qsizetype activeCount = -1;
+        qsizetype archivedCount = -1;
+        storage.requestInventoryWithCompletion(&storage,
+            [&activeCount](bool ok, const QVariantList& rows, const QString& reason) {
+                QVERIFY(ok);
+                QVERIFY(reason.isEmpty());
+                activeCount = rows.size();
+            });
+        storage.requestInventoryWithCompletion(&storage,
+            [&archivedCount](bool ok, const QVariantList& rows, const QString& reason) {
+                QVERIFY(ok);
+                QVERIFY(reason.isEmpty());
+                archivedCount = rows.size();
+            }, true);
+        bool detailRead = false;
+        storage.requestRecipeWithCompletion(originalId, &storage,
+            [&detailRead, originalId](qint64 resultId, bool ok, const QVariantMap& row,
+                                      const QString& reason) {
+                QCOMPARE(resultId, originalId);
+                QVERIFY(ok);
+                QVERIFY(reason.isEmpty());
+                QCOMPARE(row.value(QStringLiteral("name")).toString(),
+                         QStringLiteral("Scoped original"));
+                detailRead = true;
+            });
+        bool missingRead = false;
+        storage.requestRecipeWithCompletion(999999, &storage,
+            [&missingRead](qint64, bool ok, const QVariantMap& row, const QString& reason) {
+                QVERIFY(!ok);
+                QVERIFY(row.isEmpty());
+                QCOMPARE(reason, QStringLiteral("notFound"));
+                missingRead = true;
+            });
+
+        QTRY_COMPARE(activeCount, 2);
+        QTRY_COMPARE(archivedCount, 1);
+        QTRY_VERIFY(detailRead);
+        QTRY_VERIFY(missingRead);
+        QCOMPARE(activeLegacy.count(), 0);
+        QCOMPARE(archivedLegacy.count(), 0);
+        QCOMPARE(detailLegacy.count(), 0);
+
+        bool createDone = false;
+        qint64 createdId = 0;
+        QVariantMap createMap = sampleRecipe().toVariantMap();
+        createMap.insert(QStringLiteral("name"), QStringLiteral("Scoped create"));
+        storage.requestCreateRecipeWithCompletion(createMap, &storage,
+            [&createDone, &createdId](qint64 resultId, bool ok, const QVariantMap& row,
+                                      const QString& reason) {
+                QVERIFY(ok);
+                QVERIFY(reason.isEmpty());
+                QVERIFY(!row.isEmpty());
+                createdId = resultId;
+                createDone = true;
+            });
+        QTRY_VERIFY(createDone);
+        QVERIFY(createdId > 0);
+
+        bool cloneDone = false;
+        qint64 cloneId = 0;
+        storage.requestCloneRecipeWithCompletion(originalId, QStringLiteral("Scoped clone"),
+            QStringLiteral("token"), &storage,
+            [&cloneDone, &cloneId](qint64 resultId, bool ok, const QVariantMap& row,
+                                   const QString& reason) {
+                QVERIFY(ok);
+                QVERIFY(reason.isEmpty());
+                QCOMPARE(row.value(QStringLiteral("requestToken")).toString(),
+                         QStringLiteral("token"));
+                cloneId = resultId;
+                cloneDone = true;
+            });
+        QTRY_VERIFY(cloneDone);
+        QVERIFY(cloneId > 0);
+
+        bool deleteDone = false;
+        storage.requestDeleteRecipeWithCompletion(cloneId, &storage,
+            [&deleteDone, cloneId](qint64 resultId, bool ok, const QString& reason) {
+                QCOMPARE(resultId, cloneId);
+                QVERIFY(ok);
+                QVERIFY(reason.isEmpty());
+                deleteDone = true;
+            });
+        QTRY_VERIFY(deleteDone);
+        QCOMPARE(createLegacy.count(), 0);
+        QCOMPARE(deleteLegacy.count(), 0);
+        QCOMPARE(removed.count(), 1);
+
+        bool referencedDeleteDone = false;
+        QTest::ignoreMessage(QtWarningMsg,
+                             QRegularExpression("refusing to delete recipe.*with linked shots"));
+        storage.requestDeleteRecipeWithCompletion(referencedId, &storage,
+            [&referencedDeleteDone, referencedId](qint64 resultId, bool ok,
+                                                  const QString& reason) {
+                QCOMPARE(resultId, referencedId);
+                QVERIFY(!ok);
+                QCOMPARE(reason, QStringLiteral("hasShots"));
+                referencedDeleteDone = true;
+            });
+        QTRY_VERIFY(referencedDeleteDone);
+        QCOMPARE(deleteLegacy.count(), 0);
+        QCOMPARE(removed.count(), 1);
+
+        QSignalSpy defaultEquipmentLegacy(&storage,
+                                          &RecipeStorage::lastEquipmentForDrinkTypeReady);
+        bool defaultEquipmentDone = false;
+        storage.requestLastEquipmentForDrinkTypeWithCompletion(
+            QStringLiteral("latte"), &storage,
+            [&defaultEquipmentDone](const QString& drinkType, qint64 equipmentId,
+                                    bool ok, const QString& reason) {
+                QCOMPARE(drinkType, QStringLiteral("latte"));
+                QCOMPARE(equipmentId, 7);
+                QVERIFY(ok);
+                QVERIFY(reason.isEmpty());
+                defaultEquipmentDone = true;
+            });
+        QTRY_VERIFY(defaultEquipmentDone);
+        QCOMPARE(defaultEquipmentLegacy.count(), 0);
+    }
+
+    void requestScopedReadsDistinguishQueryFailureFromEmptyResults() {
+        RecipeStorage storage;
+        storage.initialize(freshDbPath()); // SQLite opens, but the recipe schema is absent.
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("inventory query failed"));
+        QTest::ignoreMessage(QtWarningMsg,
+                             QRegularExpression("lastEquipmentForDrinkType prepare failed"));
+
+        int completed = 0;
+        storage.requestInventoryWithCompletion(&storage,
+            [&completed](bool success, const QVariantList& rows, const QString& reason) {
+                QVERIFY(!success);
+                QVERIFY(rows.isEmpty());
+                QCOMPARE(reason, QStringLiteral("readFailed"));
+                ++completed;
+            });
+        storage.requestRecipeWithCompletion(1, &storage,
+            [&completed](qint64, bool success, const QVariantMap& row, const QString& reason) {
+                QVERIFY(!success);
+                QVERIFY(row.isEmpty());
+                QCOMPARE(reason, QStringLiteral("readFailed"));
+                ++completed;
+            });
+        storage.requestLastEquipmentForDrinkTypeWithCompletion(
+            QStringLiteral("latte"), &storage,
+            [&completed](const QString&, qint64 equipmentId, bool success,
+                         const QString& reason) {
+                QVERIFY(!success);
+                QCOMPARE(equipmentId, 0);
+                QCOMPARE(reason, QStringLiteral("readFailed"));
+                ++completed;
+            });
+        QTRY_COMPARE(completed, 3);
+    }
+
+    void scopedUpdateAndDeleteReturnFailureReasonsWhenDbCannotOpen() {
+        RecipeStorage storage;
+        storage.initialize(m_dir.filePath(QStringLiteral("missing/recipe.db")));
+
+        for (int i = 0; i < 2; ++i)
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("withTempDb: DB open failed"));
+        for (int i = 0; i < 2; ++i)
+            QTest::ignoreMessage(QtWarningMsg,
+                                 QRegularExpression("SerialDbWorker.*failed to open DB"));
+
+        bool updateDone = false;
+        bool deleteDone = false;
+        storage.requestUpdateRecipeWithCompletion(12,
+            {{QStringLiteral("doseG"), 19.0}}, &storage,
+            [&updateDone](qint64, bool success, const QString& reason, const QString&) {
+                QVERIFY(!success);
+                QCOMPARE(reason, QStringLiteral("updateFailed"));
+                updateDone = true;
+            });
+        storage.requestDeleteRecipeWithCompletion(12, &storage,
+            [&deleteDone](qint64, bool success, const QString& reason) {
+                QVERIFY(!success);
+                QCOMPARE(reason, QStringLiteral("deleteFailed"));
+                deleteDone = true;
+            });
+        QTRY_VERIFY(updateDone);
+        QTRY_VERIFY(deleteDone);
+    }
+
+    // Archiving must always work (it is how a name is freed); restoring into a
+    // name an active recipe has taken must not.
+    void archiveAlwaysAllowedRestoreIntoCollisionRefused() {
+        const QString path = freshDbPath();
+        qint64 idActive = 0, idArchived = 0;
+        withRawDb(path, "namedup_arch", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe a = sampleRecipe(); a.name = "Twin";
+            Recipe b = sampleRecipe(); b.name = "Twin"; b.archived = true;
+            idActive = RecipeStorage::insertRecipeStatic(db, a);
+            idArchived = RecipeStorage::insertRecipeStatic(db, b);
+        });
+        QVERIFY(idActive > 0 && idArchived > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+        {   // Restore into the taken name -> refused.
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("already used by another active recipe"));
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUnarchiveRecipe(idArchived);
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), false);
+        }
+        {   // Archiving the active twin is always allowed...
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestArchiveRecipe(idActive);
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        {   // ...and now the name is free, so the restore succeeds.
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUnarchiveRecipe(idArchived);
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+    }
+
+    // --- insert / load / update statics ---
+
+    void insertLoadRoundTrip() {
+        withRawDb(freshDbPath(), "rt", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            const qint64 id = RecipeStorage::insertRecipeStatic(db, sampleRecipe());
+            QVERIFY(id > 0);
+            const Recipe loaded = RecipeStorage::loadRecipeStatic(db, id);
+            QVERIFY(loaded.isValid());
+            QCOMPARE(loaded.name, QString("Morning capp"));
+            QCOMPARE(loaded.doseG, 18.0);
+            QCOMPARE(loaded.rpmPinned, (qint64)90);
+            QCOMPARE(loaded.steamJson, sampleRecipe().steamJson);
+            QCOMPARE(loaded.createdFromShotId, (qint64)42);
+            // created_at is read-only (COL_EPOCH_RO): the SQL DEFAULT stamped it
+            // at insert and it surfaces on load, even though the struct's value
+            // was never bound.
+            QVERIFY(loaded.createdEpoch > 0);
+            // rpm_pinned is COL_EPOCH: updating to 0 clears it to NULL (the
+            // pin-clearing path MainController relies on when the override is
+            // turned off), and it reloads as 0.
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {{"rpmPinned", 0}}));
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).rpmPinned, (qint64)0);
+            // Minimal recipe: only a name (profile optional at the storage
+            // layer — required-ness is enforced by the composer/tools).
+            Recipe minimal;
+            minimal.name = "Bare";
+            const qint64 id2 = RecipeStorage::insertRecipeStatic(db, minimal);
+            QVERIFY(id2 > 0);
+            QVERIFY(RecipeStorage::loadRecipeStatic(db, id2).isValid());
+        });
+    }
+
+    void loadMissingReturnsInvalid() {
+        withRawDb(freshDbPath(), "miss", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(!RecipeStorage::loadRecipeStatic(db, 999).isValid());
+        });
+    }
+
+    // Hot-water block (finish-recipes-first-class): the opt-in water-vessel
+    // snapshot that makes an Americano possible round-trips through the kCols
+    // column set exactly like the steam block.
+    void hotWaterBlockRoundTrip() {
+        withRawDb(freshDbPath(), "hw", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            // Fresh-DB schema converges: ensureTableStatic includes the column.
+            bool hasHotWaterCol = false;
+            QSqlQuery info(db);
+            QVERIFY(info.exec("PRAGMA table_info(recipes)"));
+            while (info.next()) {
+                if (info.value(1).toString() == "hot_water_json") { hasHotWaterCol = true; break; }
+            }
+            QVERIFY(hasHotWaterCol);
+
+            Recipe r;
+            r.name = "Americano";
+            r.profileTitle = "Filter 2.0";
+            r.hotWaterJson = "{\"hasWater\":true,\"vesselName\":\"Cup\",\"volume\":120,"
+                             "\"mode\":\"volume\",\"flowRate\":40,\"temperatureC\":90,\"order\":\"after\"}";
+            const qint64 id = RecipeStorage::insertRecipeStatic(db, r);
+            QVERIFY(id > 0);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).hotWaterJson, r.hotWaterJson);
+
+            // Update round-trips through the kCols update map; empty clears to NULL.
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {{"hotWaterJson", QString()}}));
+            QVERIFY(RecipeStorage::loadRecipeStatic(db, id).hotWaterJson.isEmpty());
+        });
+    }
+
+    void ratioWaterRoundTripAndInvalidPatch() {
+        withRawDb(freshDbPath(), "water_ratio", [this](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe;
+            recipe.name = "Ratio water";
+            recipe.profileTitle = "Espresso";
+            recipe.yieldMode = "absolute";
+            recipe.yieldValue = 40;
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.7,"mode":"weight"})";
+            const auto id = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(id > 0);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).hotWaterJson, recipe.hotWaterJson);
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {{"name", "Renamed"}}));
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).hotWaterJson, recipe.hotWaterJson);
+            QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id, {{"yieldValue", 300.0}}));
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).yieldValue, 40.0);
+            QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id, {{"profileTitle", QString()}}));
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).profileTitle, recipe.profileTitle);
+            withRawDb(freshDbPath(), "water_ratio_import", [&](QSqlDatabase& destination) {
+                QVERIFY(RecipeStorage::ensureTableStatic(destination));
+                QVERIFY(CoffeeBagStorage::ensureTableStatic(destination));
+                QHash<qint64, qint64> ids;
+                QVERIFY(RecipeStorage::importRecipesStatic(db, destination, false, ids, {}, {}));
+                QVERIFY(ids.contains(id));
+                QCOMPARE(RecipeStorage::loadRecipeStatic(destination, ids.value(id)).hotWaterJson,
+                         recipe.hotWaterJson);
+            });
+        });
+    }
+
+    void profileDoseRecommendationParticipatesInWaterValidation() {
+        withRawDb(freshDbPath(), "water_profile_dose", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            Recipe recipe;
+            recipe.name = "Profile dose water";
+            recipe.profileTitle = "Recommended dose profile";
+            recipe.yieldMode = "ratio";
+            recipe.yieldValue = 2;
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5})";
+            // An enabled 18 g recommendation supplies the missing recipe/bag dose,
+            // even when the profile itself has no stop-at-weight target.
+            const auto id = RecipeStorage::insertRecipeStatic(db, recipe, {true, 0.0, 18.0});
+            QVERIFY(id > 0);
+            // A stored recipe dose takes precedence over the recommendation.
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id,
+                {{"doseG", 10.0}, {"yieldValue", 10.0}}, {true, 40.0, 30.0}));
+            // Without that dose, 20 x 18 g espresso would require 900 g water;
+            // using the profile's 40 g fallback would incorrectly accept 100 g.
+            QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id,
+                {{"doseG", 0.0}, {"yieldValue", 20.0}}, {true, 40.0, 18.0}));
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).doseG, 10.0);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).yieldValue, 10.0);
+            CoffeeBag bag;
+            bag.roasterName = "Profile dose test";
+            bag.coffeeName = "Bag dose";
+            bag.doseWeightG = 10;
+            const auto bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(bagId > 0);
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id,
+                {{"doseG", 0.0}, {"bagId", bagId}}, {true, 40.0, 30.0}));
+        });
+    }
+
+    void installedDoseSurvivesAsyncWaterCreateAndClone() {
+        const auto path = freshDbPath();
+        withRawDb(path, "water_dose_async_seed", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+        });
+        RecipeStorage storage;
+        storage.initialize(path);
+        storage.setProfileBrewSnapshotProvider([] {
+            return QHash<QString, WaterAmount::ProfileDefaults>{{"Profile dose", {0.0, 18.0}}};
+        });
+        QSignalSpy created(&storage, &RecipeStorage::recipeCreated);
+        const QVariantMap fields{{"name", "Profile dose recipe"}, {"profileTitle", "Profile dose"},
+            {"yieldMode", "ratio"}, {"yieldValue", 2.0},
+            {"hotWaterJson", R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5})"}};
+        storage.requestCreateRecipe(fields);
+        QTRY_COMPARE(created.count(), 1);
+        const auto id = created.first().at(0).toLongLong();
+        QVERIFY(id > 0);
+        storage.requestCloneRecipe(id, "Profile dose clone");
+        QTRY_COMPARE(created.count(), 2);
+        QVERIFY(created.last().at(0).toLongLong() > 0);
+        QSignalSpy updated(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id, {{"yieldValue", 20.0}});
+        QTRY_COMPARE(updated.count(), 1);
+        QVERIFY(!updated.first().at(1).toBool());
+        storage.setProfileBrewSnapshotProvider([] {
+            return QHash<QString, WaterAmount::ProfileDefaults>{{"Profile dose", {0.0, 0.0}}};
+        });
+        auto disabled = fields;
+        disabled["name"] = "Disabled profile dose";
+        storage.requestCreateRecipe(disabled);
+        QTRY_COMPARE(created.count(), 3);
+        QVERIFY(created.last().at(0).toLongLong() < 0);
+    }
+
+    void ratioYieldWithoutDoseSurvivesStaticImport() {
+        withRawDb(freshDbPath(), "water_ratio_yield_import_source", [this](QSqlDatabase& source) {
+            QVERIFY(RecipeStorage::ensureTableStatic(source));
+            Recipe recipe;
+            recipe.name = "Installed profile fallback";
+            recipe.profileTitle = "Installed profile";
+            recipe.yieldMode = "ratio";
+            recipe.yieldValue = 2;
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5})";
+            const auto id = RecipeStorage::insertRecipeStatic(source, recipe, {true, 40.0});
+            QVERIFY(id > 0);
+            withRawDb(freshDbPath(), "water_ratio_yield_import_destination", [&](QSqlDatabase& destination) {
+                QVERIFY(RecipeStorage::ensureTableStatic(destination));
+                QVERIFY(CoffeeBagStorage::ensureTableStatic(destination));
+                QHash<qint64, qint64> ids;
+                QVERIFY(RecipeStorage::importRecipesStatic(source, destination, false, ids, {}, {}));
+                const auto imported = RecipeStorage::loadRecipeStatic(destination, ids.value(id));
+                QCOMPARE(imported.yieldMode, recipe.yieldMode);
+                QCOMPARE(imported.yieldValue, recipe.yieldValue);
+                QCOMPARE(imported.hotWaterJson, recipe.hotWaterJson);
+                QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(destination, imported.id,
+                    {{"name", "Invalid known target"}}, {true, 300.0}));
+                QCOMPARE(RecipeStorage::loadRecipeStatic(destination, imported.id).name, recipe.name);
+            });
+        });
+    }
+
+    void embeddedProfileDoseSurvivesStaticImport() {
+        withRawDb(freshDbPath(), "embedded_dose_import_source", [this](QSqlDatabase& source) {
+            QVERIFY(RecipeStorage::ensureTableStatic(source));
+            Recipe recipe;
+            recipe.name = "Embedded dose";
+            recipe.profileTitle = "Embedded profile";
+            recipe.profileJson = R"({"target_weight":50,"has_recommended_dose":true,"recommended_dose":18})";
+            recipe.yieldMode = "ratio";
+            recipe.yieldValue = 2;
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":11})";
+            const auto id = RecipeStorage::insertRecipeStatic(source, recipe, {true, 50.0, 18.0});
+            QVERIFY(id > 0);
+            withRawDb(freshDbPath(), "embedded_dose_import_destination", [&](QSqlDatabase& destination) {
+                QVERIFY(RecipeStorage::ensureTableStatic(destination));
+                QVERIFY(CoffeeBagStorage::ensureTableStatic(destination));
+                QHash<qint64, qint64> ids;
+                QVERIFY(RecipeStorage::importRecipesStatic(source, destination, false, ids, {}, {}));
+                const auto imported = RecipeStorage::loadRecipeStatic(destination, ids.value(id));
+                QCOMPARE(imported.hotWaterJson, recipe.hotWaterJson);
+                QCOMPARE(imported.doseG, 0.0);
+            });
+        });
+    }
+
+    void explicitInvalidFixedWaterNeverFallsBackToPreset() {
+        withRawDb(freshDbPath(), "invalid_fixed_water", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe;
+            recipe.name = "Fixed water";
+            recipe.profileTitle = "Espresso";
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"fixed","volume":150})";
+            const auto id = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(id > 0);
+            const QJsonObject preset{{"volume", 200}, {"mode", "weight"}, {"temperature", 85}};
+            for (const auto& amount : QJsonArray{0, -1, 1, 501, 1e100, 150.5, "150", QJsonValue(QJsonValue::Null)}) {
+                auto water = QJsonDocument::fromJson(recipe.hotWaterJson.toUtf8()).object();
+                water.insert("volume", amount);
+                QCOMPARE(WaterAmount::withPresetFallback(water, preset), water);
+                const auto json = QString::fromUtf8(QJsonDocument(water).toJson(QJsonDocument::Compact));
+                QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id,
+                    {{"name", "Must not save"}, {"hotWaterJson", json}}));
+                const auto unchanged = RecipeStorage::loadRecipeStatic(db, id);
+                QCOMPARE(unchanged.name, recipe.name);
+                QCOMPARE(unchanged.hotWaterJson, recipe.hotWaterJson);
+                auto invalid = recipe;
+                invalid.hotWaterJson = json;
+                QVERIFY(RecipeStorage::insertRecipeStatic(db, invalid) < 0);
+            }
+        });
+    }
+
+    void waterValidationContextAndDerivedTargets() {
+        withRawDb(freshDbPath(), "water_context", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe;
+            recipe.name = "Unavailable inherited target";
+            recipe.profileTitle = "Not installed here";
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5,"resolvedTargetG":999})";
+            const auto imported = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(imported > 0);
+            QVERIFY(!QJsonDocument::fromJson(RecipeStorage::loadRecipeStatic(db, imported).hotWaterJson.toUtf8()).object().contains("resolvedTargetG"));
+            recipe.name = "Known missing target";
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, recipe, {true, std::nullopt}) < 0);
+            recipe.profileJson = R"({"target_weight":40})";
+            recipe.name = "Embedded fallback";
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, recipe, {true, std::nullopt}) > 0);
+            recipe.name = "Known zero installed target";
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, recipe, {true, 0.0}) < 0);
+            recipe.yieldMode = "absolute";
+            recipe.yieldValue = 300;
+            recipe.name = "Known invalid explicit target";
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, recipe) < 0);
+        });
+    }
+
+    void enabledWaterRequiresAVesselOnEveryWrite() {
+        withRawDb(freshDbPath(), "water_required_vessel", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe;
+            recipe.name = "Explicit vessel";
+            recipe.profileTitle = "Espresso";
+            recipe.yieldMode = "absolute";
+            recipe.yieldValue = 40;
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","volume":100})";
+            const auto id = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(id > 0);
+            for (const auto& json : {
+                QStringLiteral(R"({"hasWater":true})"),
+                QStringLiteral(R"({"hasWater":true,"vesselName":" ","volume":100,"amountMode":"fixed"})"),
+                QStringLiteral(R"({"hasWater":true,"amountMode":"ratio","waterToEspressoRatio":2.5})")}) {
+                QVERIFY(!Recipe::saveValidationPasses(recipe.name, recipe.profileTitle, json));
+                QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id, {{"hotWaterJson", json}}));
+                QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).hotWaterJson, recipe.hotWaterJson);
+                auto invalid = recipe;
+                invalid.hotWaterJson = json;
+                QVERIFY(RecipeStorage::insertRecipeStatic(db, invalid) < 0);
+            }
+        });
+    }
+
+    void malformedWaterModesNeverPersist() {
+        withRawDb(freshDbPath(), "water_discriminator", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe recipe;
+            recipe.name = "Strict water mode";
+            recipe.profileTitle = "Espresso";
+            QJsonObject water{{"hasWater", true}, {"vesselName", "Cup"}, {"volume", 150}, {"mode", "volume"}};
+            recipe.hotWaterJson = QString::fromUtf8(QJsonDocument(water).toJson(QJsonDocument::Compact));
+            const auto id = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(id > 0);
+            for (const auto& mode : QJsonArray{17, true, QJsonValue(QJsonValue::Null), QJsonObject{}, QJsonArray{}, "", "unknown"}) {
+                water.insert("amountMode", mode);
+                const auto json = QString::fromUtf8(QJsonDocument(water).toJson(QJsonDocument::Compact));
+                QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id, {{"hotWaterJson", json}, {"name", "Must not save"}}));
+                QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).name, recipe.name);
+                recipe.hotWaterJson = json;
+                QVERIFY(RecipeStorage::insertRecipeStatic(db, recipe) < 0);
+            }
+        });
+    }
+
+    void ratioWaterKeepsProfileFallbackThroughAsyncWritesAndClone() {
+        const auto path = freshDbPath();
+        withRawDb(path, "water_profile_seed", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+        });
+        RecipeStorage storage;
+        storage.initialize(path);
+        storage.setProfileBrewSnapshotProvider([] { return QHash<QString, WaterAmount::ProfileDefaults>{{"Installed profile", {40.0, 0.0}}}; });
+        QSignalSpy created(&storage, &RecipeStorage::recipeCreated);
+        const QString water = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5})";
+        // No recipe/bag dose: the installed profile supplies the fallback.
+        storage.requestCreateRecipe({{"name", "Profile fallback water"}, {"profileTitle", "Installed profile"},
+            {"yieldMode", "ratio"}, {"yieldValue", 2.0}, {"hotWaterJson", water}});
+        QTRY_COMPARE(created.count(), 1);
+        const qint64 id = created.first().at(0).toLongLong();
+        QVERIFY(id > 0);
+        QSignalSpy updated(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id, {{"yieldValue", 2.1}});
+        QTRY_COMPARE(updated.count(), 1);
+        QVERIFY(updated.first().at(1).toBool());
+        storage.requestCloneRecipe(id, "Cloned profile fallback water");
+        QTRY_COMPARE(created.count(), 2);
+        QVERIFY(created.last().at(0).toLongLong() > 0);
+        QCOMPARE(created.last().at(1).toMap().value("hotWaterJson").toString(), water);
+        storage.setProfileBrewSnapshotProvider([] { return QHash<QString, WaterAmount::ProfileDefaults>{{"Installed profile", {300.0, 0.0}}}; });
+        storage.requestCloneRecipe(id, "Invalid profile fallback clone");
+        QTRY_COMPARE(created.count(), 3);
+        QVERIFY(created.last().at(0).toLongLong() <= 0);
+        const auto cloneError = WaterAmount::validationResponse(created.last().at(1).toMap().value("error").toString());
+        QCOMPARE(cloneError.value("code").toString(), QStringLiteral("invalidWaterAmount"));
+        storage.requestUpdateRecipe(id, {{"yieldValue", 2.2}});
+        QTRY_COMPARE(updated.count(), 2);
+        QVERIFY(!updated.last().at(1).toBool());
+        QTRY_VERIFY(storage.isDbWorkIdle());
+        withRawDb(path, "water_profile_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).yieldValue, 2.1);
+        });
+    }
+
+    void ratioWaterValidatesFallbackChanges_data() {
+        QTest::addColumn<bool>("profileFallback");
+        QTest::newRow("bag-relink") << false;
+        QTest::newRow("embedded-profile") << true;
+    }
+    void ratioWaterValidatesFallbackChanges() {
+        QFETCH(bool, profileFallback);
+        withRawDb(freshDbPath(), "water_fallback_change", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            CoffeeBag bag;
+            bag.roasterName = "Roaster";
+            bag.coffeeName = "Coffee";
+            bag.yieldMode = profileFallback ? "none" : "absolute";
+            bag.yieldValue = profileFallback ? 0 : 40;
+            const auto originalBag = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(originalBag > 0);
+            bag.yieldMode = "absolute";
+            bag.yieldValue = 300;
+            const auto invalidBag = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(invalidBag > 0);
+            Recipe recipe;
+            recipe.name = "Fallback water";
+            recipe.profileTitle = "Espresso";
+            recipe.bagId = originalBag;
+            if (profileFallback) recipe.profileJson = R"({"target_weight":40})";
+            recipe.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.5})";
+            const auto id = RecipeStorage::insertRecipeStatic(db, recipe);
+            QVERIFY(id > 0);
+            QVariantMap invalid{{"name", "Must not be saved"}};
+            invalid.insert(profileFallback ? "profileJson" : "bagId",
+                profileFallback ? QVariant(QStringLiteral(R"({"target_weight":300})")) : QVariant(invalidBag));
+            QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id, invalid));
+            const auto unchanged = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(unchanged.name, recipe.name);
+            QCOMPARE(unchanged.bagId, originalBag);
+            QCOMPARE(unchanged.profileJson, recipe.profileJson);
+            invalid["name"] = "Corrected";
+            invalid[profileFallback ? "profileJson" : "bagId"] = profileFallback
+                ? QVariant(QStringLiteral(R"({"target_weight":42})")) : QVariant(originalBag);
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, invalid));
+            const auto corrected = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(corrected.name, QStringLiteral("Corrected"));
+            QCOMPARE(corrected.hotWaterJson, recipe.hotWaterJson);
+        });
+    }
+
+    void ratioWaterValidationFailuresRetainClientMessage() {
+        const auto path = freshDbPath();
+        withRawDb(path, "water_error_seed", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+        });
+        RecipeStorage storage;
+        storage.initialize(path);
+        QSignalSpy created(&storage, &RecipeStorage::recipeCreated);
+        const QVariantMap fields{{"name", "Water validation"}, {"profileTitle", "Espresso"},
+            {"yieldMode", "absolute"}, {"yieldValue", 300.0}, {"requestToken", "water-error"},
+            {"hotWaterJson", R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.0})"}};
+        storage.requestCreateRecipe(fields);
+        QTRY_COMPARE(created.count(), 1);
+        QVERIFY(created.first().at(0).toLongLong() <= 0);
+        const auto failed = created.first().at(1).toMap();
+        QCOMPARE(failed.value("requestToken").toString(), QStringLiteral("water-error"));
+        const auto expected = WaterAmount::validationResponse(failed.value("error").toString());
+        QCOMPARE(expected.value("code").toString(), QStringLiteral("invalidWaterAmount"));
+        QVERIFY(expected.value("error").toString().contains(QStringLiteral("10–500 g")));
+        QVERIFY(WaterAmount::validationResponse(QStringLiteral("nameInUse")).isEmpty());
+        auto valid = fields;
+        valid["yieldValue"] = 40.0;
+        storage.requestCreateRecipe(valid);
+        QTRY_COMPARE(created.count(), 2);
+        const auto id = created.last().at(0).toLongLong();
+        QVERIFY(id > 0);
+        QSignalSpy failedUpdate(&storage, &RecipeStorage::recipeUpdateFailed);
+        QSignalSpy updated(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id, {{"yieldValue", 300.0}, {"name", "Must not be saved"}});
+        QTRY_COMPARE(updated.count(), 1);
+        QVERIFY(!updated.first().at(1).toBool());
+        QCOMPARE(failedUpdate.count(), 1);
+        QCOMPARE(WaterAmount::validationResponse(failedUpdate.first().at(1).toString()), expected);
+        QTRY_VERIFY(storage.isDbWorkIdle());
+        withRawDb(path, "water_error_verify", [&](QSqlDatabase& db) {
+            const auto recipe = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(recipe.name, QStringLiteral("Water validation"));
+            QCOMPARE(recipe.yieldValue, 40.0);
+        });
+    }
+
+    // Only the dial-in values write through to the active recipe. A live
+    // steam or hot-water change is a per-brew choice and must never reach the
+    // recipe row (#1895: an americano poured at 140 ml for someone else
+    // redefined the recipe, so every later americano on it poured 140).
+    //
+    // Asserted against the source rather than behaviourally: standing up a
+    // MainController takes five live collaborators (network manager, settings,
+    // device, machine state, shot model) plus real SettingsBrew signal traffic.
+    // Same technique as tst_profilemanager's
+    // currentProfileAssignedOnlyBySetCurrentProfile.
+    //
+    // This is an ALLOWLIST, deliberately. Naming the signals that must NOT
+    // stamp only guards the shapes named: a member-slot connect, a renamed
+    // helper, or a signal nobody thought of all pass such a test while the bug
+    // is back. Enumerating the fields that DO get stamped closes every one of
+    // those routes, because each still has to reach stampActiveRecipe.
+    void onlyDialInValuesStampTheActiveRecipe() {
+        QFile f(QStringLiteral(DECENZA_SOURCE_DIR "/src/controllers/maincontroller.cpp"));
+        QVERIFY2(f.open(QIODevice::ReadOnly | QIODevice::Text),
+                 "could not read maincontroller.cpp — this test is now blind");
+        // Each line is truncated at its first "//" so prose about these stamps
+        // is not read as code. Block comments and #if 0 are NOT stripped, which
+        // is the safe direction: either would over-count below and fail loudly.
+        const QString raw = QString::fromUtf8(f.readAll());
+        QString src;
+        for (const QString& line : raw.split(QLatin1Char('\n'))) {
+            const qsizetype commentAt = line.indexOf(QLatin1String("//"));
+            src += (commentAt >= 0 ? line.left(commentAt) : line) + QLatin1Char('\n');
+        }
+
+        // The dial-watcher stamp CALL sites still live in maincontroller.cpp:
+        // the three watchers pass the field as a QStringLiteral. The actual
+        // write-through MOVED to RecipeWiringController::stampActiveRecipe
+        // (extract-recipe-wiring-controller); MainController::stampActiveRecipe
+        // is now a thin forwarder whose `m_recipeWiring.stampActiveRecipe(...)`
+        // call takes no QStringLiteral and so does not match this regex.
+        QStringList stamped;
+        const QRegularExpression call(
+            QStringLiteral(R"RX(stampActiveRecipe\s*\(\s*QStringLiteral\("([A-Za-z]+)"\))RX"));
+        auto it = call.globalMatch(src);
+        while (it.hasNext())
+            stamped << it.next().captured(1);
+        stamped.sort();
+
+        QCOMPARE(stamped, QStringList({QStringLiteral("doseG"), QStringLiteral("grindPinned"),
+                                       QStringLiteral("rpmPinned")}));
+
+        // The regex only sees the QStringLiteral form, so account for every
+        // occurrence: the three calls, the definition of the
+        // MainController::stampActiveRecipe forwarder, and the forwarder's own
+        // `m_recipeWiring.stampActiveRecipe(...)` body line. A fourth watcher
+        // call, or a helper renamed out from under the regex, fails here.
+        // Counted over the RAW text, not the stripped copy — a call hidden
+        // behind a "//" inside a string literal would otherwise vanish from
+        // both the regex and the count and stay consistent, a silent false
+        // negative in the one direction this test exists to catch.
+        QCOMPARE(raw.count(QLatin1String("stampActiveRecipe(")), stamped.size() + 2);
+
+        // stampActiveRecipe is not the only way to write a field to the recipe
+        // row; requestUpdateRecipe is the API a future author would reach for
+        // instead, and an inline call in a watcher would sail past the allowlist
+        // above. The real store write now lives in the controller: assert it has
+        // exactly one requestUpdateRecipe() call site (inside the controller's
+        // stampActiveRecipe).
+        QFile cf(QStringLiteral(DECENZA_SOURCE_DIR "/src/controllers/recipewiringcontroller.cpp"));
+        QVERIFY2(cf.open(QIODevice::ReadOnly | QIODevice::Text),
+                 "could not read recipewiringcontroller.cpp — this test is now blind");
+        const QString controllerRaw = QString::fromUtf8(cf.readAll());
+        QCOMPARE(controllerRaw.count(QLatin1String("requestUpdateRecipe(")), 1);
+        // And keep the bypass guard on MainController itself: the sole route to
+        // the store from here is the port adapter's one delegation
+        // (`m_recipeStorage->requestUpdateRecipe`). A future inline watcher that
+        // reached straight for the store would push this above one and fail.
+        QCOMPARE(raw.count(QLatin1String("m_recipeStorage->requestUpdateRecipe")), 1);
+        // The adapter is now a private MainController member, so a watcher could
+        // also call it BARE (`requestUpdateRecipe(id, fields)`) — past both counts
+        // above. Pin the TOTAL occurrences in maincontroller.cpp to exactly two:
+        // the adapter's own definition signature and its single `m_recipeStorage->`
+        // delegation. A third occurrence is a new, unguarded write path.
+        QCOMPARE(raw.count(QLatin1String("requestUpdateRecipe(")), 2);
+
+        // The three signals that must stay unwired. Re-connecting the milk
+        // weight would drop every milk recipe seconds before its own shot is
+        // saved (it is captured automatically at the end of steaming); the two
+        // preset signals fire on add, remove, reorder and field edits, none of
+        // which is an ingredient swap.
+        for (const QString& sig : {QStringLiteral("lastSteamMilkGChanged"),
+                                   QStringLiteral("steamPitcherPresetsChanged"),
+                                   QStringLiteral("waterVesselPresetsChanged")}) {
+            const qsizetype at = src.indexOf(QStringLiteral("::setupRecipeConnections"));
+            QVERIFY2(at < 0 || !QStringView(src).mid(at).contains(sig),
+                     qPrintable(sig + QStringLiteral(" is wired inside setupRecipeConnections - "
+                                                     "it must not deactivate or stamp (#1895)")));
+        }
+    }
+
+    // The ingredient rules the deactivation watchers ask (#1895). Ownership
+    // gates first, exactly as ownsProfileChoice does, so a recipe that names no
+    // pitcher (or carries no hot-water block) is never dropped by a change to
+    // one it does not own.
+    void steamPitcherOwnershipAndDivergence() {
+        const QString named = QStringLiteral(R"({"hasMilk":true,"pitcherName":"Small"})");
+        const QString off = QStringLiteral(R"({"hasMilk":true,"heaterOff":true})");
+        const QString none = QStringLiteral(R"({"hasMilk":true})");
+
+        QVERIFY(Recipe::ownsSteamPitcherChoice(named));
+        QVERIFY(Recipe::ownsSteamPitcherChoice(off));   // "Heater off" IS a choice
+        QVERIFY(!Recipe::ownsSteamPitcherChoice(none));
+        QVERIFY(!Recipe::ownsSteamPitcherChoice(QString()));
+
+        // Owns none — never diverges, whatever is selected.
+        QVERIFY(!Recipe::steamPitcherDiverged(none, QStringLiteral("Big"), false));
+        QVERIFY(!Recipe::steamPitcherDiverged(none, QString(), true));
+
+        // Names one: same pitcher stays, a different one diverges, and the
+        // Heater off marker diverges even though it has no name to compare.
+        QVERIFY(!Recipe::steamPitcherDiverged(named, QStringLiteral("Small"), false));
+        QVERIFY(!Recipe::steamPitcherDiverged(named, QStringLiteral("small"), false));
+        QVERIFY(Recipe::steamPitcherDiverged(named, QStringLiteral("Big"), false));
+        QVERIFY(Recipe::steamPitcherDiverged(named, QString(), true));
+
+        // Saved with the boiler deliberately cold: a real pitcher diverges,
+        // the marker does not.
+        QVERIFY(!Recipe::steamPitcherDiverged(off, QString(), true));
+        QVERIFY(Recipe::steamPitcherDiverged(off, QStringLiteral("Small"), false));
+
+        // heaterOff WINS over a name carried alongside it. The wizard and the
+        // web form keep the two mutually exclusive, but MCP stores the block
+        // verbatim (mcptools_recipes.cpp), so both can arrive together.
+        const QString both = QStringLiteral(R"({"heaterOff":true,"pitcherName":"Small"})");
+        QVERIFY(!Recipe::steamPitcherDiverged(both, QString(), true));
+        QVERIFY(Recipe::steamPitcherDiverged(both, QStringLiteral("Small"), false));
+
+        // A whitespace-only name owns nothing: without the trim it would name a
+        // pitcher no selection can ever match, deactivating on the next steam.
+        QVERIFY(!Recipe::ownsSteamPitcherChoice(QStringLiteral(R"({"pitcherName":"  "})")));
+
+        // A corrupt block must never drop the user's recipe.
+        QVERIFY(!Recipe::ownsSteamPitcherChoice(QStringLiteral("{not json")));
+        QVERIFY(!Recipe::steamPitcherDiverged(QStringLiteral("[1,2]"), QStringLiteral("Big"), false));
+
+        // The live preset came back empty (a transient bad index) and is not the
+        // marker: that IS a divergence from a recipe that names a real pitcher.
+        QVERIFY(Recipe::steamPitcherDiverged(named, QString(), false));
+    }
+
+    void waterVesselOwnershipAndDivergence() {
+        const QString named = QStringLiteral(R"({"hasWater":true,"vesselName":"Cup","volume":70})");
+        const QString incomplete = QStringLiteral(R"({"hasWater":true})");
+        const QString dormant = QStringLiteral(R"({"hasWater":false,"vesselName":"Cup"})");
+
+        QVERIFY(Recipe::ownsWaterVesselChoice(named));
+        // hasWater with no vessel is a block the user toggled on and never
+        // finished; a dormant block owns nothing either.
+        QVERIFY(!Recipe::ownsWaterVesselChoice(incomplete));
+        QVERIFY(!Recipe::ownsWaterVesselChoice(dormant));
+        QVERIFY(!Recipe::ownsWaterVesselChoice(QString()));
+
+        QVERIFY(!Recipe::waterVesselDiverged(named, QStringLiteral("Cup")));
+        QVERIFY(!Recipe::waterVesselDiverged(named, QStringLiteral("CUP")));
+        QVERIFY(Recipe::waterVesselDiverged(named, QStringLiteral("Mug")));
+        QVERIFY(Recipe::waterVesselDiverged(named, QString()));
+
+        // An espresso recipe is untouched by any vessel change.
+        QVERIFY(!Recipe::waterVesselDiverged(incomplete, QStringLiteral("Mug")));
+        QVERIFY(!Recipe::waterVesselDiverged(QString(), QStringLiteral("Mug")));
+        // A dormant block names a vessel but is switched off — it owns nothing,
+        // so it cannot diverge either.
+        QVERIFY(!Recipe::waterVesselDiverged(dormant, QStringLiteral("Mug")));
+
+        QVERIFY(!Recipe::ownsWaterVesselChoice(QStringLiteral(R"({"hasWater":true,"vesselName":" "})")));
+        QVERIFY(!Recipe::ownsWaterVesselChoice(QStringLiteral("{not json")));
+        QVERIFY(!Recipe::waterVesselDiverged(QStringLiteral("[1,2]"), QStringLiteral("Mug")));
+    }
+
+    void updateFields() {
+        withRawDb(freshDbPath(), "upd", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            const qint64 id = RecipeStorage::insertRecipeStatic(db, sampleRecipe());
+
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {
+                {"doseG", 17.5}, {"grindPinned", "2.4"}, {"name", "Evening capp"}}));
+            Recipe r = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(r.doseG, 17.5);
+            QCOMPARE(r.grindPinned, QString("2.4"));
+            QCOMPARE(r.name, QString("Evening capp"));
+
+            // Unknown keys are ignored; a map of only unknown keys updates nothing.
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression("ignoring unknown update key"));
+            QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, id, {{"bogus", 1}}));
+
+            // Empty string collapses to NULL (insert-equivalent coercion):
+            // clearing the pin returns the recipe to inherit.
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {{"grindPinned", ""}}));
+            QVERIFY(RecipeStorage::loadRecipeStatic(db, id).grindPinned.isEmpty());
+
+            // Missing row: no rows affected -> false.
+            QVERIFY(!RecipeStorage::updateRecipeFieldsStatic(db, 999, {{"doseG", 20.0}}));
+        });
+    }
+
+    // --- inventory: archived filter, MRU order, shot-count aggregate ---
+
+    void inventoryFiltersAndOrders() {
+        withRawDb(freshDbPath(), "inv", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+
+            Recipe a = sampleRecipe(); a.name = "A"; a.lastUsedEpoch = 100;
+            Recipe b = sampleRecipe(); b.name = "B"; b.lastUsedEpoch = 300;
+            Recipe c = sampleRecipe(); c.name = "C"; c.lastUsedEpoch = 200; c.archived = true;
+            const qint64 idA = RecipeStorage::insertRecipeStatic(db, a);
+            const qint64 idB = RecipeStorage::insertRecipeStatic(db, b);
+            const qint64 idC = RecipeStorage::insertRecipeStatic(db, c);
+            QVERIFY(idA > 0 && idB > 0 && idC > 0);
+
+            insertShotForRecipe(db, idB);
+            insertShotForRecipe(db, idB);
+
+            const QVector<InventoryRecipe> active = RecipeStorage::loadInventoryStatic(db, false);
+            QCOMPARE(active.size(), 2);
+            QCOMPARE(active[0].recipe.name, QString("B"));  // MRU first
+            QCOMPARE(active[0].shotCount, (qint64)2);
+            QCOMPARE(active[1].recipe.name, QString("A"));
+            QCOMPARE(active[1].shotCount, (qint64)0);
+
+            const QVector<InventoryRecipe> archived = RecipeStorage::loadInventoryStatic(db, true);
+            QCOMPARE(archived.size(), 1);
+            QCOMPARE(archived[0].recipe.name, QString("C"));
+        });
+    }
+
+    // Stale flag on the inventory listing: a recipe whose linked bag is
+    // finished (or whose bean was never linked) is stale; an open link or a
+    // bean-less recipe is not. Display state only — the rows still list.
+    void inventoryStaleFlag() {
+        withRawDb(freshDbPath(), "inv_stale", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+
+            CoffeeBag open; open.roasterName = "Roaster"; open.coffeeName = "Guji";
+            open.inInventory = true;
+            const qint64 openId = CoffeeBagStorage::insertBagStatic(db, open);
+            CoffeeBag finished = open; finished.inInventory = false;
+            const qint64 finishedId = CoffeeBagStorage::insertBagStatic(db, finished);
+            QVERIFY(openId > 0 && finishedId > 0);
+
+            Recipe fresh = sampleRecipe(); fresh.name = "Fresh"; fresh.bagId = openId;
+            Recipe stale = sampleRecipe(); stale.name = "Stale"; stale.bagId = finishedId;
+            Recipe unlinked = sampleRecipe(); unlinked.name = "Unlinked";  // bean, no bag
+            Recipe bare; bare.name = "Bare"; bare.profileTitle = "P";      // no bean at all
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, fresh) > 0);
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, stale) > 0);
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, unlinked) > 0);
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, bare) > 0);
+
+            QHash<QString, bool> staleByName;
+            for (const InventoryRecipe& e : RecipeStorage::loadInventoryStatic(db, false))
+                staleByName.insert(e.recipe.name, e.stale);
+            QCOMPARE(staleByName.size(), 4);
+            QCOMPARE(staleByName.value("Fresh"), false);
+            QCOMPARE(staleByName.value("Stale"), true);
+            QCOMPARE(staleByName.value("Unlinked"), true);
+            QCOMPARE(staleByName.value("Bare"), false);
+        });
+    }
+
+    // --- bean-link resolution ---
+
+    void resolveOpenBag() {
+        withRawDb(freshDbPath(), "bag", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+
+            CoffeeBag oldBag;
+            oldBag.roasterName = "Roaster"; oldBag.coffeeName = "Guji";
+            oldBag.beanBaseId = "bb-uuid-1";
+            oldBag.inInventory = false;  // finished
+            oldBag.lastUsedEpoch = 100;
+            const qint64 finishedId = CoffeeBagStorage::insertBagStatic(db, oldBag);
+
+            CoffeeBag newBag = oldBag;
+            newBag.inInventory = true;
+            newBag.lastUsedEpoch = 200;
+            const qint64 openId = CoffeeBagStorage::insertBagStatic(db, newBag);
+            QVERIFY(finishedId > 0 && openId > 0);
+
+            // Canonical id resolves to the OPEN bag, not the finished one.
+            Recipe r = sampleRecipe();
+            QCOMPARE(RecipeStorage::resolveOpenBagStatic(db, r), openId);
+
+            // Identity fallback (no canonical id), case-insensitive.
+            r.beanBaseId.clear();
+            r.roasterName = "ROASTER"; r.coffeeName = "guji";
+            QCOMPARE(RecipeStorage::resolveOpenBagStatic(db, r), openId);
+
+            // No open bag of the bean -> -1 (display state, not an error).
+            Recipe other = sampleRecipe();
+            other.beanBaseId = "bb-uuid-other";
+            other.roasterName = "Elsewhere"; other.coffeeName = "Nope";
+            QCOMPARE(RecipeStorage::resolveOpenBagStatic(db, other), (qint64)-1);
+
+            // Bean-less recipe -> -1.
+            Recipe bare;
+            bare.name = "Bare";
+            QCOMPARE(RecipeStorage::resolveOpenBagStatic(db, bare), (qint64)-1);
+
+            // Canonical-miss fallthrough: a recipe whose beanBaseId matches NO
+            // bag but whose roaster+coffee identity matches an open bag must
+            // fall through to the identity pass (real case: bags created before
+            // Bean Base linking). If someone made a present-but-unmatched
+            // canonical id return -1, older bags would silently lose their bean.
+            Recipe canonMiss = sampleRecipe();
+            canonMiss.beanBaseId = "bb-uuid-nonexistent";  // matches no bag
+            QCOMPARE(RecipeStorage::resolveOpenBagStatic(db, canonMiss), openId);
+        });
+    }
+
+    void resolveOpenBagMruTieBreak() {
+        withRawDb(freshDbPath(), "bag_mru", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            // Two OPEN bags of the same bean -> the most recently used wins.
+            CoffeeBag a; a.roasterName = "Roaster"; a.coffeeName = "Guji";
+            a.beanBaseId = "bb-uuid-1"; a.inInventory = true; a.lastUsedEpoch = 100;
+            CoffeeBag b = a; b.lastUsedEpoch = 500;
+            const qint64 olderId = CoffeeBagStorage::insertBagStatic(db, a);
+            const qint64 newerId = CoffeeBagStorage::insertBagStatic(db, b);
+            QVERIFY(olderId > 0 && newerId > 0);
+            QCOMPARE(RecipeStorage::resolveOpenBagStatic(db, sampleRecipe()), newerId);
+        });
+    }
+
+    // Import must preserve the source's original created_at (recipe-list-
+    // organization): "Date created" ordering has to survive transfer / backup
+    // restore. created_at is read-only, so the INSERT lets the DEFAULT stamp
+    // import-time — importRecipesStatic re-stamps it from the source row.
+    void importPreservesCreatedAt() {
+        const QString srcPath = freshDbPath();
+        const QString destPath = freshDbPath();
+        const qint64 pastEpoch = 1500000000;  // a fixed date well before "now"
+        qint64 srcWithDate = 0, srcNullDate = 0;
+        withRawDb(srcPath, "created_src", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe a = sampleRecipe(); a.name = "Has date";
+            srcWithDate = RecipeStorage::insertRecipeStatic(db, a);
+            QVERIFY(srcWithDate > 0);
+            Recipe b = sampleRecipe(); b.name = "No date";
+            srcNullDate = RecipeStorage::insertRecipeStatic(db, b);
+            QVERIFY(srcNullDate > 0);
+            // Force one row's created_at to a fixed past value (the DEFAULT
+            // stamped ~now at insert), and clear the other's to NULL to exercise
+            // the guard's else-branch.
+            QSqlQuery u(db);
+            u.prepare("UPDATE recipes SET created_at = :c WHERE id = :id");
+            u.bindValue(":c", pastEpoch); u.bindValue(":id", srcWithDate);
+            QVERIFY(u.exec());
+            QSqlQuery n(db);
+            n.prepare("UPDATE recipes SET created_at = NULL WHERE id = :id");
+            n.bindValue(":id", srcNullDate);
+            QVERIFY(n.exec());
+        });
+        withRawDb(destPath, "created_dest", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+        });
+        withRawDb(srcPath, "created_src2", [&](QSqlDatabase& srcDb) {
+            withRawDb(destPath, "created_dest2", [&](QSqlDatabase& destDb) {
+                QHash<qint64, qint64> idMap;
+                QVERIFY(RecipeStorage::importRecipesStatic(srcDb, destDb, /*merge=*/false,
+                                                           idMap, {}, {}));
+                // The dated recipe keeps its ORIGINAL created_at, not import-time.
+                QCOMPARE(RecipeStorage::loadRecipeStatic(destDb, idMap.value(srcWithDate)).createdEpoch,
+                         pastEpoch);
+                // The NULL-date recipe still lands with a valid DEFAULT (never 0).
+                QVERIFY(RecipeStorage::loadRecipeStatic(destDb, idMap.value(srcNullDate)).createdEpoch > 0);
+            });
+        });
+    }
+
+    // A bag-linked create never adopts the bag's dial.
+    void createDoesNotDefaultGrindFromBag() {
+        const QString path = freshDbPath();
+        qint64 bagId = 0;
+        withRawDb(path, "create_grind_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            CoffeeBag bag; bag.roasterName = "Roaster"; bag.coffeeName = "Guji";
+            bag.beanBaseId = "bb-uuid-1"; bag.inInventory = true;
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QVERIFY(bagId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Omitted grind stays empty.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            QVariantMap map{{"name", "Adopts"}, {"profileTitle", "P"}, {"bagId", bagId}};
+            storage.requestCreateRecipe(map);
+            QTRY_COMPARE(spy.count(), 1);
+            const QVariantMap created = spy.at(0).at(1).toMap();
+            QVERIFY(created.value("grindPinned").toString().isEmpty());
+            QCOMPARE(created.value("rpmPinned").toLongLong(), (qint64)0);
+        }
+
+        // Explicitly empty grind -> stays empty (deliberate "no grind").
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            QVariantMap map{{"name", "Deliberate"}, {"profileTitle", "P"},
+                            {"bagId", bagId}, {"grindPinned", QString()}};
+            storage.requestCreateRecipe(map);
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(spy.at(0).at(1).toMap().value("grindPinned").toString().isEmpty());
+        }
+
+        // Explicit grind with rpm omitted -> no rpm adoption either.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            QVariantMap map{{"name", "Explicit grind"}, {"profileTitle", "P"},
+                            {"bagId", bagId}, {"grindPinned", "2.6"}};
+            storage.requestCreateRecipe(map);
+            QTRY_COMPARE(spy.count(), 1);
+            const QVariantMap created = spy.at(0).at(1).toMap();
+            QCOMPARE(created.value("grindPinned").toString(), QString("2.6"));
+            QCOMPARE(created.value("rpmPinned").toLongLong(), (qint64)0);
+        }
+    }
+
+    // --- import: bag_id remaps through the bag id-map ---
+
+    // --- temp-offset migration (recipe-relative-temp-offset) ---
+
+    // Migration 31's data pass: rows whose temp_offset_c is NULL convert
+    // their legacy absolute against the profile (catalog map first, embedded
+    // JSON fallback, unresolvable → 0); already-converted rows are untouched.
+    void convertLegacyTempOffsets() {
+        withRawDb(freshDbPath(), "cvt", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QSqlQuery q(db);
+            // Four legacy rows (temp_offset_c NULL = unconverted):
+            // by catalog map, by embedded JSON, unresolvable, and no override.
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('ByMap', 'Known', NULL, 87.0)"));
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, profile_json, temp_offset_c, temp_override_c) "
+                           "VALUES ('ByJson', 'Gone', '{\"espresso_temperature\":\"92\"}', NULL, 90.0)"));
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('Lost', 'Nowhere', NULL, 85.0)"));
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('NoPin', 'Known', NULL, 0)"));
+            // An already-converted row must NOT be reconverted from its dead
+            // absolute (the user reset it to 0 after migrating).
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('Cleared', 'Known', 0, 87.0)"));
+
+            const QHash<QString, double> temps{{QStringLiteral("Known"), 90.0}};
+            // "Lost"/"Nowhere" is this test's deliberate unresolvable-profile
+            // case (see comment above) — expect the warning it logs.
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression("could not resolve profile"));
+            QVERIFY(RecipeStorage::convertLegacyTempOffsetsStatic(db, temps));
+
+            auto offsetOf = [&](const QString& name) {
+                QSqlQuery r(db);
+                r.prepare("SELECT temp_offset_c FROM recipes WHERE name = :n");
+                r.bindValue(":n", name);
+                if (!r.exec() || !r.next()) return -999.0;
+                return r.value(0).isNull() ? -998.0 : r.value(0).toDouble();
+            };
+            QCOMPARE(offsetOf("ByMap"), -3.0);
+            QCOMPARE(offsetOf("ByJson"), -2.0);
+            QCOMPARE(offsetOf("Lost"), 0.0);   // unresolvable → pin dropped
+            QCOMPARE(offsetOf("NoPin"), 0.0);
+            QCOMPARE(offsetOf("Cleared"), 0.0); // untouched (was non-NULL)
+
+            // Idempotent: a second pass changes nothing.
+            QVERIFY(RecipeStorage::convertLegacyTempOffsetsStatic(db, temps));
+            QCOMPARE(offsetOf("ByMap"), -3.0);
+        });
+    }
+
+    // Clearing an offset through the normal update path must write an
+    // EXPLICIT 0, never NULL — NULL is the migration's "unconverted" marker,
+    // and a NULL here would let the conversion pass resurrect the dead
+    // absolute the user deliberately cleared. This pins bindDblSigned being
+    // wired to temp_offset_c (COL_DBL_SIGNED): "harmonizing" it back to the
+    // null-collapsing COL_DBL is exactly the refactor this test fails on.
+    void clearingOffsetWritesExplicitZeroNeverNull() {
+        withRawDb(freshDbPath(), "clr0", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QSqlQuery q(db);
+            // A migrated row: converted offset −3, dead absolute still parked.
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('Pinned', 'Known', -3.0, 87.0)"));
+            const qint64 id = q.lastInsertId().toLongLong();
+
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, id, {{"tempOffsetC", 0.0}}));
+            QSqlQuery r(db);
+            QVERIFY(r.exec(QString("SELECT temp_offset_c FROM recipes WHERE id = %1").arg(id)));
+            QVERIFY(r.next());
+            QVERIFY(!r.value(0).isNull());       // explicit 0, NOT the unconverted marker
+            QCOMPARE(r.value(0).toDouble(), 0.0);
+
+            // And the conversion pass must not resurrect the dead absolute.
+            const QHash<QString, double> temps{{QStringLiteral("Known"), 90.0}};
+            QVERIFY(RecipeStorage::convertLegacyTempOffsetsStatic(db, temps));
+            QSqlQuery r2(db);
+            QVERIFY(r2.exec(QString("SELECT temp_offset_c FROM recipes WHERE id = %1").arg(id)));
+            QVERIFY(r2.next());
+            QCOMPARE(r2.value(0).toDouble(), 0.0);
+        });
+    }
+
+    // Merge-mode import: an unconverted source row that dedup-matches an existing
+    // dest recipe maps to the existing row WITHOUT staging — the local
+    // recipe's (possibly deliberately cleared) offset must survive. Staging
+    // belongs to inserted rows only.
+    void mergeMatchedLegacyRowDoesNotStage() {
+        const QString srcPath = freshDbPath();
+        const QString destPath = freshDbPath();
+        withRawDb(srcPath, "mrg_src", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QSqlQuery q(db);
+            // temp_offset_c left NULL: unconverted.
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, roaster_name, coffee_name, "
+                           "temp_override_c) VALUES ('Twin', 'P', 'R', 'C', 87.0)"));
+        });
+        withRawDb(destPath, "mrg_dest", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QSqlQuery q(db);
+            // Same identity, offset deliberately cleared to 0 locally.
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, roaster_name, coffee_name, "
+                           "temp_offset_c, temp_override_c) VALUES ('Twin', 'P', 'R', 'C', 0, 87.0)"));
+        });
+        withRawDb(srcPath, "mrg_src2", [&](QSqlDatabase& srcDb) {
+            withRawDb(destPath, "mrg_dest2", [&](QSqlDatabase& destDb) {
+                QHash<qint64, qint64> idMap;
+                QVERIFY(RecipeStorage::importRecipesStatic(srcDb, destDb, /*merge=*/true,
+                                                           idMap, {}, {}));
+                QSqlQuery r(destDb);
+                QVERIFY(r.exec("SELECT COUNT(*), MIN(temp_offset_c) FROM recipes"));
+                QVERIFY(r.next());
+                QCOMPARE(r.value(0).toInt(), 1);         // matched, not duplicated
+                QVERIFY(!r.value(1).isNull());           // no unconverted marker planted
+                QCOMPARE(r.value(1).toDouble(), 0.0);    // the cleared offset survived
+            });
+        });
+    }
+
+    // A ≥31 source whose OWN deferred pass hadn't completed (backup exported
+    // mid-window) carries NULL-offset rows with the absolute still in the
+    // dead column. Those rows must import as UNCONVERTED — flattening the
+    // NULL to an explicit 0 would silently destroy a still-recoverable pin.
+    void importUnconvertedRowFromCurrentSourceStages() {
+        const QString srcPath = freshDbPath();
+        const QString destPath = freshDbPath();
+        withRawDb(srcPath, "unc_src", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QSqlQuery q(db);
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('Unconverted', 'Known', NULL, 87.0)"));
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('Converted', 'Known', -2.0, 87.0)"));
+        });
+        withRawDb(destPath, "unc_dest", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            // See importLegacyTempSourceStagesAndConverts: the post-import
+            // grind-ownership backfill queries coffee_bags on the dest DB.
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+        });
+        withRawDb(srcPath, "unc_src2", [&](QSqlDatabase& srcDb) {
+            withRawDb(destPath, "unc_dest2", [&](QSqlDatabase& destDb) {
+                QHash<qint64, qint64> idMap;
+                QVERIFY(RecipeStorage::importRecipesStatic(srcDb, destDb, /*merge=*/false,
+                                                           idMap, {}, {}));
+                const QHash<QString, double> temps{{QStringLiteral("Known"), 90.0}};
+                QVERIFY(RecipeStorage::convertLegacyTempOffsetsStatic(destDb, temps));
+                QSqlQuery r(destDb);
+                QVERIFY(r.exec("SELECT name, temp_offset_c FROM recipes ORDER BY name"));
+                QVERIFY(r.next());
+                QCOMPARE(r.value(0).toString(), QStringLiteral("Converted"));
+                QCOMPARE(r.value(1).toDouble(), -2.0);   // verbatim, never reconverted
+                QVERIFY(r.next());
+                QCOMPARE(r.value(0).toString(), QStringLiteral("Unconverted"));
+                QCOMPARE(r.value(1).toDouble(), -3.0);   // staged, then converted (87 − 90)
+            });
+        });
+    }
+
+    // A current-version source imports its offset VERBATIM — its dead
+    // temp_override_c (still holding the pre-migration absolute) must never
+    // resurrect an offset the user has since cleared.
+    void importCurrentSourceKeepsOffsetVerbatim() {
+        const QString srcPath = freshDbPath();
+        const QString destPath = freshDbPath();
+        withRawDb(srcPath, "cur_src", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QSqlQuery q(db);
+            // Offset deliberately cleared to 0; stale absolute in the dead column.
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('Cleared', 'Known', 0, 87.0)"));
+            QVERIFY(q.exec("INSERT INTO recipes (name, profile_title, temp_offset_c, temp_override_c) "
+                           "VALUES ('Minus2', 'Known', -2.0, 87.0)"));
+        });
+        withRawDb(destPath, "cur_dest", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            // See importLegacyTempSourceStagesAndConverts: the post-import
+            // grind-ownership backfill queries coffee_bags on the dest DB.
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+        });
+        withRawDb(srcPath, "cur_src2", [&](QSqlDatabase& srcDb) {
+            withRawDb(destPath, "cur_dest2", [&](QSqlDatabase& destDb) {
+                QHash<qint64, qint64> idMap;
+                QVERIFY(RecipeStorage::importRecipesStatic(srcDb, destDb, /*merge=*/false,
+                                                           idMap, {}, {}));
+                // Conversion pass runs after every import — it must find
+                // nothing to do (no NULL markers from a current source).
+                const QHash<QString, double> temps{{QStringLiteral("Known"), 90.0}};
+                QVERIFY(RecipeStorage::convertLegacyTempOffsetsStatic(destDb, temps));
+                QSqlQuery r(destDb);
+                QVERIFY(r.exec("SELECT name, temp_offset_c FROM recipes ORDER BY name"));
+                QVERIFY(r.next());
+                QCOMPARE(r.value(0).toString(), QStringLiteral("Cleared"));
+                QCOMPARE(r.value(1).toDouble(), 0.0);
+                QVERIFY(r.next());
+                QCOMPARE(r.value(0).toString(), QStringLiteral("Minus2"));
+                QCOMPARE(r.value(1).toDouble(), -2.0);
+            });
+        });
+    }
+
+    void importRemapsBagId() {
+        const QString srcPath = freshDbPath();
+        const QString destPath = freshDbPath();
+        qint64 srcLinkedId = 0, srcDanglingId = 0;
+        withRawDb(srcPath, "imp_src", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe linked = sampleRecipe(); linked.name = "Linked"; linked.bagId = 40;
+            Recipe dangling = sampleRecipe(); dangling.name = "Dangling"; dangling.bagId = 77;
+            srcLinkedId = RecipeStorage::insertRecipeStatic(db, linked);
+            srcDanglingId = RecipeStorage::insertRecipeStatic(db, dangling);
+            QVERIFY(srcLinkedId > 0 && srcDanglingId > 0);
+        });
+        withRawDb(destPath, "imp_dest", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+        });
+        withRawDb(srcPath, "imp_src2", [&](QSqlDatabase& srcDb) {
+            withRawDb(destPath, "imp_dest2", [&](QSqlDatabase& destDb) {
+                QHash<qint64, qint64> idMap;
+                const QHash<qint64, qint64> bagIdMap{{40, 9}};  // 77 absent -> NULL
+                QVERIFY(RecipeStorage::importRecipesStatic(srcDb, destDb, /*merge=*/false,
+                                                           idMap, {}, bagIdMap));
+                QCOMPARE(RecipeStorage::loadRecipeStatic(destDb, idMap.value(srcLinkedId)).bagId,
+                         (qint64)9);
+                QCOMPARE(RecipeStorage::loadRecipeStatic(destDb, idMap.value(srcDanglingId)).bagId,
+                         (qint64)0);
+            });
+        });
+    }
+
+    // --- save-time normalization (create/update) ---
+
+    // requestCreateRecipe normalizes the bag link once at save time: bean
+    // identity without a bag resolves to that bean's open bag (older MCP/web
+    // clients); a bag without identity adopts the bag's identity fields (the
+    // relink matching key must always be populated); an unknown bag id drops
+    // the link with a warning but still creates. The emitted map echoes the
+    // caller's requestToken — the correlation contract for the broadcast
+    // recipeCreated signal.
+    void createNormalizesBagLink() {
+        const QString path = freshDbPath();
+        qint64 openBagId = 0;
+        withRawDb(path, "create_norm_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            CoffeeBag bag; bag.roasterName = "Roaster"; bag.coffeeName = "Guji";
+            bag.beanBaseId = "bb-uuid-1"; bag.inInventory = true;
+            openBagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QVERIFY(openBagId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Identity only -> resolved to the open bag; token echoed.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            QVariantMap map = sampleRecipe().toVariantMap();
+            map.remove("id");
+            map.insert("requestToken", "tok-identity");
+            storage.requestCreateRecipe(map);
+            QTRY_COMPARE(spy.count(), 1);
+            const QVariantMap created = spy.at(0).at(1).toMap();
+            QCOMPARE(created.value("requestToken").toString(), QString("tok-identity"));
+            QCOMPARE(created.value("bagId").toLongLong(), openBagId);
+        }
+
+        // Bag only -> adopts the bag's identity fields.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            QVariantMap map{{"name", "Bag only"}, {"profileTitle", "P"},
+                            {"bagId", openBagId}};
+            storage.requestCreateRecipe(map);
+            QTRY_COMPARE(spy.count(), 1);
+            const QVariantMap created = spy.at(0).at(1).toMap();
+            QCOMPARE(created.value("bagId").toLongLong(), openBagId);
+            QCOMPARE(created.value("beanBaseId").toString(), QString("bb-uuid-1"));
+            QCOMPARE(created.value("roasterName").toString(), QString("Roaster"));
+            QCOMPARE(created.value("coffeeName").toString(), QString("Guji"));
+        }
+
+        // Unknown bag id -> link dropped (warned), recipe still created.
+        {
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression("unknown bag id"));
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            QVariantMap map{{"name", "Dangling"}, {"profileTitle", "P"},
+                            {"bagId", (qint64)999999}};
+            storage.requestCreateRecipe(map);
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(spy.at(0).at(0).toLongLong() > 0);
+            QCOMPARE(spy.at(0).at(1).toMap().value("bagId").toLongLong(), (qint64)0);
+        }
+    }
+
+    // Clone echoes the requestToken too (same correlation contract).
+    void cloneEchoesRequestToken() {
+        const QString path = freshDbPath();
+        qint64 sourceId = 0;
+        withRawDb(path, "clone_tok_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            sourceId = RecipeStorage::insertRecipeStatic(db, sampleRecipe());
+        });
+        RecipeStorage storage;
+        storage.initialize(path);
+        QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+        storage.requestCloneRecipe(sourceId, "Copy", "tok-clone");
+        QTRY_COMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(1).toMap().value("requestToken").toString(),
+                 QString("tok-clone"));
+    }
+
+    // A bagId patch adopts the new bag's identity (the manual re-point);
+    // explicit identity fields in the same patch win over adoption; a
+    // DANGLING bagId drops the link field and applies the rest (the web
+    // editor re-sends the stored bagId on every save — a bag deleted on
+    // another surface must not turn a rename into a failure).
+    void updateBagIdPatch() {
+        const QString path = freshDbPath();
+        qint64 recipeId = 0, bagAId = 0, bagBId = 0;
+        withRawDb(path, "update_patch_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            CoffeeBag a; a.roasterName = "Roaster"; a.coffeeName = "Guji";
+            a.beanBaseId = "bb-uuid-1"; a.inInventory = true;
+            bagAId = CoffeeBagStorage::insertBagStatic(db, a);
+            CoffeeBag b; b.roasterName = "Other"; b.coffeeName = "Yirg";
+            b.beanBaseId = "bb-uuid-2"; b.inInventory = true;
+            bagBId = CoffeeBagStorage::insertBagStatic(db, b);
+            Recipe r = sampleRecipe(); r.bagId = bagAId;
+            recipeId = RecipeStorage::insertRecipeStatic(db, r);
+        });
+        QVERIFY(recipeId > 0 && bagAId > 0 && bagBId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Re-point to bag B: identity follows the bag.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestRelinkRecipeToBag(recipeId, bagBId);
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        withRawDb(path, "update_patch_check1", [&](QSqlDatabase& db) {
+            const Recipe r = RecipeStorage::loadRecipeStatic(db, recipeId);
+            QCOMPARE(r.bagId, bagBId);
+            QCOMPARE(r.beanBaseId, QString("bb-uuid-2"));
+            QCOMPARE(r.roasterName, QString("Other"));
+            QCOMPARE(r.coffeeName, QString("Yirg"));
+        });
+
+        // Explicit identity in the same patch wins over adoption.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUpdateRecipe(recipeId,
+                {{"bagId", bagAId}, {"roasterName", "Custom"}});
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        withRawDb(path, "update_patch_check2", [&](QSqlDatabase& db) {
+            const Recipe r = RecipeStorage::loadRecipeStatic(db, recipeId);
+            QCOMPARE(r.bagId, bagAId);
+            QCOMPARE(r.roasterName, QString("Custom"));      // explicit wins
+            QCOMPARE(r.beanBaseId, QString("bb-uuid-1"));    // adopted
+        });
+
+        // Dangling bagId: the link field drops, the rest applies.
+        {
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression("unknown bag id"));
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUpdateRecipe(recipeId,
+                {{"bagId", (qint64)999999}, {"name", "Renamed"}});
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        // Dangling bagId as the ONLY field: a clean no-op success.
+        {
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression("unknown bag id"));
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUpdateRecipe(recipeId, {{"bagId", (qint64)888888}});
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        withRawDb(path, "update_patch_check3", [&](QSqlDatabase& db) {
+            const Recipe r = RecipeStorage::loadRecipeStatic(db, recipeId);
+            QCOMPARE(r.name, QString("Renamed"));
+            QCOMPARE(r.bagId, bagAId);  // existing link untouched
+        });
+    }
+
+    // --- relink lifecycle (recipe-bag-lifecycle) ---
+
+    void rollOnFinishHappyPath() {
+        withRawDb(freshDbPath(), "roll_happy", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            qint64 finishedId = 0, openId = 0;
+            insertBeanPair(db, &finishedId, &openId);
+            QVERIFY(finishedId > 0 && openId > 0);
+
+            Recipe r1 = sampleRecipe(); r1.name = "One"; r1.bagId = finishedId;
+            Recipe r2 = sampleRecipe(); r2.name = "Two"; r2.bagId = finishedId;
+            r2.profileTitle = "Different profile";  // no dup collision
+            const qint64 id1 = RecipeStorage::insertRecipeStatic(db, r1);
+            const qint64 id2 = RecipeStorage::insertRecipeStatic(db, r2);
+
+            qint64 target = -1;
+            const QVector<qint64> moved =
+                RecipeStorage::relinkForFinishedBagStatic(db, finishedId, &target);
+            QCOMPARE(target, openId);
+            QCOMPARE(moved.size(), 2);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id1).bagId, openId);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id2).bagId, openId);
+        });
+    }
+
+    void rollOnFinishDupGuard() {
+        withRawDb(freshDbPath(), "roll_dup", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            qint64 finishedId = 0, openId = 0;
+            insertBeanPair(db, &finishedId, &openId);
+
+            // A deliberate comparison pair: same profile + drink type on both
+            // bags. The roll would collapse it — the finished side stays put.
+            Recipe onFinished = sampleRecipe(); onFinished.name = "Old bag"; onFinished.bagId = finishedId;
+            Recipe onOpen = sampleRecipe(); onOpen.name = "New bag"; onOpen.bagId = openId;
+            const qint64 finishedRecipeId = RecipeStorage::insertRecipeStatic(db, onFinished);
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, onOpen) > 0);
+
+            const QVector<qint64> moved =
+                RecipeStorage::relinkForFinishedBagStatic(db, finishedId);
+            QVERIFY(moved.isEmpty());
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, finishedRecipeId).bagId, finishedId);
+        });
+    }
+
+    void rollDifferentDrinkTypeIsNotDup() {
+        withRawDb(freshDbPath(), "roll_type", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            qint64 finishedId = 0, openId = 0;
+            insertBeanPair(db, &finishedId, &openId);
+
+            // Same profile, DIFFERENT drink type — not a duplicate.
+            Recipe latte = sampleRecipe(); latte.name = "Latte"; latte.bagId = finishedId;
+            latte.drinkType = "latte";
+            Recipe espresso = sampleRecipe(); espresso.name = "Espresso"; espresso.bagId = openId;
+            espresso.drinkType = "espresso"; espresso.steamJson.clear();
+            const qint64 latteId = RecipeStorage::insertRecipeStatic(db, latte);
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, espresso) > 0);
+
+            const QVector<qint64> moved =
+                RecipeStorage::relinkForFinishedBagStatic(db, finishedId);
+            QCOMPARE(moved.size(), 1);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, latteId).bagId, openId);
+        });
+    }
+
+    void rollNoSuccessorKeepsLink() {
+        withRawDb(freshDbPath(), "roll_none", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            CoffeeBag only; only.roasterName = "Roaster"; only.coffeeName = "Guji";
+            only.beanBaseId = "bb-uuid-1"; only.inInventory = false;
+            const qint64 bagId = CoffeeBagStorage::insertBagStatic(db, only);
+            Recipe r = sampleRecipe(); r.bagId = bagId;
+            const qint64 recipeId = RecipeStorage::insertRecipeStatic(db, r);
+
+            qint64 target = -1;
+            const QVector<qint64> moved =
+                RecipeStorage::relinkForFinishedBagStatic(db, bagId, &target);
+            QVERIFY(moved.isEmpty());
+            QCOMPARE(target, (qint64)-1);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, recipeId).bagId, bagId);
+        });
+    }
+
+    void wakeOnRestock() {
+        withRawDb(freshDbPath(), "wake", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            CoffeeBag gone; gone.roasterName = "Roaster"; gone.coffeeName = "Guji";
+            gone.beanBaseId = "bb-uuid-1"; gone.inInventory = false;
+            const qint64 goneId = CoffeeBagStorage::insertBagStatic(db, gone);
+
+            // Stale recipe of that bean; a pinned grind must survive the move.
+            Recipe stale = sampleRecipe(); stale.bagId = goneId;
+            stale.grindPinned = "2.4"; stale.rpmPinned = 90;
+            const qint64 staleId = RecipeStorage::insertRecipeStatic(db, stale);
+            // A different bean's stale recipe must NOT wake.
+            Recipe otherBean = sampleRecipe(); otherBean.name = "Other";
+            otherBean.beanBaseId = "bb-other"; otherBean.roasterName = "Else";
+            otherBean.coffeeName = "Where";
+            const qint64 otherId = RecipeStorage::insertRecipeStatic(db, otherBean);
+
+            CoffeeBag restock = gone; restock.inInventory = true;
+            const qint64 newId = CoffeeBagStorage::insertBagStatic(db, restock);
+
+            const QVector<qint64> moved =
+                RecipeStorage::relinkForRestockedBagStatic(db, newId);
+            QCOMPARE(moved.size(), 1);
+            QCOMPARE(moved.first(), staleId);
+            const Recipe woken = RecipeStorage::loadRecipeStatic(db, staleId);
+            QCOMPARE(woken.bagId, newId);
+            // Relink never rewrites grind: the pin is untouched.
+            QCOMPARE(woken.grindPinned, QString("2.4"));
+            QCOMPARE(woken.rpmPinned, (qint64)90);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, otherId).bagId, (qint64)0);
+        });
+    }
+
+    void wakeTwinsMruFirst() {
+        withRawDb(freshDbPath(), "wake_twins", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            // Two stale TWINS (same profile + drink type) of the same bean:
+            // only the most recently used one wakes; the dup-guard holds the
+            // other back for the next restock.
+            Recipe older = sampleRecipe(); older.name = "Older"; older.lastUsedEpoch = 100;
+            Recipe newer = sampleRecipe(); newer.name = "Newer"; newer.lastUsedEpoch = 500;
+            const qint64 olderId = RecipeStorage::insertRecipeStatic(db, older);
+            const qint64 newerId = RecipeStorage::insertRecipeStatic(db, newer);
+
+            CoffeeBag bag; bag.roasterName = "Roaster"; bag.coffeeName = "Guji";
+            bag.beanBaseId = "bb-uuid-1"; bag.inInventory = true;
+            const qint64 bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+
+            const QVector<qint64> moved =
+                RecipeStorage::relinkForRestockedBagStatic(db, bagId);
+            QCOMPARE(moved.size(), 1);
+            QCOMPARE(moved.first(), newerId);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, newerId).bagId, bagId);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, olderId).bagId, (qint64)0);
+        });
+    }
+
+    // Roll matching falls back to case-insensitive roaster+coffee when the
+    // bean has no canonical id (the common non-Bean-Base path), and among
+    // SEVERAL open bags picks the NEWEST (highest id), not the MRU one.
+    void rollIdentityFallbackPicksNewest() {
+        withRawDb(freshDbPath(), "roll_ident", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            CoffeeBag finished; finished.roasterName = "ROASTER"; finished.coffeeName = "guji";
+            finished.inInventory = false;   // no beanBaseId anywhere
+            const qint64 finishedId = CoffeeBagStorage::insertBagStatic(db, finished);
+            CoffeeBag older; older.roasterName = "Roaster"; older.coffeeName = "Guji";
+            older.inInventory = true; older.lastUsedEpoch = 900;  // MRU but older
+            const qint64 olderId = CoffeeBagStorage::insertBagStatic(db, older);
+            CoffeeBag newest = older; newest.lastUsedEpoch = 100;
+            const qint64 newestId = CoffeeBagStorage::insertBagStatic(db, newest);
+            QVERIFY(finishedId > 0 && olderId > 0 && newestId > 0);
+
+            Recipe r = sampleRecipe(); r.beanBaseId.clear(); r.bagId = finishedId;
+            const qint64 recipeId = RecipeStorage::insertRecipeStatic(db, r);
+
+            qint64 target = -1;
+            const QVector<qint64> moved =
+                RecipeStorage::relinkForFinishedBagStatic(db, finishedId, &target);
+            QCOMPARE(moved.size(), 1);
+            QCOMPARE(target, newestId);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, recipeId).bagId, newestId);
+        });
+    }
+
+    // Wake guards: a bag NOT in inventory never wakes anything, and identity
+    // matching is case-insensitive.
+    void wakeGuardsAndCaseInsensitivity() {
+        withRawDb(freshDbPath(), "wake_guards", [](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            Recipe stale = sampleRecipe();
+            stale.beanBaseId.clear();
+            stale.roasterName = "ROASTER"; stale.coffeeName = "GUJI";
+            const qint64 staleId = RecipeStorage::insertRecipeStatic(db, stale);
+
+            // Out-of-inventory bag: no wake.
+            CoffeeBag closed; closed.roasterName = "Roaster"; closed.coffeeName = "Guji";
+            closed.inInventory = false;
+            const qint64 closedId = CoffeeBagStorage::insertBagStatic(db, closed);
+            QVERIFY(RecipeStorage::relinkForRestockedBagStatic(db, closedId).isEmpty());
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, staleId).bagId, (qint64)0);
+
+            // Open bag, different casing: wakes.
+            CoffeeBag open = closed; open.inInventory = true;
+            const qint64 openId = CoffeeBagStorage::insertBagStatic(db, open);
+            const QVector<qint64> moved = RecipeStorage::relinkForRestockedBagStatic(db, openId);
+            QCOMPARE(moved.size(), 1);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, staleId).bagId, openId);
+        });
+    }
+
+    // The async wrappers' observable contract: recipesRelinked (with the
+    // moved ids + target bag id + display name) and recipesChanged fire when
+    // something moved; NOTHING fires when nothing moved — the toast and the
+    // active-cache refresh both hang off exactly this payload.
+    void relinkWrappersSignalContract() {
+        const QString path = freshDbPath();
+        qint64 finishedId = 0, openId = 0, recipeId = 0;
+        withRawDb(path, "wrap_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);  // the drain read below joins shot counts
+            insertBeanPair(db, &finishedId, &openId);
+            Recipe r = sampleRecipe(); r.bagId = finishedId;
+            recipeId = RecipeStorage::insertRecipeStatic(db, r);
+        });
+        QVERIFY(recipeId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Moves: one relinked emission naming the target bag, + recipesChanged.
+        // finishedBagRolled carries the same successor and moved ids, which
+        // MainController follows with the active bag.
+        {
+            QSignalSpy relinked(&storage, &RecipeStorage::recipesRelinked);
+            QSignalSpy changed(&storage, &RecipeStorage::recipesChanged);
+            QSignalSpy rolled(&storage, &RecipeStorage::finishedBagRolled);
+            storage.requestRelinkForFinishedBag(finishedId);
+            QTRY_COMPARE(relinked.count(), 1);
+            QCOMPARE(rolled.count(), 1);
+            QCOMPARE(rolled.at(0).at(1).toLongLong(), openId);
+            QCOMPARE(rolled.at(0).at(2).toList().first().toLongLong(), recipeId);
+            const auto args = relinked.at(0);
+            QCOMPARE(args.at(0).toList().size(), 1);
+            QCOMPARE(args.at(0).toList().first().toLongLong(), recipeId);
+            QCOMPARE(args.at(1).toLongLong(), openId);
+            QCOMPARE(args.at(2).toString(), QString("Guji"));
+            QCOMPARE(changed.count(), 1);
+        }
+
+        // Nothing left to move: silent (no phantom toast) — but the roll still
+        // reports the successor, so an active bag with no recipes follows too.
+        {
+            QSignalSpy relinked(&storage, &RecipeStorage::recipesRelinked);
+            QSignalSpy changed(&storage, &RecipeStorage::recipesChanged);
+            QSignalSpy rolled(&storage, &RecipeStorage::finishedBagRolled);
+            storage.requestRelinkForFinishedBag(finishedId);
+            // Drain the worker with an unrelated read so the relink job has
+            // definitely completed before asserting silence.
+            QSignalSpy inv(&storage, &RecipeStorage::inventoryReady);
+            storage.requestInventory();
+            QTRY_COMPARE(inv.count(), 1);
+            QCOMPARE(relinked.count(), 0);
+            QCOMPARE(changed.count(), 0);
+            QCOMPARE(rolled.count(), 1);
+            QCOMPARE(rolled.at(0).at(1).toLongLong(), openId);
+            QVERIFY(rolled.at(0).at(2).toList().isEmpty());
+        }
+    }
+
+    // --- activation bundle ---
+
+    // requestRecipeForActivation loads recipe + resolved bag in ONE pass and is
+    // the terminus of every activation caller (idle pill, RecipesPage, MCP,
+    // web). Its three documented contracts — happy path, missing recipe emits
+    // an EMPTY map (activation must fail cleanly, NOT hang), and bean-less /
+    // no-linked-bag emits linkedBagId == -1 — are each load-bearing.
+    // drink_type follows the blocks on updates that change them without
+    // setting it (MCP/web edits, steam stamps) — and a stored profile-derived
+    // type (tea/filter) survives a block stamp when the profile didn't change.
+    void updateRederivesDrinkType() {
+        const QString path = freshDbPath();
+        qint64 espressoId = 0, teaId = 0;
+        withRawDb(path, "rederive_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe e; e.name = "Straight"; e.profileTitle = "P"; e.drinkType = "espresso";
+            espressoId = RecipeStorage::insertRecipeStatic(db, e);
+            Recipe t; t.name = "Sencha"; t.profileTitle = "Tea portafilter/Sencha";
+            t.drinkType = "tea";
+            teaId = RecipeStorage::insertRecipeStatic(db, t);
+        });
+        QVERIFY(espressoId > 0 && teaId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Adding a hot-water block to an espresso re-derives to americano.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUpdateRecipe(espressoId, {{"hotWaterJson",
+                "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"after\"}"}});
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(spy.at(0).at(1).toBool());
+        }
+        // A steam stamp on a tea recipe must NOT turn it into a latte.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUpdateRecipe(teaId, {{"steamJson",
+                "{\"hasMilk\":true,\"milkWeightG\":150}"}});
+            QTRY_COMPARE(spy.count(), 1);
+        }
+        // An explicit drinkType from the caller always wins (no re-derive).
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestUpdateRecipe(espressoId, {
+                {"hotWaterJson", "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"before\"}"},
+                {"drinkType", "americano"}});
+            QTRY_COMPARE(spy.count(), 1);
+        }
+        withRawDb(path, "rederive_check", [&](QSqlDatabase& db) {
+            // First update re-derived; third kept the caller's explicit value
+            // (americano, despite the order flipping to "before").
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, espressoId).drinkType,
+                     QString("americano"));
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, teaId).drinkType, QString("tea"));
+        });
+    }
+
+    void updateRederivesDrinkTypeWithBeverageHint() {
+        // The MCP/web update path attaches a transient profileBeverageType
+        // hint (installed profiles embed no JSON; the catalog is main-thread
+        // only). requestUpdateRecipe strips the hint before the column write
+        // and uses it for the drink-type re-derivation — live-caught bug:
+        // without it, switching a recipe to an installed tea profile derived
+        // "espresso".
+        const QString path = freshDbPath();
+        qint64 id = 0;
+        withRawDb(path, "hint_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe r;
+            r.name = "Becomes tea";
+            r.profileTitle = "Default";
+            r.drinkType = "espresso";
+            id = RecipeStorage::insertRecipeStatic(db, r);
+        });
+        QVERIFY(id > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id, {
+            {"profileTitle", "Tea portafilter/black tea"},
+            {"profileBeverageType", "tea_portafilter"}});
+        QTRY_COMPARE(spy.count(), 1);
+        QVERIFY(spy.at(0).at(1).toBool());
+
+        withRawDb(path, "hint_verify", [&](QSqlDatabase& db) {
+            const Recipe updated = RecipeStorage::loadRecipeStatic(db, id);
+            QCOMPARE(updated.profileTitle, QString("Tea portafilter/black tea"));
+            QCOMPARE(updated.drinkType, QString("tea"));
+            // The hint is transient — updateRecipeFieldsStatic never saw it
+            // as a column (an unknown key would have been warned + skipped;
+            // storage round-trip proves no such column landed).
+        });
+    }
+
+    // The storage layer enforces the save invariant against the RESULTING row,
+    // so every surface (wizard, MCP, web) inherits it — the web update route
+    // shipped without the MCP tool's early guard, and neither surface caught
+    // removing the hot-water block from an already profile-less recipe.
+    void updateCannotStrandRecipe() {
+        const QString path = freshDbPath();
+        qint64 espId = 0, hwId = 0;
+        withRawDb(path, "strand_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe esp;
+            esp.name = "Espresso"; esp.profileTitle = "Default"; esp.drinkType = "espresso";
+            espId = RecipeStorage::insertRecipeStatic(db, esp);
+            Recipe hw;  // profile-less hot-water tea
+            hw.name = "Earl Grey"; hw.drinkType = "tea_hotwater";
+            hw.hotWaterJson = "{\"hasWater\":true,\"vesselName\":\"Mug\"}";
+            hwId = RecipeStorage::insertRecipeStatic(db, hw);
+        });
+        QVERIFY(espId > 0 && hwId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Clearing the profile on a non-hot-water recipe is rejected — the row
+        // is untouched. The rejection logs a qWarning naming the recipe; that's
+        // the behaviour under test, so mark it expected (TESTING.md).
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(
+                QString("RecipeStorage.* rejecting update that would strand recipe %1 .*").arg(espId)));
+            storage.requestUpdateRecipe(espId, {{"profileTitle", QString()}});
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(!spy.at(0).at(1).toBool());  // failed
+        }
+        // Removing the hot-water block from a profile-less recipe is rejected
+        // too (the case the per-surface profileTitle guard misses entirely).
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(
+                QString("RecipeStorage.* rejecting update that would strand recipe %1 .*").arg(hwId)));
+            storage.requestUpdateRecipe(hwId, {{"hotWaterJson", QString()}});
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(!spy.at(0).at(1).toBool());
+        }
+        // A hint-only patch (nothing persistable) fails cleanly, not silently.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(
+                QString("RecipeStorage.* update for recipe %1 carried no persistable fields").arg(espId)));
+            storage.requestUpdateRecipe(espId, {{"profileBeverageType", "espresso"}});
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(!spy.at(0).at(1).toBool());
+        }
+        // Both rows survived the rejected updates intact.
+        withRawDb(path, "strand_verify", [&](QSqlDatabase& db) {
+            const Recipe esp = RecipeStorage::loadRecipeStatic(db, espId);
+            QCOMPARE(esp.profileTitle, QString("Default"));
+            QVERIFY(Recipe::saveValidationPasses(esp.name, esp.profileTitle, esp.hotWaterJson));
+            const Recipe hw = RecipeStorage::loadRecipeStatic(db, hwId);
+            QVERIFY(Recipe::hotWaterActive(hw.hotWaterJson));
+        });
+    }
+
+    void isKnownDrinkTypeVocabulary() {
+        for (const QString& t : {QStringLiteral("espresso"), QStringLiteral("filter"),
+                                 QStringLiteral("americano"), QStringLiteral("long_black"),
+                                 QStringLiteral("latte"), QStringLiteral("latte_hotwater"),
+                                 QStringLiteral("tea"), QStringLiteral("tea_hotwater")})
+            QVERIFY2(Recipe::isKnownDrinkType(t), qPrintable(t));
+        QVERIFY(!Recipe::isKnownDrinkType("Tea"));          // case
+        QVERIFY(!Recipe::isKnownDrinkType("cappuccino"));   // typo
+        QVERIFY(!Recipe::isKnownDrinkType(""));
+    }
+
+    // The stored-filter arm of the update re-derivation: a block stamp that
+    // leaves neither milk nor water active must keep drink_type "filter", not
+    // slide to "espresso" (the tea arm is covered above).
+    void updateRederivesPreservesFilter() {
+        const QString path = freshDbPath();
+        qint64 id = 0;
+        withRawDb(path, "filter_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe r;
+            r.name = "Pour"; r.profileTitle = "Filter 2.0"; r.drinkType = "filter";
+            id = RecipeStorage::insertRecipeStatic(db, r);
+        });
+        RecipeStorage storage;
+        storage.initialize(path);
+        QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+        // A steam stamp with hasMilk:false touches a block without changing the
+        // profile — re-derivation must fall back to the stored filter category.
+        storage.requestUpdateRecipe(id, {{"steamJson", "{\"hasMilk\":false}"}});
+        QTRY_COMPARE(spy.count(), 1);
+        QVERIFY(spy.at(0).at(1).toBool());
+        withRawDb(path, "filter_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).drinkType, QString("filter"));
+        });
+    }
+
+    // Adding a hot-water block to a stored latte (via an MCP/web update that
+    // omits drinkType) re-derives to latte_hotwater — the milk+water name.
+    void updateRederivesLatteToLatteHotWater() {
+        const QString path = freshDbPath();
+        qint64 id = 0;
+        withRawDb(path, "lattehw_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe r;
+            r.name = "Flat white"; r.profileTitle = "Espresso 1.0";
+            r.drinkType = "latte"; r.steamJson = "{\"hasMilk\":true}";
+            id = RecipeStorage::insertRecipeStatic(db, r);
+        });
+        RecipeStorage storage;
+        storage.initialize(path);
+        QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id,
+            {{"hotWaterJson", "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"after\"}"}});
+        QTRY_COMPARE(spy.count(), 1);
+        QVERIFY(spy.at(0).at(1).toBool());
+        withRawDb(path, "lattehw_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).drinkType,
+                     QString("latte_hotwater"));
+        });
+    }
+
+    // The symmetric path: removing the hot-water block from a stored
+    // latte_hotwater re-derives back to latte. Guards that the stored-type
+    // preservation branch (which special-cases only tea/filter) does not strand
+    // latte_hotwater when its water goes away.
+    void updateRederivesLatteHotWaterToLatte() {
+        const QString path = freshDbPath();
+        qint64 id = 0;
+        withRawDb(path, "lattehw_rm_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            Recipe r;
+            r.name = "Latte+water"; r.profileTitle = "Espresso 1.0";
+            r.drinkType = "latte_hotwater";
+            r.steamJson = "{\"hasMilk\":true}";
+            r.hotWaterJson = "{\"hasWater\":true,\"vesselName\":\"Cup\",\"order\":\"before\"}";
+            id = RecipeStorage::insertRecipeStatic(db, r);
+        });
+        RecipeStorage storage;
+        storage.initialize(path);
+        QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+        storage.requestUpdateRecipe(id, {{"hotWaterJson", "{\"hasWater\":false}"}});
+        QTRY_COMPARE(spy.count(), 1);
+        QVERIFY(spy.at(0).at(1).toBool());
+        withRawDb(path, "lattehw_rm_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, id).drinkType, QString("latte"));
+        });
+    }
+
+    void requestRecipeForActivation() {
+        const QString path = freshDbPath();
+        qint64 recipeId = 0, bareId = 0, staleId = 0, mruTrapId = 0;
+        qint64 linkedBagId = 0, finishedBagId = 0;
+        withRawDb(path, "act_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            // Two open bags of the same bean: the recipe links the OLDER,
+            // less recently used one — activation must apply exactly it (no
+            // MRU resolution, the whole point of the hard bag link).
+            CoffeeBag linked; linked.roasterName = "Roaster"; linked.coffeeName = "Guji";
+            linked.beanBaseId = "bb-uuid-1"; linked.inInventory = true;
+            linked.lastUsedEpoch = 100;
+            linkedBagId = CoffeeBagStorage::insertBagStatic(db, linked);
+            CoffeeBag mruTwin = linked;
+            mruTwin.lastUsedEpoch = 900;
+            QVERIFY(CoffeeBagStorage::insertBagStatic(db, mruTwin) > 0);
+            // A finished bag for the stale case.
+            CoffeeBag finished = linked; finished.inInventory = false;
+            finishedBagId = CoffeeBagStorage::insertBagStatic(db, finished);
+
+            Recipe r = sampleRecipe();
+            r.bagId = linkedBagId;
+            recipeId = RecipeStorage::insertRecipeStatic(db, r);
+            Recipe stale = sampleRecipe(); stale.name = "Stale";
+            stale.bagId = finishedBagId;
+            staleId = RecipeStorage::insertRecipeStatic(db, stale);
+            // Bean identity but NO bag link (unresolved migration): no
+            // MRU resolution happens at activation anymore.
+            Recipe unlinked = sampleRecipe(); unlinked.name = "Unlinked";
+            mruTrapId = RecipeStorage::insertRecipeStatic(db, unlinked);
+            Recipe bare; bare.name = "Bare";  // no bean link
+            bareId = RecipeStorage::insertRecipeStatic(db, bare);
+        });
+        QVERIFY(recipeId > 0 && bareId > 0 && staleId > 0 && mruTrapId > 0
+                && linkedBagId > 0 && finishedBagId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Happy path: recipe map + the LINKED bag (not the MRU twin), one pass.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeActivationReady);
+            storage.requestRecipeForActivation(recipeId);
+            QTRY_COMPARE(spy.count(), 1);
+            const auto args = spy.at(0);
+            QCOMPARE(args.at(0).toLongLong(), recipeId);
+            QCOMPARE(args.at(1).toMap().value("name").toString(), QString("Morning capp"));
+            QCOMPARE(args.at(2).toLongLong(), linkedBagId);
+        }
+
+        // Stale recipe: the FINISHED bag applies fully — full bag map, no
+        // error, no substitute bag.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeActivationReady);
+            storage.requestRecipeForActivation(staleId);
+            QTRY_COMPARE(spy.count(), 1);
+            const auto args = spy.at(0);
+            QCOMPARE(args.at(2).toLongLong(), finishedBagId);
+            QCOMPARE(args.at(3).toMap().value("inInventory").toBool(), false);
+        }
+
+        // Missing recipe: emits with an EMPTY recipe map (caller fails cleanly).
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeActivationReady);
+            storage.requestRecipeForActivation(999999);
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(spy.at(0).at(1).toMap().isEmpty());
+            QCOMPARE(spy.at(0).at(2).toLongLong(), (qint64)-1);
+        }
+
+        // Bean identity but no bag link: bagId == -1 — activation performs
+        // NO identity resolution (the retired MRU behavior must stay dead).
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeActivationReady);
+            storage.requestRecipeForActivation(mruTrapId);
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(!spy.at(0).at(1).toMap().isEmpty());
+            QCOMPARE(spy.at(0).at(2).toLongLong(), (qint64)-1);
+            QVERIFY(spy.at(0).at(3).toMap().isEmpty());
+        }
+
+        // Bean-less recipe: valid recipe, bagId == -1, empty bag map.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeActivationReady);
+            storage.requestRecipeForActivation(bareId);
+            QTRY_COMPARE(spy.count(), 1);
+            QVERIFY(!spy.at(0).at(1).toMap().isEmpty());
+            QCOMPARE(spy.at(0).at(2).toLongLong(), (qint64)-1);
+            QVERIFY(spy.at(0).at(3).toMap().isEmpty());
+        }
+    }
+
+    // --- async lifecycle: delete guard + clone provenance ---
+
+    void deleteGuardAndClone() {
+        const QString path = freshDbPath();
+        qint64 usedId = 0, unusedId = 0;
+        withRawDb(path, "life_setup", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::ensureTableStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            Recipe used = sampleRecipe(); used.name = "Used";
+            Recipe unused = sampleRecipe(); unused.name = "Unused";
+            usedId = RecipeStorage::insertRecipeStatic(db, used);
+            unusedId = RecipeStorage::insertRecipeStatic(db, unused);
+            insertShotForRecipe(db, usedId);
+        });
+        QVERIFY(usedId > 0 && unusedId > 0);
+
+        RecipeStorage storage;
+        storage.initialize(path);
+
+        // Used recipe refuses deletion (archive is the only exit). The
+        // refusal qWarning fires on the worker thread before recipeDeleted is
+        // queued back, so it lands (and is matched) before the QTRY returns.
+        {
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression("refusing to delete recipe"));
+            QSignalSpy spy(&storage, &RecipeStorage::recipeDeleted);
+            storage.requestDeleteRecipe(usedId);
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(0).toLongLong(), usedId);
+            QCOMPARE(spy.at(0).at(1).toBool(), false);
+        }
+
+        // Unused recipe deletes fine.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeDeleted);
+            storage.requestDeleteRecipe(unusedId);
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+
+        // Clone: all fields copied, provenance points at the source recipe,
+        // the source's golden-shot link is NOT copied.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeCreated);
+            storage.requestCloneRecipe(usedId, "Anna's latte");
+            QTRY_COMPARE(spy.count(), 1);
+            const qint64 cloneId = spy.at(0).at(0).toLongLong();
+            QVERIFY(cloneId > 0);
+            const QVariantMap clone = spy.at(0).at(1).toMap();
+            QCOMPARE(clone.value("name").toString(), QString("Anna's latte"));
+            QCOMPARE(clone.value("doseG").toDouble(), 18.0);
+            QCOMPARE(clone.value("steamJson").toString(), sampleRecipe().steamJson);
+            QCOMPARE(clone.value("clonedFromRecipeId").toLongLong(), usedId);
+            QCOMPARE(clone.value("createdFromShotId").toLongLong(), (qint64)0);
+        }
+
+        // Archive: recipe leaves the active inventory but stays loadable.
+        {
+            QSignalSpy spy(&storage, &RecipeStorage::recipeUpdated);
+            storage.requestArchiveRecipe(usedId);
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        withRawDb(path, "life_verify", [&](QSqlDatabase& db) {
+            QVERIFY(RecipeStorage::loadRecipeStatic(db, usedId).archived);
+            const QVector<InventoryRecipe> active = RecipeStorage::loadInventoryStatic(db, false);
+            for (const InventoryRecipe& e : active)
+                QVERIFY(e.recipe.id != usedId);
+        });
+    }
+
+};
+
+QTEST_MAIN(tst_RecipeStorage)
+#include "tst_recipestorage.moc"

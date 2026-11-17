@@ -1,0 +1,920 @@
+// The bag-picker delegate, the two recipe-card Repeaters and the StarterTile inline
+// component read this file's ids (`recipesPage`, `repointPicker`, `flickable`); Bound
+// makes them statically resolvable. Each delegate declares its one injected role,
+// `modelData`, required in the same edit -- without that, Bound stops role injection
+// and every recipe card loses its recipe at RUNTIME, silently.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import QtQuick.Layouts
+import Decenza
+import "../components/RecipeSearch.js" as RecipeSearch
+
+// Recipes management (add-recipes): mirrors BeanInfoPage — cards in a Flow
+// grid, tap a card to activate the recipe, compact action row per card.
+// A recipe with shots archives (provenance must survive); one without is a
+// mistaken creation and deletes outright — same lifecycle as bags.
+T.Page {
+    id: recipesPage
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: TranslationManager.translate("recipes.title", "Recipes")
+
+    objectName: "recipesPage"
+    background: ThemedPageBackground {}
+
+    StackView.onActivated: {
+        if (retainSearchOnActivation)
+            searchBar.setTextSilently(searchQuery)
+        else
+            searchBar.clear()
+    }
+
+    property var recipes: []
+    property var archivedRecipes: []
+    property bool showArchived: false
+    readonly property bool recipeCommandsEnabled:
+        RecipeService.ready && !RecipeService.loading && !RecipeService.busy
+
+    // Search is transient; sort settings are host-owned and revision-checked.
+    // Defaults reproduce the page's prior order (most-recently-used first).
+    property var contextPreferences: RecipeContext.preferences
+    readonly property string sortField: contextPreferences.recipeSortField || "dateUsed"
+    readonly property string sortDirection: contextPreferences.recipeSortDirection || "DESC"
+    property string searchQuery: ""
+    property bool retainSearchOnActivation: false
+    readonly property var navigationContext: ({searchQuery: searchQuery, showArchived: showArchived})
+    property string _preferenceRequestId: ""
+    property string _preferenceName: ""
+    property var _preferenceMetadata: ({})
+    readonly property bool preferencePending: _preferenceRequestId !== ""
+
+    readonly property var sortFieldLabels: ({
+        "dateUsed": TranslationManager.translate("recipes.sort.dateUsed", "Date used"),
+        "dateCreated": TranslationManager.translate("recipes.sort.dateCreated", "Date created"),
+        "coffee": TranslationManager.translate("recipes.sort.coffee", "Coffee"),
+        "profile": TranslationManager.translate("recipes.sort.profile", "Profile"),
+        "name": TranslationManager.translate("recipes.sort.name", "Name")
+    })
+    readonly property var sortFieldKeys: ["dateUsed", "dateCreated", "coffee", "profile", "name"]
+    // Sensible default direction per key when the user first picks it: recency
+    // newest-first, text A→Z.
+    readonly property var defaultSortDirections: ({
+        "dateUsed": "DESC", "dateCreated": "DESC", "coffee": "ASC", "profile": "ASC", "name": "ASC"
+    })
+
+    // Filtered + sorted copies the card grids render.
+    readonly property var visibleRecipes: filterAndSort(recipes, searchQuery, sortField, sortDirection)
+    readonly property var visibleArchivedRecipes: filterAndSort(archivedRecipes, searchQuery, sortField, sortDirection)
+
+    // Sort key: epoch seconds for the dates, a lower-cased string otherwise.
+    function _sortKey(r, field) {
+        return RecipeSearch.recipeSortKey(r, field)
+    }
+
+    function filterAndSort(list, query, field, dir) {
+        // The drink-type label is searched too, so "latte" or "tea" narrows the list.
+        var tokens = RecipeSearch.tokenize(query)
+        var out = []
+        for (let i = 0; i < list.length; ++i) {
+            let r = list[i]
+            if (tokens.length > 0) {
+                let hay = RecipeSearch.buildHaystack(
+                    r, DrinkType.shortLabel(DrinkType.fromRecipeMap(r)))
+                if (!RecipeSearch.matches(hay, tokens))
+                    continue
+            }
+            out.push(r)
+        }
+        return RecipeSearch.sortedCopy(out, function(r) { return _sortKey(r, field) }, dir)
+    }
+
+    // Profile summaries are replicated with the native profile catalogue.
+    // Embedded recipe JSON remains the fallback for renamed/uninstalled titles.
+
+    // Extract {tempC, yieldG, stepTemps} from a parsed profile object, or null.
+    function _numbersFromProfileObj(d) {
+        if (!d)
+            return null
+        var tempC = Number(d.espresso_temperature) || 0
+        var yieldG = Number(d.target_weight) || 0
+        var temps = []
+        var steps = d.steps || []
+        for (let i = 0; i < steps.length; ++i) {
+            let st = steps[i]
+            let stTemp = st ? Number(st.temperature) : 0
+            if (stTemp > 0)
+                temps.push(stTemp)
+        }
+        // A resolved profile with no explicit per-step temps must still yield a
+        // non-empty array — otherwise ShotPlanText's _tempStr falls through to
+        // the loaded-profile branch, breaking "cards render their own profile"
+        // and silently dropping the recipe's offset. Fall back to the base temp.
+        return {
+            tempC: tempC,
+            yieldG: yieldG,
+            stepTemps: temps.length > 0 ? temps : (tempC > 0 ? [tempC] : [])
+        }
+    }
+
+    function profileNumbersFor(title, profileJson) {
+        if (title === "")
+            return null
+        var summary = ProfileService.profileSummaryForTitle(title)
+        if (summary && Object.keys(summary).length > 0) {
+            return {
+                tempC: Number(summary.baseTempC) || 0,
+                yieldG: Number(summary.yieldG) || 0,
+                stepTemps: summary.stepTempsC || []
+            }
+        }
+        if (ProfileService.findProfileByTitle(title) !== "")
+            return null
+        // Title not installed: the numbers come from this recipe's own embedded
+        // snapshot, which two recipes sharing a (renamed/uninstalled) title may
+        // NOT share — so compute per-call, never cache under the title key.
+        if (profileJson && String(profileJson).length > 0) {
+            try { return _numbersFromProfileObj(JSON.parse(profileJson)) } catch (e) {
+                WebDebugLogger.warn("Recipes", "RecipesPage", ["unparsable embedded profile JSON for", title, ":", e].map(String).join(" "))
+            }
+        }
+        return null
+    }
+
+    function setContextPreference(name, value, metadata) {
+        if (preferencePending || !RecipeContext.ready) return false
+        var requestId = RecipeContext.newRequestId()
+        _preferenceRequestId = requestId
+        _preferenceName = name
+        _preferenceMetadata = metadata || ({})
+        RecipeContext.setPreference(requestId, name, value, RecipeContext.revision)
+        return true
+    }
+
+    Component.onCompleted: {
+        RecipeService.requestInventory()
+        RecipeService.requestArchived()
+        BagService.requestInventory()
+        addRecipeButton.forceActiveFocus()
+    }
+
+    // Open-bag inventory: feeds the stale card's re-point picker and the
+    // cards' product-link lookup for the photo cache (a non-canonical bag's
+    // photo is cached under the BAG's image key "bag-<id>").
+    property var _bags: []
+    Connections {
+        target: BagService
+        function onInventoryReady(bags) { recipesPage._bags = bags }
+        function onBagReady(bagId, bag) {
+            // Only the read restockRecipeBag asked for: a later bagReady for the
+            // same bag (SettingsDye reloading it) must not reset an open form.
+            if (!recipesPage._restockAwaitingBag || bagId !== recipesPage._restockRecipe.bagId) return
+            recipesPage._restockAwaitingBag = false
+            if (!bag || bag.id === undefined) {
+                recipesPage._restockRecipe = null
+                recipesPage.showToast(trRestockFailed.text, true)
+                return
+            }
+            restockDialog.openRestock(bag)
+        }
+        function onBagReadFailed(bagId) {
+            if (!recipesPage._restockAwaitingBag || bagId !== recipesPage._restockRecipe.bagId) return
+            recipesPage._restockAwaitingBag = false
+            recipesPage._restockRecipe = null
+            recipesPage.showToast(trRestockFailed.text, true)
+        }
+        function onBagsChanged() { BagService.requestInventory() }
+    }
+
+    Connections {
+        target: RecipeService
+        // Reloaded data may reflect edited profiles — drop the cached numbers
+        // so cards re-resolve once, then hit the cache on subsequent rebuilds.
+        function onInventoryReady(list) { recipesPage.recipes = list }
+        function onArchivedReady(list) { recipesPage.archivedRecipes = list }
+        // The stale card's re-point is fire-and-forget from the picker — a
+        // failure (bag deleted between snapshot and tap, DB error) must not
+        // look like the tap was ignored.
+        function onRecipeUpdated(recipeId, success) {
+            if (recipeId === recipesPage._restorePendingId) {
+                recipesPage._restorePendingId = -1
+                if (!success) {
+                    // Restoring can now be refused: an active recipe may have
+                    // taken this name while it was archived. Say which fix works.
+                    recipesPage.showToast(
+                        recipesPage._restoreFailReason === "nameInUse"
+                            ? trRestoreNameInUse.text : trRestoreFailed.text, true)
+                }
+                recipesPage._restoreFailReason = ""
+                return
+            }
+            if (recipeId !== recipesPage._repointPendingId)
+                return
+            recipesPage._repointPendingId = -1
+            if (!success)
+                recipesPage.showToast(trRepointFailed.text, true)
+        }
+        function onRecipeUpdateFailed(recipeId, reason) {
+            // Lands just before recipeUpdated(false) and names the cause.
+            if (recipeId === recipesPage._restorePendingId)
+                recipesPage._restoreFailReason = reason
+        }
+        function onOperationCompleted(requestId, operation, success, resultId, reason) {
+            if (success)
+                return
+            if (operation === "archive") {
+                recipesPage.showToast(reason === "conflict"
+                    ? trArchiveConflict.text : trArchiveFailed.text, true)
+            } else if (operation === "delete") {
+                recipesPage.showToast(reason === "hasShots"
+                    ? trDeleteHasShots.text : trDeleteFailed.text, true)
+            }
+        }
+    }
+    Connections {
+        target: RecipeContext
+        function onPreferenceCompleted(requestId, name, success, preferences, reason) {
+            if (requestId !== recipesPage._preferenceRequestId) return
+            const metadata = recipesPage._preferenceMetadata
+            recipesPage._preferenceRequestId = ""
+            recipesPage._preferenceName = ""
+            recipesPage._preferenceMetadata = ({})
+            if (!success) {
+                recipesPage.showToast(TranslationManager.translate(
+                    "recipes.preferences.failed", "Couldn't save recipe settings"), true)
+                return
+            }
+            if (name === "autoLoadRecipeId") {
+                if (metadata.disabled) {
+                    recipesPage.showToast(TranslationManager.translate(
+                        "recipes.toast.auto_load_disabled", "Auto-load disabled"))
+                } else {
+                    recipesPage.showToast(metadata.displaced
+                        ? TranslationManager.translate("recipes.toast.auto_load_set_displaced",
+                            "Auto-load set for %1 (replaced the previous auto-load)").arg(metadata.name)
+                        : TranslationManager.translate("recipes.toast.auto_load_set",
+                            "Auto-load set for %1").arg(metadata.name))
+                }
+            }
+        }
+    }
+    property int _repointPendingId: -1
+    // Restore is fire-and-forget from the archived card; these track the one in
+    // flight so a refusal can be explained instead of looking like a dead button.
+    property int _restorePendingId: -1
+    property string _restoreFailReason: ""
+
+    function showToast(message, isError) {
+        recipesToast.show(message, isError === true)
+        if (AccessibilityManager.enabled)
+            AccessibilityManager.announce(message, true)
+    }
+
+    Tr {
+        id: trRestoreFailed
+        key: "recipes.restore.failed"
+        fallback: "Couldn't restore that recipe"
+        visible: false
+    }
+    Tr {
+        id: trRestoreNameInUse
+        key: "recipes.restore.nameInUse"
+        fallback: "An active recipe already uses this name — rename that one first"
+        visible: false
+    }
+    Tr {
+        id: trRepointFailed
+        key: "recipes.repoint.failed"
+        fallback: "Couldn't move the recipe to that bag"
+        visible: false
+    }
+    Tr {
+        id: trArchiveConflict
+        key: "recipes.archive.conflict"
+        fallback: "This recipe changed before it could be archived. Review its current state and try again."
+        visible: false
+    }
+    Tr {
+        id: trArchiveFailed
+        key: "recipes.archive.failed"
+        fallback: "Couldn't archive this recipe"
+        visible: false
+    }
+    Tr {
+        id: trDeleteHasShots
+        key: "recipes.delete.hasShots"
+        fallback: "This recipe now has shot history. Archive it to keep its history."
+        visible: false
+    }
+    Tr {
+        id: trDeleteFailed
+        key: "recipes.delete.failed"
+        fallback: "Couldn't delete this recipe"
+        visible: false
+    }
+    StatusToast { id: recipesToast }
+
+    Tr { id: trCopyOf; key: "recipes.list.copyOf"; fallback: "Copy of %1"; visible: false }
+
+    function openClone(recipe) {
+        // Clone lands on the wizard summary as a prefilled copy with the name
+        // focused — rename, tweak, save. Provenance points at the source;
+        // the golden-shot link is not copied.
+        var copy = JSON.parse(JSON.stringify(recipe))
+        delete copy.id
+        delete copy.shotCount
+        copy.createdFromShotId = 0
+        copy.clonedFromRecipeId = recipe.id
+        copy.name = trCopyOf.text.arg(recipe.name)
+        AppShell.recipeWizardRequested("create", { prefill: copy })
+    }
+
+    // Restock a recipe's finished bag: the new-bag form prefilled from it; the
+    // saved bag becomes this recipe's bag.
+    property var _restockRecipe: null
+    property bool _restockAwaitingBag: false
+    function restockRecipeBag(recipe) {
+        _restockRecipe = recipe
+        _restockAwaitingBag = true
+        BagService.requestBag(recipe.bagId)
+    }
+    Tr { id: trRestockFailed; key: "recipes.restock.failed"; fallback: "Couldn't read this recipe's bag"; visible: false }
+    ChangeBeansDialog {
+        id: restockDialog
+        context: "inventory"
+        // The new bag goes to the recipe; the active bag stays as the user left it.
+        activateOnSave: false
+        onBagSelected: function(bagId, bag) {
+            if (!recipesPage.recipeCommandsEnabled || !recipesPage._restockRecipe) return
+            recipesPage._repointPendingId = recipesPage._restockRecipe.id
+            RecipeService.requestRelinkRecipeToBag(recipesPage._restockRecipe.id, bagId)
+            recipesPage._restockRecipe = null
+        }
+        onClosed: {
+            recipesPage._restockRecipe = null
+            recipesPage._restockAwaitingBag = false
+        }
+    }
+
+    // The stale card's one-tap re-point: an open-bag picker scoped to one
+    // recipe (recipe-bag-lifecycle "manual re-point"). Selecting a bag only
+    // moves the bag link (the recipe's own grind is untouched by construction).
+    property var _repointRecipe: null
+    DecenzaDialog {
+        id: repointPicker
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(Theme.scaled(520), parent.width - Theme.scaled(40))
+        height: Math.min(Theme.scaled(620), parent.height - Theme.scaled(80))
+        background: Rectangle { color: Theme.surfaceColor; radius: Theme.cardRadius; border.color: Theme.borderColor; border.width: 1 }
+        contentItem: ColumnLayout {
+            spacing: Theme.spacingSmall
+            Label {
+                Layout.fillWidth: true
+                text: TranslationManager.translate("recipes.repoint.title", "Choose beans for %1")
+                    .arg(recipesPage._repointRecipe ? (recipesPage._repointRecipe.name || "") : "")
+                font: Theme.subtitleFont
+                color: Theme.textColor
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.Heading
+                Accessible.name: text
+            }
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                // Kind-matched open bags: a tea recipe re-points to tea bags.
+                model: {
+                    var r = recipesPage._repointRecipe
+                    var wantTea = r && String(DrinkType.fromRecipeMap(r)).indexOf("tea") === 0
+                    var out = []
+                    for (let i = 0; i < recipesPage._bags.length; ++i) {
+                        let b = recipesPage._bags[i]
+                        let isTea = String(b.kind || "") === "tea"
+                        if (isTea === wantTea)
+                            out.push(b)
+                    }
+                    return out
+                }
+                delegate: ItemDelegate {
+                    id: bagRow
+                    required property var modelData
+
+                    width: ListView.view.width
+                    contentItem: ColumnLayout {
+                        spacing: 0
+                        Label {
+                            Layout.fillWidth: true
+                            text: ((bagRow.modelData.roasterName || "") + " " + (bagRow.modelData.coffeeName || "")).trim()
+                            font: Theme.bodyFont
+                            color: Theme.textColor
+                            elide: Text.ElideRight
+                        }
+                        Label {
+                            visible: (bagRow.modelData.roastDate || "") !== ""
+                            text: bagRow.modelData.roastDate || ""
+                            font: Theme.captionFont
+                            color: Theme.textSecondaryColor
+                        }
+                    }
+                    Accessible.role: Accessible.Button
+                    Accessible.name: ((modelData.roasterName || "") + " " + (modelData.coffeeName || "")).trim()
+                    enabled: recipesPage.recipeCommandsEnabled
+                    onClicked: {
+                        if (recipesPage.recipeCommandsEnabled && recipesPage._repointRecipe) {
+                            recipesPage._repointPendingId = recipesPage._repointRecipe.id
+                            RecipeService.requestRelinkRecipeToBag(
+                                recipesPage._repointRecipe.id, bagRow.modelData.id)
+                        }
+                        repointPicker.close()
+                    }
+                }
+            }
+        }
+    }
+
+    // Recipe card: the shared RecipeDrinkCard (also the wizard summary's
+    // hero — design D4) plus this page's action row and tap-to-activate.
+    component RecipeCard: RecipeDrinkCard {
+        id: card
+        property bool archivedCard: false
+
+        readonly property bool selected: recipe && recipe.id !== undefined
+            && recipe.id === RecipeService.activeRecipeId
+        readonly property bool hasShots: recipe && (recipe.shotCount ?? 0) > 0
+        // recipe-auto-load: this card is the current auto-load target.
+        readonly property bool isAutoLoad: recipe && recipe.id !== undefined
+            && recipe.id === Number(recipesPage.contextPreferences.autoLoadRecipeId ?? -1)
+
+        active: selected
+        stale: recipe && recipe.stale === true
+        showStaleAction: !archivedCard && recipesPage.recipeCommandsEnabled
+        onStaleActionClicked: {
+            recipesPage._repointRecipe = card.recipe
+            repointPicker.open()
+        }
+        onPlanClicked: {
+            if (!card.archivedCard && recipesPage.recipeCommandsEnabled)
+                RecipeService.requestActivateRecipe(card.recipe.id)
+        }
+
+        // Bean photo cache key (BeanBaseClient::imageKeyFor).
+        imageKey: recipe ? BeanUiService.bagImageKey(recipe.bagId || 0,
+                                                               recipe.beanBaseId ? String(recipe.beanBaseId) : "")
+                         : ""
+        // Product-page link from the linked bag's blob (lets the cache
+        // backfill a manual bag's photo, same as BagCard).
+        imageLink: {
+            if (!recipe || (recipe.bagId || 0) <= 0) return ""
+            for (let i = 0; i < recipesPage._bags.length; ++i) {
+                let b = recipesPage._bags[i]
+                if (b.id === recipe.bagId && b.beanBaseData && String(b.beanBaseData).length > 0) {
+                    try { return JSON.parse(b.beanBaseData).link || "" } catch (e) { return "" }
+                }
+            }
+            return ""
+        }
+
+        // The plan line needs the profile's base temperature, target weight,
+        // and frame temperatures (the recipe stores only its deltas). These are
+        // resolved once per profile title and memoized on the page
+        // (profileNumbersFor) so the repeated delegate rebuilds from
+        // filtering/sorting don't each re-read the profile catalog. The frame
+        // temps make the card render ITS OWN profile, never the loaded one
+        // (recipe-relative-temp-offset); the recipe's embedded profile JSON
+        // is the fallback for a renamed/uninstalled profile, and a recipe
+        // resolvable by neither shows no temperature segment at all.
+        function refreshProfileNumbers() {
+            var nums = recipesPage.profileNumbersFor(
+                recipe && recipe.profileTitle ? String(recipe.profileTitle) : "",
+                recipe ? recipe.profileJson : "")
+            profileTempC = nums ? nums.tempC : 0
+            profileYieldG = nums ? nums.yieldG : 0
+            profileStepTemps = nums ? nums.stepTemps : []
+        }
+        onRecipeChanged: refreshProfileNumbers()
+        Component.onCompleted: refreshProfileNumbers()
+
+        opacity: archivedCard ? 0.7 : 1.0
+
+        // Tap anywhere on the card to activate (buttons overlay and win).
+        CardTapArea {
+            enabled: !card.archivedCard && recipesPage.recipeCommandsEnabled
+            accessibleName: TranslationManager.translate("recipes.accessible.activate", "Activate recipe %1").arg(card.recipe.name || "")
+            accessibleItem: card
+            onAccessibleClicked: {
+                if (recipesPage.recipeCommandsEnabled)
+                    RecipeService.requestActivateRecipe(card.recipe.id)
+            }
+        }
+
+            // Action row — compact, BagCard-style — rides the shared card's
+            // footer slot so the border encloses it.
+            footer: Flow {
+                Layout.fillWidth: true
+                spacing: Theme.scaled(6)
+                enabled: recipesPage.recipeCommandsEnabled
+
+                // The recipe's bag is finished: a new bag of the same coffee.
+                AccessibleButton {
+                    visible: card.stale && (card.recipe.bagId || 0) > 0
+                    height: Theme.scaled(36)
+                    _customFontSize: Theme.captionFont.pixelSize
+                    leftPadding: Theme.scaled(10)
+                    rightPadding: Theme.scaled(10)
+                    text: TranslationManager.translate("recipes.restock", "Restock")
+                    accessibleName: TranslationManager.translate("recipes.accessible.restock", "Restock: add a new bag of this recipe's coffee")
+                    onClicked: recipesPage.restockRecipeBag(card.recipe)
+                }
+
+                // recipe-auto-load: pin this recipe as the auto-load target.
+                // Reuses pin.svg (ProfileSelectorPage's auto-load glyph) and
+                // StyledIconButton's built-in active/inactive tint — no
+                // confirmation, immediate toggle + toast, matching the
+                // profile card's pattern. Setting this silently clears any
+                // prior profile OR recipe auto-load (mutual exclusion is
+                // wired in Settings; see settings.cpp).
+                StyledIconButton {
+                    visible: !card.archivedCard
+                    enabled: !recipesPage.preferencePending && RecipeContext.ready
+                    width: Theme.scaled(36)
+                    height: Theme.scaled(36)
+                    icon.source: "qrc:/icons/pin.svg"
+                    active: card.isAutoLoad
+                    accessibleName: card.isAutoLoad
+                        ? TranslationManager.translate("recipes.accessible.autoLoadDisable", "Disable auto-load")
+                        : TranslationManager.translate("recipes.accessible.autoLoadSet", "Set auto-load")
+                    onClicked: {
+                        if (card.isAutoLoad) {
+                            recipesPage.setContextPreference("autoLoadRecipeId", -1,
+                                { disabled: true })
+                        } else {
+                            let displaced = ProfileService.autoLoadProfileFilename !== ""
+                                || Number(recipesPage.contextPreferences.autoLoadRecipeId ?? -1) !== -1
+                            recipesPage.setContextPreference("autoLoadRecipeId", card.recipe.id,
+                                { name: card.recipe.name || "", displaced: displaced })
+                        }
+                    }
+                }
+
+                // recipe-auto-load: on-card status for the current auto-load
+                // target only. Spells out "Auto-load" in words (a bare pin
+                // icon doesn't communicate its meaning on its own) plus the
+                // revert-minutes stepper shared with the profile side. No
+                // recipe name (redundant with the card's own title) and no
+                // clear button (redundant with the toggle button above,
+                // which already clears on a second tap).
+                Row {
+                    visible: card.isAutoLoad
+                    height: Theme.scaled(36)
+                    spacing: Theme.scaled(4)
+
+                    ColoredIcon {
+                        anchors.verticalCenter: parent.verticalCenter
+                        source: "qrc:/icons/pin.svg"
+                        iconWidth: Theme.scaled(14)
+                        iconHeight: Theme.scaled(14)
+                        iconColor: Theme.primaryColor
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: TranslationManager.translate("recipes.autoLoad.label", "Auto-load")
+                        color: Theme.textSecondaryColor
+                        font: Theme.captionFont
+                        Accessible.ignored: true
+                    }
+
+                    ValueInput {
+                        id: cardAutoLoadRevertInput
+                        anchors.verticalCenter: parent.verticalCenter
+                        height: Math.round(Theme.captionFont.pixelSize * 1.9)
+                        valueFontPixelSize: Theme.captionFont.pixelSize
+                        value: Number(recipesPage.contextPreferences.autoLoadRevertMinutes || 0)
+                        enabled: !recipesPage.preferencePending && RecipeContext.ready
+                        from: 0
+                        to: 60
+                        stepSize: 1
+                        suffix: TranslationManager.translate("recipes.autoLoad.minutesShort", "min")
+                        displayText: value === 0
+                            ? TranslationManager.translate("recipes.autoLoad.off", "off")
+                            : value + " " + TranslationManager.translate("recipes.autoLoad.minutesShort", "min")
+                        accessibleName: TranslationManager.translate("recipes.accessible.autoLoadRevertAfter", "Auto-load revert after, minutes")
+                        onValueModified: function(newValue) {
+                            recipesPage.setContextPreference("autoLoadRevertMinutes", newValue)
+                        }
+                    }
+                }
+
+                StyledIconButton {
+                    visible: !card.archivedCard
+                    width: Theme.scaled(36)
+                    height: Theme.scaled(36)
+                    icon.source: "qrc:/icons/edit.svg"
+                    accessibleName: TranslationManager.translate("recipes.accessible.edit", "Edit recipe")
+                    onClicked: AppShell.recipeWizardRequested("edit", { editRecipeId: card.recipe.id })
+                }
+
+                AccessibleButton {
+                    visible: !card.archivedCard
+                    height: Theme.scaled(36)
+                    _customFontSize: Theme.captionFont.pixelSize
+                    leftPadding: Theme.scaled(10)
+                    rightPadding: Theme.scaled(10)
+                    text: TranslationManager.translate("recipes.action.clone", "Clone")
+                    accessibleName: TranslationManager.translate("recipes.accessible.clone", "Clone this recipe")
+                    onClicked: recipesPage.openClone(card.recipe)
+                }
+
+                // Used recipe: archive (history keeps its name). Same rule
+                // and wording pattern as "Bag finished".
+                AccessibleButton {
+                    visible: !card.archivedCard && card.hasShots
+                    height: Theme.scaled(36)
+                    _customFontSize: Theme.captionFont.pixelSize
+                    leftPadding: Theme.scaled(10)
+                    rightPadding: Theme.scaled(10)
+                    text: TranslationManager.translate("recipes.action.archive", "Archive")
+                    accessibleName: TranslationManager.translate("recipes.accessible.archive", "Archive: remove from the list; shot history is kept")
+                    onClicked: {
+                        RecipeService.requestArchiveRecipe(card.recipe.id)
+                    }
+                }
+
+                // No shots yet: a mistaken creation — delete outright.
+                StyledIconButton {
+                    visible: !card.archivedCard && !card.hasShots
+                    width: Theme.scaled(36)
+                    height: Theme.scaled(36)
+                    icon.source: "qrc:/icons/trash.svg"
+                    accessibleName: TranslationManager.translate("recipes.accessible.delete", "Delete recipe")
+                    accessibleDescription: TranslationManager.translate("recipes.accessible.deleteHint", "Deletes this unused recipe entirely")
+                    onClicked: {
+                        RecipeService.requestDeleteRecipe(card.recipe.id)
+                    }
+                }
+
+                // Archived card: restore is the only action.
+                AccessibleButton {
+                    visible: card.archivedCard
+                    height: Theme.scaled(36)
+                    _customFontSize: Theme.captionFont.pixelSize
+                    leftPadding: Theme.scaled(10)
+                    rightPadding: Theme.scaled(10)
+                    text: TranslationManager.translate("recipes.action.restore", "Restore")
+                    accessibleName: TranslationManager.translate("recipes.accessible.restore", "Restore this archived recipe")
+                    onClicked: {
+                        recipesPage._restorePendingId = card.recipe.id
+                        recipesPage._restoreFailReason = ""
+                        RecipeService.requestUnarchiveRecipe(card.recipe.id)
+                    }
+                }
+            }
+    }
+
+    // The search field is the page's only text input; this gives it the
+    // keyboard handling (and tap-outside dismissal) every text page gets.
+    KeyboardAwareContainer {
+        anchors.fill: parent
+        textFields: [searchBar.field]
+        targetFlickable: flickable
+
+        Flickable {
+            id: flickable
+            anchors.fill: parent
+            anchors.topMargin: Theme.pageTopMargin
+            anchors.bottomMargin: Theme.bottomBarHeight
+            anchors.leftMargin: Theme.standardMargin
+            anchors.rightMargin: Theme.standardMargin
+            contentHeight: contentColumn.implicitHeight + Theme.scaled(20)
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            ColumnLayout {
+                id: contentColumn
+                width: flickable.width
+                spacing: Theme.spacingMedium
+
+                // Header row: title + "Add [Recipe]" (the Beans and Equipment pattern)
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spacingMedium
+                    Tr {
+                        key: "recipes.title"
+                        fallback: "Recipes"
+                        font: Theme.titleFont
+                        color: Theme.textColor
+                        Accessible.role: Accessible.Heading
+                        Accessible.name: text
+                    }
+                    Item { Layout.fillWidth: true }
+                    AddLabel {}
+                    AccessibleButton {
+                        id: addRecipeButton
+                        Layout.preferredHeight: Theme.scaled(44)
+                        icon.source: "qrc:/icons/cup.svg"
+                        text: TranslationManager.translate("recipes.addButton.recipe", "Recipe")
+                        accessibleName: TranslationManager.translate("recipes.accessible.add", "Add a new recipe")
+                        enabled: recipesPage.recipeCommandsEnabled
+                        onClicked: AppShell.recipeWizardRequested("create", {})
+                    }
+                }
+
+                // Search + sort, shown once there is anything to organize.
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: recipesPage.recipes.length > 0 || recipesPage.archivedRecipes.length > 0
+                    spacing: Theme.spacingSmall
+
+                    SearchField {
+                        id: searchBar
+                        Layout.fillWidth: true
+                        placeholder: TranslationManager.translate("recipes.searchPlaceholder", "Search recipes...")
+                        accessibleName: TranslationManager.translate("recipes.accessible.search", "Search recipes")
+                        onQueryChanged: function(query) { recipesPage.searchQuery = query }
+                    }
+
+                    SortControls {
+                        keys: recipesPage.sortFieldKeys
+                        labels: recipesPage.sortFieldLabels
+                        defaultDirections: recipesPage.defaultSortDirections
+                        field: recipesPage.sortField
+                        direction: recipesPage.sortDirection
+                        enabled: !recipesPage.preferencePending && RecipeContext.ready
+                        onSortChanged: function(field, direction) {
+                            recipesPage.setContextPreference("recipeSort",
+                                { field: field, direction: direction })
+                        }
+                    }
+                }
+
+                // Empty state: two starter tiles teach both creation paths —
+                // promote a good shot from history, or walk the wizard.
+                Flow {
+                    visible: recipesPage.recipes.length === 0
+                    Layout.fillWidth: true
+                    Layout.topMargin: Theme.spacingMedium
+                    spacing: Theme.spacingMedium
+
+                    component StarterTile: Rectangle {
+                        id: tile
+                        property string icon: ""
+                        property string title: ""
+                        property string subtitle: ""
+                        signal tapped()
+                        width: {
+                            var avail = flickable.width
+                            var columns = avail >= Theme.scaled(640) ? 2 : 1
+                            return (avail - (columns - 1) * Theme.spacingMedium) / columns
+                        }
+                        implicitHeight: tileColumn.implicitHeight + 2 * Theme.spacingLarge
+                        radius: Theme.cardRadius
+                        color: Theme.cardBackgroundColor
+                        border.color: Theme.borderColor
+                        border.width: 1
+                        ColumnLayout {
+                            id: tileColumn
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.leftMargin: Theme.spacingLarge
+                            anchors.rightMargin: Theme.spacingLarge
+                            spacing: Theme.spacingSmall
+                            ColoredIcon {
+                                Layout.alignment: Qt.AlignHCenter
+                                source: tile.icon
+                                iconWidth: Theme.scaled(40)
+                                iconHeight: Theme.scaled(40)
+                                iconColor: Theme.primaryColor
+                                Accessible.ignored: true
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                horizontalAlignment: Text.AlignHCenter
+                                text: tile.title
+                                font: Theme.subtitleFont
+                                color: Theme.textColor
+                                wrapMode: Text.WordWrap
+                                Accessible.ignored: true
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                horizontalAlignment: Text.AlignHCenter
+                                text: tile.subtitle
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                                Accessible.ignored: true
+                            }
+                        }
+                        AccessibleMouseArea {
+                            anchors.fill: parent
+                            accessibleName: tile.title + ", " + tile.subtitle
+                            accessibleItem: tile
+                            onAccessibleClicked: tile.tapped()
+                        }
+                    }
+
+                    StarterTile {
+                        icon: "qrc:/icons/history.svg"
+                        title: TranslationManager.translate("recipes.empty.fromShot", "Start from a good shot")
+                        subtitle: TranslationManager.translate("recipes.empty.fromShotHint",
+                            "Pick a shot you liked in history and save it as a recipe")
+                        onTapped: AppShell.shotHistoryRequested({})
+                    }
+                    StarterTile {
+                        icon: "qrc:/icons/plus.svg"
+                        title: TranslationManager.translate("recipes.empty.fromScratch", "Build from scratch")
+                        subtitle: TranslationManager.translate("recipes.empty.fromScratchHint",
+                            "Walk through drink, beans, profile, and details")
+                        onTapped: AppShell.recipeWizardRequested("create", {})
+                    }
+                }
+
+                // Card grid (BeanInfoPage pattern: fixed base width, computed columns)
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: Theme.spacingMedium
+
+                    Repeater {
+                        model: recipesPage.visibleRecipes
+                        delegate: RecipeCard {
+                            required property var modelData
+
+                            recipe: modelData
+                            width: Theme.cardGridWidth(flickable.width)
+                        }
+                    }
+                }
+
+                // No-matches state: a search that matches nothing anywhere —
+                // neither active nor archived (so a match hiding in the collapsed
+                // archived section never triggers a false "nothing matches"). The
+                // archived toggle below still shows its matching count so the user
+                // can reach any archived-only matches. Distinct from the "no
+                // recipes yet" starter tiles (a genuinely empty library).
+                Label {
+                    Layout.fillWidth: true
+                    Layout.topMargin: Theme.spacingMedium
+                    visible: recipesPage.searchQuery.length > 0
+                             && (recipesPage.recipes.length + recipesPage.archivedRecipes.length) > 0
+                             && recipesPage.visibleRecipes.length === 0
+                             && recipesPage.visibleArchivedRecipes.length === 0
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    text: TranslationManager.translate("recipes.noMatches", "No recipes match your search")
+                    font: Theme.bodyFont
+                    color: Theme.textSecondaryColor
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: text
+                }
+
+                // --- Archived section ---
+                // Count and visibility track the FILTERED archived set: with a
+                // search active the toggle only appears when archived recipes match
+                // and its count reflects the matches (with no search,
+                // visibleArchivedRecipes == archivedRecipes, so behaviour is
+                // unchanged).
+                AccessibleButton {
+                    visible: recipesPage.visibleArchivedRecipes.length > 0
+                    Layout.preferredHeight: Theme.scaled(36)   // Layout child: raw height is ignored
+                    _customFontSize: Theme.captionFont.pixelSize
+                    leftPadding: Theme.scaled(10)
+                    rightPadding: Theme.scaled(10)
+                    text: (recipesPage.showArchived
+                           ? TranslationManager.translate("recipes.archived.hide", "Hide archived")
+                           : TranslationManager.translate("recipes.archived.show", "Show archived"))
+                          + " (" + recipesPage.visibleArchivedRecipes.length + ")"
+                    accessibleName: text
+                    onClicked: recipesPage.showArchived = !recipesPage.showArchived
+                }
+
+                Flow {
+                    visible: recipesPage.showArchived
+                    Layout.fillWidth: true
+                    spacing: Theme.spacingMedium
+
+                    Repeater {
+                        model: recipesPage.showArchived ? recipesPage.visibleArchivedRecipes : []
+                        delegate: RecipeCard {
+                            required property var modelData
+
+                            recipe: modelData
+                            archivedCard: true
+                            width: Theme.cardGridWidth(flickable.width)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    BottomBar {
+        barColor: "transparent"
+        onBackClicked: AppShell.backRequested()
+    }
+}

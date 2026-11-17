@@ -1,0 +1,1591 @@
+#include "core/diagnosticlogging.h"
+#include "machinestate.h"
+
+#include "core/logtags.h"
+#include "sawlogging.h"
+#include "../ble/de1logging.h"
+#include "../ble/de1device.h"
+#include "../ble/scaledevice.h"
+#include "../ble/scales/scaletypeids.h"
+#include "../ble/scales/scalelogging.h"
+#include "../core/settings.h"
+#include "../core/settings_calibration.h"  // currentScaleType()/setServingScale() — settings.h
+                                           // only forward-declares the domain sub-objects
+#include "../core/settings_brew.h"
+#include "../controllers/shottimingcontroller.h"
+#include <algorithm>
+#include <QDateTime>
+#include <QDebug>
+#include <QMetaEnum>
+#include <QUuid>
+
+// MachineState carries no logMessage signal, so the stderr form. Aliased, never
+// copied — see de1logging.h.
+#define STANDBY_LOG(msg)  DE1_LOG_STDERR_TAGGED("StandbySwitch", msg)
+#define STANDBY_INFO(msg) DE1_INFO_STDERR_TAGGED("StandbySwitch", msg)
+
+MachineState::MachineState(DE1Device* device, QObject* parent)
+    : QObject(parent)
+    , m_device(device)
+    , m_controlContextId(QUuid::createUuid().toString(QUuid::WithoutBraces))
+{
+    m_waterSettle.setSingleShot(true);
+    m_waterSettle.setInterval(1500);
+    connect(&m_waterSettle, &QTimer::timeout, this, [this] { finishWaterCapture(false, true); });
+    m_weightEmitTimer.start();
+    m_flowRateEmitTimer.start();
+
+    // hotWaterTargetWeight() reads m_phase.
+    connect(this, &MachineState::phaseChanged, this, &MachineState::hotWaterTargetWeightChanged);
+
+    // Trailing-edge timers: start on the first update suppressed by the 10Hz
+    // throttle. When they fire 100ms later, QML re-reads the property getter,
+    // picking up whatever the latest cached value is at that point.
+    m_weightTrailingTimer = new QTimer(this);
+    m_weightTrailingTimer->setSingleShot(true);
+    m_weightTrailingTimer->setInterval(100);
+    connect(m_weightTrailingTimer, &QTimer::timeout, this, [this]() {
+        m_weightEmitTimer.restart();
+        emit scaleWeightChanged();
+    });
+
+    m_flowRateTrailingTimer = new QTimer(this);
+    m_flowRateTrailingTimer->setSingleShot(true);
+    m_flowRateTrailingTimer->setInterval(100);
+    connect(m_flowRateTrailingTimer, &QTimer::timeout, this, [this]() {
+        m_flowRateEmitTimer.restart();
+        emit scaleFlowRateChanged();
+    });
+
+    m_shotTimer = new QTimer(this);
+    m_shotTimer->setInterval(100);  // Update every 100ms
+    connect(m_shotTimer, &QTimer::timeout, this, &MachineState::onShotTimerTick);
+
+    // How long Error_NoAC must persist before it counts as the standby switch.
+    //
+    // 6 s is OUR estimate, not a figure from anywhere: the one field observation we
+    // have is a spurious episode of "about three seconds" on a single machine
+    // (firmware v1363, #1893), and this is that plus margin. de1app is NOT precedent
+    // for it — see the note at the standbySwitchOpen computation.
+    m_noAcSettleTimer = new QTimer(this);
+    m_noAcSettleTimer->setSingleShot(true);
+    m_noAcSettleTimer->setInterval(6000);
+    connect(m_noAcSettleTimer, &QTimer::timeout, this, [this]() {
+        m_noAcSettled = true;
+        updatePhase();
+    });
+
+    if (m_device) {
+        connect(m_device, &DE1Device::stateChanged, this, &MachineState::onDE1StateChanged);
+        connect(m_device, &DE1Device::subStateChanged, this, &MachineState::onDE1SubStateChanged);
+        connect(m_device, &DE1Device::connectedChanged, this, &MachineState::updatePhase);
+        // standbySwitchOpen's firmware gate needs this too: firmwareBuildNumber() starts at 0
+        // (unknown) and is only populated later by an MMR read, well after the STATE_INFO read
+        // that can already be reporting Error_NoAC at connect. Without this, a machine already
+        // in Error_NoAC when the app launches never gets re-evaluated once the firmware build
+        // number lands — Error_NoAC is latching, so no later STATE_INFO notification would ever
+        // re-trigger it. de1app hits this exact gap and papers over it with an `after 6000`
+        // timer (de1_de1.tcl); a signal-driven recheck is the event-based equivalent this
+        // project's no-timers-as-guards rule calls for.
+        connect(m_device, &DE1Device::firmwareVersionChanged, this, &MachineState::updatePhase);
+
+        // Sync initial phase from device (handles case where device was already
+        // connected before MachineState was constructed, e.g. simulator mode)
+        updatePhase();
+    }
+}
+
+MachineState::~MachineState() {
+    // The provider installed in syncServingScale() captures `this`. Settings is not
+    // owned by MachineState and outlives it in the tests that build both on the stack,
+    // so leaving a dangling closure behind would turn any later currentScaleType()
+    // into a use-after-free.
+    if (m_settings && m_settings->calibration())
+        m_settings->calibration()->setServingScaleTypeProvider(nullptr);
+}
+
+bool MachineState::isFlowing() const {
+    // For steam, only count as flowing during SubState::Steaming or
+    // SubState::Pouring (whitelist). All other substates that map to
+    // Phase::Steaming — Puffing, Ending, FinalHeating, PausedSteam, etc. —
+    // return false.
+    if (m_phase == Phase::Steaming && m_device) {
+        DE1::SubState subState = m_device->subState();
+        return subState == DE1::SubState::Steaming ||
+               subState == DE1::SubState::Pouring;
+    }
+
+    // Phase::Transport (air purge) is deliberately excluded: no scale
+    // participates and no shot/purge timer UI reads shotTime, so it needs no
+    // flow tracking. Add it here only if a purge-elapsed readout is introduced.
+    return m_phase == Phase::Preinfusion ||
+           m_phase == Phase::Pouring ||
+           m_phase == Phase::HotWater ||
+           m_phase == Phase::Flushing ||
+           m_phase == Phase::Descaling ||
+           m_phase == Phase::Cleaning;
+}
+
+bool MachineState::isHeating() const {
+    return m_phase == Phase::Heating;
+}
+
+bool MachineState::isReady() const {
+    // de1app does no state check — it sends commands directly and lets the DE1
+    // firmware decide. Including Heating here lets users queue operations while
+    // the machine warms up, matching that behavior.
+    return m_phase == Phase::Ready || m_phase == Phase::Idle ||
+           m_phase == Phase::Sleep || m_phase == Phase::Heating;
+}
+
+bool MachineState::isOperating() const {
+    return m_phase != Phase::Disconnected && m_phase != Phase::Sleep && m_phase != Phase::Idle
+           && m_phase != Phase::Heating && m_phase != Phase::Ready && m_phase != Phase::Refill;
+}
+
+double MachineState::shotTime() const {
+    // Use timing controller only for espresso phases
+    bool isEspressoPhase = (m_phase == Phase::EspressoPreheating ||
+                           m_phase == Phase::Preinfusion ||
+                           m_phase == Phase::Pouring ||
+                           m_phase == Phase::Ending);
+    if (m_timingController && isEspressoPhase) {
+        return m_timingController->shotTime();
+    }
+    // Use local timer for steam/hot water/flush and fallback
+    if (m_shotTimer->isActive() && m_shotStartTime > 0) {
+        qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_shotStartTime;
+        return elapsed / 1000.0;
+    }
+    return m_shotTime;
+}
+
+QString MachineState::phaseString() const {
+    QMetaEnum metaEnum = QMetaEnum::fromType<Phase>();
+    return QString::fromLatin1(metaEnum.valueToKey(static_cast<int>(m_phase)));
+}
+
+ScaleDevice* MachineState::scale() const {
+    return m_scale;
+}
+
+void MachineState::setScale(ScaleDevice* scale) {
+    if (m_scale == scale) {
+        // Same scale pointer — just refresh QML, don't add duplicate connections.
+        // Without this guard, each call adds 2 more signal connections that never
+        // get disconnected, causing progressive main-thread congestion over days.
+        if (m_scale) {
+            emit scaleWeightChanged();
+            emit scaleFlowRateChanged();
+        }
+        return;
+    }
+
+    if (m_waterCapturing) {
+        if (m_waterSettle.isActive()) finishWaterCapture();
+        else m_waterScaleValid = false;
+    }
+    if (m_scale) {
+        disconnect(m_scale, nullptr, this, nullptr);
+        m_weightTrailingTimer->stop();
+        m_flowRateTrailingTimer->stop();
+    }
+
+    m_scale = scale;
+    // The window describes ONE device's sample stream; carrying it across a swap
+    // would mix two scales' readings into one stillness verdict.
+    resetAutoTareWindow();
+
+    if (m_scale) {
+        connect(m_scale, &ScaleDevice::weightChanged,
+                this, &MachineState::onScaleWeightChanged);
+        // Separate slot on purpose. The settle window counts sample ARRIVALS, and
+        // ScaleDevice::setWeight dedupes weightChanged on value (the
+        // `if (m_weight != weight)` guard) — so a cup sitting perfectly still emits
+        // nothing and would never fill the window. Constant-weight windows are real
+        // here; the scale-feed liveness detector exists because of them (#1176).
+        // Routing weightSampleReceived into onScaleWeightChanged instead would run
+        // that whole slot twice per changed sample — MQTT relay, hot-water baseline
+        // burst log and all — which scaledevice.cpp:165-167 documents it must not.
+        connect(m_scale, &ScaleDevice::weightSampleReceived,
+                this, &MachineState::onScaleWeightSample);
+        // Relay weight changes to QML via scaleWeightChanged signal (throttled to 10Hz)
+        // LSLR flow rate is computed by WeightProcessor on a worker thread
+        // and cached via updateCachedFlowRates()
+        connect(m_scale, &ScaleDevice::weightChanged, this, [this](double) {
+            if (m_weightEmitTimer.elapsed() >= 100) {  // 10Hz cap
+                m_weightEmitTimer.restart();
+                m_weightTrailingTimer->stop();
+                emit scaleWeightChanged();
+            } else if (!m_weightTrailingTimer->isActive()) {
+                m_weightTrailingTimer->start();
+            }
+        });
+        // activeScaleType() answers differently once the link comes up or drops, and
+        // nothing else would tell QML. Same connection lifetime as the weight relays
+        // above (disconnected wholesale on the next swap).
+        connect(m_scale, &ScaleDevice::connectedChanged,
+                this, &MachineState::activeScaleTypeChanged);
+        connect(m_scale, &ScaleDevice::connectedChanged, this, [this] {
+            if (m_waterCapturing && !m_scale->isConnected()) {
+                if (m_waterSettle.isActive()) m_waterWeightClosed = true;
+                else m_waterScaleValid = false;
+                m_waterSawLearningEligible = false;
+            }
+        });
+        // Emit immediately so QML picks up current weight
+        emit scaleWeightChanged();
+        emit scaleFlowRateChanged();
+    }
+
+    emit activeScaleTypeChanged();
+}
+
+void MachineState::syncServingScale() {
+    // SettingsCalibration resolves the SAW pool key for every consumer, so it needs to
+    // know which scale is serving. Hand it a closure over m_scale rather than the value:
+    // main.cpp swaps the serving scale at a dozen device-event sites and connectedChanged
+    // fires independently of those, so a pushed value would need re-pushing from both
+    // and would be wrong the first time one was missed. Reading live state cannot go
+    // stale, so this only has to be installed once.
+    //
+    // Raw identity only — empty when nothing real is connected. The canonical-vocabulary
+    // test and the saved-scale fallback belong to SettingsCalibration, and duplicating
+    // either here would recreate the second implementation this refactor removed.
+    if (!m_settings || !m_settings->calibration())
+        return;
+    m_settings->calibration()->setServingScaleTypeProvider([this]() -> QString {
+        return m_scale && m_scale->isConnected() ? m_scale->type() : QString();
+    });
+}
+
+QString MachineState::activeScaleType() const {
+    // Forwarder. The resolution itself lives on SettingsCalibration, which owns the
+    // SAW pools and which every consumer already holds a pointer to — so a call site
+    // that needs the key does NOT need a MachineState. This property exists purely to
+    // expose it to QML (the Calibration tab) with a notify signal; it is not a second
+    // implementation, and must never become one.
+    //
+    // The fallback to the saved type when the serving scale is virtual is only safe
+    // for the PREDICTION read: flow-derived shots must not feed SAW learning at all,
+    // which is enforced upstream by the isFlowScale() guard in
+    // ShotTimingController::onSettlingComplete() — see the reasoning there. Were that
+    // guard removed, this fallback is the exact mechanism by which a scale-less shot
+    // would write into a physical scale's pool.
+    return m_settings && m_settings->calibration()
+               ? m_settings->calibration()->currentScaleType() : QString();
+}
+
+QString MachineState::activeScaleName() const {
+    const QString saved = m_settings ? m_settings->scaleType() : QString();
+    const QString active = activeScaleType();
+
+    // Normal case: the serving scale IS the saved primary, so the user's own label
+    // (which may be a custom name) is both correct and the friendlier answer.
+    if (active == saved)
+        return m_settings ? m_settings->scaleName() : QString();
+
+    // Diverged — the saved label names a scale that is not serving. Report the
+    // canonical name of the one that is; a stale label next to a live model is
+    // exactly the confusion activeScaleType exists to remove.
+    const QString name = ScaleTypeIds::scaleTypeNameForId(active);
+    return name.isEmpty() ? (m_settings ? m_settings->scaleName() : QString()) : name;
+}
+
+
+void MachineState::setSettings(Settings* settings) {
+    if (m_settings == settings) return;
+    if (m_settings) {
+        disconnect(m_settings, nullptr, this, nullptr);
+        disconnect(m_settings->brew(), nullptr, this, nullptr);
+    }
+
+    m_settings = settings;
+
+    // activeScaleType()/activeScaleName() fall back to the SAVED scale whenever the
+    // serving one is virtual or disconnected — which is the common case, since the app
+    // starts on FlowScale. Without these, changing the primary scale (Connections tab,
+    // removing a known scale, a settings restore) would move the answer while every
+    // QML binding on it kept the old value. The Calibration tab would then show one
+    // pool's lag and model tier while its reset button — an imperative read, not a
+    // binding — cleared a different pool. That read/write divergence is precisely what
+    // activeScaleType exists to prevent, so leaving it unwired would have reintroduced
+    // the bug one layer up.
+    if (m_settings) {
+        connect(m_settings, &Settings::scaleTypeChanged,
+                this, &MachineState::activeScaleTypeChanged);
+        connect(m_settings, &Settings::scaleNameChanged,
+                this, &MachineState::activeScaleTypeChanged);
+        // A vessel picked mid-pour replaces the target the -/+ was relative to.
+        connect(m_settings->brew(), &SettingsBrew::waterVolumeChanged, this, [this]() {
+            m_hotWaterTargetAdjustG = 0.0;
+            emit hotWaterTargetWeightChanged();
+        });
+    }
+
+    syncServingScale();
+    emit activeScaleTypeChanged();
+}
+
+void MachineState::setTimingController(ShotTimingController* controller) {
+    m_timingController = controller;
+    if (m_timingController) {
+        // Forward timing controller signals
+        connect(m_timingController, &ShotTimingController::shotTimeChanged,
+                this, &MachineState::shotTimeChanged);
+        // Handle tare complete - need to update m_tareCompleted flag AND emit signal
+        connect(m_timingController, &ShotTimingController::tareCompleteChanged,
+                this, &MachineState::onTimingControllerTareComplete);
+    }
+}
+
+void MachineState::setTargetWeight(double weight) {
+    if (m_targetWeight != weight) {
+        m_targetWeight = weight;
+        emit targetWeightChanged();
+    }
+}
+
+void MachineState::setTargetVolume(double volume) {
+    if (m_targetVolume != volume) {
+        m_targetVolume = volume;
+        emit targetVolumeChanged();
+    }
+}
+
+double MachineState::hotWaterTargetWeight() const {
+    const double saved = m_settings ? m_settings->brew()->waterVolume() : 0.0;
+    return m_phase == Phase::HotWater ? saved + m_hotWaterTargetAdjustG : saved;
+}
+
+bool MachineState::adjustHotWaterTarget(double deltaG) {
+    if (m_phase != Phase::HotWater || m_stopAtWeightTriggered || !m_settings
+        || m_settings->brew()->waterVolumeMode() == QLatin1String("volume")
+        || !m_scale || !m_scale->isConnected() || m_scale->isFlowScale())
+        return false;
+
+    // The saved volume itself is unbounded (MCP, settings import), so a range-only clamp
+    // would turn +10 on a saved 600 g into a drop to 500 g.
+    const double current = hotWaterTargetWeight();
+    const double target = std::clamp(current + deltaG, std::min(MinHotWaterTargetG, current),
+                                     std::max(MaxHotWaterTargetG, current));
+    if (target == current) return true;
+    m_hotWaterTargetAdjustG = target - m_settings->brew()->waterVolume();
+    SAW_INFO_STDERR("HotWater", QStringLiteral("Target adjusted for this pour: %1 g -> %2 g (saved %3 g unchanged)")
+        .arg(current, 0, 'f', 0).arg(target, 0, 'f', 0).arg(m_settings->brew()->waterVolume()));
+    emit hotWaterTargetWeightChanged();
+    return true;
+}
+
+void MachineState::onDE1StateChanged() {
+    updatePhase();
+}
+
+void MachineState::onDE1SubStateChanged() {
+    updatePhase();
+}
+
+void MachineState::updateControlContextId()
+{
+    const bool connected = m_device && m_device->isConnected();
+    const DE1::State state = m_device ? m_device->state() : DE1::State::Idle;
+    const DE1::SubState subState = m_device ? m_device->subState() : DE1::SubState::Ready;
+    if (!m_controlContextInitialized) {
+        m_controlContextConnected = connected;
+        m_controlContextState = state;
+        m_controlContextSubState = subState;
+        m_controlContextInitialized = true;
+        return;
+    }
+    if (connected == m_controlContextConnected && state == m_controlContextState
+        && subState == m_controlContextSubState) {
+        return;
+    }
+    m_controlContextConnected = connected;
+    m_controlContextState = state;
+    m_controlContextSubState = subState;
+    m_controlContextId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    emit controlContextIdChanged();
+}
+
+namespace {
+// The substates that mean "the machine is heating and water has NOT reached the puck
+// yet". Shared deliberately: updatePhase() uses it to decide
+// Phase::EspressoPreheating, and the auto-tare gate re-checks the substate directly
+// because m_phase lags behind BLE state changes. That second read is only sound
+// while both agree — as two hand-written copies they could drift apart, and the
+// failure would be silent: a substate added here alone re-opens the window in which
+// a tare can fire on a moving cell.
+bool isPreFlowSubState(DE1::SubState subState) {
+    return subState == DE1::SubState::Heating ||
+           subState == DE1::SubState::FinalHeating ||
+           subState == DE1::SubState::Stabilising;
+}
+}  // namespace
+
+void MachineState::updatePhase() {
+    // Rotate before any phase notification is queued so delayed controls cannot
+    // apply against a later raw DE1 state/substate or connection.
+    updateControlContextId();
+    if (!m_device || !m_device->isConnected()) {
+        if (m_waterCapturing) finishWaterCapture(!m_waterSettle.isActive());
+        // A BLE drop mid-steam must disarm the steam flow-stop event WITHOUT
+        // emitting it: a dropped connection is not a completion (no "Steam
+        // done"), and a stale armed flag would otherwise leak across the
+        // disconnect and ghost-fire on a later steam whose flow was never
+        // observed — violating the steamFlowStopped exactly-once/observed-flow
+        // contract (see the signal doc).
+        m_steamFlowStopPending = false;
+        if (m_phase != Phase::Disconnected) {
+            // A drop mid-shot LEAVES the espresso cycle, so the cycle-ended
+            // pair must fire here too — this branch returns before the normal
+            // exit detection below ever runs. Without it a BLE drop during a
+            // pour leaks anything held since cycle start (the shot latch),
+            // which is the same failure shotEnded had, reached by a different
+            // road. Unlike steamFlowStopped above, this is not a "completion"
+            // event whose absence matters: it says the cycle is no longer
+            // running, which a disconnect makes true.
+            const bool wasInEspresso = (m_phase == Phase::EspressoPreheating ||
+                                        m_phase == Phase::Preinfusion ||
+                                        m_phase == Phase::Pouring ||
+                                        m_phase == Phase::Ending);
+            // Neither timer stops on its own: both other stop sites sit past
+            // this early return, and onShotTimerTick() has no connectivity
+            // guard. The scale is a separate BLE link and keeps counting on
+            // its own display.
+            //
+            // Gated like the other stop sites, which all require that
+            // something was running: a drop from Idle or Sleep must not send
+            // an unsolicited stop to a scale the user is timing with by hand.
+            if (m_shotTimer->isActive() || wasInEspresso)
+                stopShotAndScaleTimers("DE1 disconnected");
+            m_phase = Phase::Disconnected;
+            m_lastEmittedPhase = m_phase;
+            emit phaseChanged();
+            if (wasInEspresso)
+                emit espressoCycleEnded();
+        }
+        if (m_noAcEpisode.isValid()) {
+            // A drop mid-episode is a real way for one to end, and losing its length
+            // loses exactly the measurement the interval needs correcting from.
+            STANDBY_INFO(QStringLiteral("no-AC episode ended by a DE1 disconnect after "
+                                        "%1 ms (the wait is %2 ms); %3")
+                             .arg(m_noAcEpisode.elapsed())
+                             .arg(m_noAcSettleTimer->interval())
+                             .arg(m_standbySwitchOpen
+                                      ? QStringLiteral("the warning was showing and is "
+                                                       "now cleared")
+                                      : QStringLiteral("no warning had shown")));
+        }
+        if (m_standbySwitchOpen) {
+            m_standbySwitchOpen = false;
+            emit standbySwitchOpenChanged();
+        }
+        m_noAcSettleTimer->stop();
+        m_noAcSettled = false;
+        m_noAcEpisode.invalidate();
+        return;
+    }
+
+    Phase oldPhase = m_phase;
+    DE1::State state = m_device->state();
+    DE1::SubState subState = m_device->subState();
+    DE1::SubState previousSubState = m_previousSubState;
+    m_previousSubState = subState;
+
+    // Front standby switch cutting AC (Error_NoAC). Firmware < 1337 reports this
+    // substate spuriously, matching de1app's own gate — see DE1::SubState::Error_NoAC.
+    //
+    // Firmware >= 1337 reports it spuriously too, briefly: the machine enters
+    // Error_NoAC while waking or heating and leaves it untouched a few seconds later
+    // (field reports on v1363, seen on every tap-to-wake). A snapshot cannot tell that
+    // apart from the real thing — an open switch reports "Idle, Error_NoAC" and so
+    // does the blip — so DURATION is the only discriminator, and this is a
+    // measurement of the hardware rather than a guard against a race.
+    //
+    // de1app does NOT do this, and the difference is unexplained. It shows its warning
+    // immediately (machine.tcl:1354, no duration test; commit 04d3b02e reports "page
+    // appears ~1ms after the switch is flipped" on firmware 1352). Its only timer here
+    // is a one-shot `after 6000` on connect (de1_de1.tcl:946) that re-checks a machine
+    // already latched in Error_NoAC — the gap our firmwareVersionChanged hook covers,
+    // not a settling wait. Whether their users tolerate the same flash, or 1352 and 1363
+    // differ, is unknown — so 6 s is a workaround for a mechanism nobody has identified,
+    // and the logging below exists to identify it.
+    //
+    // Deliberately not keyed on what preceded the episode: the substate it arrives
+    // from varies by entry point (Ready on a tap-to-wake, a heating substate mid
+    // warm-up, nothing at all on a fresh connect), so every history-based rule misses
+    // at least one path. Duration covers them all.
+    //
+    // Every line that ENDS an episode carries its measured length in ms. That is the
+    // diagnostic value here: 6 s is an estimate from one reported episode, so a
+    // submitted log has to say how long real episodes actually run. Without it a report
+    // of "still happening" cannot distinguish a longer episode from a different
+    // mechanism. The warning-cleared line below carries no duration and does not need
+    // to: the episode-ended line always fires alongside it, and by then the episode has
+    // been invalidated anyway.
+    const bool noAc = (subState == DE1::SubState::Error_NoAC);
+    if (!noAc) {
+        if (m_noAcEpisode.isValid()) {
+            // INFO only when the user saw the warning. A blip that cleared inside
+            // the wait is tuning data for that wait, so DEBUG.
+            const QString text = QStringLiteral("machine reported no AC for %1 ms then cleared "
+                                                "it (substate is now %2); the wait is %3 ms, so "
+                                                "%4")
+                                     .arg(m_noAcEpisode.elapsed())
+                                     .arg(DE1::subStateToString(subState))
+                                     .arg(m_noAcSettleTimer->interval())
+                                     .arg(m_standbySwitchOpen
+                                              ? QStringLiteral("the warning had already shown")
+                                              : QStringLiteral("no warning was shown"));
+            if (m_standbySwitchOpen)
+                STANDBY_INFO(text);
+            else
+                STANDBY_LOG(text);
+            m_noAcEpisode.invalidate();
+        }
+        m_noAcSettleTimer->stop();
+        m_noAcSettled = false;
+    } else if (!m_noAcSettled && !m_noAcSettleTimer->isActive()) {
+        m_noAcEpisode.start();
+        m_noAcSettleTimer->start();
+    }
+
+    // m_noAcSettled, not the timer, is what the firmware-arrival re-run reads: the
+    // build number can land after the wait has already elapsed.
+    const bool standbySwitchOpen = noAc && m_noAcSettled
+        && m_device->firmwareBuildNumber() >= 1337;
+    if (standbySwitchOpen != m_standbySwitchOpen) {
+        m_standbySwitchOpen = standbySwitchOpen;
+        if (standbySwitchOpen) {
+            STANDBY_INFO(QStringLiteral("warning shown: machine has reported no AC for "
+                                        "%1 ms, past the %2 ms wait (state=%3, firmware "
+                                        "build %4)")
+                             .arg(m_noAcEpisode.elapsed())
+                             .arg(m_noAcSettleTimer->interval())
+                             .arg(DE1::stateToString(state))
+                             .arg(m_device->firmwareBuildNumber()));
+        } else {
+            STANDBY_INFO(QStringLiteral("warning cleared: substate is now %1")
+                             .arg(DE1::subStateToString(subState)));
+        }
+        emit standbySwitchOpenChanged();
+    }
+
+    // Log steam substate transitions to reconstruct the full
+    // Steaming->Puffing->Ending->Idle sequence in bug reports.
+    // Gate on oldPhase==Steaming so the first entry into Steam doesn't log
+    // a spurious transition from m_previousSubState's init value.
+    if (state == DE1::State::Steam && oldPhase == Phase::Steaming
+        && subState != previousSubState) {
+        DIAG_DEBUG(STEAM, "MachineState").noquote() << QString("steam substate: %1 -> %2")
+            .arg(DE1::subStateToString(previousSubState),
+                 DE1::subStateToString(subState));
+    }
+
+    switch (state) {
+        case DE1::State::Sleep:
+        case DE1::State::GoingToSleep:
+            m_phase = Phase::Sleep;
+            break;
+
+        case DE1::State::Idle:
+        case DE1::State::SchedIdle:
+            if (subState == DE1::SubState::Heating ||
+                subState == DE1::SubState::FinalHeating) {
+                m_phase = Phase::Heating;
+            } else if (subState == DE1::SubState::Ready ||
+                       subState == DE1::SubState::Stabilising) {
+                m_phase = Phase::Ready;
+            } else {
+                m_phase = Phase::Idle;
+            }
+            break;
+
+        case DE1::State::Espresso:
+            if (isPreFlowSubState(subState)) {
+                m_phase = Phase::EspressoPreheating;  // Use specific phase for espresso preheating
+            } else if (subState == DE1::SubState::Preinfusion) {
+                m_phase = Phase::Preinfusion;
+            } else if (subState == DE1::SubState::Pouring) {
+                m_phase = Phase::Pouring;
+            } else if (subState == DE1::SubState::Ending) {
+                m_phase = Phase::Ending;
+            } else {
+                m_phase = Phase::Preinfusion;
+            }
+            break;
+
+        case DE1::State::Steam:
+            if (m_device->isSteamPurgeActive()) {
+                m_phase = Phase::SteamPurge;
+                break;
+            }
+            // Map all active steam substates to Steaming phase
+            // This keeps the live view visible during purge (Puffing) and ending
+            // Only show Heating for pre-steam warmup (Heating/FinalHeating substates)
+            //
+            // PreparationController finalizes steam when phase leaves Steaming;
+            // keep purge and ending substates in this phase to avoid resetting
+            // settings while the DE1 is still completing steam.
+            if (subState == DE1::SubState::Steaming ||
+                subState == DE1::SubState::Pouring ||
+                subState == DE1::SubState::Puffing ||
+                subState == DE1::SubState::Ending) {
+                m_phase = Phase::Steaming;
+            } else {
+                m_phase = Phase::Heating;
+            }
+            break;
+
+        case DE1::State::HotWater:
+            m_phase = Phase::HotWater;
+            break;
+
+        case DE1::State::HotWaterRinse:
+            m_phase = Phase::Flushing;
+            break;
+
+        case DE1::State::Refill:
+            m_phase = Phase::Refill;
+            break;
+
+        case DE1::State::Descale:
+            m_phase = Phase::Descaling;
+            break;
+
+        case DE1::State::Clean:
+            m_phase = Phase::Cleaning;
+            break;
+
+        case DE1::State::AirPurge:
+            m_phase = Phase::Transport;
+            break;
+
+        // A firmware steam-wand purge (add-steam-purge): an operation the firmware
+        // ends itself, not a steam session.
+        case DE1::State::SteamRinse:
+            m_phase = Phase::SteamPurge;
+            break;
+
+        default:
+            m_phase = Phase::Idle;
+            break;
+    }
+
+    if (m_phase != oldPhase) {
+        // Detect espresso cycle start (entering preheating from non-espresso state)
+        bool wasInEspresso = (oldPhase == Phase::EspressoPreheating ||
+                              oldPhase == Phase::Preinfusion ||
+                              oldPhase == Phase::Pouring ||
+                              oldPhase == Phase::Ending);
+        bool isInEspresso = (m_phase == Phase::EspressoPreheating ||
+                             m_phase == Phase::Preinfusion ||
+                             m_phase == Phase::Pouring ||
+                             m_phase == Phase::Ending);
+
+        // Start/stop shot timer (do this immediately, before deferred signals)
+        bool wasFlowing = (oldPhase == Phase::Preinfusion ||
+                          oldPhase == Phase::Pouring ||
+                          oldPhase == Phase::Steaming ||
+                          oldPhase == Phase::HotWater ||
+                          oldPhase == Phase::Flushing ||
+                          oldPhase == Phase::Descaling ||
+                          oldPhase == Phase::Cleaning);
+        const bool flowStarted = isFlowing() && !wasFlowing;
+        const bool flowEnded = !isFlowing() && wasFlowing;
+
+        // Close the previous water measurement before any operation resets its scale.
+        if (m_waterCapturing && oldPhase != Phase::HotWater
+            && (isInEspresso || flowStarted || m_phase == Phase::Disconnected))
+            finishWaterCapture(m_phase == Phase::Disconnected);
+
+        if (oldPhase == Phase::HotWater && m_waterCapturing) {
+            m_waterVolume = m_cumulativeVolume;
+            if (m_phase == Phase::Idle || m_phase == Phase::Ready || m_phase == Phase::Heating)
+                m_waterSettle.start();
+            else
+                finishWaterCapture(true);
+        }
+
+        if (flowStarted) {
+            // Always clear hot water frozen weight when any new flow starts.
+            // This is outside the !wasInEspresso guard because the frozen weight
+            // is a hot-water-only display feature that must not persist into
+            // espresso cycles. Without this, hot water SAW freezing the display
+            // at e.g. 75g causes scaleWeight() to return that stale value for
+            // the entire subsequent espresso shot (issue #529).
+            m_hotWaterFrozenWeight = -1.0;
+
+            // Arm the steam flow-stop event: steamFlowStopped fires exactly
+            // once per steam, and only for a steam whose flow was actually
+            // observed here. isFlowing() treats Steaming AND Pouring as
+            // flowing, so a steam first seen at Pouring still arms; only a
+            // steam first seen on a non-flowing substate (Puffing/Ending —
+            // both flowing notifications missed) never arms, keeping its
+            // phase exit silent.
+            if (m_phase == Phase::Steaming)
+                m_steamFlowStopPending = true;
+
+            // Don't restart timer mid-espresso cycle (BLE phase glitch protection)
+            // For espresso, the timer starts at preinfusion and should not reset
+            // if there's a brief glitch to a non-flowing state and back
+            if (!wasInEspresso) {
+                startShotTimer();
+                m_stopAtWeightTriggered = false;
+                m_stopAtVolumeTriggered = false;
+                m_stopAtTimeTriggered = false;
+                m_hotWaterTareBaseline = 0.0;
+                m_hotWaterTareTimeMs = 0;
+                m_hotWaterMaxEffectiveWeight = 0.0;
+                m_hotWaterSawTriggerWeight = -1.0;
+                m_hotWaterTargetAdjustG = 0.0;
+                m_lastAutoTareTime = 0;  // Reset holdoff for new flow cycle
+                m_preinfusionVolume = 0.0;
+                m_pourVolume = 0.0;
+                m_cumulativeVolume = 0.0;
+                m_lastEmittedCumulativeVolumeMl = -1;
+                m_lastEmittedPreinfusionVolumeMl = -1;
+                m_lastEmittedPourVolumeMl = -1;
+
+                // CRITICAL: Clear any pending BLE commands to prevent stale profile uploads
+                // from executing during active operations. This fixes a bug where queued
+                // profile commands could corrupt a running shot.
+                if (m_device) {
+                    m_device->clearCommandQueue();
+                }
+
+                m_tareCompleted = false;
+                m_waitingForTare = false;
+                m_hotWaterTarePending = false;
+                m_lastHotWaterTareWarnMs = 0;
+                if (m_tareTimeoutTimer)
+                    m_tareTimeoutTimer->stop();
+
+                // Reset and start scale timer when non-espresso flow starts.
+                // For espresso, reset + start are handled separately below
+                // (split by preheating phase for scales with independent reset).
+                if (m_scale && !isInEspresso) {
+                    m_scale->resetTimer();
+                    m_scale->startTimer();
+                    DIAG_DEBUG(SCALE, "MachineState") << "SCALE TIMER: Reset + Started (flow began)";
+                }
+
+                if (m_phase == Phase::HotWater)
+                    beginWaterCapture();
+
+                // Auto-tare for Hot Water (espresso tares at cycle start via MainController)
+                // Delay 200ms after resetTimer/startTimer to avoid BLE command contention —
+                // WriteWithoutResponse can silently drop packets when sent in rapid succession.
+                if (m_phase == Phase::HotWater) {
+                    // Hot water started while an espresso still settles: end that
+                    // settle before the tare below zeroes the reading.
+                    if (m_timingController)
+                        m_timingController->endSettlingForHotWater();
+                    m_hotWaterTarePending = true;
+                    QTimer::singleShot(200, this, [this]() {
+                        // Cleared on BOTH paths: the early return leaves no tare coming,
+                        // and a pending flag that outlives its tare would silence the
+                        // warning for the rest of the pour.
+                        m_hotWaterTarePending = false;
+                        if (m_phase != Phase::HotWater) return;  // Operation ended before timer fired
+                        tareScale();
+                        DIAG_DEBUG(SCALE, "MachineState") << "TARE: Hot Water started (200ms after timer cmds)";
+                    });
+                }
+            } else {
+                // Mid-espresso: either starting extraction (from preheating) or glitch recovery
+                bool startingExtraction = (oldPhase == Phase::EspressoPreheating);
+
+                if (startingExtraction) {
+                    // EspressoPreheating is wasInEspresso=true, so the outer !wasInEspresso
+                    // reset block does not fire. Reset counters here for a fresh extraction.
+                    startShotTimer();
+                    m_stopAtWeightTriggered = false;
+                    m_stopAtVolumeTriggered = false;
+                    m_stopAtTimeTriggered = false;
+                        m_preinfusionVolume = 0.0;
+                    m_pourVolume = 0.0;
+                    m_cumulativeVolume = 0.0;
+                    m_lastEmittedCumulativeVolumeMl = -1;
+                    m_lastEmittedPreinfusionVolumeMl = -1;
+                    m_lastEmittedPourVolumeMl = -1;
+
+                    // Start scale timer. For scales with independent reset, reset was
+                    // already sent at cycle start. For others, send reset+start together.
+                    if (m_scale) {
+                        if (!m_scale->hasIndependentTimerReset()) {
+                            m_scale->resetTimer();
+                        }
+                        m_scale->startTimer();
+                        DIAG_DEBUG(SCALE, "MachineState") << "SCALE TIMER: Started (espresso extraction began)";
+                    }
+                } else if (!m_shotTimer->isActive()) {
+                    // Actual glitch recovery: restart timer without resetting state
+                    // This preserves stop-at-weight triggers and cumulative tracking
+                    DIAG_DEBUG(SHOT, "MachineState") << "TIMER RESTART: recovering from mid-espresso phase glitch";
+                    // If m_shotStartTime is invalid (0 or in the future), reset it
+                    qint64 now = QDateTime::currentMSecsSinceEpoch();
+                    if (m_shotStartTime <= 0 || m_shotStartTime > now) {
+                        DIAG_WARN(SHOT, "MachineState") << "TIMER FIX: m_shotStartTime was invalid:" << m_shotStartTime << "- resetting to now";
+                        m_shotStartTime = now;
+                        m_shotTime = 0.0;
+                    }
+                    m_shotTimer->start();
+                }
+            }
+        } else if (flowEnded) {
+            // Don't stop timer during espresso Ending phase - let it run until cycle ends
+            if (!isInEspresso) {
+                stopShotAndScaleTimers("flow ended");
+                // Steam left the Steaming phase. Two cases reach this: a manual
+                // stop straight out of flowing steam (the pending flag emits
+                // here), or the Steaming->Idle exit AFTER an auto-stop —
+                // wasFlowing derives from oldPhase alone, so this branch also
+                // runs seconds after flow actually stopped. The pending flag
+                // (consumed by whichever site fires first) keeps the signal
+                // exactly-once per steam across both calls.
+                if (oldPhase == Phase::Steaming && m_steamFlowStopPending) {
+                    m_steamFlowStopPending = false;
+                    emit steamFlowStopped();
+                }
+            }
+
+            // Consumers that correlate the deferred completion must capture
+            // the operation token now: a later machine update may start a new
+            // cycle before the queued shotEnded notification is delivered.
+            emit shotFlowEnded(wasInEspresso);
+        }
+
+        // Stop scale timer when exiting espresso cycle (e.g., Ending -> Idle)
+        if (wasInEspresso && !isInEspresso) {
+            if (m_scale) {
+                m_scale->stopTimer();
+                DIAG_DEBUG(SCALE, "MachineState") << "SCALE TIMER: Stopped (espresso cycle ended)";
+            }
+            // The pair of espressoCycleStarted — emitted on EVERY exit,
+            // including a cycle that never flowed. shotEnded cannot serve this
+            // role: it is gated on flow having started, so an abort during
+            // preheat would never release anything held since cycle start.
+            emit espressoCycleEnded();
+        }
+
+        // Reset timer state when entering espresso cycle (before signals)
+        // This ensures timer shows 0 during preheating and properly starts at preinfusion
+        // Without this, m_shotStartTime would contain the PREVIOUS shot's timestamp,
+        // causing the timer to show huge elapsed values when preinfusion starts
+        if (isInEspresso && !wasInEspresso) {
+            m_shotTime = 0.0;
+            m_shotStartTime = 0;  // Mark as invalid so preinfusion properly starts it
+            m_lastAutoTareTime = 0;  // Reset holdoff for new espresso cycle
+            emit shotTimeChanged();  // Update UI to show 0 during preheating
+
+            // Reset scale timer at cycle start (like de1app's on_major_state_change).
+            // Normally startTimer() is sent later when extraction begins, separating
+            // the two commands by the preheating phase to avoid BLE command contention
+            // (WriteWithoutResponse can silently drop back-to-back packets).
+            // Only split for scales with a true independent reset — some scales send the
+            // same bytes for resetTimer() as startTimer() (DiFluid), so splitting would
+            // cause unwanted side effects during preheating.
+            // If already flowing (machine skipped preheating), send both now — there
+            // won't be a separate extraction-start transition to send startTimer().
+            if (m_scale && m_scale->hasIndependentTimerReset()) {
+                m_scale->resetTimer();
+                if (isFlowing()) {
+                    m_scale->startTimer();
+                    DIAG_DEBUG(SCALE, "MachineState") << "SCALE TIMER: Reset + Started (espresso cycle started, already flowing)";
+                } else {
+                    DIAG_DEBUG(SCALE, "MachineState") << "SCALE TIMER: Reset (espresso cycle started, waiting for extraction)";
+                }
+            } else if (m_scale && isFlowing()) {
+                // Safety net: machine skipped preheating (missed BLE substate notification).
+                // Non-independent-reset scales won't reach the startingExtraction path
+                // (requires wasInEspresso=true), so send reset+start together here.
+                m_scale->resetTimer();
+                m_scale->startTimer();
+                DIAG_DEBUG(SCALE, "MachineState") << "SCALE TIMER: Reset + Started (espresso cycle started, already flowing, non-independent reset)";
+            }
+
+            // CRITICAL: Emit espressoCycleStarted IMMEDIATELY (not deferred) so MainController
+            // can reset its m_shotStartTime before any shot samples arrive via BLE.
+            // If deferred, shot samples could arrive first with wrong timestamps.
+            emit espressoCycleStarted();
+        }
+
+        // Emit after espressoCycleStarted above so direct-flow starts (the DE1
+        // can skip preheating) carry the newly allocated operation token.
+        if (flowStarted)
+            emit shotFlowStarted(static_cast<int>(m_phase));
+
+        // Defer other signal emissions to allow pending BLE notifications to process first.
+        // This prevents QML binding updates from blocking the event loop during the BLE callback chain.
+        // Note: espressoCycleStarted is emitted immediately above to avoid race conditions.
+        QMetaObject::invokeMethod(this, [this, flowStarted, flowEnded, oldPhase]() {
+            if (m_phase != m_lastEmittedPhase) {
+                m_lastEmittedPhase = m_phase;
+                emit phaseChanged();
+            }
+
+            if (flowStarted) {
+                if (m_phase == Phase::Steaming)
+                    DIAG_DEBUG(STEAM, "MachineState").noquote() << "steam flow started (phase entered Steaming)";
+                emit shotStarted();
+            } else if (flowEnded) {
+                if (oldPhase == Phase::Steaming)
+                    DIAG_DEBUG(STEAM, "MachineState").noquote() << "steam flow stopped (phase left Steaming)";
+                emit shotEnded();
+            }
+        }, Qt::QueuedConnection);
+    }
+
+    // Also check for timer stop on substate changes (even if phase didn't change)
+    // This handles steam stopping (Puffing/Ending substates) where phase stays Steaming
+    if (!isFlowing() && m_shotTimer->isActive()) {
+        if (m_device && m_device->state() == DE1::State::Steam) {
+            DIAG_DEBUG(STEAM, "MachineState").noquote() << QString("steam flow stopped via substate change (substate=%1)")
+                .arg(DE1::subStateToString(m_device->subState()));
+        } else {
+            DIAG_DEBUG(SHOT, "MachineState") << "TIMER STOP: isFlowing() became false (substate change)";
+        }
+        stopShotAndScaleTimers("substate change");
+        // Steam auto-stop path: substate left Steaming (Puffing/Ending) while
+        // the phase stays Steaming. This emission marks the actual end of flow;
+        // consuming the pending flag here keeps the later Steaming->Idle
+        // phase-change path (which would otherwise re-fire — wasFlowing derives
+        // from oldPhase alone) silent, so the signal is exactly-once per steam.
+        if (m_phase == Phase::Steaming && m_steamFlowStopPending) {
+            m_steamFlowStopPending = false;
+            emit steamFlowStopped();
+        }
+    }
+}
+
+// Negative until the window has filled — an unmeasured reading is not a still one.
+double MachineState::autoTareSpread() const {
+    if (m_autoTareCount < kAutoTareSettleSamples)
+        return -1.0;
+    const auto [lo, hi] = std::minmax_element(m_autoTareWindow,
+                                              m_autoTareWindow + kAutoTareSettleSamples);
+    return *hi - *lo;
+}
+
+void MachineState::resetAutoTareWindow() {
+    m_autoTareCount = 0;
+    m_settleWaitLogged = false;
+}
+
+// Every sample the scale reports, including repeats of an identical reading.
+// onScaleWeightChanged is deduped on value and cannot see a perfectly still cup;
+// the settle window below needs those repeats, so it lives here instead.
+void MachineState::onScaleWeightSample(double weight) {
+    captureWaterWeight(weight);
+    // Auto-tare during "flow before" phase (like de1app: heating substates before water flows)
+    // Handles forgotten-cup scenario for both Espresso and HotWater
+    constexpr double AUTO_TARE_THRESHOLD = 2.0;  // grams (de1app uses 0.04g, 2g avoids noise)
+    constexpr qint64 AUTO_TARE_HOLDOFF_MS = 1000;  // 1s between tares (matches de1app)
+
+    // Substate, not m_phase: m_phase lags behind BLE state changes, and taring after
+    // water has started flowing is the failure this guards.
+    const bool isFlowBefore =
+        (m_phase == Phase::EspressoPreheating || m_phase == Phase::HotWater) && m_device
+        && isPreFlowSubState(m_device->subState());
+
+    // Wait for the reading to hold still before taring. A tare zeroes the scale on
+    // whatever the load cell reads at that instant, so taring mid-disturbance bakes
+    // the transient in as the new zero — and every reading for the rest of the shot
+    // is off by it, silently, with `tare= true` in the log the whole way. Observed
+    // once, on the 2026-08-20 9:37 AM shot: the zero landed at -20.6 g and
+    // stop-at-weight ran 23 g late.
+    //
+    // Stillness is the SPREAD across the window, not a per-sample delta, and the
+    // window must be long enough that the spread exceeds the band at the drift rate
+    // we care about. The observed drift ran roughly 0.47 g/sample (20.6 g over the
+    // ~4.4 s to the first at-rest reading, at the 10 Hz this scale reports), and a
+    // window of N samples only ever sees (N-1) steps — so N must satisfy
+    // (N-1) * 0.47 > kAutoTareSettleBandG. N=3 gives 0.94 g and would still call that
+    // drift "still"; N=4 gives 1.41 g and rejects it. Both a per-sample band and a
+    // 3-sample window were tried and both let it through. Calibrated on a 10 Hz
+    // scale: four samples span 0.3 s there and 1.5 s on a 2 Hz scale, so treat these
+    // two constants as one pair, never edited alone.
+    //
+    // Deliberately NOT here: verifying afterwards that the zero held, detecting a
+    // lifted cup, an interlock on the outstanding tare. Each was built and each only
+    // defended against a problem the previous one introduced.
+    if (!isFlowBefore) {
+        resetAutoTareWindow();
+        return;
+    }
+
+    // Order within the window is irrelevant — only min and max are read — so a
+    // wrapping index beats shifting the contents.
+    m_autoTareWindow[m_autoTareCount++ % kAutoTareSettleSamples] = weight;
+
+    if (!m_tareCompleted || weight <= AUTO_TARE_THRESHOLD)
+        return;
+
+    const double spread = autoTareSpread();
+    if (spread < 0.0 || spread > kAutoTareSettleBandG) {
+        // Not an error: the cup has only just landed. Logged once per window, and at
+        // INFO because the connections views filter DEBUG out — a scale whose noise
+        // floor never fits the band would otherwise never auto-tare, with nothing
+        // anywhere saying why.
+        if (!m_settleWaitLogged) {
+            m_settleWaitLogged = true;
+            SCALE_INFO_STDERR_TAGGED("AutoTare",
+                QStringLiteral("Cup placed during %1 (weight %2 g) — holding tare until the "
+                               "reading settles (spread %3, needs under %4 g across "
+                               "%5 samples)")
+                    .arg(phaseString()).arg(weight, 0, 'f', 1)
+                    .arg(spread < 0.0 ? QStringLiteral("not yet measured")
+                                      : QString::number(spread, 'f', 2) + QStringLiteral(" g"))
+                    .arg(kAutoTareSettleBandG, 0, 'f', 1)
+                    .arg(kAutoTareSettleSamples));
+        }
+        return;
+    }
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    // The holdoff is what retries a tare whose BLE packet was dropped, and this file
+    // documents that WriteWithoutResponse drops packets.
+    if (now - m_lastAutoTareTime < AUTO_TARE_HOLDOFF_MS)
+        return;
+
+    m_lastAutoTareTime = now;
+    resetAutoTareWindow();  // the tare itself moves the reading
+    // The samples still in flight carry the pre-tare weight; announcing a hold on
+    // them would describe a wait that is not happening.
+    m_settleWaitLogged = true;
+    SCALE_INFO_STDERR_TAGGED("AutoTare",
+        QStringLiteral("Cup placed during %1 (weight %2 g) — taring")
+            .arg(phaseString()).arg(weight, 0, 'f', 1));
+    tareScale();
+    emit flowBeforeAutoTare();
+}
+
+void MachineState::onScaleWeightChanged(double weight) {
+    // Check if tare completed (scale reported near-zero after tare command)
+    if (m_waitingForTare && qAbs(weight) < 1.0) {
+        m_waitingForTare = false;
+        m_tareCompleted = true;
+        if (m_tareTimeoutTimer)
+            m_tareTimeoutTimer->stop();
+        emit tareCompleted();
+    }
+
+    // Hot water fire-and-forget: if the BLE tare actually worked (scale zeroed),
+    // clear the baseline so SAW uses absolute weight from now on.
+    // Guard: only clear if we haven't seen significant water flow yet (< 3g effective)
+    // OR if we're still within the tare burst window (first 2s after tare request).
+    // Within the burst window, the scale zeroing is clearly a tare response, not a
+    // coincidence — so clear baseline unconditionally and reset maxEffectiveWeight
+    // to prevent the stale baseline from causing a false SAW trigger.
+    // After the burst window, the < 3g guard protects against slow-tare scales
+    // (e.g. Eureka Precisa) that process tare after water has been dispensed.
+    if (m_phase == Phase::HotWater && m_hotWaterTareBaseline != 0.0 && qAbs(weight) < 1.0) {
+        bool inTareWindow = m_hotWaterTareTimeMs > 0
+            && (QDateTime::currentMSecsSinceEpoch() - m_hotWaterTareTimeMs) < 2000;
+        if (inTareWindow || m_hotWaterMaxEffectiveWeight < 3.0) {
+            DIAG_DEBUG(SCALE, "MachineState") << "TARE: Scale zeroed, clearing hot water baseline";
+            m_hotWaterTareBaseline = 0.0;
+            m_hotWaterMaxEffectiveWeight = 0.0;  // Reset so SAW uses fresh absolute weight
+        }
+    }
+
+    // Track peak effective weight during hot water (used to guard baseline clearing)
+    if (m_phase == Phase::HotWater && m_hotWaterTareBaseline != 0.0) {
+        double effective = weight - m_hotWaterTareBaseline;
+        if (effective > m_hotWaterMaxEffectiveWeight) {
+            m_hotWaterMaxEffectiveWeight = effective;
+        }
+    }
+
+    // Burst-log every weight sample for 2s after hot water tare (debugging BLE tare reliability)
+    if (m_phase == Phase::HotWater && m_hotWaterTareTimeMs > 0) {
+        qint64 sinceMs = QDateTime::currentMSecsSinceEpoch() - m_hotWaterTareTimeMs;
+        if (sinceMs < 2000) {
+            DIAG_DEBUG(SCALE, "HotWaterTare") << "elapsedMs=" << sinceMs << "scale=" << weight
+                     << "effective=" << (weight - m_hotWaterTareBaseline)
+                     << "baseline=" << m_hotWaterTareBaseline;
+        } else {
+            // First sample past 2s — log whether tare succeeded
+            SAW_LOG_STDERR("HotWater", QStringLiteral("Tare 2s summary: baseline=%1")
+                .arg(m_hotWaterTareBaseline == 0.0
+                         ? QStringLiteral("cleared (tare OK)")
+                         : QString::number(m_hotWaterTareBaseline, 'f', 1)
+                               + QStringLiteral("g (tare FAILED, using baseline)")));
+            m_hotWaterTareTimeMs = 0;  // Stop burst logging
+        }
+    }
+
+    if (!m_device) return;
+    DE1::State state = m_device->state();
+
+    // Hot water: MachineState handles stop-at-weight (ShotTimingController not active)
+    // Espresso: WeightProcessor handles SAW on worker thread (adaptive lag via learned drip data)
+    if (state == DE1::State::HotWater) {
+        checkStopAtWeightHotWater(weight);
+    }
+}
+
+void MachineState::beginWaterCapture()
+{
+    if (m_waterCapturing) finishWaterCapture(true);
+    ++m_waterCycleId;
+    m_waterCapturing = true;
+    m_waterWeightClosed = false;
+    m_waterTareAwaitingZero = false;
+    m_waterScaleValid = m_scale && m_scale->isConnected() && !m_scale->isFlowScale()
+        && std::isfinite(m_scale->weight());
+    m_waterWeightReference = m_waterScaleValid ? m_scale->weight() : 0;
+    m_waterWeightOffset = 0;
+    m_waterLastWeight.reset();
+    m_waterTriggerWeight.reset();
+    m_waterSawLearningEligible = true;
+    m_waterVolume = 0;
+    m_waterResult = ShotWaterResult();
+    m_waterResult.status = QStringLiteral("dispensed");
+    if (m_settings) {
+        m_waterResult.temperatureC = m_settings->brew()->waterTemperature();
+        if (m_settings->brew()->waterVolumeMode() == QLatin1String("weight"))
+            m_waterResult.targetWeightG = m_settings->brew()->waterVolume();
+    }
+}
+
+void MachineState::captureWaterWeight(double weight)
+{
+    if (!m_waterCapturing || !m_waterScaleValid || m_waterWeightClosed) return;
+    if (!m_scale || !m_scale->isConnected() || m_scale->isFlowScale() || !std::isfinite(weight)) {
+        m_waterScaleValid = false;
+        return;
+    }
+    const double previousRaw = m_waterLastWeight.value_or(m_waterWeightOffset)
+        - m_waterWeightOffset + m_waterWeightReference;
+    if (m_waterTareAwaitingZero && qAbs(weight) < 1.0 && weight < previousRaw) {
+        // Observe the reset, not an unchanged zero from an already tared cup.
+        // Preserve water added before a late tare; the next readings have a new zero.
+        m_waterWeightOffset = m_waterLastWeight.value_or(0);
+        m_waterWeightReference = weight;
+        m_waterTareAwaitingZero = false;
+    }
+    const double net = weight - m_waterWeightReference + m_waterWeightOffset;
+    if (net < -2.0 || (m_waterLastWeight && net < *m_waterLastWeight - 2.0)) {
+        m_waterSawLearningEligible = false;
+        if (m_waterSettle.isActive()) m_waterWeightClosed = true;
+        else m_waterScaleValid = false;
+        return;
+    }
+    m_waterLastWeight = qMax(0.0, net);
+}
+
+void MachineState::finishWaterCapture(bool interrupted, bool allowLearning)
+{
+    if (!m_waterCapturing) return;
+    const bool settled = m_waterSettle.isActive();
+    m_waterSettle.stop();
+    m_waterCapturing = false;
+    if (!settled && m_phase == Phase::HotWater) m_waterVolume = m_cumulativeVolume;
+    m_waterResult.status = interrupted ? QStringLiteral("interrupted") : QStringLiteral("dispensed");
+    if (m_waterScaleValid && m_waterLastWeight) {
+        m_waterResult.weightG = m_waterLastWeight;
+        m_waterResult.amountSource = QStringLiteral("scale");
+    } else if (std::isfinite(m_waterVolume) && m_waterVolume > 0) {
+        m_waterResult.volumeMl = m_waterVolume;
+        m_waterResult.amountSource = QStringLiteral("flowEstimate");
+    }
+    if (allowLearning && !interrupted && m_waterSawLearningEligible && m_waterResult.weightG
+        && m_waterTriggerWeight && m_settings) {
+        const double overshoot = *m_waterResult.weightG - *m_waterTriggerWeight;
+        if (overshoot >= -2.0 && overshoot <= 20.0) {
+            const int n = m_settings->brew()->hotWaterSawSampleCount();
+            const double alpha = n < 3 ? 0.5 : 0.3;
+            const double oldOffset = m_settings->brew()->hotWaterSawOffset();
+            m_settings->brew()->setHotWaterSawOffset(qBound(0.0,
+                (1 - alpha) * oldOffset + alpha * qMax(0.0, overshoot), 10.0));
+            m_settings->brew()->setHotWaterSawSampleCount(n + 1);
+            SAW_LOG_STDERR("HotWaterLearn", QStringLiteral("overshoot=%1 g samples=%2")
+                .arg(overshoot, 0, 'f', 2).arg(n + 1));
+        }
+    }
+    m_hotWaterSawTriggerWeight = -1;
+    emit hotWaterResultReady(m_waterCycleId, m_waterResult.toMap());
+}
+
+void MachineState::checkStopAtWeightHotWater(double weight) {
+    if (m_stopAtWeightTriggered) return;
+    if (!m_tareCompleted) {
+        // Not yet SENT is not the same as failed. The tare is scheduled a moment after
+        // flow starts, and the samples arriving in between still carry the last pour's
+        // zero (a logged one read -138.40 g, 56 ms before its own tare fired). Skipping
+        // them is right; warning about them is not — it named a condition that had not
+        // had its chance to happen yet.
+        if (!m_hotWaterTarePending) {
+            // Throttle this warning to every 5s to avoid log spam at 5Hz. A MEMBER, not
+            // a function-local static: a process-wide throttle outlives every object in
+            // the process, so whichever caller reached this line first in the last five
+            // seconds decides whether anyone else gets a line — which in a test binary
+            // means one test can silence another's expected warning.
+            qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+            if (nowMs - m_lastHotWaterTareWarnMs >= 5000) {
+                SAW_WARN_STDERR("HotWater",
+                    QStringLiteral("Tare not completed — skipping stop-at-weight check, weight=%1 g")
+                        .arg(weight, 0, 'f', 2));
+                m_lastHotWaterTareWarnMs = nowMs;
+            }
+        }
+        return;
+    }
+
+    // Volume mode: machine handles auto-stop via flowmeter, don't interfere
+    if (m_settings && m_settings->brew()->waterVolumeMode() == "volume") return;
+
+    const double target = hotWaterTargetWeight();  // ml ≈ g for water
+    if (target <= 0) return;
+
+    // Use weight relative to the baseline recorded at tare time.
+    // If the BLE tare command succeeded, baseline was cleared to 0 (absolute weight).
+    // If the BLE tare was lost/ignored, baseline holds the pre-tare weight so we
+    // measure only the water added since the tare was requested.
+    double effectiveWeight = hotWaterNetWeight(weight);
+
+    // Learned offset: starts at 2g default, adapts from measured overshoot after each pour.
+    // After stopping, the app measures how much weight landed after the stop command and
+    // adjusts the offset so subsequent pours hit the target more accurately.
+    double sawOffset = m_settings ? m_settings->brew()->hotWaterSawOffset() : 2.0;
+    double stopThreshold = target - sawOffset;
+
+    if (effectiveWeight >= stopThreshold) {
+        m_stopAtWeightTriggered = true;
+        m_hotWaterFrozenWeight = effectiveWeight;      // Freeze UI display at trigger weight
+        m_waterTriggerWeight = qMax(0.0, weight - m_waterWeightReference + m_waterWeightOffset);
+        m_hotWaterSawTriggerWeight = weight;            // Raw scale weight for learning overshoot
+        // INFO: the stop itself is the user-facing answer to "why did my hot
+        // water stop there". Once per dispense.
+        SAW_INFO_STDERR("HotWater",
+            QStringLiteral("Stop triggered: effectiveWeight=%1 g scaleWeight=%2 g baseline=%3 g "
+                           "threshold=%4 g target=%5 g offset=%6 g")
+                .arg(effectiveWeight, 0, 'f', 2).arg(weight, 0, 'f', 2)
+                .arg(m_hotWaterTareBaseline, 0, 'f', 2).arg(stopThreshold, 0, 'f', 2)
+                .arg(target, 0, 'f', 2).arg(sawOffset, 0, 'f', 2));
+        emit targetWeightReached();
+
+        if (m_device) {
+            m_device->stopOperationUrgent();  // Front of the BLE queue, ahead of everything waiting
+        }
+    }
+}
+
+void MachineState::checkStopAtVolume() {
+    if (m_stopAtVolumeTriggered) return;
+    if (!m_tareCompleted) return;  // Don't check until tare has happened
+
+    // Skip volume-based stop when a physical scale is configured and the user has
+    // opted in. Uses "configured" (scaleAddress non-empty) not "connected" so a
+    // momentary BLE disconnect mid-shot doesn't re-enable SAV unexpectedly.
+    if (m_settings && m_settings->brew()->ignoreVolumeWithScale()
+        && !m_settings->scaleAddress().isEmpty()) return;
+
+    // Skip SAV for basic profiles when a scale is configured. The volume value in
+    // settings_2a/2b profiles (e.g. 36ml in Default) is invisible to users and fires far
+    // too early (~15g in cup when 36ml is pumped). Matches de1app's skip_sav_check logic.
+    // Uses "configured" (scaleAddress non-empty) not "connected" for saved BLE scales so a
+    // momentary BLE disconnect mid-shot doesn't re-enable SAV. SimulatedScale and USB scales
+    // have no saved address so the third condition covers them via isConnected(); the
+    // SimulatedScale debug toggle calls simulateDisconnection() which clears isConnected().
+    bool isBasicProfile = (m_profileType == QLatin1String("settings_2a")
+                        || m_profileType == QLatin1String("settings_2b"));
+    bool scaleConfigured = (m_settings && !m_settings->scaleAddress().isEmpty())
+                        || (m_settings && m_settings->useFlowScale())
+                        || (m_scale && m_scale->isConnected() && !m_scale->isFlowScale());
+    if (isBasicProfile && scaleConfigured) return;
+
+    double target = m_targetVolume;
+    if (target <= 0) return;
+
+    // No lag compensation for SAV (matches de1app). Volume is already imprecise
+    // from the flow sensor, and de1app uses a raw comparison intentionally.
+    if (m_pourVolume >= target) {
+        m_stopAtVolumeTriggered = true;
+        emit targetVolumeReached();
+
+        DIAG_DEBUG(SHOT, "MachineState") << "Target pour volume reached -" << m_pourVolume
+                 << "ml (preinfusion:" << m_preinfusionVolume << "ml, total:" << m_cumulativeVolume << "ml) /" << target << "ml";
+
+        // Stop the operation
+        if (m_device) {
+            m_device->stopOperation();
+        }
+    }
+}
+
+void MachineState::checkStopAtVolumeHotWater() {
+    if (m_stopAtVolumeTriggered) return;
+    if (!m_settings) return;
+    if (!m_tareCompleted) return;  // Don't check until tare has happened
+
+    // Hot water SAV logic (based on de1app but improved):
+    // - Scale configured (physical BLE address set, or flow scale enabled): safety net above
+    //   the user's target so SAW stops first. Uses max(waterVolume + 50, 250) to handle large
+    //   volumes (de1app hardcodes 250). Uses "configured" not "connected" — same reasoning
+    //   as the espresso SAV skip above.
+    // - No scale: target = waterVolume setting (app-side volume stop is primary)
+    double target;
+    bool scaleConfigured = (m_settings && !m_settings->scaleAddress().isEmpty())
+                        || (m_settings && m_settings->useFlowScale())
+                        || (m_scale && m_scale->isConnected() && !m_scale->isFlowScale());
+    if (scaleConfigured) {
+        target = qMax(hotWaterTargetWeight() + 50.0, 250.0);
+    } else {
+        target = m_settings->brew()->waterVolume();
+    }
+    if (target <= 0) return;
+
+    if (m_pourVolume >= target) {
+        m_stopAtVolumeTriggered = true;
+        emit targetVolumeReached();
+
+        DIAG_DEBUG(DE1, "MachineState") << "Hot water volume stop -" << m_pourVolume
+                 << "ml /" << target << "ml"
+                 << (scaleConfigured ? "(safety net)" : "(no scale)");
+
+        if (m_device) {
+            m_device->stopOperation();
+        }
+    }
+}
+
+void MachineState::onFlowSample(double flowRate, double deltaTime) {
+    // Only process during active dispensing states
+    auto state = m_device->state();
+    if (state != DE1::State::Espresso &&
+        state != DE1::State::Steam &&
+        state != DE1::State::HotWater &&
+        state != DE1::State::HotWaterRinse) return;
+    if (!isFlowing()) return;
+
+    // Forward flow samples to the scale (FlowScale will integrate, physical scales ignore)
+    if (m_scale) {
+        m_scale->addFlowSample(flowRate, deltaTime);
+    }
+
+    // Integrate flow to track volume (ml), split by DE1 substate (matches de1app).
+    // de1app routes volume by substate: preinfusion → preinfusion_volume,
+    // pouring → pour_volume. Other substates (heating, stabilising) never reach
+    // here because isFlowing() excludes them above.
+    double volumeDelta = flowRate * deltaTime;
+    if (volumeDelta > 0) {
+        if (m_phase == Phase::Preinfusion) {
+            m_preinfusionVolume += volumeDelta;
+            int roundedMl = static_cast<int>(m_preinfusionVolume);
+            if (roundedMl != m_lastEmittedPreinfusionVolumeMl) {
+                m_lastEmittedPreinfusionVolumeMl = roundedMl;
+                emit preinfusionVolumeChanged();
+            }
+        } else {
+            // Pouring, HotWater, and all other flowing states count as pour volume
+            m_pourVolume += volumeDelta;
+            int roundedMl = static_cast<int>(m_pourVolume);
+            if (roundedMl != m_lastEmittedPourVolumeMl) {
+                m_lastEmittedPourVolumeMl = roundedMl;
+                emit pourVolumeChanged();
+            }
+        }
+        m_cumulativeVolume = m_preinfusionVolume + m_pourVolume;
+        // Only emit when rounded ml changes (avoids ~206 samples/shot of QML binding churn at 5Hz)
+        int roundedMl = static_cast<int>(m_cumulativeVolume);
+        if (roundedMl != m_lastEmittedCumulativeVolumeMl) {
+            m_lastEmittedCumulativeVolumeMl = roundedMl;
+            emit cumulativeVolumeChanged();
+        }
+
+        // Check volume-based stops (matches de1app: SAV runs for both Espresso and HotWater)
+        if (state == DE1::State::Espresso) {
+            checkStopAtVolume();
+        } else if (state == DE1::State::HotWater) {
+            checkStopAtVolumeHotWater();
+        }
+    }
+}
+
+void MachineState::startShotTimer() {
+    m_shotTime = 0.0;
+    m_shotStartTime = QDateTime::currentMSecsSinceEpoch();
+    m_shotTimer->start();
+    emit shotTimeChanged();
+}
+
+void MachineState::stopShotTimer() {
+    m_shotTimer->stop();
+}
+
+void MachineState::stopShotAndScaleTimers(const char* reason) {
+    stopShotTimer();
+    if (m_scale) {
+        m_scale->stopTimer();
+        DIAG_DEBUG(SCALE, "MachineState").noquote()
+            << QStringLiteral("SCALE TIMER: Stopped (%1)").arg(QLatin1String(reason));
+    }
+}
+
+void MachineState::onShotTimerTick() {
+    qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_shotStartTime;
+    m_shotTime = elapsed / 1000.0;
+    emit shotTimeChanged();
+
+    // Check if we've reached the target time for steam/flush
+    // Real machines handle this in firmware, but this provides
+    // support for the simulator and a fallback for real devices
+    checkStopAtTime();
+}
+
+void MachineState::checkStopAtTime() {
+    if (m_stopAtTimeTriggered) return;
+    if (!m_settings) return;
+
+    double target = 0;
+    if (m_phase == Phase::Steaming) {
+        // Steam timeout is handled by DE1 firmware via ShotSettings.steamTimeout.
+        // The firmware stops steam flow but keeps the machine in Steaming state so
+        // pressing GHC Stop triggers a final cleaning purge puff. App-side stop
+        // exits steaming entirely, killing the GHC light and purge opportunity.
+        // Only use app-side stop for the simulator (which has no firmware timer).
+        if (m_device && m_device->simulationMode()) {
+            target = m_settings->brew()->steamTimeout();
+        }
+    } else if (m_phase == Phase::Flushing) {
+        target = m_settings->brew()->flushSeconds();
+    } else {
+        return;  // Only Steam and Flush use time-based stop
+    }
+    if (target <= 0) return;
+
+    if (m_shotTime >= target) {
+        m_stopAtTimeTriggered = true;
+
+        // Stop the operation
+        if (m_device) {
+            m_device->stopOperation();
+            // Steam or flush, never a shot: a [Shot] tag read as a shot that stopped on time.
+            if (m_phase == Phase::Steaming)
+                DIAG_DEBUG(STEAM, "MachineState") << QStringLiteral("Steam stopped at its %1 s limit").arg(target);
+            else
+                DIAG_DEBUG(DE1, "MachineState") << QStringLiteral("Flush stopped at its %1 s limit").arg(target);
+        }
+    }
+}
+
+double MachineState::scaleWeight() const {
+    if (!m_scale) return 0.0;
+
+    // After hot water SAW triggered, freeze the display to prevent late tare from
+    // showing 0g. Checked outside the phase guard because the completion overlay
+    // reads scaleWeight() after phase has already transitioned to Idle.
+    // Safe unconditionally: reset to -1.0 at the start of each new flow cycle.
+    if (m_hotWaterFrozenWeight >= 0.0)
+        return m_hotWaterFrozenWeight;
+
+    // Same correction WeightProcessor applies to the SAW series and the saved final
+    // weight. Applied to the OFFSET, not by routing this through the corrected series:
+    // that series is spike-filtered and de-jittered, so a rejected sample would freeze
+    // the readout mid-pour.
+    if (m_phase == Phase::HotWater)
+        return qMax(0.0, hotWaterNetWeight(m_scale->weight()));
+    double raw = m_scale->weight() - m_preShotZeroOffset;
+
+    return raw;
+}
+
+double MachineState::scaleFlowRate() const {
+    return smoothedScaleFlowRate();
+}
+
+// LSLR flow rate is now computed by WeightProcessor on a dedicated worker thread.
+// These methods return cached values updated via updateCachedFlowRates().
+double MachineState::smoothedScaleFlowRate() const {
+    return m_cachedFlowRate;
+}
+
+void MachineState::updatePreShotZeroOffset(double offsetG) {
+    if (m_preShotZeroOffset == offsetG)
+        return;
+    m_preShotZeroOffset = offsetG;
+    emit scaleWeightChanged();
+}
+
+void MachineState::updateCachedFlowRates(double flowRate, double flowRateShort) {
+    m_cachedFlowRate = flowRate;
+    m_cachedFlowRateShort = flowRateShort;
+    if (m_flowRateEmitTimer.elapsed() >= 100) {  // 10Hz cap
+        m_flowRateEmitTimer.restart();
+        m_flowRateTrailingTimer->stop();
+        emit scaleFlowRateChanged();
+    } else if (!m_flowRateTrailingTimer->isActive()) {
+        m_flowRateTrailingTimer->start();
+    }
+}
+
+void MachineState::tareScale() {
+    if (m_waterSettle.isActive()) finishWaterCapture();
+    // Delegate to timing controller if available (new centralized timing)
+    if (m_timingController && m_phase != Phase::HotWater) {
+        m_timingController->tare();
+        return;
+    }
+
+    // Hot water: fire-and-forget tare (matches de1app behavior).
+    // Record baseline weight so SAW can use (scale_weight - baseline) regardless
+    // of whether the BLE tare command is actually executed by the scale.
+    // When the scale does tare, onScaleWeightChanged detects the drop and clears
+    // the baseline so SAW switches to using absolute weight.
+    if (m_phase == Phase::HotWater && m_scale && m_scale->isConnected()) {
+        m_hotWaterTareBaseline = m_scale->weight();
+        if (m_waterCapturing) m_waterTareAwaitingZero = true;
+        m_hotWaterTareTimeMs = QDateTime::currentMSecsSinceEpoch();
+        m_scale->tare();
+        m_scale->resetFlowCalculation();
+        m_tareCompleted = true;
+        m_waitingForTare = false;
+        if (m_tareTimeoutTimer)
+            m_tareTimeoutTimer->stop();
+        DIAG_DEBUG(SCALE, "MachineState") << "=== TARE: Hot Water fire-and-forget, baseline=" << m_hotWaterTareBaseline << "g ===";
+        emit tareCompleted();
+        return;
+    }
+
+    // Fallback: legacy wait-for-zero tare (used when no timing controller)
+    if (m_scale && m_scale->isConnected()) {
+        // Skip if a tare is already in progress — sending another BLE tare command
+        // while waiting for the scale to respond confuses the scale and can cause it
+        // to never report ~0g, eventually triggering a 6s timeout (issue #430).
+        if (m_waitingForTare) {
+            DIAG_DEBUG(SCALE, "MachineState") << "TARE: Skipped (already waiting for scale response)";
+            return;
+        }
+
+        m_tareCompleted = false;
+        m_waitingForTare = true;
+
+        m_scale->tare();
+        m_scale->resetFlowCalculation();
+
+        if (!m_tareTimeoutTimer) {
+            m_tareTimeoutTimer = new QTimer(this);
+            m_tareTimeoutTimer->setSingleShot(true);
+            m_tareTimeoutTimer->setInterval(6000);
+            connect(m_tareTimeoutTimer, &QTimer::timeout, this, [this]() {
+                if (m_waitingForTare) {
+                    DIAG_WARN(SCALE, "MachineState") << "Tare timeout: scale didn't report ~0g within 6s";
+                    m_waitingForTare = false;
+                    m_tareCompleted = true;
+                    emit tareCompleted();
+                }
+            });
+        }
+        m_tareTimeoutTimer->start();
+    }
+}
+
+void MachineState::onTimingControllerTareComplete() {
+    m_tareCompleted = true;
+    m_waitingForTare = false;
+    emit tareCompleted();
+}

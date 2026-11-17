@@ -1,0 +1,231 @@
+# bag-inventory-view Specification
+
+## Purpose
+Governs the Beans window's bag-inventory list that replaced the old preset list: cards that show less when more is known (canonical vs. partial data), the single life-stage-appropriate removal action per card (delete before any shot, "Bag finished" after), the idle-page MRU bag-pill widget, and in-place editing that never disturbs existing shots' immutable bean snapshots.
+
+## Requirements
+
+### Requirement: Beans window shows bag inventory
+The Beans window SHALL display a list of bags where `inInventory = true`, replacing the current preset list.
+
+#### Scenario: Inventory with canonical bags
+- **WHEN** the Beans window is opened and the user has canonical-linked bags
+- **THEN** each bag SHALL display: roaster name, coffee name, canonical verified badge, key attributes (origin · variety · process), roast age, and defrost age if `defrostDate` is set
+
+#### Scenario: Inventory with non-canonical bags
+- **WHEN** a bag has no `beanBaseId`
+- **THEN** the card SHALL display roaster name, coffee name, roast age, and a "Find in Bean Base" nudge link — but SHALL NOT display empty attribute fields
+
+#### Scenario: Empty inventory
+- **WHEN** no bags are in inventory
+- **THEN** the window SHALL display a prompt to add the first bag, with an "Add New Bag" action
+
+### Requirement: Bag cards adapt to data confidence
+Bag cards SHALL follow the "show less when more is known" principle: canonical-linked bags show a single dense attribute line; non-canonical bags show only what is available.
+
+#### Scenario: Full canonical card
+- **WHEN** a bag has `beanBaseId` and `beanBaseData` with origin, variety, and process
+- **THEN** the card SHALL render all three on one line (e.g., "Ethiopia · Washed · Heirloom")
+
+#### Scenario: Partial data card
+- **WHEN** a bag has only roaster and coffee name (no canonical)
+- **THEN** the card SHALL show only those two fields — no empty placeholders
+
+### Requirement: "Bag finished" removes bag from inventory
+The system SHALL provide a "Bag finished" action on each bag card. Activating it SHALL set `inInventory = false`, removing the bag from the inventory view. Historical shots referencing the bag SHALL be unaffected.
+
+#### Scenario: Bag finished
+- **WHEN** the user activates "Bag finished" on a bag
+- **THEN** the bag SHALL disappear from the inventory view immediately
+- **AND** shots that were made with that bag SHALL retain their bean snapshot
+
+#### Scenario: Active bag marked empty
+- **WHEN** the user finishes the currently active bag
+- **THEN** `activeBagId` SHALL be cleared
+- **AND** the bean summary in shot contexts SHALL show "No beans selected"
+
+### Requirement: Add New Bag entry point
+The Beans window SHALL provide two creation entry points: a "Bag of Coffee" action that opens the Change Beans dialog in its existing creation mode, and a "Bag of Tea" action beside it, the two styled alike with their kind's icon and preceded by an "Add" label that opens the Change Beans dialog in tea creation mode. Each entry point stamps the created bag's kind. The labels name what is added — a bag — so "coffee" is not read as a bean.
+
+#### Scenario: Add coffee from inventory
+- **WHEN** the user taps "Bag of Coffee"
+- **THEN** the Change Beans dialog SHALL open in its search-first coffee flow
+- **AND** on bag creation, the new bag SHALL appear in inventory and become the active bag
+
+#### Scenario: Add tea from inventory
+- **WHEN** the user taps "Bag of Tea"
+- **THEN** the Change Beans dialog SHALL open in tea mode
+- **AND** the created bag SHALL have kind "tea" and appear in inventory
+
+### Requirement: Idle-page bean widget shows inventory bags
+
+The idle-page bean layout widget (`BeansItem.qml`) SHALL display inventory bags (`inInventory = true`, MRU order) as selectable pills, replacing the showOnIdle-filtered preset pills. Tapping a pill SHALL set `activeBagId`. The full inventory remains on the Beans page. The widget SHALL mirror the Recipes idle widget's fit-based pagination (recipe-quick-switch).
+
+#### Scenario: Selecting a bag from the idle page
+- **WHEN** the user taps a bag pill on the idle page
+- **THEN** `activeBagId` SHALL be set to that bag
+- **AND** the pill SHALL show a selected state
+
+#### Scenario: Bag marked empty disappears from idle widget
+- **WHEN** a bag is marked empty
+- **THEN** its pill SHALL be removed from the idle widget (visibility criterion is `inInventory`, the dropped `showOnIdle` flag has no successor)
+
+#### Scenario: Page size follows name length
+- **WHEN** bags have long names such that fewer fit within two rows
+- **THEN** the first page shows only as many as fit, the rest paginate, and different pages MAY show different numbers of bags
+
+#### Scenario: Paging to reach older bags
+- **WHEN** more bags exist than fit within two rows and the user taps the next arrow
+- **THEN** the row shows the next group of bags (however many fit) in MRU order without changing `activeBagId`
+
+#### Scenario: Everything fits needs no arrows
+- **WHEN** every bag fits within two rows at the current width
+- **THEN** the pill row SHALL show no pagination arrows and appear exactly as the non-paginated row did
+
+#### Scenario: Never more than two rows
+- **WHEN** any page of bag pills is shown
+- **THEN** the pills SHALL occupy at most two rows
+
+### Requirement: Bag paging SHALL NOT change the active bag
+
+The previous arrow SHALL show only when a previous page exists, and the next arrow only when a further page exists. Paging SHALL NOT change `activeBagId` or reorder the inventory.
+
+#### Scenario: Paging keeps the active bag
+
+- **WHEN** the user pages the bag pill row
+- **THEN** `activeBagId` SHALL be unchanged
+
+### Requirement: The bag pill row SHALL fit bags within two rows
+
+The pill row SHALL show as many bags as fit within at most two rows at the current width, computed live from measured pill widths, so the count MAY differ between pages. Opening the widget SHALL start on the first page, and the current page SHALL be clamped to range when the inventory changes.
+
+#### Scenario: Page size follows measured widths
+
+- **WHEN** bag names are long enough that fewer fit within two rows
+- **THEN** each page SHALL hold only as many bags as fit at the measured width
+
+### Requirement: Bags are editable in place
+Each bag SHALL be editable from its card via an Edit action, opening the Bag Details form in edit mode. All bag fields are editable (roaster, coffee name, roast date, roast level, notes, startWeightG, freeze dates, canonical link). Edits modify the existing bag row — no new bag is created, and `activeBagId` is unaffected.
+
+#### Scenario: Fixing a typo on a bag
+- **WHEN** the user edits a bag's coffee name and saves
+- **THEN** the same bag row SHALL be updated in place
+- **AND** shots already linked to the bag keep their snapshots unchanged (snapshots are immutable history)
+
+#### Scenario: Adding a roast date later
+- **WHEN** the user edits a bag that was created without a roast date and enters one
+- **THEN** the bag SHALL store it and roast-age displays SHALL appear from then on
+
+### Requirement: Re-buying the same coffee flows through Change Beans
+There SHALL be no per-card save-as shortcut (removed — it added clutter without saving meaningful effort). Buying the same coffee again: finish the old bag, then the coffee surfaces in the Change Beans search as a history/canonical result whose selection pre-fills the creation form (roast date blank).
+
+#### Scenario: New bag of a previously finished coffee
+- **WHEN** the user finishes a bag and later searches for the same coffee in Change Beans
+- **THEN** the coffee SHALL appear as a history (and/or canonical) result
+- **AND** picking it SHALL pre-fill the creation form with roast date blank
+
+### Requirement: One removal action per card, following the bag's life
+Each bag card SHALL show exactly ONE removal action, chosen by whether shots reference the bag (`shotCount` from the inventory query): a delete (trash) action while no shot references it (a mistaken creation — removes the row entirely), and "Bag finished" once shots exist (leaves inventory, history kept). Storage SHALL still refuse deleting a referenced bag as a stale-count safety net.
+
+#### Scenario: Deleting a mistakenly created bag
+- **WHEN** a bag has zero linked shots
+- **THEN** the card SHALL show the delete action (and not "Bag finished")
+- **AND** activating it SHALL remove the bag row from the database entirely
+
+#### Scenario: First shot converts the action
+- **WHEN** the first shot is saved against a bag
+- **THEN** the card SHALL show "Bag finished" instead of delete (inventory refreshes via bagsChanged)
+
+### Requirement: Finished bags are listed and can be restocked
+
+The Beans window SHALL offer a "Show finished (N)" toggle, shown when any bag has `inInventory = false`. It SHALL list finished bags as dimmed cards in most-recently-used order, and tapping a finished card SHALL open it for editing. The finished bag SHALL stay finished, with its shots.
+
+#### Scenario: Restocking a coffee whose bag was finished
+- **GIVEN** a finished bag of Saka Gran Bar with a recipe linked to it
+- **WHEN** the user opens Show finished, taps Restock on it, enters the new roast date and saves
+- **THEN** a new Saka Gran Bar bag is in inventory with the old bag's details and dial-in, and the old bag is still finished
+
+#### Scenario: Restoring a bag finished by mistake
+- **WHEN** the user taps Restore on a finished bag
+- **THEN** that same bag is back in inventory, with its dates and shots
+
+#### Scenario: Restocking a bag still in use
+- **WHEN** the user taps Restock on a bag in inventory, enters the new roast date and saves
+- **THEN** a new bag of that coffee is added, and the original bag stays in inventory
+
+#### Scenario: No finished bags
+- **WHEN** every bag is in inventory
+- **THEN** no Show finished toggle is shown
+
+### Requirement: Finished cards SHALL offer Restore, Edit and bean details
+
+A finished card SHALL offer Restore, which returns that same bag to inventory with its dates and shots. It SHALL also offer Edit and, for a linked bag, bean details.
+
+#### Scenario: Finished card actions
+
+- **WHEN** a finished linked bag's card is shown
+- **THEN** it SHALL offer Restore, Edit and bean details
+
+### Requirement: Restock SHALL create a new bag from an existing one
+
+Restock SHALL be offered on finished bags and on bags in inventory. It SHALL open the new-bag form prefilled from that bag's identity, bean details, dose and yield, with roast date, freezer dates, opened date and notes left blank. Saving SHALL create a new bag and SHALL leave the original bag's state unchanged.
+
+#### Scenario: Restock on a bag still in use keeps it in inventory
+
+- **WHEN** the user taps Restock on a bag in inventory and saves a new roast date
+- **THEN** a new bag of that coffee SHALL be added and the original SHALL stay in inventory
+
+### Requirement: A failed bag read is not an empty inventory or a missing bag
+
+A bag query that fails, or a database that does not open, SHALL be reported as a failure: the inventory SHALL NOT be shown as empty, and the active bag selection SHALL NOT be cleared. Only a bag row that is genuinely absent SHALL count as not found.
+
+#### Scenario: Bag table cannot be read
+- **GIVEN** a database whose bag table cannot be queried
+- **WHEN** the Beans window opens and the active bag is reloaded
+- **THEN** the window says the bags could not be read, not "No bags yet", and the active bag stays selected
+
+### Requirement: Beans page search and sort
+
+The Beans window SHALL offer the same search field and sort controls as the Recipes page. A search SHALL match every text value a bag holds (its fields, its bean-details blob, and its localized kind, "Tea" or "Coffee"), and SHALL NOT match identifiers, links, stored enum values or sync bookkeeping. The search SHALL reset when the page is entered.
+
+#### Scenario: Search by a bean detail
+- **WHEN** the user types a region recorded only in a bag's bean details
+- **THEN** that bag is listed and bags without that text are not
+
+#### Scenario: Search by kind
+- **WHEN** the user types "tea"
+- **THEN** every bag of tea is listed
+
+#### Scenario: Search reaches finished bags
+- **WHEN** a search matches only a finished bag
+- **THEN** "Show finished (1)" is shown and lists it, and the page does not say nothing matches
+
+#### Scenario: Finished bags change during a search
+- **WHEN** the user finishes a bag that matches the current search
+- **THEN** it moves from the open results to the finished matches
+
+#### Scenario: No matches
+- **WHEN** a search matches no bag, open or finished
+- **THEN** the page says no bags match the search
+
+#### Scenario: Finished bags cannot be read
+- **WHEN** reading the finished bags fails while a search is on or the finished bags are shown
+- **THEN** the page says the finished bags could not be read, and does not say nothing matches
+
+### Requirement: Sort SHALL persist and fall back to Last used
+
+Sort SHALL offer Last used (the default, newest first), Roast date, and Coffee and Roaster. The chosen sort SHALL persist. A saved sort the page does not offer SHALL show and sort as Last used.
+
+#### Scenario: Unoffered saved sort falls back
+
+- **WHEN** a saved sort that the page does not offer is loaded
+- **THEN** the page SHALL show Last used and sort by it
+
+### Requirement: Search SHALL update on every edit and include finished bags
+
+The search SHALL update on every edit and SHALL apply to finished bags too. The "Show finished (N)" count SHALL count the matching finished bags.
+
+#### Scenario: Finished count follows the search
+
+- **WHEN** a search matches one finished bag
+- **THEN** the toggle SHALL read "Show finished (1)"

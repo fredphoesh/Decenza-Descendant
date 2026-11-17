@@ -1,0 +1,366 @@
+#pragma once
+
+#include <QObject>
+#include <QString>
+#include <QVariantMap>
+#include <QVariantList>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QUdpSocket>
+#include <QTemporaryDir>
+#include <QList>
+#include <QPair>
+
+#include "../history/shothistorystorage.h"
+#include <QHostAddress>
+#include <QTimer>
+#include <QPointer>
+#include <QSettings>
+#include <memory>
+#include <atomic>
+
+#include <QtQmlIntegration/qqmlintegration.h>
+class TranslationManager;
+class FullBackupRestore;
+class QTcpSocket;
+
+class Settings;
+class ProfileStorage;
+class ShotHistoryStorage;
+class ScreensaverVideoManager;
+class AIManager;
+
+/**
+ * @brief Client for importing data from another Decenza device over WiFi.
+ *
+ * Connects to a remote Decenza device running the shot server and imports
+ * settings, profiles, shot history, personal media, and AI conversations.
+ */
+class DataMigrationClient : public QObject {
+    Q_OBJECT
+
+    // Compile-time QML registration, so qmllint, qmlcachegen and the language server can
+    // follow MainController's property through to this class. A runtime qmlRegister* call is
+    // invisible to all three. Full rationale in src/controllers/maincontroller.h.
+    QML_ELEMENT
+    QML_UNCREATABLE("DataMigrationClient is created in C++ and reached via MainController")
+
+    Q_PROPERTY(bool isConnecting READ isConnecting NOTIFY isConnectingChanged)
+    Q_PROPERTY(bool isImporting READ isImporting NOTIFY isImportingChanged)
+    Q_PROPERTY(bool isSearching READ isSearching NOTIFY isSearchingChanged)
+    Q_PROPERTY(double progress READ progress NOTIFY progressChanged)
+    Q_PROPERTY(QString currentOperation READ currentOperation NOTIFY currentOperationChanged)
+    Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY errorMessageChanged)
+    // What the AI-conversation step could not do, empty when it did everything.
+    //
+    // A PROPERTY, not a parameter on importComplete: the cases that produce it
+    // are the cases that end the run with an error, and importComplete only
+    // fires on a clean run. Carried as a signal argument it evaporated exactly
+    // when it mattered — a refused shot history holds every conversation back,
+    // sets an error, and the note went with it. A property is also one fewer
+    // handler signature to keep in step; the first version of this reached one
+    // of its two QML handlers and silently dropped out of the other.
+    Q_PROPERTY(QString aiConversationNote READ aiConversationNote NOTIFY aiConversationNoteChanged)
+    Q_PROPERTY(QVariantMap manifest READ manifest NOTIFY manifestChanged)
+    Q_PROPERTY(QString serverUrl READ serverUrl NOTIFY serverUrlChanged)
+    Q_PROPERTY(QVariantList discoveredDevices READ discoveredDevices NOTIFY discoveredDevicesChanged)
+    Q_PROPERTY(bool needsAuthentication READ needsAuthentication NOTIFY needsAuthenticationChanged)
+
+public:
+    explicit DataMigrationClient(QNetworkAccessManager* networkManager, QObject* parent = nullptr);
+    ~DataMigrationClient();
+
+    // Dependencies (set by MainController)
+    void setSettings(Settings* settings) { m_settings = settings; }
+    void setProfileStorage(ProfileStorage* profileStorage) { m_profileStorage = profileStorage; }
+    void setShotHistoryStorage(ShotHistoryStorage* shotHistory) { m_shotHistory = shotHistory; }
+    void setScreensaverVideoManager(ScreensaverVideoManager* screensaver) { m_screensaver = screensaver; }
+    void setAIManager(AIManager* aiManager) { m_aiManager = aiManager; }
+    void setFullBackupRestore(FullBackupRestore* restore);
+
+    // Property getters
+    bool isConnecting() const { return m_connecting; }
+    bool isImporting() const { return m_importing || m_shotImportInFlight; }
+    bool canCancelImport() const { return !m_fullRestoreInFlight; }
+    bool lastImportWasReplacement() const { return m_lastImportWasReplacement; }
+    bool isSearching() const { return m_searching; }
+    double progress() const { return m_progress; }
+    QString currentOperation() const { return m_currentOperation; }
+    QString errorMessage() const { return m_errorMessage; }
+    QString aiConversationNote() const { return m_aiConversationNote; }
+
+    // Inject the TranslationManager so the AI-conversation note localizes; until
+    // injected, the English fallback is used. Same shape as
+    // DatabaseBackupManager's. Main thread only — TranslationManager is not
+    // thread-safe, and every producer of the note above runs on it.
+    void setTranslationManager(TranslationManager* tm) { m_translationManager = tm; }
+    QVariantMap manifest() const { return m_manifest; }
+    QString serverUrl() const { return m_serverUrl; }
+    QVariantList discoveredDevices() const { return m_discoveredDevices; }
+    bool needsAuthentication() const { return m_needsAuthentication; }
+
+    // Authentication
+    Q_INVOKABLE void authenticate(const QString& totpCode);
+
+    // Device discovery
+    Q_INVOKABLE void startDiscovery();
+    Q_INVOKABLE void stopDiscovery();
+
+    // Connect to a server and fetch its manifest
+    Q_INVOKABLE void connectToServer(const QString& serverUrl);
+
+    // Pure, testable interface-selection helper: given a target address, the
+    // local IPv4 addresses (paired with their subnet prefix length), and the
+    // OS-preferred source address for the target, return the ordered list of
+    // candidate local source addresses whose subnet contains the target, with
+    // the preferred (default-route) source moved to the front. Empty when the
+    // target is on no directly-connected subnet. Defined inline so tests can
+    // exercise it without linking the full client (and its storage deps).
+    static QList<QHostAddress> orderedSubnetCandidates(
+        const QHostAddress& target,
+        const QList<QPair<QHostAddress, int>>& localV4,
+        const QHostAddress& preferred)
+    {
+        QList<QHostAddress> result;
+        for (const auto& entry : localV4) {
+            const QHostAddress& ip = entry.first;
+            const int prefix = entry.second;
+            if (prefix <= 0) {
+                continue;
+            }
+            // target on the same subnet as this local address?
+            if (target.isInSubnet(ip, prefix) && !result.contains(ip)) {
+                result.append(ip);
+            }
+        }
+        // Move the OS default-route source to the front so it is probed first.
+        if (!preferred.isNull()) {
+            const qsizetype idx = result.indexOf(preferred);
+            if (idx > 0) {
+                result.move(idx, 0);
+            }
+        }
+        return result;
+    }
+
+    // Errors that mean "the connection could not be established" and warrant a
+    // retry / an "unreachable" classification. EHOSTUNREACH surfaces as
+    // UnknownNetworkError. Deliberately EXCLUDES ConnectionRefusedError and
+    // RemoteHostClosedError — those mean the host answered, so it is reachable.
+    // Inline so tests can exercise the mapping without linking the client.
+    static bool isTransientNetworkError(QNetworkReply::NetworkError error)
+    {
+        switch (error) {
+        case QNetworkReply::HostNotFoundError:
+        case QNetworkReply::TimeoutError:
+        case QNetworkReply::TemporaryNetworkFailureError:
+        case QNetworkReply::NetworkSessionFailedError:
+        case QNetworkReply::UnknownNetworkError:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Disconnect from current server
+    Q_INVOKABLE void disconnect();
+
+    // Import all data types
+    Q_INVOKABLE void importAll(bool replace = false);
+
+    // Import individual data types (can be called from QML)
+    Q_INVOKABLE void importOnlySettings();
+    Q_INVOKABLE void importOnlyProfiles();
+    Q_INVOKABLE void importOnlyShots();
+    Q_INVOKABLE void importOnlyMedia();
+    Q_INVOKABLE void importOnlyAIConversations();
+
+    // Cancel ongoing import
+    Q_INVOKABLE void cancel();
+
+signals:
+    void isConnectingChanged();
+    void isImportingChanged();
+    void isSearchingChanged();
+    void progressChanged();
+    void currentOperationChanged();
+    void errorMessageChanged();
+    void aiConversationNoteChanged();
+    void manifestChanged();
+    void serverUrlChanged();
+    void discoveredDevicesChanged();
+    void connected();
+    void connectionFailed(const QString& error);
+    void importComplete(int settingsImported, int profilesImported, int shotsImported,
+                        int mediaImported, int aiConversationsImported);
+    void importFailed(const QString& error);
+    void discoveryComplete();
+    void needsAuthenticationChanged();
+    void authenticationFailed(const QString& error);
+    void authenticationSucceeded();
+
+private slots:
+    void onManifestReply();
+    void onSettingsReply();
+    void onExtraSettingsReply();
+    void onFullBackupReply();
+    void onProfileListReply();
+    void onProfileFileReply();
+    void onShotsReply();
+    void onMediaListReply();
+    void onMediaFileReply();
+    void onAIConversationsReply();
+    void onDownloadProgress(qint64 received, qint64 total);
+    void onDiscoveryDatagram();
+    void onDiscoveryTimeout();
+    void onDiscoveryRetransmit();
+    void onAuthReply();
+
+private:
+    struct FullBackupDownload;
+    void pumpFullBackupDownload();
+    // Helper structs for tracking downloads
+    struct ProfileDownload {
+        QString category;
+        QString filename;
+        qint64 size;
+    };
+
+    struct MediaDownload {
+        QString filename;
+        qint64 size;
+    };
+
+    void setProgress(double progress);
+    void setCurrentOperation(const QString& operation);
+    void setError(const QString& error);
+    // Report `error` only when no failure has been reported yet. See the .cpp:
+    // the steps run in a fixed order and the dialog shows one message, so an
+    // unconditional write lets the LAST failure hide the first and worst.
+    void setErrorIfFirst(const QString& error);
+    void setAiConversationNote(const QString& note);
+    void setupSslHandling(QNetworkReply* reply);
+    void addSessionCookie(QNetworkRequest& request);
+    void saveSessionToken(const QString& serverHost, const QString& token);
+    QString loadSessionToken(const QString& serverHost);
+    void startImport(const QStringList& types);  // Common setup for all import methods
+    void startNextImport();
+
+    // Connection establishment (interface-aware, multi-homing-robust).
+    // gatherSubnetCandidates reads the live interface table + OS-preferred
+    // source and delegates ordering to orderedSubnetCandidates().
+    QList<QHostAddress> gatherSubnetCandidates(const QHostAddress& target, quint16 port) const;
+    void startReachabilityPreflight();  // picks a reachable local interface, then fetchManifest()
+    void tryNextProbeCandidate();
+    void onProbeSucceeded();
+    void onProbeFailed();
+    void teardownProbeSocket();
+    void finishProbe(bool reachable);
+    void fetchManifest();               // issues the actual GET /api/backup/manifest
+    void downloadNextProfile();
+    void downloadNextMedia();
+
+    // Internal import methods (used by queue)
+    void doImportSettings();
+    // Chained after settings: fetch /api/backup/extra-settings (shot-map
+    // location, accessibility, language) so LAN migration matches the full
+    // archive. Older servers lack the endpoint → fetch fails → skipped cleanly.
+    void doImportExtraSettings();
+    void doImportProfiles();
+    void doImportShots();
+    void doCheckSourceSchema();
+    void refuseUncheckedSource(bool belowFloor);
+    void doImportMedia();
+    void doImportAIConversations();
+
+    QNetworkAccessManager* m_networkManager;
+    QPointer<QNetworkReply> m_currentReply;
+    std::shared_ptr<FullBackupDownload> m_fullBackupDownload;
+    QTemporaryDir* m_tempDir = nullptr;
+
+    Settings* m_settings = nullptr;
+    ProfileStorage* m_profileStorage = nullptr;
+    QPointer<ShotHistoryStorage> m_shotHistory;
+    ScreensaverVideoManager* m_screensaver = nullptr;
+    AIManager* m_aiManager = nullptr;
+
+    QString m_serverUrl;
+    QVariantMap m_manifest;
+    bool m_connecting = false;
+    bool m_importing = false;
+    bool m_cancelled = false;
+    double m_progress = 0.0;
+    QString m_currentOperation;
+    QString m_errorMessage;
+    QString m_aiConversationNote;   // what the conversation step could not do; see the property
+    TranslationManager* m_translationManager = nullptr;
+    QPointer<FullBackupRestore> m_fullRestore;
+    bool m_fullRestoreInFlight = false;
+    bool m_lastImportWasReplacement = false;
+
+    // Import queue for importAll()
+    QStringList m_importQueue;
+    int m_settingsImported = 0;
+    int m_profilesImported = 0;
+    int m_shotsImported = 0;
+    int m_mediaImported = 0;
+    int m_aiConversationsImported = 0;
+
+    // Shot id map from the `shots` step, consumed by the `ai_conversations`
+    // step that importAll() queues after it. Empty when no shots landed this
+    // run — the archive had none, the import failed, or it was refused — which
+    // the conversation import reads as "clear every stored shot id", since
+    // those ids name the SOURCE device's database.
+    //
+    // RESET IN startImport(). It is the only per-run state held across steps,
+    // and a stale one would remap a later run's turns through an earlier run's
+    // map, possibly from a different source device.
+    ShotHistoryStorage::ImportResult m_shotImport;
+
+    // Pending downloads
+    QList<ProfileDownload> m_pendingProfiles;
+    QList<MediaDownload> m_pendingMedia;
+
+    // For progress calculation
+    qint64 m_totalBytes = 0;
+    qint64 m_receivedBytes = 0;
+
+    // Device discovery
+    QUdpSocket* m_discoverySocket = nullptr;
+    QTimer* m_discoveryTimer = nullptr;
+    QTimer* m_discoveryRetransmitTimer = nullptr;
+    QVariantList m_discoveredDevices;
+    bool m_searching = false;
+    int m_discoveryRetransmitIndex = 0;
+    void sendDiscoveryBroadcasts();
+    static constexpr int DISCOVERY_PORT = 8889;
+    static constexpr int DISCOVERY_TIMEOUT_MS = 5000;  // Search for 5 seconds
+    // Retransmit schedule in ms from the start of discovery. First entry must be 0.
+    // UDP broadcasts can be dropped silently, especially on Wi-Fi, so we repeat a few
+    // times to improve the chance every responder gets at least one request.
+    static constexpr int DISCOVERY_RETRANSMIT_SCHEDULE_MS[] = {0, 500, 1200, 2500};
+
+    // Connection establishment state
+    QString m_connectHost;                  // host parsed from m_serverUrl
+    quint16 m_connectPort = 0;              // port parsed from m_serverUrl
+    QList<QHostAddress> m_probeCandidates;  // ordered local source addresses to try
+    int m_probeIndex = 0;
+    QTcpSocket* m_probeSocket = nullptr;
+    QTimer* m_probeTimer = nullptr;
+    int m_manifestRetriesLeft = 0;
+    static constexpr int PROBE_TIMEOUT_MS = 900;   // per-candidate connect timeout
+    static constexpr int MANIFEST_MAX_RETRIES = 2; // transient-error retries
+
+    // Authentication
+    bool m_needsAuthentication = false;
+    QString m_sessionToken;  // Current session cookie token
+
+    // A cancelled shot import still owns its physical DB mutation until its
+    // application-thread completion drains. A later run cannot overlap it.
+    bool m_shotImportInFlight = false;
+    std::shared_ptr<std::atomic_bool> m_shotImportCancelled;
+    // False for a source from before the manifest carried shotSchemaVersion:
+    // its database has to be checked before anything else is applied.
+    bool m_sourceSchemaReported = false;
+    quint64 m_importGeneration = 0;
+};

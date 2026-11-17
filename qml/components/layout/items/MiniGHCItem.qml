@@ -1,0 +1,207 @@
+// Delegates below declare their model roles with `required property`; ids from this file then
+// resolve statically inside them. See PresetPillRow.qml for the full rationale.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Layouts
+import QtQuick.Effects
+import Decenza
+
+// Layout widget with 5 buttons to control DE1 machine operations:
+// Espresso, Steam, Hot Water, Flush, and Stop.
+// Enabled in simulation mode or for headless machines (no physical GHC).
+// Starting requires a ready machine; Stop remains available during operations.
+LayoutWidgetItem {
+    id: root
+
+    enabled: (DE1Device.simulationMode || DE1Device.isHeadless) && DE1Device.connected
+    opacity: enabled ? 1.0 : 0.4
+
+    function _effectiveColor(baseColor) {
+        return Theme.glassChrome ? Theme.chromeFill(baseColor) : baseColor
+    }
+
+    implicitWidth: isCompact ? compactContent.implicitWidth : fullContent.implicitWidth
+    implicitHeight: isCompact ? compactContent.implicitHeight : fullContent.implicitHeight
+
+    // --- COMPACT MODE (status bar) ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: compactRow.implicitWidth + Theme.scaled(16)
+        implicitHeight: Theme.bottomBarHeight
+
+        RowLayout {
+            id: compactRow
+            anchors.centerIn: parent
+            spacing: Theme.scaled(4)
+
+            Repeater {
+                model: [
+                    { icon: "qrc:/icons/espresso.svg", label: "Espresso", nameKey: "idle.button.espresso", action: function() { HomePresetActions.startEspresso() } },
+                    { icon: "qrc:/icons/steam.svg", label: "Steam", nameKey: "idle.button.steam", action: function() { HomePresetActions.startSteam() } },
+                    { icon: "qrc:/icons/water.svg", label: "Hot Water", nameKey: "idle.button.hotwater", action: function() { HomePresetActions.startHotWater() } },
+                    { icon: "qrc:/icons/flush.svg", label: "Flush", nameKey: "idle.button.flush", action: function() { HomePresetActions.startFlush() } },
+                    { icon: "qrc:/icons/hand.svg", label: "Stop", nameKey: "common.button.stop", action: function() { HomePresetActions.requestIdle() } }
+                ]
+
+                Rectangle {
+                    id: compactBtn
+
+                    required property var modelData
+                    enabled: modelData.label === "Stop" || MachineState.isReady
+                    opacity: enabled ? 1.0 : 0.4
+                    width: Theme.scaled(32)
+                    height: Theme.scaled(32)
+                    radius: Theme.scaled(6)
+                    color: compactArea.isPressed ? Qt.darker(root._effectiveColor(Theme.primaryColor), 1.2) : root._effectiveColor(Theme.primaryColor)
+                    Accessible.ignored: true
+
+                    Image {
+                        anchors.centerIn: parent
+                        source: compactBtn.modelData.icon
+                        sourceSize.width: Theme.scaled(18)
+                        sourceSize.height: Theme.scaled(18)
+                        Accessible.ignored: true
+                        layer.enabled: true
+                        layer.effect: MultiEffect {
+                            colorization: 1.0
+                            colorizationColor: Theme.surfaceColor
+                        }
+                    }
+
+                    AccessibleMouseArea {
+                        id: compactArea
+                        anchors.fill: parent
+                        accessibleName: TranslationManager.translate(compactBtn.modelData.nameKey, compactBtn.modelData.label)
+                        accessibleItem: compactBtn
+                        onAccessibleClicked: compactBtn.modelData.action()
+                    }
+                }
+            }
+        }
+    }
+
+    // --- FULL MODE (grid) ---
+    Item {
+        id: fullContent
+        visible: !root.isCompact
+        anchors.fill: parent
+        implicitWidth: Theme.scaled(200)
+        implicitHeight: Theme.scaled(200)
+
+        Rectangle {
+            anchors.fill: parent
+            color: Theme.cardBackgroundColor
+            radius: Theme.cardRadius
+            border.color: Theme.borderColor
+            border.width: 1
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: Theme.spacingSmall
+                spacing: Theme.scaled(4)
+
+                Tr {
+                    key: "layoutEditor.widgetGHCSimulator"
+                    fallback: "Mini GHC"
+                    color: Theme.textColor
+                    font: Theme.captionFont
+                    Layout.alignment: Qt.AlignHCenter
+                    Accessible.ignored: true
+                }
+
+                // Top row: Espresso, Steam
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    spacing: Theme.scaled(4)
+                    MiniGHCButton { translationKey: "idle.button.espresso"; translationFallback: "Espresso"; iconSource: "qrc:/icons/espresso.svg"; buttonColor: Theme.primaryColor; onTapped: HomePresetActions.startEspresso() }
+                    MiniGHCButton { translationKey: "idle.button.steam";    translationFallback: "Steam";    iconSource: "qrc:/icons/steam.svg";    buttonColor: Theme.primaryColor; onTapped: HomePresetActions.startSteam() }
+                }
+
+                // Middle row: Hot Water, Flush
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    spacing: Theme.scaled(4)
+                    MiniGHCButton { translationKey: "idle.button.hotwater.short"; translationFallback: "Water"; iconSource: "qrc:/icons/water.svg"; buttonColor: Theme.primaryColor; onTapped: HomePresetActions.startHotWater() }
+                    MiniGHCButton { translationKey: "idle.button.flush";    translationFallback: "Flush"; iconSource: "qrc:/icons/flush.svg"; buttonColor: Theme.primaryColor; onTapped: HomePresetActions.startFlush() }
+                }
+
+                // Bottom: Stop
+                MiniGHCButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    isStop: true
+                    translationKey: "common.button.stop"
+                    translationFallback: "Stop"
+                    iconSource: "qrc:/icons/hand.svg"
+                    buttonColor: Theme.errorColor
+                    onTapped: HomePresetActions.requestIdle()
+                }
+            }
+
+            component MiniGHCButton: Rectangle {
+                id: btn
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                radius: Theme.buttonRadius
+                property string translationKey: ""
+                property string translationFallback: ""
+                property string iconSource: ""
+                property color buttonColor: Theme.primaryColor
+                property bool isStop: false
+                enabled: isStop || MachineState.isReady
+                opacity: enabled ? 1.0 : 0.4
+                signal tapped()
+
+                readonly property string _label: {
+                    return TranslationManager.translate(translationKey, translationFallback)
+                }
+
+                readonly property color _effectiveButtonColor:
+                    Theme.glassChrome ? Theme.chromeFill(buttonColor) : buttonColor
+
+                color: btnArea.isPressed ? Qt.darker(_effectiveButtonColor, 1.2) : _effectiveButtonColor
+                Accessible.ignored: true
+                clip: true
+
+                Row {
+                    anchors.centerIn: parent
+                    spacing: Theme.scaled(6)
+
+                    Image {
+                        anchors.verticalCenter: parent.verticalCenter
+                        source: btn.iconSource
+                        sourceSize.width: Theme.scaled(18)
+                        sourceSize.height: Theme.scaled(18)
+                        Accessible.ignored: true
+                        layer.enabled: true
+                        layer.effect: MultiEffect {
+                            colorization: 1.0
+                            colorizationColor: Theme.surfaceColor
+                        }
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: btn._label
+                        color: Theme.actionButtonContentColor
+                        font: Theme.captionFont
+                        Accessible.ignored: true
+                    }
+                }
+
+                AccessibleMouseArea {
+                    id: btnArea
+                    anchors.fill: parent
+                    accessibleName: btn._label
+                    accessibleItem: btn
+                    onAccessibleClicked: btn.tapped()
+                }
+            }
+        }
+    }
+}

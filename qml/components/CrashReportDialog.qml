@@ -1,0 +1,621 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Decenza
+
+DecenzaDialog {
+    id: root
+    anchors.centerIn: parent
+    width: Theme.scaled(450)
+    modal: true
+    padding: 0
+    closePolicy: Dialog.NoAutoClose
+    browserBackDismissible: false
+    browserUnloadDirty: visible && (dialogState === "submitting"
+        || userNotesInput.text !== _openedUserNotes)
+
+    property string crashLog: ""
+    property string debugLogTail: ""
+
+    // State management
+    property string dialogState: "prompt"  // prompt, submitting, success, error
+    property string issueUrl: ""
+    property string errorMessage: ""
+
+    property string submitRequestId: ""
+    property string _openedUserNotes: ""
+    readonly property int maximumNotesLength: 4000
+    property string notesValidationMessage: ""
+
+    signal dismissed()
+    signal reported()
+
+    onAboutToShow: _openedUserNotes = userNotesInput.text
+
+    function syncSubmissionState() {
+        if (!root.visible || !GlobalSupportService.ready)
+            return
+        const status = GlobalSupportService.state.crashSubmissionStatus
+        if (status === "submitting") {
+            root.dialogState = "submitting"
+        } else if (status === "success") {
+            root.issueUrl = GlobalSupportService.state.crashIssueUrl
+            root.dialogState = "success"
+        } else if (status === "error") {
+            root.errorMessage = GlobalSupportService.state.crashError
+            root.dialogState = "error"
+        }
+    }
+
+    Connections {
+        target: GlobalSupportService
+        function onStateChanged() { root.syncSubmissionState() }
+        function onOperationCompleted(requestId, operation, success, result, reason) {
+            if (requestId !== root.submitRequestId || operation !== "submitCrashReport")
+                return
+            root.submitRequestId = ""
+            if (!success) {
+                root.errorMessage = GlobalSupportService.state.crashError.length
+                    ? GlobalSupportService.state.crashError : reason
+                root.dialogState = "error"
+            } else {
+                root.issueUrl = result.issueUrl || ""
+                root.dialogState = "success"
+            }
+        }
+    }
+
+    function submitCrashReport(userNotes: string): void {
+        if (userNotes.length > root.maximumNotesLength) {
+            root.notesValidationMessage = TranslationManager.translate(
+                "crashReport.notesTooLong", "Keep your notes to %1 characters or fewer.")
+                .arg(root.maximumNotesLength)
+        } else if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(userNotes)) {
+            root.notesValidationMessage = TranslationManager.translate(
+                "crashReport.notesInvalid", "Remove unsupported control characters from your notes.")
+        } else {
+            root.notesValidationMessage = ""
+        }
+        if (root.notesValidationMessage.length > 0) {
+            root.dialogState = "prompt"
+            userNotesInput.forceActiveFocus()
+            AccessibilityManager.announce(root.notesValidationMessage)
+            return
+        }
+        root.dialogState = "submitting"
+        root.errorMessage = ""
+        root.submitRequestId = GlobalSupportService.execute("submitCrashReport", {
+            "userNotes": userNotes
+        })
+        if (root.submitRequestId.length === 0) {
+            root.errorMessage = TranslationManager.translate(
+                "common.error.notConnected", "The host service is unavailable.")
+            root.dialogState = "error"
+        }
+    }
+
+    background: Rectangle {
+        color: Theme.surfaceColor
+        radius: Theme.cardRadius
+        border.width: 1
+        border.color: Theme.primaryContrastColor
+    }
+
+    contentItem: ColumnLayout {
+        spacing: 0
+
+        // === PROMPT STATE ===
+        ColumnLayout {
+            visible: root.dialogState === "prompt"
+            spacing: 0
+            Layout.fillWidth: true
+
+            // Header
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(50)
+                Layout.topMargin: Theme.scaled(10)
+
+                RowLayout {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.scaled(20)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.scaled(12)
+
+                    Rectangle {
+                        Layout.preferredWidth: Theme.scaled(32)
+                        Layout.preferredHeight: Theme.scaled(32)
+                        radius: Theme.scaled(16)
+                        color: Theme.errorColor
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "!"
+                            font.pixelSize: Theme.scaled(20)
+                            font.bold: true
+                            color: Theme.primaryContrastColor
+                        }
+                    }
+
+                    Text {
+                        text: TranslationManager.translate("crashReport.appCrashed", "App Crashed")
+                        font: Theme.titleFont
+                        color: Theme.textColor
+                    }
+                }
+
+                HideKeyboardButton {
+                    anchors.right: parent.right
+                    anchors.rightMargin: Theme.scaled(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: Theme.borderColor
+                }
+            }
+
+            // Message
+            Text {
+                text: TranslationManager.translate("crashReport.message", "The app crashed during the last session.\nWould you like to send a crash report to help us fix this issue?")
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.margins: Theme.scaled(20)
+            }
+
+            // Crash log preview (collapsible)
+            Rectangle {
+                id: crashDetailsPreview
+                Layout.fillWidth: true
+                Layout.leftMargin: Theme.scaled(20)
+                Layout.rightMargin: Theme.scaled(20)
+                Layout.preferredHeight: detailsExpanded ? Theme.scaled(150) : Theme.scaled(36)
+                color: Theme.backgroundColor
+                radius: Theme.scaled(4)
+                clip: true
+
+                property bool detailsExpanded: false
+
+                Behavior on Layout.preferredHeight {
+                    NumberAnimation { duration: 200 }
+                }
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(8)
+                    spacing: Theme.scaled(4)
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        Text {
+                            text: TranslationManager.translate("crashReport.crashDetails", "Crash Details")
+                            font: Theme.labelFont
+                            color: Theme.textSecondaryColor
+                        }
+
+                        Item { Layout.fillWidth: true }
+
+                        Text {
+                            text: crashDetailsPreview.detailsExpanded
+                                  ? TranslationManager.translate("crashReport.hide", "Hide")
+                                  : TranslationManager.translate("crashReport.show", "Show")
+                            font: Theme.labelFont
+                            color: Theme.primaryColor
+
+                            Accessible.role: Accessible.Button
+                            Accessible.name: crashDetailsPreview.detailsExpanded
+                                ? TranslationManager.translate("crashReport.hide", "Hide")
+                                : TranslationManager.translate("crashReport.show", "Show")
+                            Accessible.focusable: true
+                            Accessible.onPressAction: crashDetailsPreview.detailsExpanded = !crashDetailsPreview.detailsExpanded
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: crashDetailsPreview.detailsExpanded = !crashDetailsPreview.detailsExpanded
+                            }
+                        }
+                    }
+
+                    ScrollView {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        visible: crashDetailsPreview.detailsExpanded
+                        clip: true
+
+                        TextArea {
+                            readOnly: true
+                            text: root.crashLog
+                            font.family: Theme.monoFontFamily
+                            font.pixelSize: Theme.scaled(10)
+                            color: Theme.textColor
+                            wrapMode: TextArea.Wrap
+                            background: null
+
+                            Accessible.role: Accessible.EditableText
+                            Accessible.name: TranslationManager.translate("crashReport.crashDetails", "Crash Details")
+                            Accessible.description: Theme.capAccessibleText(text)
+                            Accessible.focusable: true
+                            activeFocusOnTab: true
+                        }
+                    }
+                }
+            }
+
+            // User notes input
+            Text {
+                text: TranslationManager.translate("crashReport.whatWereYouDoing", "What were you doing? (optional)")
+                font: Theme.labelFont
+                color: Theme.textSecondaryColor
+                Layout.leftMargin: Theme.scaled(20)
+                Layout.topMargin: Theme.scaled(12)
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(70)
+                Layout.leftMargin: Theme.scaled(20)
+                Layout.rightMargin: Theme.scaled(20)
+                Layout.topMargin: Theme.scaled(8)
+                color: Theme.backgroundColor
+                radius: Theme.scaled(4)
+                border.color: userNotesInput.activeFocus ? Theme.primaryColor : Theme.borderColor
+                border.width: 1
+
+                TextArea {
+                    id: userNotesInput
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(8)
+                    font: Theme.bodyFont
+                    color: Theme.textColor
+                    placeholderText: TranslationManager.translate("crashReport.placeholder", "e.g., 'Steaming milk after a shot'")
+                    placeholderTextColor: Qt.rgba(Theme.textSecondaryColor.r, Theme.textSecondaryColor.g, Theme.textSecondaryColor.b, 0.5)
+                    wrapMode: TextArea.Wrap
+                    background: null
+                    Accessible.role: Accessible.EditableText
+                    Accessible.name: TranslationManager.translate("crashReport.userNotes", "What were you doing?")
+                    Accessible.description: root.notesValidationMessage.length
+                        ? root.notesValidationMessage : text
+                    Accessible.focusable: true
+                    onTextChanged: root.notesValidationMessage = ""
+                }
+            }
+
+            Text {
+                visible: root.notesValidationMessage.length > 0
+                text: root.notesValidationMessage
+                font: Theme.bodyFont
+                color: Theme.errorColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.leftMargin: Theme.scaled(20)
+                Layout.rightMargin: Theme.scaled(20)
+                Layout.topMargin: Theme.scaled(8)
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+
+            // Buttons
+            Grid {
+                Layout.fillWidth: true
+                Layout.margins: Theme.scaled(20)
+                columns: 2
+                spacing: Theme.scaled(10)
+
+                property real buttonWidth: (width - spacing) / 2
+                property real buttonHeight: Theme.scaled(50)
+
+                AccessibleButton {
+                    id: dismissButton
+                    width: parent.buttonWidth
+                    height: parent.buttonHeight
+                    text: TranslationManager.translate("crashReport.dismiss", "Dismiss")
+                    accessibleName: TranslationManager.translate("crashReport.dismissAccessible", "Dismiss crash report")
+                    onClicked: {
+                        root.close()
+                        root.dismissed()
+                    }
+                    background: Rectangle {
+                        implicitHeight: Theme.scaled(60)
+                        radius: Theme.buttonRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: Theme.textSecondaryColor
+                    }
+                    contentItem: Text {
+                        text: dismissButton.text
+                        font: Theme.bodyFont
+                        color: Theme.textColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+
+                AccessibleButton {
+                    id: sendReportButton
+                    width: parent.buttonWidth
+                    height: parent.buttonHeight
+                    text: TranslationManager.translate("crashReport.sendReport", "Send Report")
+                    accessibleName: TranslationManager.translate("crashReport.sendReportAccessible", "Send crash report")
+                    enabled: !GlobalSupportService.state.crashSubmitting
+                    onClicked: {
+                        Keyboard.commit()
+                        root.submitCrashReport(userNotesInput.text)
+                    }
+                    background: Rectangle {
+                        implicitHeight: Theme.scaled(60)
+                        radius: Theme.buttonRadius
+                        color: sendReportButton.down || sendReportButton.isPressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                    }
+                    contentItem: Text {
+                        text: sendReportButton.text
+                        font: Theme.bodyFont
+                        color: Theme.primaryContrastColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+        }
+
+        // === SUBMITTING STATE ===
+        ColumnLayout {
+            visible: root.dialogState === "submitting"
+            spacing: Theme.scaled(20)
+            Layout.fillWidth: true
+            Layout.margins: Theme.scaled(40)
+
+            BusyIndicator {
+                Layout.alignment: Qt.AlignHCenter
+                running: parent.visible
+            }
+
+            Text {
+                Layout.alignment: Qt.AlignHCenter
+                text: TranslationManager.translate("crashReport.submitting", "Submitting crash report...")
+                font: Theme.bodyFont
+                color: Theme.textColor
+            }
+        }
+
+        // === SUCCESS STATE ===
+        ColumnLayout {
+            visible: root.dialogState === "success"
+            spacing: 0
+            Layout.fillWidth: true
+
+            // Header
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(50)
+                Layout.topMargin: Theme.scaled(10)
+
+                RowLayout {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.scaled(20)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.scaled(12)
+
+                    Rectangle {
+                        Layout.preferredWidth: Theme.scaled(32)
+                        Layout.preferredHeight: Theme.scaled(32)
+                        radius: Theme.scaled(16)
+                        color: Theme.primaryColor
+
+                        Image {
+                            anchors.centerIn: parent
+                            source: "qrc:/icons/tick.svg"
+                            sourceSize.width: Theme.scaled(18)
+                            sourceSize.height: Theme.scaled(18)
+                        }
+                    }
+
+                    Text {
+                        text: TranslationManager.translate("crashReport.reportSubmitted", "Report Submitted")
+                        font: Theme.titleFont
+                        color: Theme.textColor
+                    }
+                }
+
+                Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: Theme.borderColor
+                }
+            }
+
+            Text {
+                text: TranslationManager.translate("crashReport.thankYou", "Thank you! Your crash report has been submitted and will help us improve the app.")
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.margins: Theme.scaled(20)
+            }
+
+            Text {
+                visible: root.issueUrl !== ""
+                text: TranslationManager.translate("crashReport.viewOnGithub", "View issue on GitHub")
+                font: Theme.bodyFont
+                color: Theme.primaryColor
+                Layout.leftMargin: Theme.scaled(20)
+                Layout.bottomMargin: Theme.scaled(10)
+
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                Accessible.focusable: true
+                Accessible.onPressAction: Qt.openUrlExternally(root.issueUrl)
+
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Qt.openUrlExternally(root.issueUrl)
+                }
+            }
+
+            // Button
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(50)
+                Layout.margins: Theme.scaled(20)
+
+                AccessibleButton {
+                    id: okButton
+                    anchors.right: parent.right
+                    width: Theme.scaled(120)
+                    height: parent.height
+                    text: TranslationManager.translate("crashReport.ok", "OK")
+                    accessibleName: TranslationManager.translate("crashReport.closeDialog", "Close dialog")
+                    onClicked: {
+                        root.close()
+                        root.reported()
+                    }
+                    background: Rectangle {
+                        implicitHeight: Theme.scaled(60)
+                        radius: Theme.buttonRadius
+                        color: okButton.down || okButton.isPressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                    }
+                    contentItem: Text {
+                        text: okButton.text
+                        font: Theme.bodyFont
+                        color: Theme.primaryContrastColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+        }
+
+        // === ERROR STATE ===
+        ColumnLayout {
+            visible: root.dialogState === "error"
+            spacing: 0
+            Layout.fillWidth: true
+
+            // Header
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(50)
+                Layout.topMargin: Theme.scaled(10)
+
+                RowLayout {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.scaled(20)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.scaled(12)
+
+                    Rectangle {
+                        Layout.preferredWidth: Theme.scaled(32)
+                        Layout.preferredHeight: Theme.scaled(32)
+                        radius: Theme.scaled(16)
+                        color: Theme.errorColor
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "X"
+                            font.pixelSize: Theme.scaled(16)
+                            font.bold: true
+                            color: Theme.primaryContrastColor
+                        }
+                    }
+
+                    Text {
+                        text: TranslationManager.translate("crashReport.submissionFailed", "Submission Failed")
+                        font: Theme.titleFont
+                        color: Theme.textColor
+                    }
+                }
+
+                Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: Theme.borderColor
+                }
+            }
+
+            Text {
+                text: TranslationManager.translate("crashReport.failedToSubmit", "Failed to submit crash report:\n%1").arg(root.errorMessage)
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.margins: Theme.scaled(20)
+            }
+
+            // Buttons
+            Grid {
+                Layout.fillWidth: true
+                Layout.leftMargin: Theme.scaled(20)
+                Layout.rightMargin: Theme.scaled(20)
+                Layout.bottomMargin: Theme.scaled(20)
+                columns: 2
+                spacing: Theme.scaled(10)
+
+                property real buttonWidth: (width - spacing) / 2
+                property real buttonHeight: Theme.scaled(50)
+
+                AccessibleButton {
+                    id: dismissButton2
+                    width: parent.buttonWidth
+                    height: parent.buttonHeight
+                    text: TranslationManager.translate("crashReport.dismiss", "Dismiss")
+                    accessibleName: TranslationManager.translate("crashReport.dismissAccessible", "Dismiss crash report")
+                    onClicked: {
+                        root.close()
+                        root.dismissed()
+                    }
+                    background: Rectangle {
+                        implicitHeight: Theme.scaled(60)
+                        radius: Theme.buttonRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: Theme.textSecondaryColor
+                    }
+                    contentItem: Text {
+                        text: dismissButton2.text
+                        font: Theme.bodyFont
+                        color: Theme.textColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+
+                AccessibleButton {
+                    id: retryButton
+                    width: parent.buttonWidth
+                    height: parent.buttonHeight
+                    text: TranslationManager.translate("crashReport.retry", "Retry")
+                    accessibleName: TranslationManager.translate("crashReport.retryAccessible", "Retry sending crash report")
+                    enabled: !GlobalSupportService.state.crashSubmitting
+                    onClicked: {
+                        Keyboard.commit()
+                        root.submitCrashReport(userNotesInput.text)
+                    }
+                    background: Rectangle {
+                        implicitHeight: Theme.scaled(60)
+                        radius: Theme.buttonRadius
+                        color: retryButton.down || retryButton.isPressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                    }
+                    contentItem: Text {
+                        text: retryButton.text
+                        font: Theme.bodyFont
+                        color: Theme.primaryContrastColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+        }
+    }
+}

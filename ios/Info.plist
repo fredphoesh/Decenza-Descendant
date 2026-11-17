@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>CFBundleDisplayName</key>
+    <string>Decenza</string>
+    <key>CFBundleExecutable</key>
+    <string>Decenza</string>
+    <key>CFBundleIdentifier</key>
+    <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+    <key>CFBundleName</key>
+    <string>Decenza</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+    <key>CFBundleVersion</key>
+    <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UIRequiresFullScreen</key>
+    <true/>
+    <key>MinimumOSVersion</key>
+    <string>${CMAKE_OSX_DEPLOYMENT_TARGET}</string>
+    <key>UILaunchStoryboardName</key>
+    <string>LaunchScreen</string>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>bluetooth-le</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>This app uses Bluetooth to connect to your DE1 espresso machine and scales.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>This app uses your location to show where your espresso shots were made on the shot map.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>This app uses your location to show where your espresso shots were made on the shot map.</string>
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>This app uses your location to show where your espresso shots were made on the shot map.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>This app uses Bluetooth to connect to your DE1 espresso machine and scales.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>This app does not use the camera.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>This app does not use the microphone.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>This app can import photos and videos for the screensaver.</string>
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>This app runs a local web server so you can edit themes and view shot data from a browser on the same network, and discovers the Half Decent Scale on your local network.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_http._tcp</string>
+        <!-- The Half Decent Scale's DNS-SD advertisement (openscale v3.0.9+).
+             iOS only permits browsing service types declared here, so without
+             this entry the scale browse silently returns nothing. Declaring it
+             is also what lets the browse go through mDNSResponder instead of a
+             raw multicast socket, which would need the multicast entitlement. -->
+        <string>_decentscale._tcp</string>
+    </array>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>bluetooth-central</string>
+    </array>
+    <key>UIViewControllerBasedStatusBarAppearance</key>
+    <false/>
+</dict>
+</plist>

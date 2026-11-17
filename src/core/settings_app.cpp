@@ -1,0 +1,649 @@
+#include "core/diagnosticlogging.h"
+#include "settings_app.h"
+#include "settings.h"
+
+#include <QHash>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLocale>
+#include <QUuid>
+
+#ifdef Q_OS_ANDROID
+#include <QJniObject>
+#include <QJniEnvironment>
+#include <QCoreApplication>
+#endif
+
+SettingsApp::SettingsApp(QObject* parent)
+    : QObject(parent)
+    , m_use12HourTime(QLocale::system().timeFormat(QLocale::ShortFormat).contains("AP", Qt::CaseInsensitive))
+    , m_temperatureUnit(m_settings.value("display/temperatureUnit", "celsius").toString())
+{
+}
+
+// Platform capabilities
+bool SettingsApp::hasQuick3D() const {
+#ifdef HAVE_QUICK3D
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool SettingsApp::isDebugBuild() const {
+#ifdef QT_DEBUG
+    return true;
+#else
+    return false;
+#endif
+}
+
+// Launcher mode (Android only)
+bool SettingsApp::launcherMode() const {
+    return m_settings.value("app/launcherMode", false).toBool();
+}
+
+void SettingsApp::setLauncherMode(bool enabled) {
+    bool changed = (launcherMode() != enabled);
+    m_settings.setValue("app/launcherMode", enabled);
+
+#ifdef Q_OS_ANDROID
+    // Enable/disable the LauncherAlias activity-alias at runtime
+    QJniObject activity = QNativeInterface::QAndroidApplication::context();
+    if (activity.isValid()) {
+        QJniObject pm = activity.callObjectMethod(
+            "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        QJniObject pkgName = activity.callObjectMethod(
+            "getPackageName", "()Ljava/lang/String;");
+        QJniObject aliasName = QJniObject::fromString(
+            "io.github.kulitorum.decenza_de1.LauncherAlias");
+
+        QJniObject componentName("android/content/ComponentName",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            pkgName.object<jstring>(), aliasName.object<jstring>());
+
+        // COMPONENT_ENABLED_STATE_ENABLED = 1, COMPONENT_ENABLED_STATE_DISABLED = 2
+        // DONT_KILL_APP = 1
+        int state = enabled ? 1 : 2;
+        pm.callMethod<void>("setComponentEnabledSetting",
+            "(Landroid/content/ComponentName;II)V",
+            componentName.object(), state, 1);
+    }
+#endif
+
+    if (changed)
+        emit launcherModeChanged();
+}
+
+// Profile favorites
+QVariantList SettingsApp::favoriteProfiles() const {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    QVariantList result;
+    for (const QJsonValue& v : arr) {
+        result.append(v.toObject().toVariantMap());
+    }
+    return result;
+}
+
+int SettingsApp::selectedFavoriteProfile() const {
+    return m_settings.value("profile/selectedFavorite", -1).toInt();
+}
+
+void SettingsApp::setSelectedFavoriteProfile(int index) {
+    if (selectedFavoriteProfile() != index) {
+        DIAG_DEBUG(APP, "settings_app") << "setSelectedFavoriteProfile:" << selectedFavoriteProfile() << "->" << index;
+        m_settings.setValue("profile/selectedFavorite", index);
+        emit selectedFavoriteProfileChanged();
+    }
+}
+
+void SettingsApp::addFavoriteProfile(const QString& name, const QString& filename) {
+    DIAG_DEBUG(APP, "SettingsApp") << "addFavoriteProfile name=" << name << "filename=" << filename;
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    // Max 50 favorites
+    if (arr.size() >= 50) {
+        return;
+    }
+
+    // Don't add duplicates
+    for (const QJsonValue& v : arr) {
+        if (v.toObject()["filename"].toString() == filename) {
+            return;
+        }
+    }
+
+    QJsonObject favorite;
+    favorite["name"] = name;
+    favorite["filename"] = filename;
+    arr.append(favorite);
+
+    m_settings.setValue("profile/favorites", QJsonDocument(arr).toJson());
+
+    // If the newly added favorite is the currently active profile, sync the selected index
+    if (currentProfile() == filename) {
+        setSelectedFavoriteProfile(static_cast<int>(arr.size()) - 1);
+    }
+
+    emit favoriteProfilesChanged();
+}
+
+void SettingsApp::removeFavoriteProfile(int index) {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    if (index >= 0 && index < arr.size()) {
+        QString filename = arr[index].toObject()["filename"].toString();
+        DIAG_DEBUG(APP, "SettingsApp") << "removeFavoriteProfile index=" << index << "filename=" << filename;
+        arr.removeAt(index);
+        m_settings.setValue("profile/favorites", QJsonDocument(arr).toJson());
+
+        // The stored index is positional: removing a slot BEFORE the selected
+        // one used to leave it pointing at the neighbour, so the idle page
+        // highlighted a pill the machine had not loaded. The selection follows
+        // the profile: the removed one deselects, any other keeps its profile.
+        const int selected = selectedFavoriteProfile();
+        if (selected == index) {
+            setSelectedFavoriteProfile(-1);
+        } else if (selected > index) {
+            setSelectedFavoriteProfile(selected - 1);
+        } else if (selected >= arr.size()) {
+            setSelectedFavoriteProfile(arr.isEmpty() ? -1 : static_cast<int>(arr.size()) - 1);
+        }
+
+        emit favoriteProfilesChanged();
+
+        // Eager-clear: un-favoriting the auto-load profile makes it ineligible
+        // (favorites are the only membership now — moved here from the removed
+        // addHiddenProfile/removeSelectedBuiltInProfile eager-clears).
+        if (autoLoadProfileFilename() == filename) {
+            setAutoLoadProfileFilename("");
+        }
+    }
+}
+
+void SettingsApp::moveFavoriteProfile(int from, int to) {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    if (from >= 0 && from < arr.size() && to >= 0 && to < arr.size() && from != to) {
+        QJsonValue item = arr[from];
+        arr.removeAt(from);
+        arr.insert(to, item);
+        m_settings.setValue("profile/favorites", QJsonDocument(arr).toJson());
+
+        // Update selection to follow the moved item if it was selected
+        int selected = selectedFavoriteProfile();
+        if (selected == from) {
+            setSelectedFavoriteProfile(to);
+        } else if (from < selected && to >= selected) {
+            setSelectedFavoriteProfile(selected - 1);
+        } else if (from > selected && to <= selected) {
+            setSelectedFavoriteProfile(selected + 1);
+        }
+
+        emit favoriteProfilesChanged();
+    }
+}
+
+QVariantMap SettingsApp::getFavoriteProfile(int index) const {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    if (index >= 0 && index < arr.size()) {
+        return arr[index].toObject().toVariantMap();
+    }
+    return QVariantMap();
+}
+
+bool SettingsApp::isFavoriteProfile(const QString& filename) const {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    for (const QJsonValue& v : arr) {
+        if (v.toObject()["filename"].toString() == filename) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int SettingsApp::findFavoriteIndexByFilename(const QString& filename) const {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    for (int i = 0; i < arr.size(); ++i) {
+        QString favFilename = arr[i].toObject()["filename"].toString();
+        if (favFilename == filename) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool SettingsApp::updateFavoriteProfile(const QString& oldFilename, const QString& newFilename, const QString& newTitle) {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject obj = arr[i].toObject();
+        if (obj["filename"].toString() == oldFilename) {
+            obj["filename"] = newFilename;
+            obj["name"] = newTitle;
+            arr[i] = obj;
+            m_settings.setValue("profile/favorites", QJsonDocument(arr).toJson());
+            emit favoriteProfilesChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+void SettingsApp::setFavoritesOrder(const QStringList& filenamesInOrder) {
+    QByteArray data = m_settings.value("profile/favorites").toByteArray();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    QHash<QString, QJsonObject> byFilename;
+    byFilename.reserve(arr.size());
+    for (const QJsonValue& v : arr) {
+        const QJsonObject obj = v.toObject();
+        byFilename.insert(obj["filename"].toString(), obj);
+    }
+
+    QJsonArray reordered;
+    for (const QString& filename : filenamesInOrder) {
+        auto it = byFilename.find(filename);
+        if (it != byFilename.end())
+            reordered.append(it.value());
+    }
+
+    // Usage-mode resorts run after every shot save; most change nothing, and
+    // a spurious favoriteProfilesChanged() makes every idle pill row relayout.
+    if (reordered == arr)
+        return;
+
+    m_settings.setValue("profile/favorites", QJsonDocument(reordered).toJson());
+    emit favoriteProfilesChanged();
+}
+
+// Favorites order (profile-favorites-order). Resolve-when-absent: an
+// upgraded install with favorites keeps ITS order (custom). A fresh install
+// is stamped "usage" where its default favorites are seeded (settings.cpp),
+// so the empty branch below is only reached by a hand-emptied store. This
+// read never persists — only ProfileFavoritesOrderDialog and a backup
+// import write the key.
+QString SettingsApp::favoriteProfileOrder() const {
+    const QVariant stored = m_settings.value("profile/favoriteOrder");
+    if (stored.isValid()) {
+        const QString mode = stored.toString();
+        if (mode == QLatin1String("custom") || mode == QLatin1String("alpha")
+            || mode == QLatin1String("usage"))
+            return mode;
+    }
+    return favoriteProfiles().isEmpty() ? QStringLiteral("usage") : QStringLiteral("custom");
+}
+
+// Stamps the resolved mode once, at startup. Without this a new user's mode
+// would flip from usage to custom the moment they star their first profile,
+// because the resolve rule keys on whether favorites exist.
+void SettingsApp::persistFavoriteProfileOrderIfAbsent() {
+    if (!m_settings.value("profile/favoriteOrder").isValid())
+        m_settings.setValue("profile/favoriteOrder", favoriteProfileOrder());
+}
+
+void SettingsApp::setFavoriteProfileOrder(const QString& mode) {
+    if (favoriteProfileOrder() != mode) {
+        DIAG_DEBUG(APP, "SettingsApp") << "setFavoriteProfileOrder:" << favoriteProfileOrder() << "->" << mode;
+        m_settings.setValue("profile/favoriteOrder", mode);
+        emit favoriteProfileOrderChanged();
+    }
+}
+
+// Current profile
+QString SettingsApp::currentProfile() const {
+    return m_settings.value("profile/current", "Adaptive v3").toString();
+}
+
+void SettingsApp::setCurrentProfile(const QString& profile) {
+    if (currentProfile() != profile) {
+        m_settings.setValue("profile/current", profile);
+        emit currentProfileChanged();
+    }
+}
+
+// Auto-load profile
+QString SettingsApp::autoLoadProfileFilename() const {
+    return m_settings.value("profile/autoLoadFilename", "").toString();
+}
+
+void SettingsApp::setAutoLoadProfileFilename(const QString& filename) {
+    if (autoLoadProfileFilename() != filename) {
+        m_settings.setValue("profile/autoLoadFilename", filename);
+        emit autoLoadProfileFilenameChanged();
+    }
+}
+
+int SettingsApp::autoLoadRevertMinutes() const {
+    return m_settings.value("profile/autoLoadRevertMinutes", 5).toInt();
+}
+
+void SettingsApp::setAutoLoadRevertMinutes(int minutes) {
+    int clamped = qBound(0, minutes, 60);
+    if (autoLoadRevertMinutes() != clamped) {
+        m_settings.setValue("profile/autoLoadRevertMinutes", clamped);
+        emit autoLoadRevertMinutesChanged();
+    }
+}
+
+// Auto-update
+bool SettingsApp::autoCheckUpdates() const {
+    return m_settings.value("updates/autoCheck", true).toBool();
+}
+
+void SettingsApp::setAutoCheckUpdates(bool enabled) {
+    if (autoCheckUpdates() != enabled) {
+        m_settings.setValue("updates/autoCheck", enabled);
+        emit autoCheckUpdatesChanged();
+    }
+}
+
+bool SettingsApp::betaUpdatesEnabled() const {
+    return m_settings.value("updates/betaEnabled", false).toBool();
+}
+
+void SettingsApp::setBetaUpdatesEnabled(bool enabled) {
+    if (betaUpdatesEnabled() != enabled) {
+        m_settings.setValue("updates/betaEnabled", enabled);
+        emit betaUpdatesEnabledChanged();
+    }
+}
+
+qint64 SettingsApp::lastKnownApkSizeBytes() const {
+    return m_settings.value("updates/lastKnownApkSizeBytes", 0).toLongLong();
+}
+
+void SettingsApp::setLastKnownApkSizeBytes(qint64 size) {
+    if (lastKnownApkSizeBytes() == size) return;
+    m_settings.setValue("updates/lastKnownApkSizeBytes", size);
+    emit lastKnownApkSizeBytesChanged();
+}
+
+bool SettingsApp::autoRelaunchPromptShown() const {
+    return m_settings.value("updates/autoRelaunchPromptShown", false).toBool();
+}
+
+void SettingsApp::setAutoRelaunchPromptShown(bool shown) {
+    if (autoRelaunchPromptShown() == shown) return;
+    m_settings.setValue("updates/autoRelaunchPromptShown", shown);
+    emit autoRelaunchPromptShownChanged();
+}
+
+bool SettingsApp::firmwareEarlyAccess() const {
+    return m_settings.value("firmware/EA", false).toBool();
+}
+
+void SettingsApp::setFirmwareEarlyAccess(bool enabled) {
+    if (firmwareEarlyAccess() != enabled) {
+        m_settings.setValue("firmware/EA", enabled);
+        emit firmwareEarlyAccessChanged();
+    }
+}
+
+// Daily backup
+int SettingsApp::dailyBackupHour() const {
+    return m_settings.value("backup/dailyBackupHour", -1).toInt();  // -1 = off
+}
+
+void SettingsApp::setDailyBackupHour(int hour) {
+    if (dailyBackupHour() != hour) {
+        m_settings.setValue("backup/dailyBackupHour", hour);
+        emit dailyBackupHourChanged();
+    }
+}
+
+// Water level / refill
+QString SettingsApp::waterLevelDisplayUnit() const {
+    return m_settings.value("display/waterLevelUnit", "percent").toString();
+}
+
+void SettingsApp::setWaterLevelDisplayUnit(const QString& unit) {
+    if (waterLevelDisplayUnit() != unit) {
+        m_settings.setValue("display/waterLevelUnit", unit);
+        emit waterLevelDisplayUnitChanged();
+    }
+}
+
+// Temperature display unit. Default Celsius; all internal storage stays Celsius.
+QString SettingsApp::temperatureUnit() const {
+    return m_temperatureUnit;
+}
+
+void SettingsApp::invalidateCache() {
+    const QString unit = m_settings.value("display/temperatureUnit", "celsius").toString();
+    if (unit != m_temperatureUnit) {
+        m_temperatureUnit = unit;
+        emit temperatureUnitChanged();
+    }
+}
+
+void SettingsApp::setTemperatureUnit(const QString& unit) {
+    // Normalise + whitelist so a malformed value (e.g. from an imported settings
+    // file during device-to-device migration) can't be stored and silently
+    // re-exported as garbage. Anything outside {celsius, fahrenheit} degrades to
+    // celsius — loudly, not silently.
+    QString normalized = unit.trimmed().toLower();
+    if (normalized != QLatin1String("celsius") && normalized != QLatin1String("fahrenheit")) {
+        DIAG_WARN(APP, "SettingsApp") << "invalid temperatureUnit" << unit << "- coercing to celsius";
+        normalized = QStringLiteral("celsius");
+    }
+    if (m_temperatureUnit != normalized) {
+        m_temperatureUnit = normalized;
+        m_settings.setValue("display/temperatureUnit", normalized);
+        emit temperatureUnitChanged();
+    }
+}
+
+int SettingsApp::waterRefillPoint() const {
+    return m_settings.value("water/refillPoint", 5).toInt();
+}
+
+void SettingsApp::setWaterRefillPoint(int mm) {
+    if (waterRefillPoint() != mm) {
+        m_settings.setValue("water/refillPoint", mm);
+        emit waterRefillPointChanged();
+    }
+}
+
+int SettingsApp::refillKitOverride() const {
+    return m_settings.value("water/refillKitOverride", 2).toInt();  // Default: auto-detect
+}
+
+void SettingsApp::setRefillKitOverride(int value) {
+    if (refillKitOverride() != value) {
+        m_settings.setValue("water/refillKitOverride", value);
+        emit refillKitOverrideChanged();
+    }
+}
+
+// Developer settings
+bool SettingsApp::developerTranslationUpload() const {
+    // Runtime-only flag — not persisted, resets to false on app restart
+    return m_developerTranslationUpload;
+}
+
+void SettingsApp::setDeveloperTranslationUpload(bool enabled) {
+    if (m_developerTranslationUpload != enabled) {
+        m_developerTranslationUpload = enabled;
+        emit developerTranslationUploadChanged();
+    }
+}
+
+bool SettingsApp::simulatorAvailable() const {
+#ifdef DECENZA_SIMULATOR
+    return true;
+#else
+    return false;
+#endif
+}
+
+// The stored preference with this build's default applied. The default is not
+// uniform — a debug desktop build starts in simulation — so the setter must
+// compare against this rather than against a raw value() with a false default,
+// or "switch it off" while the key is unset would write nothing and leave the
+// effective value true.
+bool SettingsApp::storedSimulationMode() const {
+#if defined(QT_DEBUG) && (defined(Q_OS_WIN) || defined(Q_OS_MACOS))
+    return m_settings.value("developer/simulationMode", true).toBool();
+#else
+    return m_settings.value("developer/simulationMode", false).toBool();
+#endif
+}
+
+bool SettingsApp::refractometerAutoTest() const {
+    // Defaults to the device's own factory default, so a first run configures nothing.
+    return m_settings.value("refractometer/autoTest", false).toBool();
+}
+
+void SettingsApp::setRefractometerAutoTest(bool value) {
+    if (refractometerAutoTest() == value) return;
+    m_settings.setValue("refractometer/autoTest", value);
+    emit refractometerAutoTestChanged();
+}
+
+bool SettingsApp::simulationMode() const {
+#ifndef DECENZA_SIMULATOR
+    // No simulator in this build, so the answer is no regardless of what is
+    // stored. A const getter must not mutate storage; setSimulationMode() below
+    // is what keeps a stale stored `true` from surviving here.
+    return false;
+#else
+    return storedSimulationMode();
+#endif
+}
+
+void SettingsApp::setSimulationMode(bool enabled) {
+#ifndef DECENZA_SIMULATOR
+    // Never persist a value this build cannot honour. Without this the setter is
+    // asymmetric, because it compares against a getter hard-wired to false:
+    // setSimulationMode(true) would store `true` while the getter still read
+    // false, and setSimulationMode(false) would short-circuit and never clear
+    // it. The stored `true` would then be unreachable through every API on this
+    // device (the Settings card is hidden, MCP reads false) and would take
+    // effect the next time the same install ran a build that HAS the simulator
+    // — booting it into simulation with DE1 BLE disabled and no way back.
+    if (enabled) {
+        DIAG_WARN(APP, "SettingsApp") << "simulation mode requested, but no simulator is "
+                      "compiled into this build - ignoring";
+        return;
+    }
+    // Fall through on `false` so a stale stored `true` still gets cleared.
+#endif
+    if (storedSimulationMode() != enabled) {
+        m_settings.setValue("developer/simulationMode", enabled);
+        emit simulationModeChanged();
+    }
+}
+
+bool SettingsApp::hideGhcSimulator() const {
+    return m_settings.value("developer/hideGhcSimulator", false).toBool();
+}
+
+void SettingsApp::setHideGhcSimulator(bool hide) {
+    if (hideGhcSimulator() != hide) {
+        m_settings.setValue("developer/hideGhcSimulator", hide);
+        emit hideGhcSimulatorChanged();
+    }
+}
+
+bool SettingsApp::simulatedScaleEnabled() const {
+    return m_settings.value("developer/simulatedScaleEnabled", true).toBool();
+}
+
+void SettingsApp::setSimulatedScaleEnabled(bool enabled) {
+    if (simulatedScaleEnabled() != enabled) {
+        m_settings.setValue("developer/simulatedScaleEnabled", enabled);
+        emit simulatedScaleEnabledChanged();
+    }
+}
+
+bool SettingsApp::screenCaptureEnabled() const {
+    return m_settings.value("machine/screenCaptureEnabled", false).toBool();
+}
+
+void SettingsApp::setScreenCaptureEnabled(bool enabled) {
+    if (screenCaptureEnabled() != enabled) {
+        m_settings.setValue("machine/screenCaptureEnabled", enabled);
+        emit screenCaptureEnabledChanged();
+    }
+}
+
+bool SettingsApp::steamCoachVisualEnabled() const {
+    return m_settings.value("steam/steamCoachVisualEnabled", false).toBool();
+}
+
+void SettingsApp::setSteamCoachVisualEnabled(bool enabled) {
+    if (steamCoachVisualEnabled() != enabled) {
+        m_settings.setValue("steam/steamCoachVisualEnabled", enabled);
+        emit steamCoachVisualEnabledChanged();
+    }
+}
+
+bool SettingsApp::steamCoachAudioEnabled() const {
+    return m_settings.value("steam/steamCoachAudioEnabled", false).toBool();
+}
+
+void SettingsApp::setSteamCoachAudioEnabled(bool enabled) {
+    if (steamCoachAudioEnabled() != enabled) {
+        m_settings.setValue("steam/steamCoachAudioEnabled", enabled);
+        emit steamCoachAudioEnabledChanged();
+    }
+}
+
+QString SettingsApp::steamViewMode() const
+{
+    const QString mode = m_settings.value("steam/steamView", "timer").toString();
+    return mode == QStringLiteral("chart") ? QStringLiteral("chart")
+                                             : QStringLiteral("timer");
+}
+
+void SettingsApp::setSteamViewMode(const QString& mode)
+{
+    if (mode != QStringLiteral("timer") && mode != QStringLiteral("chart"))
+        return;
+    if (steamViewMode() == mode)
+        return;
+    m_settings.setValue("steam/steamView", mode);
+    emit steamViewModeChanged();
+}
+
+// Device identity
+QString SettingsApp::deviceId() const {
+    QString id = m_settings.value("device/uuid").toString();
+    if (id.isEmpty()) {
+        id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        m_settings.setValue("device/uuid", id);
+    }
+    return id;
+}
+
+// Pocket app pairing
+QString SettingsApp::pocketPairingToken() const {
+    return m_settings.value("pocket/pairingToken").toString();
+}
+
+void SettingsApp::setPocketPairingToken(const QString& token) {
+    m_settings.setValue("pocket/pairingToken", token);
+}

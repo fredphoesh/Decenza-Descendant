@@ -1,0 +1,177 @@
+#pragma once
+
+#include "scales/scaletypeids.h"  // ScaleType + ScaleTypeIds::scaleTypeId (dependency-free)
+
+#include <QObject>
+#include <QBluetoothDeviceInfo>
+#include <QLowEnergyController>
+#include <QLowEnergyService>
+#include <QTimer>
+
+class ScaleBleTransport;
+
+class ScaleDevice : public QObject {
+    Q_OBJECT
+
+    Q_PROPERTY(bool connected READ isConnected NOTIFY connectedChanged)
+    Q_PROPERTY(bool simulationMode READ simulationMode WRITE setSimulationMode NOTIFY simulationModeChanged)
+    Q_PROPERTY(double weight READ weight NOTIFY weightChanged)
+    Q_PROPERTY(double flowRate READ flowRate NOTIFY flowRateChanged)
+    Q_PROPERTY(int batteryLevel READ batteryLevel NOTIFY batteryLevelChanged)
+    Q_PROPERTY(bool charging READ charging NOTIFY chargingChanged)
+    Q_PROPERTY(QString firmwareVersion READ firmwareVersion NOTIFY firmwareVersionChanged)
+    Q_PROPERTY(bool supportsFirmwareUpdate READ supportsFirmwareUpdate NOTIFY firmwareVersionChanged)
+    Q_PROPERTY(QString name READ name CONSTANT)
+    Q_PROPERTY(bool isFlowScale READ isFlowScale CONSTANT)
+    Q_PROPERTY(bool isSimulated READ isSimulated CONSTANT)
+
+public:
+    explicit ScaleDevice(QObject* parent = nullptr);
+    virtual ~ScaleDevice();
+
+    virtual void connectToDevice(const QBluetoothDeviceInfo& device) = 0;
+
+    bool isConnected() const;
+    double weight() const { return m_weight; }
+    double flowRate() const { return m_flowRate; }
+    int batteryLevel() const { return m_batteryLevel; }
+    bool charging() const { return m_charging; }
+    virtual QString firmwareVersion() const { return {}; }
+    // A scale is a firmware-update candidate once it has told us what it runs.
+    // Every HDS transport answers this the same way, so it is defaulted here
+    // rather than overridden identically three times.
+    virtual bool supportsFirmwareUpdate() const { return !firmwareVersion().isEmpty(); }
+    virtual QString name() const { return QString(); }
+    virtual QString type() const { return QString(); }
+    virtual bool isFlowScale() const { return false; }
+    virtual bool isSimulated() const { return false; }
+
+    bool simulationMode() const { return m_simulationMode; }
+    void setSimulationMode(bool enabled);
+
+    // The underlying BLE transport, when this scale is BLE-backed (null for
+    // FlowScale / USB / WiFi / simulated). Set once by ScaleFactory at creation —
+    // the single scale-agnostic chokepoint, so no per-driver code is needed.
+    // Lets the connection-priority detection (wired in main.cpp) reach the
+    // shared transport without exposing each driver's private member.
+    ScaleBleTransport* bleTransport() const { return m_bleTransport; }
+    void setBleTransport(ScaleBleTransport* transport) { m_bleTransport = transport; }
+
+    // Whether the display stays off. main.cpp keeps it equal to "the screensaver
+    // is up" (set on connect and on each screensaver edge, cleared on DE1 wake);
+    // a driver's connect handshake checks it instead of turning the display on.
+    bool displayHeldOff() const { return m_displayHeldOff; }
+    void setDisplayHeldOff(bool off) { m_displayHeldOff = off; }
+
+public slots:
+    virtual void tare() = 0;
+    virtual void startTimer() {}
+    virtual void stopTimer() {}
+    virtual void resetTimer() {}
+    // Whether resetTimer() is a true no-side-effect reset (distinct from startTimer/tare).
+    // False for scales where resetTimer() has side effects (e.g., DiFluid sends same bytes
+    // as startTimer). When false, MachineState sends reset+start together at extraction
+    // start instead of splitting them across the preheating phase.
+    virtual bool hasIndependentTimerReset() const { return true; }
+    // Whether this scale implements the three timer slots above at all. They are
+    // virtual with EMPTY default bodies, so a scale that does not implement them
+    // accepts every timer command and does nothing — indistinguishable, from the
+    // outside, from a timer that started. The UI never noticed because a user
+    // watching the scale can see its display; MCP reported `{"success": true}`.
+    //
+    // Defaults to false ON PURPOSE: a driver whose override is forgotten reports
+    // "not supported" rather than a fictional success, so an incomplete rollout
+    // fails in the safe direction.
+    //
+    // Distinct from hasIndependentTimerReset(), which asks a different question
+    // about the same three methods — whether resetTimer() has side effects on a
+    // scale that DOES support them.
+    virtual bool supportsTimer() const { return false; }
+    virtual void sleep() { emit sleepCompleted(); }  // Put scale to sleep (battery power saving - full power off)
+    virtual void wake() {}   // Wake scale from sleep (enable LCD)
+    virtual void disableLcd() {}  // Turn off LCD but keep scale powered (for screensaver)
+    virtual void sendKeepAlive() {}  // Periodic 30 s hook; do not rewrite CCCDs here (PR Kulitorum/Decenza#1092, #1965)
+    virtual void startFirmwareUpdate(const QString& targetVersion) { Q_UNUSED(targetVersion); }
+    virtual void disconnectFromScale();  // Disconnect BLE from scale
+    void resetFlowCalculation();  // Call after tare to avoid flow rate spikes
+
+    // Flow sample input (used by FlowScale to integrate flow into weight)
+    // Physical scales ignore this - they get weight directly from the device
+    virtual void addFlowSample(double flowRate, double deltaTime) { Q_UNUSED(flowRate); Q_UNUSED(deltaTime); }
+
+signals:
+    void connectedChanged();
+    void weightChanged(double weight);
+    // Liveness signal: emitted for every weight value this layer publishes —
+    // every setWeight() sample including unchanged repeats, plus the synthetic
+    // setSimulationMode() reset. weightChanged is intentionally deduped (drives
+    // the `weight` Q_PROPERTY / QML bindings, and onScaleWeightChanged which
+    // feeds MQTT — a constant value must not churn those). But the scale-feed
+    // stall detector and SAW
+    // de-jitter need sample *arrival*, not value *change*: a healthy scale
+    // reporting a constant weight (a static cup through DE1 preheat) is
+    // otherwise indistinguishable from a dead feed and trips a false stall →
+    // mid-shot connection-priority backoff / ruined shot. See #1176, PR Kulitorum/Decenza#1185.
+    // WeightProcessor::processWeight is wired to THIS, never weightChanged.
+    void weightSampleReceived(double weight);
+    void flowRateChanged(double rate);
+    void batteryLevelChanged(int level);
+    void chargingChanged(bool charging);
+    void firmwareVersionChanged();
+    // Emitted when the scale synchronously, explicitly refuses a just-sent
+    // startFirmwareUpdate() request — currently WiFi only, the only transport
+    // whose protocol replies to a command in-band. Never fires for a LATER,
+    // async refusal the firmware discovers after accepting the request (e.g.
+    // catalog/signature checks); those reach only the scale's own display —
+    // see HdsFirmwareUpdateController's class doc. Base class default: never
+    // emitted; a transport with no such reply channel simply never raises it.
+    void firmwareUpdateRejected(const QString& reason);
+    void buttonPressed(int button);
+    void errorOccurred(const QString& error);
+    void simulationModeChanged();
+    void sleepCompleted();  // Emitted when the sleep BLE write completes (or immediately if no confirmation possible)
+    void logMessage(const QString& message);  // For debug logging to UI/file
+
+protected:
+    void setConnected(bool connected);
+    // Declare the NEXT disconnect deliberate, so it is reported as narrative
+    // rather than as a fault. One-shot: consumed by the disconnect transition.
+    //
+    // The base class cannot work this out. Only the driver knows a close was
+    // app-initiated — DecentScaleWifi already computes exactly this for its own
+    // "(expected)" wording — and without it every teardown reads WARN.
+    //
+    // The two cases came from two DIFFERENT logs, not one (the .cpp says which,
+    // and an earlier version of this comment claimed they appeared back to back
+    // in a single capture, which is not true of either): a user's log has eight
+    // disconnects, every one preceded by a genuine "CONTROLLER ERROR:
+    // ConnectionError", while a maintainer's has a deliberate DE1-sleep close
+    // reported at the same WARN. Indistinguishable at that tier in both. Warning
+    // on the deliberate one teaches the reader to skim the tier that means "look
+    // here" — the failure this subsystem was audited for.
+    void markExpectedDisconnect() { m_expectedDisconnect = true; }
+    void setWeight(double weight);
+    void setFlowRate(double rate);
+    void setBatteryLevel(int level);
+    void setCharging(bool charging);
+
+    QLowEnergyController* m_controller = nullptr;
+    QLowEnergyService* m_service = nullptr;
+
+private:
+    ScaleBleTransport* m_bleTransport = nullptr;  // Not owned (lives inside the concrete driver)
+    bool m_connected = false;
+    // Set by ~ScaleDevice() before the transport teardown, so setConnected()
+    // knows the subclass is gone and must not log through the (now base-class)
+    // name() or emit signals into slots that assume a live scale.
+    bool m_destroying = false;
+    // Consumed (and cleared) by the next disconnect — see markExpectedDisconnect().
+    bool m_expectedDisconnect = false;
+    bool m_simulationMode = false;
+    bool m_displayHeldOff = false;
+    double m_weight = 0.0;
+    double m_flowRate = 0.0;
+    int m_batteryLevel = -1;  // -1 = not reported by this scale
+    bool m_charging = false;
+    QTimer m_keepAliveTimer;
+};

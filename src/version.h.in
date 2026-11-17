@@ -1,0 +1,12 @@
+#pragma once
+// Auto-generated from version.h.in - do not edit directly
+// Edit version in CMakeLists.txt: project(Decenza VERSION x.y.z)
+
+#define VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#define VERSION_STRING "@PROJECT_VERSION@"
+
+// Build number — defined in generated version_code.cpp, updated every build
+int versionCode();

@@ -1,0 +1,948 @@
+#pragma once
+
+#include "shothistory_types.h"
+#include "shotprojection.h"
+#include "shotscope.h"
+#include "decentuploadstate.h"
+#include "upgradefloor.h"
+
+#include <QObject>
+#include <QSqlDatabase>
+#include <QHash>
+#include <QSet>
+#include <QVariantList>
+#include <QDateTime>
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <optional>
+
+#include <QtQmlIntegration/qqmlintegration.h>
+
+class QSqlQuery;
+class QThread;
+class SerialDbWorker;
+
+class ShotDataModel;
+class Profile;
+struct ShotMetadata;
+
+class ShotHistoryStorage : public QObject {
+    Q_OBJECT
+
+    // Compile-time QML registration, so qmllint, qmlcachegen and the language server can
+    // follow MainController's property through to this class. A runtime qmlRegister* call is
+    // invisible to all three. Full rationale in src/controllers/maincontroller.h.
+    QML_ELEMENT
+    QML_UNCREATABLE("ShotHistoryStorage is created in C++ and reached via MainController")
+
+    Q_PROPERTY(int totalShots READ totalShots NOTIFY totalShotsChanged)
+    Q_PROPERTY(bool isReady READ isReady NOTIFY readyChanged)
+    Q_PROPERTY(bool loadingFiltered READ loadingFiltered NOTIFY loadingFilteredChanged)
+
+public:
+    explicit ShotHistoryStorage(QObject* parent = nullptr);
+    ~ShotHistoryStorage();
+
+    // Database lifecycle
+    bool initialize(const QString& dbPath = QString());
+    bool isReady() const { return m_ready; }
+    // The schema version this database reached on open; a transfer manifest reports it.
+    int schemaVersion() const { return m_schemaVersion; }
+    // Migration 52's one-time notice for users who relied on per-bag grind recall.
+    Q_INVOKABLE bool bagGrindNoticePending() const { return m_bagGrindNoticePending; }
+    Q_INVOKABLE void acknowledgeBagGrindNotice();
+    int totalShots() const { return m_totalShots; }
+    bool loadingFiltered() const { return m_loadingFiltered; }
+
+    // The version a database lands on after the full migration chain. BUMP THIS
+    // WITH EVERY NEW MIGRATION. It exists because the tests spelled the terminal
+    // version as a bare literal in 24 places across two files, so every migration
+    // had to find and edit all 24 — and a missed one fails as "expected 39, got
+    // 40", which reads like a migration bug rather than a stale test.
+    //
+    // runMigrations()' blocks deliberately keep their own literals: each stamps
+    // the version IT introduces, which must not move when a later migration is
+    // added. This is not their source — it is the total they must reach, and
+    // freshDbCreatesSchema() is what checks that they do.
+    static constexpr int kCurrentSchemaVersion = 53;
+
+    enum class UpgradeFloorProbe { NoDatabase, Supported, BelowFloor, Unknown };
+    // Reads the schema version at `path` through its own connection and writes
+    // nothing, so main() can call it before Settings or any migration exists.
+    // A `shots` table with no version row is BelowFloor: createTables() would
+    // otherwise have seeded it at 1.
+    static UpgradeFloorProbe probeUpgradeFloor(const QString& path);
+    // The path initialize() uses when given none.
+    static QString defaultDatabasePath();
+
+    // Save a completed shot (async). Extracts data on main thread, runs DB work on background thread.
+    // Returns 0 if async save started, -1 if preconditions not met (shotSaved(-1) also emitted).
+    // Actual shot ID delivered via shotSaved() signal.
+    qint64 saveShot(ShotDataModel* shotData,
+                    const Profile* profile,
+                    double duration,
+                    double finalWeight,
+                    double doseWeight,
+                    const ShotMetadata& metadata,
+                    const QString& debugLog,
+                    double temperatureOverride,
+                    double targetWeight,
+                    const QString& stoppedBy = QString());  // #1161
+
+    // Async: runs update on background thread, emits visualizerInfoUpdated()
+    Q_INVOKABLE void requestUpdateVisualizerInfo(qint64 shotId,
+                                                  const QString& visualizerId,
+                                                  const QString& visualizerUrl);
+
+    // Decent account upload state (add-decent-shot-upload). The writes emit
+    // decentUploadStateUpdated, never shotMetadataUpdated, so recording an
+    // upload can never read as a user edit (ShotUploads sends edits off
+    // shotMetadataUpdated). None bumps updated_at, which the history export keys on.
+    // `stillPending`: an edit landed while the upload was out, so it may not be in it.
+    void requestRecordDecentUpload(qint64 shotId, const QString& serverShotId, const QString& serial,
+                                   bool stillPending);
+    // Only for a shot already uploaded: its latest edit still has to reach Decent.
+    void requestMarkDecentReplacePending(qint64 shotId);
+    // Emits decentUploadStateReady(shotId, {uploaded, serverShotId, serial,
+    // replacePending, rejected, rejectedStatus}) for the shot pages.
+    Q_INVOKABLE void requestDecentUploadState(qint64 shotId);
+    void requestDecentUploadStateForRequest(const QString& requestId, qint64 shotId);
+    static bool loadDecentUploadStateStatic(QSqlDatabase& db, qint64 shotId, DecentUploadState* out);
+
+    // The outcome every upload destination records the same way (D15), in
+    // <destination>_failed_at and <destination>_rejected_at/_status. Column names
+    // are built from ShotUploadDestination::name(), so only "decent" and
+    // "visualizer" are accepted: a third destination needs the allow-list in
+    // requestRecordUploadOutcome, requestClearUploadRejections and a migration.
+    enum class UploadOutcome { Sent, Failed, Rejected };
+    void requestRecordUploadOutcome(qint64 shotId, const QString& destination, UploadOutcome outcome,
+                                    int httpStatus = 0);
+    // An edit may make a refused shot acceptable, so it clears every destination's rejection.
+    void requestClearUploadRejections(qint64 shotId);
+    // Runs `task` on the serial DB worker, after every write already queued —
+    // so a reader sees an edit the user just saved (the post-shot review page
+    // saves, then uploads). The task opens its own connection with withTempDb.
+    void runAfterQueuedWrites(std::function<void()> task) { runOnDbThread(std::move(task)); }
+
+    // Async: clear visualizer_id/visualizer_url on a shot row, but ONLY if the
+    // row still holds `staleVisualizerId` — a guarded clear so a link that was
+    // replaced meanwhile (e.g. the user re-uploaded the shot and the row now
+    // carries a fresh id) is never wiped. Used when a Visualizer PATCH 404s
+    // permanently (#1431). Logs the outcome (cleared /
+    // already replaced / failed); fire-and-forget, no completion signal.
+    void requestClearStaleVisualizerLink(qint64 shotId,
+                                         const QString& staleVisualizerId);
+
+    // Read the Visualizer bean-repair queue: the uploaded shots whose bag was
+    // unlinked from a borrowed canonical record, flagged at that moment by
+    // CoffeeBagStorage::markShotsForBeanRepairStatic. Emits
+    // pendingBeanRepairsReady() with one BeanRepair per shot — the app's values
+    // to push, and the canonical id to send back (empty = clear it, which is
+    // what stops the server rewriting the names again).
+    //
+    // Strictly read-only. Never-uploaded rows stay flagged and are skipped, not
+    // cleared: such a row may be mid-upload, and dropping its flag would lose it
+    // from the queue moments before its id lands (see the note at the query).
+    Q_INVOKABLE void requestPendingBeanRepairs();
+
+    // Drop one shot's repair flag, after the server confirmed the repair (or
+    // reported it was never needed). Fire-and-forget on the DB thread; every
+    // failure path warns, because a flag that fails to clear means repairing
+    // that shot again on the next boot.
+    Q_INVOKABLE void clearBeanRepairPending(qint64 shotId);
+
+    // Async: runs SQL on a background thread and emits shotsFilteredReady()
+    Q_INVOKABLE void requestShotsFiltered(const QVariantMap& filter, int offset = 0, int limit = 50);
+    // Correlated form for shared clients. Unlike the legacy view-wide serial,
+    // each response is returned to its caller and cannot cancel another client.
+    void requestShotsFilteredForRequest(const QString& requestId, const QVariantMap& filter,
+                                        int offset, int limit);
+
+    // Async: runs on background thread, emits shotReady()
+    Q_INVOKABLE void requestShot(qint64 shotId);
+
+    // Async: how the shot went and how it differs from the shot pulled just before
+    // it on the same profile, drink and equipment package. Emits
+    // shotOutcomeReady(shotId, { previousShotId (0: none), previousDateTime (that
+    // shot's time as a label), comparison }), where comparison is
+    // ShotComparison::compare() with the previous shot as base, or of this shot
+    // alone. An empty map when the shot cannot be read; nothing before ready, so
+    // callers ask from onShotReady.
+    Q_INVOKABLE void requestShotOutcome(qint64 shotId);
+    void requestShotOutcomeForRequest(const QString& requestId, qint64 shotId);
+
+    // Dial-in history for one profile family, scoped to one equipment package.
+    // Summary data, no time-series. Thread-safe: the caller provides its own
+    // connection. Shared by MCP and the in-app advisor.
+    // `scope` has no default on purpose: an omittable filter gets omitted.
+    // `ok`, when given, reports whether the query RAN — not whether it matched.
+    // Both are an empty list, and the advisor has to tell them apart: "no shot
+    // matches this equipment package" is a fact worth stating to the model,
+    // while "the query failed" is not, and reporting the second as the first
+    // would assert something the database never said.
+    static QVariantList loadRecentShotsByKbIdStatic(QSqlDatabase& db, const QString& kbId,
+                                                    const AdviceScope& scope, int limit,
+                                                    qint64 excludeShotId = -1,
+                                                    bool* ok = nullptr);
+
+    // Async: profiles used with a bean, for the recipe wizard's ranked profile
+    // step (add-recipe-wizard-tea). Emits rankedProfilesForBeanReady() with
+    // {"withBean": [...], "similar": [...]}, each entry {profileName, lastUsed},
+    // recency-ordered, similar deduped against withBean. Similarity is
+    // teaType (bag-blob JOIN via shots.bag_id) when teaType is non-empty, else
+    // roast level. Beverage-type filtering is NOT done here — the wizard
+    // intersects these names with its drink-type-filtered profile list.
+    Q_INVOKABLE void requestRankedProfilesForBean(const QString& beanBrand,
+                                                  const QString& beanType,
+                                                  const QString& roastLevel,
+                                                  const QString& teaType = QString());
+
+    // Static version for background-thread use — caller provides the connection.
+    static QVariantMap loadRankedProfilesForBeanStatic(QSqlDatabase& db,
+                                                       const QString& beanBrand,
+                                                       const QString& beanType,
+                                                       const QString& roastLevel,
+                                                       const QString& teaType = QString());
+
+    // Async: per-profile usage for the picker (profile-usage-history). One
+    // GROUP BY profile_name query, keyed by title (what shots.profile_name
+    // stores). Emits profileUsageReady() with title -> {lastTimestamp
+    // (epoch seconds), count}; a title with no shots is simply absent.
+    Q_INVOKABLE void requestProfileUsage();
+
+    // Static version for background-thread use — caller provides the connection.
+    static QVariantMap loadProfileUsageStatic(QSqlDatabase& db);
+
+    // Async: the most recent shot with this exact bean+profile pair — the
+    // wizard's details-step prefill source (dose/yield/temp/grind that
+    // actually worked, beating profile defaults). Emits
+    // latestShotForBeanProfileReady() with an empty map when no such shot.
+    Q_INVOKABLE void requestLatestShotForBeanProfile(const QString& beanBrand,
+                                                     const QString& beanType,
+                                                     const QString& profileName);
+
+    // Static version for background-thread use — caller provides the connection.
+    static QVariantMap loadLatestShotForBeanProfileStatic(QSqlDatabase& db,
+                                                          const QString& beanBrand,
+                                                          const QString& beanType,
+                                                          const QString& profileName);
+
+    // Async: the latest grind dialed for this bean regardless of profile —
+    // exact bean identity first, same roast level as fallback. Feeds the
+    // wizard's grind hint (the value plus WHICH profile it was dialed for,
+    // so a UGS direction can be shown when the picked profile differs).
+    // Emits latestGrindForBeanReady() with an empty map when nothing matches.
+    // equipmentId > 0 scopes the hint to the selected package, then to packages
+    // sharing its grinder+basket identity (ignoring puck prep); a different
+    // grinder or basket never qualifies. 0 keeps the unscoped behavior (a recipe
+    // deliberately configured with no package). The echoed reply carries
+    // queryEquipmentId so a stale selection's reply can be dropped.
+    Q_INVOKABLE void requestLatestGrindForBean(const QString& beanBrand,
+                                               const QString& beanType,
+                                               const QString& roastLevel,
+                                               qint64 equipmentId = 0);
+
+    // Correlated counterparts for remote/shared UI requests. They share the
+    // same canonical queries as the legacy signals above but never notify
+    // unrelated QML callers that happen to have the same request in flight.
+    void requestShotForRequest(const QString& requestId, qint64 shotId);
+    void requestRankedProfilesForBeanRequest(const QString& requestId,
+                                             const QString& beanBrand,
+                                             const QString& beanType,
+                                             const QString& roastLevel,
+                                             const QString& teaType = QString());
+    void requestLatestShotForBeanProfileRequest(const QString& requestId,
+                                                const QString& beanBrand,
+                                                const QString& beanType,
+                                                const QString& profileName);
+    void requestLatestGrindForBeanRequest(const QString& requestId,
+                                         const QString& beanBrand,
+                                         const QString& beanType,
+                                         const QString& roastLevel,
+                                         qint64 equipmentId = 0);
+    void requestRecipeGrindDefault(const QString& requestId, const QString& beanBaseId,
+                                   const QString& beanBrand, const QString& beanType);
+    // Correlated filter choices for shared recipe/bean forms. These use the
+    // same canonical DISTINCT queries as the synchronous native getters.
+    void requestDistinctBeanBrandsForRequest(const QString& requestId);
+    void requestDistinctBeanTypesForBrandForRequest(const QString& requestId,
+                                                    const QString& beanBrand);
+    // One asynchronous snapshot for a grinder picker. Returns the same
+    // per-grinder history inputs used by the legacy grind-step getters.
+    void requestGrindContextForRequest(const QString& requestId,
+                                       const QString& grinderModel);
+
+    // Static version for background-thread use — caller provides the connection.
+    // Result keys: grinderSetting, rpm, profileName, matchLevel ("bean"|"similarRoast").
+    // equipmentId: see requestLatestGrindForBean (0 = unscoped, byte-identical to before).
+    static QVariantMap loadLatestGrindForBeanStatic(QSqlDatabase& db,
+                                                    const QString& beanBrand,
+                                                    const QString& beanType,
+                                                    const QString& roastLevel,
+                                                    qint64 equipmentId = 0);
+    // A shot matches by exact Bean Base id, or by brand+type when either side lacks an id
+    // (off when those names map to more than one canonical id). Newest match wins, ties by
+    // higher shot id; any profile or equipment. Scans shots: call on a DB thread.
+    static QVariantMap loadRecipeGrindDefaultStatic(QSqlDatabase& db, const QString& beanBaseId,
+                                                     const QString& beanBrand, const QString& beanType,
+                                                     QString* error = nullptr);
+
+    // Static version for background-thread use — caller provides their own connection.
+    // Always recomputes the four quality badges from the loaded curve data and, when
+    // any recomputed flag differs from the stored column, issues an UPDATE on the same
+    // connection so the DB converges with the current detector logic. outBadgesPersisted
+    // (when non-null) is set true when a write happened, false otherwise — used by
+    // requestShot to decide whether to emit shotBadgesUpdated.
+    enum class PortalCalibration { Include, Skip };
+    static ShotRecord loadShotRecordStatic(QSqlDatabase& db, qint64 shotId,
+                                            bool* outBadgesPersisted = nullptr,
+                                            const char* requestedBy = "unspecified",
+                                            PortalCalibration portalCalibration = PortalCalibration::Include);
+
+    // Compute resistance, conductance, Darcy resistance, and the conductance
+    // derivative from a shot's own raw pressure/flow data. Called
+    // unconditionally by decompressSampleData() on every load — these are
+    // pure functions of pressure/flow, not values to trust from storage. A
+    // no-op below 3 samples (leaves whatever was already in `record`).
+    static void computeDerivedCurves(ShotRecord& record);
+
+    // Compute per-phase summaries (avg pressure, flow, weight gained, etc.) from raw curves
+    // and phase markers for legacy shots that lack phaseSummariesJson.
+    static void computePhaseSummaries(ShotRecord& record);
+
+    // Paired or rated PORTAL measurements for this bag/bean; no logs or sample blobs.
+    // nullopt (logged) when a query fails, so a failure never reads as "no references".
+    static std::optional<QVector<PortalTailAnalyzer::CalibrationPoint>> loadPortalCalibrationPointsStatic(QSqlDatabase& db, qint64 bagId,
+        const QString& beanBrand, const QString& beanType);
+    void requestPortalCalibration(const QString& requestId, qint64 bagId,
+                                  const QString& beanBrand, const QString& beanType,
+                                  PortalTailAnalyzer::MountingMode mountingMode);
+
+    // Query observed grinder settings for one equipment package + beverage type.
+    // Thread-safe: caller provides their own connection. Shared by MCP and in-app AI.
+    //
+    // `beanBrand` (optional, default empty): when non-empty, restrict the
+    // returned `settingsObserved` to shots whose `bean_brand` matches.
+    // Empty argument preserves the legacy cross-bean behavior. See
+    // openspec change `optimize-dialing-context-payload` task 7 —
+    // cross-bean settings invite "you've used grind 9 before"
+    // recommendations when 9 was on a different bean entirely.
+    //
+    // This function is single-shot: it returns ONE filtered list. The
+    // two-tier "bean-scoped first, fall back to cross-bean when sparse"
+    // policy is implemented by the *caller* (`buildGrinderContextBlock`,
+    // which calls this twice and surfaces a separate `allBeansSettings`
+    // field). Do not collapse that fallback into this function — a future
+    // caller may want bean-scoped only.
+    //
+    // `scope` bounds the observed axes only. stepSize / rpmStepSize stay
+    // grinder-wide so the advisor's step equals grindStepForGrinder().
+    static GrinderContext queryGrinderContext(QSqlDatabase& db, const QString& grinderModel,
+                                              const AdviceScope& scope,
+                                              const QString& beverageType,
+                                              const QString& beanBrand = QString());
+
+    // Convert ShotRecord to a typed ShotProjection (shared by requestShot,
+    // ShotServer, AIManager, MCP). Returns a default-constructed ShotProjection
+    // (id == 0, isValid() == false) when the record is empty. Replaces the
+    // QVariantMap projection that lived here pre-#975 — see shotprojection.h.
+    static ShotProjection convertShotRecord(const ShotRecord& record);
+    // A shot's time as a label, "Oct 6, 10:35 AM": the comparison headers, the shot
+    // page's previous shot and the web pages.
+    static QString shortDateTime(qint64 secsSinceEpoch);
+    // The shot pulled just before `shotId` on the same profile, drink and equipment
+    // package; 0 when there is none. Caller provides the connection.
+    static qint64 previousShotIdStatic(QSqlDatabase& db, qint64 shotId);
+    // The shot after (newer) or before (older) this one in history, by (timestamp, id)
+    // so two imported shots sharing a second are both reachable; 0 at either end.
+    static qint64 neighbourShotIdStatic(QSqlDatabase& db, qint64 shotId, bool newer);
+    // The payload requestShotOutcome delivers, for a caller with its own connection.
+    static QVariantMap shotOutcomeStatic(QSqlDatabase& db, qint64 shotId);
+
+    // Thread-safe shot save: opens a temporary connection, does all INSERTs + WAL checkpoint.
+    // Safe to call from any thread (does not use m_db). Returns shotId or -1 on failure.
+    static qint64 saveShotStatic(const QString& dbPath, const ShotSaveData& data);
+
+    // Delete shot(s)
+    Q_INVOKABLE void deleteShots(const QVariantList& shotIds);
+    void deleteShotsForRequest(const QString& requestId, const QVariantList& shotIds);
+
+    // Async: runs delete on background thread, emits shotDeleted()
+    Q_INVOKABLE void requestDeleteShot(qint64 shotId);
+    void requestDeleteShotForRequest(const QString& requestId, qint64 shotId);
+    void requestDistinctBaristasForRequest(const QString& requestId);
+
+    // Metadata update owns a write transaction on the caller's connection.
+    // Safe to call from any thread (does not use m_db). Returns true on success.
+    // `refusal`, when given, receives why the write was refused (a bag id that
+    // names no bag); "" for any other failure.
+    static bool updateShotMetadataStatic(QSqlDatabase& db, qint64 shotId, const QVariantMap& metadata,
+                                         QString* refusal = nullptr);
+    // Caller owns a DbWriteTxn spanning validation and this write (MCP shots_update).
+    static bool updateShotMetadataInTransaction(QSqlDatabase& db, qint64 shotId, const QVariantMap& metadata,
+                                                QString* refusal = nullptr);
+    // Strict input guard for requestShotMetadataUpdate transports. The legacy
+    // static writer remains permissive for its established native callers.
+    static bool validateShotMetadataRequest(const QVariantMap& metadata,
+                                            QString* reason = nullptr);
+    // The structured taste values a shot accepts ("" clears).
+    static const QStringList& tasteBalanceValues();
+    static const QStringList& tasteBodyValues();
+
+    // Async: runs update on background thread, emits shotMetadataUpdated()
+    Q_INVOKABLE void requestUpdateShotMetadata(qint64 shotId, const QVariantMap& metadata);
+    void requestUpdateShotWaterResult(qint64 shotId, const QString& uuid, const QVariantMap& result);
+    static bool updateShotWaterResultStatic(QSqlDatabase& db, qint64 shotId, const QString& uuid,
+                                            const QVariantMap& result);
+    void requestUpdateShotMetadataForRequest(const QString& requestId, qint64 shotId,
+                                             const QVariantMap& metadata);
+
+    // Two-way Visualizer sync (visualizer-two-way-sync). An edit through
+    // updateShotMetadataStatic sets a VisualizerSync::Field bit in
+    // shots.visualizer_dirty for each field it changes and bumps
+    // visualizer_dirty_seq; a successful send clears what it carried.
+    static bool readVisualizerDirtyStatic(QSqlDatabase& db, qint64 shotId, quint32* dirty, qint64* seq);
+    // Clears `fields` only if no edit has landed since `seq` was read: that
+    // edit's bits are not in the send being acknowledged.
+    static bool clearVisualizerDirtyStatic(QSqlDatabase& db, qint64 shotId, quint32 fields, qint64 seq);
+    void requestClearVisualizerDirty(qint64 shotId, quint32 fields, qint64 seq);
+    // Writes a pull's values (VisualizerSync::remoteShotValues) where they
+    // differ from the row and the field is not dirty, decided inside the write
+    // transaction so an edit saved meanwhile still wins. Marks nothing dirty.
+    // `written` gets the metadata keys written and `previous` their old values;
+    // a shot deleted here is a successful no-op. False on a database failure.
+    static bool applyVisualizerPullStatic(QSqlDatabase& db, qint64 shotId, const QVariantMap& remote,
+                                          QVariantMap* written, QVariantMap* previous);
+    // As above on the DB worker, then done(ok) on the main thread. A shot that
+    // changed emits historyDataChanged and shotPulledFromVisualizer — never
+    // shotMetadataUpdated, whose listeners take it as the result of their own write.
+    void requestApplyVisualizerPull(qint64 shotId, const QVariantMap& remote, std::function<void(bool ok)> done);
+    // The local shot linked to each of `visualizerIds`, for those linked here.
+    static bool shotIdsForVisualizerIdsStatic(QSqlDatabase& db, const QStringList& visualizerIds,
+                                              QHash<QString, qint64>* out);
+
+    // Async: fetch most recent shot ID on background thread, emits mostRecentShotIdReady()
+    Q_INVOKABLE void requestMostRecentShotId();
+    // Request-correlated form used by shared services. Unlike the legacy
+    // broadcast above, every accepted request receives one result including an
+    // explicit reason when the database cannot answer.
+    void requestMostRecentShotIdForRequest(const QString& requestId);
+
+    // Get filter options. Each runs its query against the live database and
+    // returns the answer. There is deliberately no cache; the measurements and
+    // the reasoning are on queryDistinctList() in shothistorystorage_queries.cpp
+    // — one copy, next to the code they justify.
+    //
+    // These are cheap but NOT free, and several are read from QML suggestion
+    // bindings. Do not call one from inside a binding that depends on the text
+    // the user is typing: hoist it to a property refreshed on load and on
+    // historyDataChanged(). PostShotReviewPage and ChangeBeansDialog both had to
+    // be fixed for exactly that.
+    Q_INVOKABLE QStringList getDistinctBeanBrands();
+    Q_INVOKABLE QStringList getDistinctBaristas();
+
+    // Get filter options with parent-based filtering (live reads)
+    Q_INVOKABLE QStringList getDistinctBeanTypesForBrand(const QString& beanBrand);
+    Q_INVOKABLE QStringList getDistinctGrinderBrands();
+    Q_INVOKABLE QStringList getDistinctGrinderModelsForBrand(const QString& grinderBrand);
+    Q_INVOKABLE QStringList getDistinctGrinderBurrsForModel(const QString& grinderBrand, const QString& grinderModel);
+    Q_INVOKABLE QStringList getDistinctGrinderSettingsForGrinder(const QString& grinderModel);
+
+    // Typical dial increment observed for a grinder, for the Grind quick-select
+    // widget. Non-empty model → that grinder's settings; empty model → the full
+    // cross-grinder history (grinderWideNumericSettings handles both).
+    // Parses the numeric subset and runs the same noise-filtered estimator the
+    // AI dialing context uses, so the widget and the AI never disagree. Returns
+    // 0 when it cannot derive (<2 distinct numeric settings) — the caller
+    // applies its own default.
+    Q_INVOKABLE double grindStepForGrinder(const QString& grinderModel);
+
+    // RPM counterpart of grindStepForGrinder, for variable-RPM grinders: the
+    // typical increment between the RPMs the user has actually dialed on this
+    // grinder (the shots.rpm column), via the same noise-filtered estimator.
+    // Returns 0 when it cannot derive (<2 distinct RPMs) — the
+    // widget falls back to its fixed RPM step. Empty model → 0 (RPM mode always
+    // has an identified grinder).
+    Q_INVOKABLE double grindRpmStepForGrinder(const QString& grinderModel);
+
+    // Async: runs query on background thread, emits autoFavoritesReady()
+    Q_INVOKABLE void requestAutoFavorites(const QString& groupBy, int maxItems,
+                                          const QString& requestId = {});
+
+    // Async: runs query on background thread, emits autoFavoriteGroupDetailsReady().
+    // doseBucket/targetWeight are only consulted when groupBy == "bean_profile_grinder_weight".
+    Q_INVOKABLE void requestAutoFavoriteGroupDetails(const QString& groupBy,
+                                                      const QString& beanBrand,
+                                                      const QString& beanType,
+                                                      const QString& profileName,
+                                                      qint64 equipmentId,
+                                                      const QString& grinderSetting,
+                                                      double doseBucket = 0.0,
+                                                      double targetWeight = 0.0,
+                                                      const QString& requestId = {});
+
+    // Async: runs backup on background thread, emits backupFinished()
+    Q_INVOKABLE void requestCreateBackup(const QString& destPath);
+
+    // Async: runs import on background thread, emits importDatabaseFinished()
+    Q_INVOKABLE void requestImportDatabase(const QString& filePath, bool merge);
+    bool isImportInProgress() const { return m_importInProgress.load(); }
+
+    // Async: recomputes all quality badge flags for a shot and updates the DB if changed.
+    // Emits shotBadgesUpdated() only when at least one flag changed. No signal is emitted
+    // if the shot ID is not in the database or if all flags are already up to date.
+    // Import a shot record directly (for .shot file import).
+    // Returns: shot ID on success, 0 if duplicate (skipped), -1 on error.
+    // If overwriteExisting is true, duplicates will be replaced instead of skipped.
+    // SYNCHRONOUS DB I/O on the caller's thread — call only from the main thread
+    // (the .shot batch importer does; see ShotImporter). Off-thread callers use
+    // importShotRecordAsync instead.
+    qint64 importShotRecord(const ShotRecord& record, bool overwriteExisting = false);
+
+    // Async variant: runs the insert on the shared serial DB worker thread (its
+    // own withTempDb connection), then delivers the result code to `onDone` on
+    // the main thread — >0 imported, 0 duplicate/skipped, -1 error. Used by the
+    // Visualizer recovery import so its per-shot inserts never block the main
+    // thread. `onDone` may capture the caller; the storage guards its own
+    // lifetime, and both objects here are MainController-owned for the app's
+    // lifetime, so the callback is safe to fire.
+    void importShotRecordAsync(const ShotRecord& record, bool overwriteExisting,
+                               std::function<void(qint64 resultCode)> onDone);
+
+    // Refresh the total shots count (call after bulk import)
+    Q_INVOKABLE void refreshTotalShots();
+
+    // Id of the most recent shot: seeded from MAX(id) at initialize() so it
+    // is valid immediately after an app restart, then updated on every save
+    // (not adjusted on delete — may briefly point at a deleted shot until
+    // the next save or restart).
+    Q_INVOKABLE qint64 lastSavedShotId() const { return m_lastSavedShotId; }
+
+    // Get database path
+    QString databasePath() const { return m_dbPath; }
+
+    // Close the database (for factory reset before file deletion)
+    void close();
+
+    // True when no background DB work is queued, running, or waiting to deliver
+    // its result — covering BOTH the FIFO CRUD worker and the one-shot read
+    // threads from runDetachedDbThread(). False only while something is in flight.
+    //
+    // "Waiting to deliver its result" is exact for the CRUD worker. For a detached
+    // read thread it means the thread has finished touching the DB FILE; its
+    // result callback is already posted and m_destroyed guards it. That is the
+    // granularity callers actually need — it is what makes deleting the file safe.
+    //
+    // For callers that must not continue until the DB work has really finished —
+    // a test tearing this object down, a factory reset about to delete the file —
+    // so they can wait on the CONDITION instead of guessing a duration. Always
+    // true when no async work has ever been posted (the worker is lazily created).
+    bool isDbWorkIdle() const;
+
+    // Just the serialized WRITE worker, without the detached read/backup threads
+    // isDbWorkIdle() also counts. For a caller that only needs "will a queued
+    // write be lost if I destroy this now?" — which is the shutdown drain, and
+    // only that.
+    //
+    // The distinction is not cosmetic. Detached threads carry reads, plus backup
+    // and import; none of them is in SerialDbWorker's outstanding count, so none
+    // can be discarded by ~SerialDbWorker and there is nothing to protect. Making
+    // the drain wait on them charged its whole timeout to a quit-during-backup —
+    // which cannot finish in that budget anyway — and then printed a warning
+    // about discarded writes that were never at risk.
+    //
+    // The other three storages need no equivalent: they have no detached threads,
+    // so their isDbWorkIdle() is already write-only.
+    bool isDbWriteWorkIdle() const;
+
+    // Checkpoint WAL to main database file
+    void checkpoint();
+
+    // Thread-safe backup: a VACUUM INTO snapshot (WAL included) through a temporary connection.
+    // Safe to call from any thread (does not use m_db).
+    static QString createBackupStatic(const QString& dbPath, const QString& destPath);
+
+    // What an import did, beyond succeeded/failed.
+    //
+    // shotIdMap is the reason this struct exists. Every imported shot gets a
+    // NEW id (`shots.id` is AUTOINCREMENT and the import re-INSERTs each row),
+    // exactly as equipment packages, bags and recipes do — and those three
+    // already hand a map to the next importer so foreign keys land on
+    // destination ids. Shot ids had no map, so references living OUTSIDE
+    // shots.db (AI advisor conversation turns) kept naming the source
+    // database's ids after a restore. A stale id is not inert: ids are handed
+    // out in increasing order, so it eventually becomes a valid id belonging
+    // to an unrelated shot and a write meant for one shot lands on another.
+    //
+    // Keyed by source id. A skipped duplicate maps to the id of the
+    // destination row it matched; a row that failed to insert is ABSENT, and
+    // absent means "clear the reference", never "leave it alone".
+    //
+    // The counts distinguish outcomes that used to log identically: merging
+    // into an empty destination and merging into a populated one both printed
+    // "N imported, 0 skipped, 0 failed".
+    struct ImportResult {
+        QHash<qint64, qint64> shotIdMap;
+        // Source equipment-package ids to the ids those packages received here,
+        // same shape and same rule as shotIdMap. An AI conversation is KEYED on
+        // the package, so a restored conversation has to be re-keyed through
+        // this map; without it the thread exists in the index and no shot on
+        // this device ever opens it.
+        QHash<qint64, qint64> equipmentIdMap;
+        // Destination row count before the import. MERGE MODE ONLY — replace
+        // mode never reads it, so 0 there means "not measured", not "empty".
+        std::optional<int> destShotsBefore;
+        int imported = 0;
+        int skipped = 0;              // already present, matched by uuid
+        int failed = 0;
+
+        // Why the import refused, when it refused for an integrity reason
+        // rather than an I/O one. English, already specific about which counts
+        // disagreed; callers pair it with a translated lead-in rather than
+        // reproducing the detail. Empty on success and on plain I/O failure.
+        QString integrityFailure;
+
+        // True when the import STOPPED to protect the existing history, as
+        // opposed to failing or finding nothing to do.
+        bool refused() const { return !integrityFailure.isEmpty(); }
+
+        // The source predates the upgrade floor; nothing was read from it or
+        // written here. Callers report UpgradeFloor::sourceTooOldMessage().
+        bool sourceTooOld = false;
+
+        // The map to hand AIConversation::importConversationsStatic, or nullptr
+        // meaning "clear every stored shotId".
+        //
+        // One definition because the answer is a POLICY, and it was previously
+        // spelled three different ways at three call sites, each resting on a
+        // different local invariant. Callers must still check refused() FIRST
+        // and skip the conversation import entirely — see the note there.
+        const QHash<qint64, qint64>* idMapOrNull() const {
+            return shotIdMap.isEmpty() ? nullptr : &shotIdMap;
+        }
+
+        // Same policy for the package map. Empty means no equipment crossed: a
+        // pre-equipment source, an import that failed, or a source without
+        // equipment packages.
+        //
+        // The importer then refuses any conversation naming a package rather
+        // than demoting it to bucket 0. Conversations that name NO package
+        // (bucket 0, the unpackaged pool) are unaffected — 0 means the same
+        // thing on both devices and needs no map.
+        const QHash<qint64, qint64>* equipmentIdMapOrNull() const {
+            return equipmentIdMap.isEmpty() ? nullptr : &equipmentIdMap;
+        }
+    };
+
+    // Thread-safe import: opens separate connections for source and destination.
+    // Safe to call from any thread (does not use m_db).
+    // Caller must invoke refreshTotalShots() on the main thread afterward.
+    //
+    // Pass `outResult` to receive the shot id map; a caller that carries any
+    // reference to a shot id across this call MUST remap it through that map
+    // (see AIConversation::importConversationsStatic). Callers that import nothing referencing
+    // shots may leave it null.
+    static bool importDatabaseStatic(const QString& destDbPath, const QString& srcFilePath, bool merge,
+                                     ImportResult* outResult = nullptr);
+
+    // Thread-safe shot count: opens a temporary connection.
+    // Safe to call from any thread (does not use m_db).
+    static int getShotCountStatic(const QString& dbPath);
+
+    // Which of `ids` name a shot that actually exists. Used to decide whether a
+    // stored reference still resolves, so a stale id is not read back as live
+    // on a conversation loaded from storage.
+    //
+    // Bounded by construction: the caller passes the DISTINCT ids of one
+    // conversation's turns (at most a couple of dozen), and the query is a
+    // primary-key IN over that set. Not for open-ended membership scans.
+    //
+    // `nullopt` means COULD NOT ANSWER — the database is not ready, the query
+    // failed, or the read stopped early — and is deliberately NOT the same
+    // value as an empty set.
+    // The caller's response to "this id resolves to nothing" is to DELETE the
+    // reference, so collapsing the two would let one transient SQLITE_BUSY
+    // strip every advisor-to-shot link on the device. That is the same
+    // inference importDatabaseStatic's GUARD 1 refuses: a failed read is not
+    // evidence of an empty table. On `nullopt` the caller must leave the data
+    // alone, not clear it.
+    [[nodiscard]] std::optional<QSet<qint64>> existingShotIds(const QSet<qint64>& ids) const;
+
+signals:
+    void portalCalibrationReady(const QString& requestId, const QVariantMap& calibration,
+                                const QString& reason);
+    void readyChanged();
+    void totalShotsChanged();
+    void shotSaved(qint64 shotId);
+    void shotSavedWithUuid(qint64 shotId, const QString& uuid);
+    void shotDeleted(qint64 shotId);
+    void shotsDeleted(const QVariantList& shotIds);
+    void shotsDeleteRequestFinished(const QString& requestId, bool success,
+                                    const QVariantList& shotIds, const QString& reason);
+    // Terminal outcome of ONE requestDeleteShot(), success or failure, naming the
+    // shot it refers to. `shotDeleted` fires only on success and `errorOccurred`
+    // is storage-wide with no shot id, so a caller that wants to know how its own
+    // delete ended cannot assemble that from the two: waiting on `shotDeleted`
+    // alone waits forever on failure, and resolving on `errorOccurred` resolves on
+    // some other operation's failure. Emitted exactly once per request, on both
+    // outcomes, in addition to (not instead of) the two above, which the UI uses.
+    void shotDeleteFinished(qint64 shotId, bool success, const QString& reason);
+    void shotDeleteRequestFinished(const QString& requestId, qint64 shotId,
+                                   bool success, const QString& reason);
+    void errorOccurred(const QString& message);
+    void shotsFilteredReady(const QVariantList& results, bool isAppend, int totalCount);
+    void shotsFilteredRequestReady(const QString& requestId, int offset,
+                                   const QVariantList& results, int totalCount,
+                                   const QString& reason);
+    void loadingFilteredChanged();
+    void shotReady(qint64 shotId, const ShotProjection& shot);
+    void shotOutcomeReady(qint64 shotId, const QVariantMap& outcome);
+    void shotOutcomeRequestReady(const QString& requestId, qint64 shotId,
+                                 const QVariantMap& outcome, const QString& reason);
+    void decentUploadStateRequestReady(const QString& requestId, qint64 shotId,
+                                       const QVariantMap& state, const QString& reason);
+    void distinctBaristasRequestReady(const QString& requestId,
+                                      const QStringList& values, const QString& reason);
+    void rankedProfilesForBeanReady(const QVariantMap& result);
+    void profileUsageReady(const QVariantMap& usage);
+    void latestShotForBeanProfileReady(const QVariantMap& shot);
+    void latestGrindForBeanReady(const QVariantMap& grind);
+    void shotRequestReady(const QString& requestId, qint64 shotId,
+                          const QVariantMap& shot, const QString& reason);
+    void mostRecentShotIdRequestReady(const QString& requestId, qint64 shotId,
+                                      const QString& reason);
+    void rankedProfilesRequestReady(const QString& requestId,
+                                    const QVariantMap& result, const QString& reason);
+    void latestShotForBeanProfileRequestReady(const QString& requestId,
+                                              const QVariantMap& shot, const QString& reason);
+    void latestGrindForBeanRequestReady(const QString& requestId,
+                                        const QVariantMap& grind, const QString& reason);
+    void recipeGrindDefaultReady(const QString& requestId, const QVariantMap& grind,
+                                 const QString& reason);
+    void distinctBeanBrandsRequestReady(const QString& requestId,
+                                        const QStringList& values, const QString& reason);
+    void distinctBeanTypesForBrandRequestReady(const QString& requestId,
+                                               const QStringList& values, const QString& reason);
+    void grindContextRequestReady(const QString& requestId,
+                                  const QVariantMap& context, const QString& reason);
+    void importDatabaseFinished(bool success);
+    // Emitted on the owning thread after an imported database commits.
+    void importedDatabaseChanged();
+    void shotMetadataUpdated(qint64 shotId, bool success);
+    void shotWaterResultUpdated(qint64 shotId, const QVariantMap& result);
+    void shotWaterResultUpdateFinished(qint64 shotId, bool success);
+    void shotMetadataUpdateRequestFinished(const QString& requestId, qint64 shotId,
+                                           bool success, const QString& reason);
+    // A Visualizer pull changed these metadata keys (from `previous` to `written`).
+    void shotPulledFromVisualizer(qint64 shotId, const QVariantMap& previous, const QVariantMap& written);
+
+    // A write landed that can change what the getDistinct*() getters and the
+    // grind-step derivation return: a shot saved, deleted, metadata-edited, or a
+    // database imported. Emitted from exactly the sites that used to call
+    // invalidateDistinctCache().
+    //
+    // This is NOT the distinct-value cache returning. Nothing is stored; this
+    // only tells a QML binding that already reads live that its answer may have
+    // moved. The cache's problem was that it fired on every async single-key
+    // fill as well, re-running every consumer for an answer that had not
+    // changed — this fires on writes only.
+    //
+    // A binding whose value can change with history needs it: a `readonly
+    // property` over grindStepForGrinder() depends on nothing else, so without
+    // this a resident widget keeps its first answer for its whole life.
+    void historyDataChanged();
+    void autoFavoritesRequestReady(const QString& requestId, const QVariantList& results, const QString& reason);
+    void autoFavoriteGroupDetailsRequestReady(const QString& requestId, const QVariantMap& details, const QString& reason);
+    void autoFavoritesReady(const QVariantList& results);
+    void autoFavoriteGroupDetailsReady(const QVariantMap& details);
+    void backupFinished(bool success, const QString& resultPath);
+    void visualizerInfoUpdated(qint64 shotId, bool success);
+    void decentUploadStateUpdated(qint64 shotId, bool success);
+    void uploadOutcomeUpdated(qint64 shotId, bool success);
+    void decentUploadStateReady(qint64 shotId, const QVariantMap& state);
+    // Result of requestPendingBeanRepairs. `ok` false means the read did not
+    // run — the DB would not open, or the query failed — and must NOT be read
+    // as an empty queue. `repairs` is empty when the queue genuinely is, which
+    // is the normal case.
+    void pendingBeanRepairsReady(bool ok, const QVector<BeanRepair>& repairs);
+    void mostRecentShotIdReady(qint64 shotId);
+    void shotBadgesUpdated(qint64 shotId, bool channelingDetected, bool grindIssueDetected, bool skipFirstFrameDetected, bool pourTruncatedDetected);
+
+private:
+    // Post shot-CRUD background work onto a single FIFO worker thread, so two
+    // writes to the same shot row dispatched close together apply in submission
+    // order (a fresh-thread-per-request scheme lets the OS scheduler reorder
+    // them — see SerialDbWorker). `task` opens its own withTempDb connection and
+    // marshals results back to the main thread itself. Heavy one-shot ops
+    // (backup/import) deliberately stay on their own threads.
+    void runOnDbThread(std::function<void()> task);
+    void requestMostRecentShotIdImpl(const QString& requestId);
+    void requestShotsFilteredImpl(const QString& requestId, const QVariantMap& filter,
+                                  int offset, int limit);
+    void deleteShotsImpl(const QString& requestId, const QVariantList& shotIds);
+    void requestShotOutcomeImpl(const QString& requestId, qint64 shotId);
+    void requestDecentUploadStateImpl(const QString& requestId, qint64 shotId);
+    void requestDeleteShotImpl(const QString& requestId, qint64 shotId);
+    // One UPDATE of a shot's upload state on the DB thread. `ifLost` is the
+    // consequence of a failed write, logged with it; `report` runs back on the
+    // storage's own thread with the result.
+    void runUploadStateWrite(qint64 shotId, const QString& what, const char* ifLost,
+                             std::function<bool(QSqlQuery&)> bindAndExec, std::function<void(bool)> report);
+    void runDecentStateWrite(qint64 shotId, const char* what, const char* ifLost,
+                             std::function<bool(QSqlQuery&)> bindAndExec);
+
+    // Run `body` on a one-shot background thread for a read query that does NOT
+    // need the FIFO ordering runOnDbThread() provides (and for the two heavy
+    // one-shot ops, backup and import). The thread deletes itself when it
+    // finishes and is counted, so isDbWorkIdle() covers it.
+    //
+    // ALWAYS spawn through this, never a bare QThread::create — that boilerplate
+    // was hand-copied at eleven sites, none of which was counted, and one of which
+    // had already drifted to calling start() before the deleteLater connect.
+    void runDetachedDbThread(std::function<void()> body);
+
+    // One-shot startup census of which grinder each shot is attributed to, and
+    // how much numeric dial history that grinder actually has. Log only — it
+    // reads nothing back and changes no state.
+    //
+    // It exists because "grind step for X = 0, derived from 0" has two causes a
+    // log cannot currently separate, and they are different bugs: the shots are
+    // not LINKED to a package with that model, or they are linked and none of
+    // the settings parse as numeric. Both report the same TooThin outcome, so
+    // the outcome enum cannot help. Diagnosing #1726 needed exactly this fact
+    // and the log did not carry it; the answer had to be inferred from a single
+    // incidental "Loaded shot metadata" line that happened to name a grinder.
+    //
+    // Runs on the shared DB worker rather than a detached thread: it is a full
+    // scan of `shots` with a join, so it must not sit on the main thread at
+    // startup, and the FIFO worker keeps it behind work that matters. The
+    // reason to prefer it is that the worker is JOINED in the destructor, so
+    // the census cannot outlive this object — NOT that only it is covered by
+    // isDbWorkIdle(), which counts detached threads too and has since the
+    // tst_mcptools_write failure that a detached pre-warm from initialize()
+    // caused. An earlier draft of this comment gave that wrong reason.
+    //
+    // Not called at all in test builds — see the call site for why posting it
+    // there would arm a "writes are being discarded" warning about a task that
+    // writes nothing.
+    void logGrinderCensus();
+
+    bool createTables();
+    bool runMigrations();
+    QByteArray compressSampleData(ShotDataModel* shotData, const QString& phaseSummariesJson = QString());
+    // outCorrectedBlob (when non-null): set to a recompressed blob when the
+    // recomputed derived curves differ from what was stored, left empty
+    // (cleared) otherwise. Callers on a DB connection use this to self-heal
+    // shot_samples.data_blob — see loadShotRecordStatic.
+    static void decompressSampleData(const QByteArray& blob, ShotRecord* record,
+                                      QByteArray* outCorrectedBlob = nullptr);
+    void updateTotalShots();
+    QString buildFilterQuery(const ShotFilter& filter, QVariantList& bindValues);
+    ShotFilter parseFilterMap(const QVariantMap& filterMap);
+    QString formatFtsQuery(const QString& userInput);
+
+    // SQL fragment matching shots to a grinder MODEL, case- and whitespace-folded.
+    // Public + static because its callers are file-static free functions in
+    // shothistorystorage_queries.cpp, which cannot reach a private member.
+    // `placeholder` is the bind style at the call site (":model" or "?").
+public:
+    static QString grinderModelMatchSql(const QString& placeholder);
+private:
+
+    static bool refreshPortalEligibilityInTransaction(QSqlDatabase& db, qint64 shotId);
+
+    // Run a SELECT DISTINCT against m_db and return the non-empty values.
+    // THE single place these getters touch the database.
+    QStringList queryDistinctList(const QString& sql, const QVariantList& binds = {});
+    // Column-name form; the column is checked against an allow-list because it is
+    // interpolated into the SQL text and cannot be bound.
+    QStringList getDistinctValues(const QString& column);
+    // Internal wrappers used as fallbacks by parametric methods when parameter is empty.
+    QStringList getDistinctBeanTypes();
+    QStringList getDistinctGrinders();
+    QStringList getDistinctGrinderSettings();
+    // Helper to apply smart sorting for grinder settings
+    void sortGrinderSettings(QStringList& settings);
+    // Connection-parameterised core of importShotRecord, so the import logic can
+    // run on either the main-thread m_db (importShotRecord) or a background
+    // withTempDb connection (importShotRecordAsync) from one implementation.
+    // deleteShotStatic is the internal row delete used by the overwrite path.
+    //
+    // beginAttempts is passed through to DbWriteTxn::begin. It defaults to the
+    // guard's own default for the background path; importShotRecord passes 1
+    // because it runs on the GUI thread, where each extra attempt can spend the
+    // full busy_timeout blocking the UI (see the COST note on DbWriteTxn).
+    static qint64 importShotRecordStatic(QSqlDatabase& db, const ShotRecord& record,
+                                         bool overwriteExisting, int beginAttempts = 2);
+    // [[nodiscard]]: dropping this return let a failed delete fall through to the
+    // INSERT, which then either duplicated the shot the import meant to replace
+    // or failed on the uuid constraint and blamed the wrong thing. With
+    // -Werror=unused-result, ignoring it is now a build error rather than a
+    // review finding.
+    [[nodiscard]] static bool deleteShotStatic(QSqlDatabase& db, qint64 shotId);
+
+    // Helper for converting QVector<QPointF> to JSON object with t/v arrays
+    static QJsonObject pointsToJsonObject(const QVector<QPointF>& points);
+
+    // Core backup helper: checkpoint + close + copy + reopen
+    // Returns true on success, false on failure
+    bool performDatabaseCopy(const QString& destPath);
+
+    QSqlDatabase m_db;
+    QString m_dbPath;
+    bool m_ready = false;
+    int m_totalShots = 0;
+    int m_schemaVersion = 1;
+    bool m_bagGrindNoticePending = false;
+    qint64 m_lastSavedShotId = 0;
+    std::atomic<bool> m_backupInProgress{false};  // Prevent concurrent backup/export operations (thread-safe)
+    std::atomic<bool> m_importInProgress{false};   // Prevent concurrent import/restore operations (thread-safe)
+
+    // Deduped narration of what grindStepForGrinder() derived — see its definition.
+    // Why a derivation answered what it did. All three non-derived outcomes
+    // return the SAME 0.0, so a log that does not name them cannot tell a broken
+    // query from a grinder with no numeric history — which is exactly how the
+    // single-digit grind report stayed undiagnosed for so long.
+    enum class GrindStepOutcome { Derived, NotReady, QueryFailed, TooThin, NoGrinder };
+    void reportGrindStep(const QString& grinderModel, qsizetype sampleCount, double step,
+                         GrindStepOutcome outcome);
+    // Last "<count>:<step>" reported per grinder model, so the derivation is
+    // logged when it CHANGES rather than on every re-evaluation. Keyed by model:
+    // a single scalar alternated between two live GrindRowSources (startup has
+    // two, one usually empty) and deduped nothing. Not a cache — only compared.
+    QHash<QString, QString> m_lastGrindStepReport;
+
+    // Async filter support
+    bool m_loadingFiltered = false;
+    int m_filterSerial = 0;
+
+    // Shared flag for destructor safety in background thread lambdas.
+    // Atomic because the flag is written on the main thread (destructor) and
+    // read on background threads (before QMetaObject::invokeMethod).
+    std::shared_ptr<std::atomic<bool>> m_destroyed = std::make_shared<std::atomic<bool>>(false);
+
+    // Number of runDetachedDbThread() threads currently touching the DB file.
+    // shared_ptr for the same reason as m_destroyed — a thread may outlive `this`
+    // and still has to decrement. Read by isDbWorkIdle().
+    std::shared_ptr<std::atomic<int>> m_detachedDbThreads = std::make_shared<std::atomic<int>>(0);
+
+    // Serializes shot-CRUD background work onto one FIFO worker thread so
+    // successive writes to the same shot row apply in submission order
+    // (see runOnDbThread / SerialDbWorker).
+    std::unique_ptr<SerialDbWorker> m_dbWorker;
+
+    static const QString DB_CONNECTION_NAME;
+
+#ifdef DECENZA_TESTING
+public:
+    // Lets the read-gating test put the storage in the one state initialize()
+    // can't reach on its own: m_ready=true with an m_dbPath whose parent dir is
+    // absent, so the worker's withTempDb open fails while the !m_ready guard is
+    // bypassed — exercising requestShot's open-failure gate directly.
+    friend class tst_CoffeeBags;
+    // Exercises the sample-blob round-trip directly (compressSampleData /
+    // decompressSampleData) without standing up a database.
+    friend class tst_SampleBlobSeries;
+#endif
+};

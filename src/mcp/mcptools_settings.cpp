@@ -1,0 +1,409 @@
+#include "core/settings_app.h"
+#include "mcpserver.h"
+#include "mcptoolregistry.h"
+#include "../core/settings.h"
+#include "../core/settings_brew.h"
+#include "../core/settings_dye.h"
+#include "../core/settings_network.h"
+#include "../core/settings_mqtt.h"
+#include "../core/settings_autowake.h"
+#include "../core/settings_hardware.h"
+#include "../core/settings_ai.h"
+#include "../core/settings_theme.h"
+#include "../core/settings_visualizer.h"
+#include "../core/settings_decent.h"
+#include "../core/settings_upload.h"
+#include "../network/decentaccount.h"
+#include <QMetaEnum>
+#include "../core/settings_mcp.h"
+#include "../core/settings_calibration.h"
+#include "../core/accessibilitymanager.h"
+#include "../core/translationmanager.h"
+#include "../core/batterymanager.h"
+#include "../screensaver/screensavervideomanager.h"
+#include "../ai/aimanager.h"
+#include "../controllers/maincontroller.h"
+#include "../ble/de1device.h"
+#include "../controllers/profilemanager.h"
+
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QSet>
+
+void registerSettingsReadTools(McpToolRegistry* registry, Settings* settings,
+                               AccessibilityManager* accessibility,
+                               ScreensaverVideoManager* screensaver,
+                               TranslationManager* translation,
+                               BatteryManager* battery,
+                               AIManager* aiManager,
+                               MainController* mainController)
+{
+    // settings_get
+    registry->registerTool(
+        "settings_get",
+        "Read app settings. Returns all settings, specific keys, or a category of settings. "
+        "Categories match QML settings tabs: machine, calibration, connections, screensaver, accessibility, "
+        "ai, espresso, steam, water, flush, dye, mqtt, themes, upload, update, data, "
+        "history, language, debug, battery, heater, autofavorites",
+        QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"keys", QJsonObject{
+                    {"type", "array"},
+                    {"items", QJsonObject{{"type", "string"}}},
+                    {"description", "Specific setting keys to return. If empty, returns all (or filtered by category)."}
+                }},
+                {"category", QJsonObject{
+                    {"type", "string"},
+                    {"description", "Return only this category's settings; omit to return all of them"}
+                }}
+            }}
+        },
+        [settings, accessibility, screensaver, translation, battery, aiManager, mainController](const QJsonObject& args) -> QJsonObject {
+            QJsonObject result;
+            if (!settings) {
+                // Not a bare `{}`: with no `error` key this ships as a SUCCESSFUL
+                // call (PR Kulitorum/Decenza#1754 marks failure off that key), so the model reads an
+                // empty settings object as "you have no settings" rather than
+                // "this app cannot answer".
+                result["error"] = "Settings not available";
+                return result;
+            }
+
+            QJsonArray keys = args["keys"].toArray();
+            QString category = args["category"].toString();
+            bool hasKeys = !keys.isEmpty();
+
+            // Track which keys and categories the iteration considers, so
+            // that requested keys/categories that don't match anything can
+            // be reported as errors rather than returning {} silently
+            // (#986). Typos and outdated category names ("preferences" was
+            // removed in phase 16) are the worst kind of failure mode for
+            // an LLM agent — indistinguishable from "the value is empty."
+            //
+            // Pre-seed with the full static category list. The include()
+            // helper also inserts as it iterates, but several categories
+            // ("screensaver", "accessibility", "battery", "language") only
+            // get an include() call from inside null-guarded service blocks
+            // — if the matching service is null at registration time, those
+            // categories would otherwise be falsely reported as unknown.
+            QSet<QString> knownCategories = {
+                QStringLiteral("machine"), QStringLiteral("calibration"),
+                QStringLiteral("connections"), QStringLiteral("screensaver"),
+                QStringLiteral("accessibility"), QStringLiteral("ai"),
+                QStringLiteral("espresso"), QStringLiteral("steam"),
+                QStringLiteral("water"), QStringLiteral("flush"),
+                QStringLiteral("dye"), QStringLiteral("mqtt"),
+                QStringLiteral("themes"), QStringLiteral("upload"),
+                QStringLiteral("update"), QStringLiteral("data"),
+                QStringLiteral("history"), QStringLiteral("language"),
+                QStringLiteral("debug"), QStringLiteral("battery"),
+                QStringLiteral("heater"), QStringLiteral("autofavorites")
+            };
+            QSet<QString> matchedKeys;
+
+            // If keys are specified, return those regardless of category.
+            // If category is specified, return all settings in that category.
+            // If neither, return all settings.
+            //
+            // The keys filter accepts both the canonical write name (e.g.
+            // "espressoTemperature") and the suffixed read name returned in
+            // the response (e.g. "espressoTemperatureC"). An LLM that reads
+            // a value, stores the field name it received, and asks for it
+            // again must round-trip — see #985.
+            auto include = [&](const QString& key, const QString& cat,
+                               const QString& alias = QString()) -> bool {
+                knownCategories.insert(cat);
+                if (hasKeys) {
+                    for (const auto& k : keys) {
+                        const QString s = k.toString();
+                        if (s == key || (!alias.isEmpty() && s == alias)) {
+                            matchedKeys.insert(s);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                if (!category.isEmpty()) return category == cat;
+                return true;
+            };
+
+            // === Machine ===
+            if (include("themeMode", "machine")) result["themeMode"] = settings->theme()->themeMode();
+            if (include("darkThemeName", "machine")) result["darkThemeName"] = settings->theme()->darkThemeName();
+            if (include("lightThemeName", "machine")) result["lightThemeName"] = settings->theme()->lightThemeName();
+            if (include("autoSleepMinutes", "machine")) result["autoSleepMinutes"] = settings->value("autoSleepMinutes", 60).toInt();
+            if (include("postShotReviewTimeout", "machine")) result["postShotReviewTimeout"] = settings->value("postShotReviewTimeout", 31).toInt();
+            if (include("keepWarmWhenIdle", "machine")) result["keepWarmWhenIdle"] = settings->brew()->keepWarmWhenIdle();
+            if (include("letRecipeDecide", "machine")) result["letRecipeDecide"] = settings->brew()->letRecipeDecide();
+            if (include("steamAutoFlushSeconds", "machine")) result["steamAutoFlushSeconds"] = settings->brew()->steamAutoFlushSeconds();
+            if (include("refillKitOverride", "machine")) result["refillKitOverride"] = settings->app()->refillKitOverride();
+            if (include("waterRefillPoint", "machine")) result["waterRefillPoint"] = settings->app()->waterRefillPoint();
+            if (include("waterLevelDisplayUnit", "machine")) result["waterLevelDisplayUnit"] = settings->app()->waterLevelDisplayUnit();
+            if (include("screenBrightness", "machine")) result["screenBrightness"] = settings->theme()->screenBrightness();
+            if (include("launcherMode", "machine")) result["launcherMode"] = settings->app()->launcherMode();
+            {
+                auto* aw = settings->autoWake();
+                if (include("autoWakeEnabled", "machine")) result["autoWakeEnabled"] = aw->autoWakeEnabled();
+                if (include("autoWakeStayAwakeEnabled", "machine")) result["autoWakeStayAwakeEnabled"] = aw->autoWakeStayAwakeEnabled();
+                if (include("autoWakeStayAwakeMinutes", "machine")) result["autoWakeStayAwakeMinutes"] = aw->autoWakeStayAwakeMinutes();
+            }
+
+            // === Calibration ===
+            if (include("useFlowScale", "calibration")) result["useFlowScale"] = settings->useFlowScale();
+            if (include("flowCalibrationMultiplier", "calibration")) result["flowCalibrationMultiplier"] = settings->calibration()->flowCalibrationMultiplier();
+            if (include("autoFlowCalibration", "calibration")) result["autoFlowCalibration"] = settings->calibration()->autoFlowCalibration();
+            if (include("ignoreVolumeWithScale", "calibration")) result["ignoreVolumeWithScale"] = settings->brew()->ignoreVolumeWithScale();
+            if (include("steamTwoTapStop", "machine")) result["steamTwoTapStop"] = settings->hardware()->steamTwoTapStop();
+
+            // === Connections ===
+            if (include("machineAddress", "connections")) result["machineAddress"] = settings->machineAddress();
+            if (include("scaleAddress", "connections")) result["scaleAddress"] = settings->scaleAddress();
+            if (include("scaleType", "connections")) result["scaleType"] = settings->scaleType();
+            if (include("scaleName", "connections")) result["scaleName"] = settings->scaleName();
+            if (include("usbSerialEnabled", "connections")) result["usbSerialEnabled"] = settings->usbSerialEnabled();
+            if (include("showScaleDialogs", "connections")) result["showScaleDialogs"] = settings->showScaleDialogs();
+
+            // === Screensaver ===
+            if (screensaver) {
+                if (include("screensaverType", "screensaver")) result["screensaverType"] = screensaver->screensaverType();
+                if (include("dimDelayMinutes", "screensaver")) result["dimDelayMinutes"] = screensaver->dimDelayMinutes();
+                if (include("dimPercent", "screensaver")) result["dimPercent"] = screensaver->dimPercent();
+                if (include("pipesSpeed", "screensaver")) result["pipesSpeed"] = screensaver->pipesSpeed();
+                if (include("pipesCameraSpeed", "screensaver")) result["pipesCameraSpeed"] = screensaver->pipesCameraSpeed();
+                if (include("pipesShowClock", "screensaver")) result["pipesShowClock"] = screensaver->pipesShowClock();
+                if (include("flipClockUse3D", "screensaver")) result["flipClockUse3D"] = screensaver->flipClockUse3D();
+                if (include("videosShowClock", "screensaver")) result["videosShowClock"] = screensaver->videosShowClock();
+                if (include("cacheEnabled", "screensaver")) result["cacheEnabled"] = screensaver->cacheEnabled();
+                if (include("attractorShowClock", "screensaver")) result["attractorShowClock"] = screensaver->attractorShowClock();
+                if (include("imageDisplayDuration", "screensaver")) result["imageDisplayDuration"] = screensaver->imageDisplayDuration();
+                if (include("showDateOnPersonal", "screensaver")) result["showDateOnPersonal"] = screensaver->showDateOnPersonal();
+                if (include("shotMapShape", "screensaver")) result["shotMapShape"] = screensaver->shotMapShape();
+                if (include("shotMapTexture", "screensaver")) result["shotMapTexture"] = screensaver->shotMapTexture();
+                if (include("shotMapShowClock", "screensaver")) result["shotMapShowClock"] = screensaver->shotMapShowClock();
+                if (include("shotMapShowProfiles", "screensaver")) result["shotMapShowProfiles"] = screensaver->shotMapShowProfiles();
+                if (include("shotMapShowTerminator", "screensaver")) result["shotMapShowTerminator"] = screensaver->shotMapShowTerminator();
+            }
+
+            // === Accessibility ===
+            if (accessibility) {
+                if (include("accessibilityEnabled", "accessibility")) result["accessibilityEnabled"] = accessibility->enabled();
+                if (include("ttsEnabled", "accessibility")) result["ttsEnabled"] = accessibility->ttsEnabled();
+                if (include("tickEnabled", "accessibility")) result["tickEnabled"] = accessibility->tickEnabled();
+                if (include("tickSoundIndex", "accessibility")) result["tickSoundIndex"] = accessibility->tickSoundIndex();
+                if (include("tickVolume", "accessibility")) result["tickVolume"] = accessibility->tickVolume();
+                if (include("extractionAnnouncementsEnabled", "accessibility")) result["extractionAnnouncementsEnabled"] = accessibility->extractionAnnouncementsEnabled();
+                if (include("extractionAnnouncementMode", "accessibility")) result["extractionAnnouncementMode"] = accessibility->extractionAnnouncementMode();
+                if (include("extractionAnnouncementInterval", "accessibility")) result["extractionAnnouncementInterval"] = accessibility->extractionAnnouncementInterval();
+            }
+
+            // === AI ===
+            {
+                auto* a = settings->ai();
+                if (include("aiProvider", "ai")) result["aiProvider"] = a->aiProvider();
+                if (include("ollamaEndpoint", "ai")) result["ollamaEndpoint"] = a->ollamaEndpoint();
+                if (include("ollamaModel", "ai")) result["ollamaModel"] = a->ollamaModel();
+                if (include("openaiEndpoint", "ai")) result["openaiEndpoint"] = a->openaiEndpoint();
+                if (include("anthropicEndpoint", "ai")) result["anthropicEndpoint"] = a->anthropicEndpoint();
+                // Effective model for the active provider (resolves the stored
+                // value or the provider default) + the catalog of selectable
+                // models, so a client can discover valid aiModel values to set.
+                if (aiManager) {
+                    const QString provider = a->aiProvider();
+                    if (include("aiModel", "ai")) result["aiModel"] = aiManager->currentModelName();
+                    if (include("aiModelDisplay", "ai")) result["aiModelDisplay"] = aiManager->modelDisplayName(provider);
+                    if (include("aiAvailableModels", "ai")) result["aiAvailableModels"] = QJsonArray::fromVariantList(aiManager->availableModels(provider));
+                }
+            }
+            if (include("mcpEnabled", "ai")) result["mcpEnabled"] = settings->mcp()->mcpEnabled();
+            if (include("mcpAccessLevel", "ai")) result["mcpAccessLevel"] = settings->mcp()->mcpAccessLevel();
+            if (include("mcpConfirmationLevel", "ai")) result["mcpConfirmationLevel"] = settings->mcp()->mcpConfirmationLevel();
+            if (include("discussShotApp", "ai")) result["discussShotApp"] = settings->network()->discussShotApp();
+            if (include("discussShotCustomUrl", "ai")) result["discussShotCustomUrl"] = settings->network()->discussShotCustomUrl();
+            // API keys excluded — sensitive
+
+            // === Espresso (Brew Settings) ===
+            // What the next shot brews with; the profile's own values are on profiles_get_active.
+            const SettingsBrew* brew = settings->brew();
+            const ProfileManager* pm = mainController ? mainController->profileManager() : nullptr;
+            if (pm && include("espressoTemperature", "espresso", "espressoTemperatureC"))
+                result["espressoTemperatureC"] = pm->getGroupTemperature();
+            if (pm && include("targetWeight", "espresso", "targetWeightG"))
+                result["targetWeightG"] = pm->targetWeight();
+            if (include("brewYieldMode", "espresso")) result["brewYieldMode"] = brew->brewYieldMode();
+            if (include("brewYieldValue", "espresso")) result["brewYieldValue"] = brew->brewYieldOverride();
+            if (pm && include("yieldRatio", "espresso")) result["yieldRatio"] = pm->brewByRatio();
+            if (include("hasTemperatureOverride", "espresso")) result["hasTemperatureOverride"] = brew->hasTemperatureOverride();
+            if (brew->hasTemperatureOverride() && include("temperatureOverride", "espresso", "temperatureOverrideC"))
+                result["temperatureOverrideC"] = brew->temperatureOverride();
+            if (mainController) {
+                if (include("baselineYieldMode", "espresso")) result["baselineYieldMode"] = mainController->activeBaselineYieldMode();
+                if (include("baselineYieldValue", "espresso")) result["baselineYieldValue"] = mainController->activeBaselineYieldValue();
+                if (include("baselineYieldSource", "espresso")) result["baselineYieldSource"] = mainController->activeBaselineYieldSource();
+                if (include("baselineTemperature", "espresso", "baselineTemperatureC")) result["baselineTemperatureC"] = mainController->activeBaselineTemperatureC();
+                if (include("yieldIsRealOverride", "espresso")) result["yieldIsRealOverride"] = mainController->yieldIsRealOverride();
+                if (include("temperatureIsRealOverride", "espresso")) result["temperatureIsRealOverride"] = mainController->temperatureIsRealOverride();
+                if (include("yieldPersistTarget", "espresso")) result["yieldPersistTarget"] = mainController->yieldPersistTarget();
+            }
+            if (include("lastUsedRatio", "espresso")) result["lastUsedRatio"] = brew->lastUsedRatio();
+            if (include("ratioPreset1", "espresso")) result["ratioPreset1"] = brew->ratioPreset1();
+            if (include("ratioPreset2", "espresso")) result["ratioPreset2"] = brew->ratioPreset2();
+            if (include("ratioPreset3", "espresso")) result["ratioPreset3"] = brew->ratioPreset3();
+            if (include("doseCupTareWeight", "espresso", "doseCupTareWeightG")) result["doseCupTareWeightG"] = brew->doseCupTareWeight();
+            if (include("doseCaptureSoundEnabled", "espresso")) result["doseCaptureSoundEnabled"] = brew->doseCaptureSoundEnabled();
+            if (include("currentProfile", "espresso")) result["currentProfile"] = settings->app()->currentProfile();
+
+            // === Steam ===
+            if (include("steamTemperature", "steam", "steamTemperatureC")) result["steamTemperatureC"] = settings->brew()->steamTemperature();
+            if (include("steamTimeout", "steam", "steamTimeoutSec")) result["steamTimeoutSec"] = settings->brew()->steamTimeout();
+            if (include("steamFlow", "steam", "steamFlowMlPerSec")) result["steamFlowMlPerSec"] = settings->brew()->steamFlow() / 100.0;
+            if (include("steamDisabled", "steam")) result["steamDisabled"] = settings->brew()->steamDisabled();
+
+            // === Hot Water ===
+            if (include("waterTemperature", "water", "waterTemperatureC")) result["waterTemperatureC"] = settings->brew()->waterTemperature();
+            if (include("waterVolume", "water", "waterVolumeMl")) result["waterVolumeMl"] = settings->brew()->waterVolume();
+            if (include("waterVolumeMode", "water")) result["waterVolumeMode"] = settings->brew()->waterVolumeMode();
+            if (include("hotWaterFlowRate", "water", "hotWaterFlowRateMlPerSec")) result["hotWaterFlowRateMlPerSec"] = settings->hardware()->hotWaterFlowRate() / 10.0;
+
+            // === Flush ===
+            if (include("flushFlow", "flush", "flushFlowMlPerSec")) result["flushFlowMlPerSec"] = settings->brew()->flushFlow();
+            if (include("flushSeconds", "flush")) result["flushSeconds"] = settings->brew()->flushSeconds();
+
+            // === DYE (bean/grinder metadata) ===
+            if (include("dyeBeanBrand", "dye")) result["dyeBeanBrand"] = settings->dye()->dyeBeanBrand();
+            if (include("dyeBeanType", "dye")) result["dyeBeanType"] = settings->dye()->dyeBeanType();
+            if (include("dyeRoastDate", "dye")) result["dyeRoastDate"] = settings->dye()->dyeRoastDate();
+            if (include("dyeRoastLevel", "dye")) result["dyeRoastLevel"] = settings->dye()->dyeRoastLevel();
+            if (include("dyeGrinderBrand", "dye")) result["dyeGrinderBrand"] = settings->dye()->dyeGrinderBrand();
+            if (include("dyeGrinderModel", "dye")) result["dyeGrinderModel"] = settings->dye()->dyeGrinderModel();
+            if (include("dyeGrinderBurrs", "dye")) result["dyeGrinderBurrs"] = settings->dye()->dyeGrinderBurrs();
+            if (include("dyeGrinderSetting", "dye")) result["dyeGrinderSetting"] = settings->dye()->dyeGrinderSetting();
+            if (include("dyeGrinderRpm", "dye")) result["dyeGrinderRpm"] = settings->dye()->dyeGrinderRpm();
+            if (include("dyeBeanWeight", "dye")) result["dyeBeanWeight"] = settings->dye()->dyeBeanWeight();
+            if (include("dyeDrinkWeight", "dye")) result["dyeDrinkWeight"] = settings->dye()->dyeDrinkWeight();
+            // dyeDrinkTds/dyeDrinkEy are session-scratch and intentionally not exposed via MCP.
+            if (include("dyeShotNotes", "dye")) result["dyeShotNotes"] = settings->dye()->dyeShotNotes();
+            if (include("dyeBarista", "dye")) result["dyeBarista"] = settings->dye()->dyeBarista();
+
+            // === MQTT ===
+            {
+                auto* m = settings->mqtt();
+                if (include("mqttEnabled", "mqtt")) result["mqttEnabled"] = m->mqttEnabled();
+                if (include("mqttBrokerHost", "mqtt")) result["mqttBrokerHost"] = m->mqttBrokerHost();
+                if (include("mqttBrokerPort", "mqtt")) result["mqttBrokerPort"] = m->mqttBrokerPort();
+                if (include("mqttUsername", "mqtt")) result["mqttUsername"] = m->mqttUsername();
+                if (include("mqttBaseTopic", "mqtt")) result["mqttBaseTopic"] = m->mqttBaseTopic();
+                if (include("mqttPublishInterval", "mqtt")) result["mqttPublishInterval"] = m->mqttPublishInterval();
+                if (include("mqttRetainMessages", "mqtt")) result["mqttRetainMessages"] = m->mqttRetainMessages();
+                if (include("mqttHomeAssistantDiscovery", "mqtt")) result["mqttHomeAssistantDiscovery"] = m->mqttHomeAssistantDiscovery();
+                if (include("mqttClientId", "mqtt")) result["mqttClientId"] = m->mqttClientId();
+                if (include("mqttUseTls", "mqtt")) result["mqttUseTls"] = m->mqttUseTls();
+                if (include("mqttCaCertificate", "mqtt")) result["mqttCaCertificate"] = m->mqttCaCertificate();
+                if (include("mqttDeviceId", "mqtt")) result["mqttDeviceId"] = m->mqttDeviceId();
+                // mqttPassword excluded — sensitive
+            }
+
+            // === Themes ===
+            if (include("activeThemeName", "themes")) result["activeThemeName"] = settings->theme()->activeThemeName();
+            if (include("themeNames", "themes")) result["themeNames"] = QJsonArray::fromStringList(settings->theme()->themeNames());
+            if (include("activeShader", "themes")) result["activeShader"] = settings->theme()->activeShader();
+            if (include("isDarkMode", "themes")) result["isDarkMode"] = settings->theme()->isDarkMode();
+
+            // === Shot Upload (Visualizer and the Decent account; one set of upload settings) ===
+            if (include("visualizerEnabled", "upload")) result["visualizerEnabled"] = settings->visualizer()->visualizerEnabled();
+            if (include("decentEnabled", "upload")) result["decentEnabled"] = settings->decent()->enabled();
+            if (include("uploadAutomatically", "upload")) result["uploadAutomatically"] = settings->upload()->autoUpload();
+            if (include("updateAutomatically", "upload")) result["updateAutomatically"] = settings->upload()->autoUpdate();
+            if (include("uploadMinDurationSec", "upload")) result["uploadMinDurationSec"] = settings->upload()->minDuration();
+            if (include("visualizerExtendedMetadata", "upload")) result["visualizerExtendedMetadata"] = settings->visualizer()->visualizerExtendedMetadata();
+            if (mainController && mainController->decentAccount() && include("decentAccountState", "upload"))
+                result["decentAccountState"] = QString::fromLatin1(QMetaEnum::fromType<DecentAccount::State>().valueToKey(
+                    int(mainController->decentAccount()->state())));
+            // Account names and passwords excluded — MCP is reachable remotely
+            if (include("visualizerShowAfterShot", "machine")) result["visualizerShowAfterShot"] = settings->visualizer()->visualizerShowAfterShot();
+            if (include("visualizerClearNotesOnStart", "machine")) result["visualizerClearNotesOnStart"] = settings->visualizer()->visualizerClearNotesOnStart();
+
+            // === Update ===
+            if (include("autoCheckUpdates", "update")) result["autoCheckUpdates"] = settings->app()->autoCheckUpdates();
+            if (include("betaUpdatesEnabled", "update")) result["betaUpdatesEnabled"] = settings->app()->betaUpdatesEnabled();
+
+            // === Data ===
+            if (include("webSecurityEnabled", "data")) result["webSecurityEnabled"] = settings->network()->webSecurityEnabled();
+            if (include("dailyBackupHour", "data")) result["dailyBackupHour"] = settings->app()->dailyBackupHour();
+            if (include("shotServerEnabled", "data")) result["shotServerEnabled"] = settings->network()->shotServerEnabled();
+            if (include("shotServerPort", "data")) result["shotServerPort"] = settings->network()->shotServerPort();
+
+            // === History ===
+            if (include("shotHistorySortField", "history")) result["shotHistorySortField"] = settings->network()->shotHistorySortField();
+            if (include("shotHistorySortDirection", "history")) result["shotHistorySortDirection"] = settings->network()->shotHistorySortDirection();
+
+            // === Language ===
+            if (translation) {
+                if (include("currentLanguage", "language")) result["currentLanguage"] = translation->currentLanguage();
+            }
+
+            // === Debug ===
+            if (include("simulationMode", "debug")) result["simulationMode"] = settings->app()->simulationMode();
+            // Without this a client cannot tell "the user switched it off" from
+            // "this build has no simulator", and would keep retrying a write
+            // that settings_set refuses.
+            if (include("simulatorAvailable", "debug")) result["simulatorAvailable"] = settings->app()->simulatorAvailable();
+            if (include("hideGhcSimulator", "debug")) result["hideGhcSimulator"] = settings->app()->hideGhcSimulator();
+            if (include("simulatorSerialNumber", "debug") && mainController && mainController->de1Device())
+                result["simulatorSerialNumber"] = mainController->de1Device()->simulatedSerialNumber();
+
+            // === Battery ===
+            if (battery) {
+                if (include("batteryPercent", "battery")) result["batteryPercent"] = battery->batteryPercent();
+                if (include("isCharging", "battery")) result["isCharging"] = battery->isCharging();
+                if (include("chargingMode", "battery")) result["chargingMode"] = battery->chargingMode();
+                if (include("usbChargerEnabled", "battery")) result["usbChargerEnabled"] = battery->usbChargerEnabled();
+            }
+
+            // === Heater calibration (stored as tenths internally — divide by 10 to match QML display) ===
+            {
+                auto* hw = settings->hardware();
+                if (include("heaterIdleTemp", "heater", "heaterIdleTempC")) result["heaterIdleTempC"] = hw->heaterIdleTemp() / 10.0;
+                if (include("heaterWarmupFlow", "heater", "heaterWarmupFlowMlPerSec")) result["heaterWarmupFlowMlPerSec"] = hw->heaterWarmupFlow() / 10.0;
+                if (include("heaterTestFlow", "heater", "heaterTestFlowMlPerSec")) result["heaterTestFlowMlPerSec"] = hw->heaterTestFlow() / 10.0;
+                if (include("heaterWarmupTimeout", "heater", "heaterWarmupTimeoutSec")) result["heaterWarmupTimeoutSec"] = hw->heaterWarmupTimeout() / 10.0;
+            }
+
+            // === Auto-favorites ===
+            if (include("autoFavoritesGroupBy", "autofavorites")) result["autoFavoritesGroupBy"] = settings->network()->autoFavoritesGroupBy();
+            if (include("autoFavoritesMaxItems", "autofavorites")) result["autoFavoritesMaxItems"] = settings->network()->autoFavoritesMaxItems();
+            if (include("autoFavoritesOpenBrewSettings", "autofavorites")) result["autoFavoritesOpenBrewSettings"] = settings->network()->autoFavoritesOpenBrewSettings();
+            if (include("autoFavoritesHideUnrated", "autofavorites")) result["autoFavoritesHideUnrated"] = settings->network()->autoFavoritesHideUnrated();
+
+            // Reject unknown category. Empty category is "no filter" — fine.
+            if (!category.isEmpty() && !knownCategories.contains(category)) {
+                QStringList sorted = knownCategories.values();
+                sorted.sort();
+                QJsonArray validCategories;
+                for (const QString& c : std::as_const(sorted)) validCategories.append(c);
+                return QJsonObject{
+                    {"error", QString("Unknown category '%1'").arg(category)},
+                    {"validCategories", validCategories}
+                };
+            }
+
+            // Report keys that were requested but matched no known field.
+            // (Empty `keys` array means "all settings" — nothing to validate.)
+            if (hasKeys) {
+                QJsonArray unknown;
+                for (const auto& k : keys) {
+                    const QString s = k.toString();
+                    if (!matchedKeys.contains(s)) unknown.append(s);
+                }
+                if (!unknown.isEmpty()) {
+                    return QJsonObject{
+                        {"error", "Unknown settings key(s)"},
+                        {"unknownKeys", unknown}
+                    };
+                }
+            }
+
+            return result;
+        },
+        "read", McpTierCore);
+}

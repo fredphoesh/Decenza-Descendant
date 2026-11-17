@@ -1,0 +1,792 @@
+#include "core/diagnosticlogging.h"
+#include "profilegenerator.h"
+#include "profile.h"
+#include <QDebug>
+#include <cmath>
+
+QList<ProfileFrame> ProfileGenerator::generateFrames(const ProfileParams& params) {
+    // Branch on editor type
+    switch (params.editorType) {
+    case EditorType::Pressure:
+        return generatePressureFrames(params);
+    case EditorType::Flow:
+        return generateFlowFrames(params);
+    case EditorType::AFlow:
+        return generateAFlowFrames(params);
+    case EditorType::DFlow:
+        break;  // Fall through to D-Flow generation below
+    }
+
+    // D-Flow frame generation
+    // Always 3 core frames (matching de1app): Filling, Infusing, Pouring
+    QList<ProfileFrame> frames;
+
+    // Filling - pressure mode to saturate puck (always first)
+    frames.append(createFillFrame(params));
+
+    // Infusing - hold at soak pressure (always emitted; seconds=0 skips it when disabled)
+    frames.append(createInfuseFrame(params));
+
+    // Pouring - main extraction phase
+    frames.append(createPourFrame(params));
+
+    // Fallback: add empty frame if no frames were created (consistency with other generators)
+    if (frames.isEmpty()) {
+        DIAG_WARN(PROFILES, "ProfileGenerator") << "D-Flow generateFrames produced 0 frames, adding fallback";
+        ProfileFrame empty;
+        empty.name = "empty";
+        empty.temperature = 90.0;
+        empty.sensor = "coffee";
+        empty.pump = "flow";
+        empty.transition = "fast";
+        empty.flow = 0.0;
+        empty.seconds = 0.0;
+        frames.append(empty);
+    }
+
+    return frames;
+}
+
+Profile ProfileGenerator::createProfile(const ProfileParams& params, const QString& title) {
+    Profile profile;
+
+    // Metadata
+    profile.setTitle(title);
+    profile.setAuthor("Profile Editor");
+    profile.setBeverageType("espresso");
+
+    // Set profile type based on editor type
+    if (params.editorType == EditorType::Pressure) {
+        profile.setProfileType("settings_2a");
+    } else if (params.editorType == EditorType::Flow) {
+        profile.setProfileType("settings_2b");
+    } else {
+        profile.setProfileType("settings_2c");
+    }
+
+    // Targets
+    profile.setTargetWeight(params.targetWeight);
+    profile.setTargetVolume(params.targetVolume);
+    // Mode
+    profile.setMode(Profile::Mode::FrameBased);
+
+    // Generate and set frames
+    profile.setSteps(generateFrames(params));
+
+    // Use first frame temperature (matches de1app behavior)
+    if (!profile.steps().isEmpty()) {
+        profile.setEspressoTemperature(profile.steps().first().temperature);
+    }
+
+    if (profile.steps().size() == 1 && profile.steps()[0].name == "empty") {
+        DIAG_WARN(PROFILES, "ProfileGenerator") << "createProfile: params produced fallback empty frame for" << title;
+    }
+
+    // Use the params' preinfuseFrameCount if set (D-Flow/A-Flow templates provide this via
+    // applyEditorDefaults), otherwise fall back to counting for simple profiles.
+    // countPreinfuseFramesWithForcedRise() also folds a Pressure profile's forced-rise
+    // frame(s) into the count (matching de1app commit 13a30463); it is a no-op add for
+    // Flow, which never generates one.
+    if (params.preinfuseFrameCount >= 0) {
+        profile.setPreinfuseFrameCount(params.preinfuseFrameCount);
+    } else {
+        profile.setPreinfuseFrameCount(Profile::countPreinfuseFramesWithForcedRise(profile.steps()));
+    }
+
+    // Store params for re-editing
+    profile.setProfileParams(params);
+
+    return profile;
+}
+
+ProfileFrame ProfileGenerator::createFillFrame(const ProfileParams& params) {
+    ProfileFrame frame;
+
+    frame.name = "Filling";
+    frame.pump = "pressure";
+    frame.pressure = params.infusePressure;
+    // Flow and duration are the plugin's own template values, used only when a
+    // profile is created from scratch. update_D-Flow never writes either, so on a
+    // regenerate the source profile's values are restored over these
+    // (Profile::restoreFieldsThePluginNeverWrites).
+    frame.flow = 8.0;
+    frame.temperature = params.fillTemperature;
+    frame.seconds = 25.0;
+    frame.transition = "fast";
+    frame.sensor = "coffee";
+    frame.volume = 100.0;
+
+    // Exit when pressure builds (indicates puck is saturated).
+    // Threshold matches de1app formula: pressure/2 + 0.6 for high pressures, else pressure itself.
+    double exitP = params.infusePressure;
+    if (exitP >= 2.8)
+        exitP = std::round((exitP / 2.0 + 0.6) * 10.0) / 10.0;
+    if (exitP < 1.2)
+        exitP = 1.2;
+    frame.exitIf = true;
+    frame.exitType = "pressure_over";
+    frame.exitPressureOver = exitP;
+    frame.exitPressureUnder = 0.0;
+    frame.exitFlowOver = 6.0;
+    frame.exitFlowUnder = 0.0;
+
+    // App-side weight exit during fill (matches de1app default: weight 5.00)
+    frame.exitWeight = 5.0;
+
+    // No extension limiter (de1app: max_flow_or_pressure=0)
+    frame.maxFlowOrPressure = 0.0;
+    frame.maxFlowOrPressureRange = 0.2;
+
+    return frame;
+}
+
+ProfileFrame ProfileGenerator::createInfuseFrame(const ProfileParams& params) {
+    ProfileFrame frame;
+
+    frame.name = "Infusing";
+    frame.pump = "pressure";
+    frame.pressure = params.infusePressure;
+    frame.flow = 8.0;
+    frame.temperature = params.pourTemperature;  // de1app uses pouring temp for infuse
+    frame.transition = "fast";
+    frame.sensor = "coffee";
+    frame.volume = params.infuseVolume;
+
+    // "First reached" exits: time is the max timeout, weight exits early if
+    // reached first. infuseTime 0 is how the plugins express "no soak" — the
+    // machine skips a zero-length frame — so no separate enable flag is needed.
+    frame.seconds = params.infuseTime;
+    if (params.infuseWeight > 0)
+        frame.exitWeight = params.infuseWeight;  // app-side SkipToNext when scale hits target
+
+    // No machine-side exit condition; time-based exits via frame timeout, weight-based exits via app-side SkipToNext
+    // Dead exit fields stored for de1app compatibility
+    frame.exitIf = false;
+    frame.exitType = "pressure_over";
+    frame.exitPressureOver = params.infusePressure;
+    frame.exitPressureUnder = 0.0;
+    frame.exitFlowOver = 6.0;
+    frame.exitFlowUnder = 0.0;
+
+    // No extension limiter (de1app: max_flow_or_pressure=0)
+    frame.maxFlowOrPressure = 0.0;
+    frame.maxFlowOrPressureRange = 0.2;
+
+    return frame;
+}
+
+ProfileFrame ProfileGenerator::createPourFrame(const ProfileParams& params) {
+    ProfileFrame frame;
+
+    frame.name = "Pouring";
+    frame.temperature = params.pourTemperature;
+    frame.seconds = 127.0;  // Max duration - weight system stops the shot
+    frame.transition = "fast";
+    frame.sensor = "coffee";
+    frame.volume = 0.0;
+
+    // Flow mode with pressure limiter (de1app D-Flow model)
+    frame.pump = "flow";
+    frame.flow = params.pourFlow;
+    frame.pressure = 4.8;  // Vestigial field - de1app never updates it
+    frame.maxFlowOrPressure = params.pourPressure;
+    frame.maxFlowOrPressureRange = 0.2;
+
+    // No machine-side exit condition - weight system handles shot termination
+    // Dead exit fields stored for de1app compatibility
+    frame.exitIf = false;
+    frame.exitType = "flow_over";
+    frame.exitPressureOver = 11.0;
+    frame.exitPressureUnder = 0.0;
+    frame.exitFlowOver = 2.80;
+    frame.exitFlowUnder = 0.0;
+
+    return frame;
+}
+
+// === A-Flow Frame Generation ===
+// Matches de1app's update_A-Flow proc. All 9 frames built inline (not shared with D-Flow).
+// Pre Fill → Fill → Infuse → 2nd Fill → Pause → Pressure Up → Pressure Decline → Flow Start → Flow Extraction
+//
+// Key differences from D-Flow:
+// - Fill: flow pump with pressure limiter (8.0 bar), range 0.6
+// - Infuse: flow=0 (pressure hold), uses fill temperature, limiter=1.0, range 0.6
+// - pourFlow = user's target flow (de1app Aflow_pouring_flow), goes into Flow Start
+// - Extraction flow derived: flowExtractionUp ? pourFlow*2 : 0
+// - rampDownEnabled splits rampTime between Pressure Up and Decline
+
+QList<ProfileFrame> ProfileGenerator::generateAFlowFrames(const ProfileParams& params) {
+    QList<ProfileFrame> frames;
+
+    // Frame 0: Pre Fill (1s workaround for DE1 "skip first step" bug)
+    {
+        ProfileFrame preFill;
+        preFill.name = "Pre Fill";
+        preFill.pump = "flow";
+        preFill.flow = 8.0;
+        preFill.pressure = 3.0;
+        preFill.temperature = params.fillTemperature;
+        preFill.seconds = 1.0;
+        preFill.transition = "fast";
+        preFill.sensor = "coffee";
+        preFill.volume = 100.0;
+        preFill.maxFlowOrPressure = 8.0;
+        preFill.maxFlowOrPressureRange = 0.6;
+        preFill.exitIf = false;
+        preFill.exitType = "pressure_over";
+        preFill.exitPressureOver = 3.0;
+        preFill.exitPressureUnder = 0.0;
+        preFill.exitFlowOver = 6.0;
+        preFill.exitFlowUnder = 0.0;
+        frames.append(preFill);
+    }
+
+    // Frame 1: Fill — flow pump with pressure limiter at 8.0 bar
+    {
+        ProfileFrame fill;
+        fill.name = "Fill";
+        fill.pump = "flow";
+        // update_A-Flow writes the fill frame's TEMPERATURE and nothing else
+        // (code.tcl:251). The rest are the plugin's template values for a
+        // from-scratch profile; on a regenerate the source profile's own values
+        // are restored over them (Profile::restoreFieldsThePluginNeverWrites).
+        fill.flow = 8.0;
+        fill.pressure = 3.0;
+        fill.temperature = params.fillTemperature;
+        fill.seconds = 15.0;
+        fill.transition = "fast";
+        fill.sensor = "coffee";
+        fill.volume = 100.0;
+        fill.exitIf = true;
+        fill.exitType = "pressure_over";
+        fill.exitPressureOver = 3.0;  // de1app A-Flow template value
+        fill.exitPressureUnder = 0.0;
+        fill.exitFlowOver = 6.0;
+        fill.exitFlowUnder = 0.0;
+        fill.maxFlowOrPressure = 8.0;
+        fill.maxFlowOrPressureRange = 0.6;
+        frames.append(fill);
+    }
+
+    // Frame 2: Infuse — pressure hold with zero flow, uses fill temperature
+    // Always emitted (de1app always has 9 A-Flow frames). When disabled, seconds=0 skips it.
+    {
+        ProfileFrame infuse;
+        infuse.name = "Infuse";
+        infuse.pump = "pressure";
+        infuse.flow = 0.0;
+        infuse.pressure = params.infusePressure;
+        infuse.temperature = params.fillTemperature;  // A-Flow uses fill temp, not pour temp
+        infuse.transition = "fast";
+        infuse.sensor = "coffee";
+        infuse.volume = params.infuseVolume;
+
+        infuse.seconds = params.infuseTime;
+        if (params.infuseWeight > 0)
+            infuse.exitWeight = params.infuseWeight;
+
+        // Dead exit fields (exit_if=false, but stored for de1app compatibility)
+        infuse.exitIf = false;
+        infuse.exitType = "pressure_over";
+        infuse.exitPressureOver = 3.0;
+        infuse.exitPressureUnder = 0.0;
+        infuse.exitFlowOver = 6.0;
+        infuse.exitFlowUnder = 0.0;
+        infuse.maxFlowOrPressure = 1.0;
+        infuse.maxFlowOrPressureRange = 0.6;
+        frames.append(infuse);
+    }
+
+    // Frame 3: 2nd Fill (active when secondFillEnabled, 0s otherwise)
+    {
+        ProfileFrame secondFill;
+        secondFill.name = "2nd Fill";
+        secondFill.pump = "flow";
+        secondFill.flow = 8.0;
+        secondFill.pressure = 0.0;
+        secondFill.temperature = params.secondFillEnabled ? params.pourTemperature : 95.0;
+        secondFill.seconds = params.secondFillEnabled ? 15.0 : 0.0;
+        secondFill.transition = "fast";
+        secondFill.sensor = "coffee";
+        secondFill.volume = 100.0;
+        secondFill.maxFlowOrPressure = 3.0;
+        secondFill.maxFlowOrPressureRange = 0.6;
+        secondFill.exitIf = true;
+        secondFill.exitType = "pressure_over";
+        secondFill.exitPressureOver = 2.5;
+        secondFill.exitPressureUnder = 0.0;
+        secondFill.exitFlowOver = 6.0;
+        secondFill.exitFlowUnder = 0.0;
+        frames.append(secondFill);
+    }
+
+    // Frame 4: Pause (active when secondFillEnabled, 0s otherwise)
+    {
+        ProfileFrame pause;
+        pause.name = "Pause";
+        pause.pump = "pressure";
+        pause.pressure = 1.0;
+        pause.flow = 6.0;
+        pause.temperature = params.secondFillEnabled ? params.pourTemperature : 95.0;
+        pause.seconds = params.secondFillEnabled ? 15.0 : 0.0;
+        pause.transition = "fast";
+        pause.sensor = "coffee";
+        pause.volume = 100.0;
+        pause.maxFlowOrPressure = 1.0;
+        pause.maxFlowOrPressureRange = 0.6;
+        pause.exitIf = true;
+        pause.exitType = "flow_under";
+        pause.exitPressureOver = 0.0;
+        pause.exitPressureUnder = 0.0;
+        pause.exitFlowOver = 6.0;
+        pause.exitFlowUnder = 1.0;
+        frames.append(pause);
+    }
+
+    // Compute pressureUp seconds once — used for both Pressure Up and Flow Start activation.
+    // Integer rounding matches de1app: round_to_integer(rampTime / 2), remainder to Decline.
+    double pressureUpSeconds = params.rampDownEnabled
+        ? std::floor(params.rampTime / 2.0)
+        : params.rampTime;
+
+    // Frame 5: Pressure Up — smooth ramp to pour pressure
+    // rampDownEnabled splits rampTime between Up and Decline
+    {
+        ProfileFrame pressureUp;
+        pressureUp.name = "Pressure Up";
+        pressureUp.pump = "pressure";
+        pressureUp.pressure = params.pourPressure;
+        pressureUp.flow = 8.0;
+        pressureUp.temperature = params.pourTemperature;
+        pressureUp.transition = "smooth";
+        pressureUp.sensor = "coffee";
+        pressureUp.volume = 100.0;
+
+        pressureUp.seconds = pressureUpSeconds;
+
+        pressureUp.exitIf = true;
+        pressureUp.exitType = "flow_over";
+        // When rampDownEnabled, exit at higher flow (pourFlow*2) since decline handles the rest.
+        // round_to_one_digits matches de1app.
+        pressureUp.exitFlowOver = std::round((params.rampDownEnabled
+            ? params.pourFlow * 2.0
+            : params.pourFlow) * 10.0) / 10.0;
+        pressureUp.exitPressureOver = 8.5;
+        pressureUp.exitPressureUnder = 0.0;
+        pressureUp.exitFlowUnder = 0.0;
+        pressureUp.maxFlowOrPressure = 0.0;
+        pressureUp.maxFlowOrPressureRange = 0.6;
+        frames.append(pressureUp);
+    }
+
+    // Frame 6: Pressure Decline — decline to 1 bar, exit when flow drops
+    // rampDownEnabled gives remaining time to Decline; otherwise 0 (exit-controlled)
+    {
+        ProfileFrame pressureDecline;
+        pressureDecline.name = "Pressure Decline";
+        pressureDecline.pump = "pressure";
+        pressureDecline.pressure = 1.0;
+        pressureDecline.flow = 8.0;
+        pressureDecline.temperature = params.pourTemperature;
+        pressureDecline.transition = "smooth";
+        pressureDecline.sensor = "coffee";
+        pressureDecline.volume = 100.0;
+
+        // Integer rounding matches de1app: remainder second goes to Decline
+        pressureDecline.seconds = params.rampDownEnabled
+            ? params.rampTime - std::floor(params.rampTime / 2.0)
+            : 0.0;
+
+        pressureDecline.exitIf = true;
+        pressureDecline.exitType = "flow_under";
+        pressureDecline.exitFlowUnder = std::round((params.pourFlow + 0.1) * 10.0) / 10.0;
+        pressureDecline.exitFlowOver = 3.0;
+        pressureDecline.exitPressureOver = 11.0;
+        pressureDecline.exitPressureUnder = 1.0;
+        pressureDecline.maxFlowOrPressure = 0.0;
+        pressureDecline.maxFlowOrPressureRange = 0.6;
+        frames.append(pressureDecline);
+    }
+
+    // Frame 7: Flow Start — conditionally activated when pressureUpSeconds < 1
+    {
+        ProfileFrame flowStart;
+        flowStart.name = "Flow Start";
+        flowStart.pump = "flow";
+        flowStart.flow = params.pourFlow;
+        flowStart.pressure = 3.0;  // Vestigial template constant
+        flowStart.temperature = params.pourTemperature;
+        flowStart.transition = "fast";
+        flowStart.sensor = "coffee";
+        flowStart.volume = 100.0;
+        flowStart.maxFlowOrPressure = 0.0;
+        flowStart.maxFlowOrPressureRange = 0.6;
+
+        if (pressureUpSeconds < 1.0) {
+            // Activated: becomes an exit frame that waits for flow to stabilize
+            flowStart.seconds = 10.0;
+            flowStart.exitIf = true;
+            flowStart.exitType = "flow_over";
+            flowStart.exitFlowOver = std::round((params.pourFlow - 0.1) * 10.0) / 10.0;
+            flowStart.exitPressureOver = 11.0;
+            flowStart.exitPressureUnder = 0.0;
+            flowStart.exitFlowUnder = 0.0;
+        } else {
+            // Passthrough: zero seconds, no exit
+            flowStart.seconds = 0.0;
+            flowStart.exitIf = false;
+            flowStart.exitType = "pressure_under";  // Dead template value
+            flowStart.exitFlowOver = 6.0;
+            flowStart.exitPressureOver = 11.0;
+            flowStart.exitPressureUnder = 0.0;
+            flowStart.exitFlowUnder = 0.0;
+        }
+        frames.append(flowStart);
+    }
+
+    // Frame 8: Flow Extraction — main extraction with pressure limiter
+    // flowExtractionUp: pourFlow*2 with smooth ramp; otherwise 0 (flat, pressure-limited)
+    {
+        ProfileFrame extraction;
+        extraction.name = "Flow Extraction";
+        extraction.pump = "flow";
+        extraction.flow = params.flowExtractionUp
+            ? std::round(params.pourFlow * 2.0 * 10.0) / 10.0 : 0.0;
+        extraction.pressure = 3.0;  // Vestigial template constant
+        extraction.temperature = params.pourTemperature;
+        extraction.seconds = 60.0;  // Long duration - weight system stops the shot
+        extraction.transition = "smooth";
+        extraction.sensor = "coffee";
+        extraction.volume = 100.0;
+        extraction.maxFlowOrPressure = params.pourPressure;
+        extraction.maxFlowOrPressureRange = 0.6;
+        // Dead exit fields
+        extraction.exitIf = false;
+        extraction.exitType = "pressure_under";
+        extraction.exitFlowOver = 6.0;
+        extraction.exitPressureOver = 11.0;
+        extraction.exitPressureUnder = 0.0;
+        extraction.exitFlowUnder = 0.0;
+        frames.append(extraction);
+    }
+
+    return frames;
+}
+
+// === Simple Pressure Profile Frame Generation (settings_2a) ===
+// Matches de1app's pressure_to_advanced_list():
+// Preinfusion → (Forced Rise) → Hold → Decline
+
+QList<ProfileFrame> ProfileGenerator::generatePressureFrames(const ProfileParams& params) {
+    QList<ProfileFrame> frames;
+    double tempStart = params.tempStart;
+    double tempPreinfuse = params.tempPreinfuse;
+    double tempHold = params.tempHold;
+    double tempDecline = params.tempDecline;
+
+    // Preinfusion frame(s) (flow pump, exit on pressure_over)
+    // When tempStart != tempPreinfuse, split into a 2-second temp boost at tempStart
+    // followed by remaining time at tempPreinfuse (matches de1app's temp_bump_time_seconds)
+    if (params.preinfusionTime > 0) {
+        bool needTempBoost = !qFuzzyCompare(1.0 + tempStart, 1.0 + tempPreinfuse);
+        double boostDuration = 2.0;  // de1app: temp_bump_time_seconds
+
+        if (needTempBoost) {
+            double boostLen = qMin(boostDuration, params.preinfusionTime);
+            double remainLen = params.preinfusionTime - boostDuration;
+            if (remainLen < 0) remainLen = 0;
+
+            // Temp boost frame at tempStart (no flow exit)
+            ProfileFrame boost;
+            boost.name = "preinfusion temp boost";
+            boost.temperature = tempStart;
+            boost.sensor = "coffee";
+            boost.pump = "flow";
+            boost.transition = "fast";
+            boost.pressure = 1.0;
+            boost.flow = params.preinfusionFlowRate;
+            boost.seconds = boostLen;
+            boost.volume = 0;
+            boost.exitIf = true;
+            boost.exitType = "pressure_over";
+            boost.exitPressureOver = params.preinfusionStopPressure;
+            // exitFlowOver = 0 (default) - no flow exit during temp boost
+            frames.append(boost);
+
+            // Preinfusion frame at tempPreinfuse (with flow exit)
+            if (remainLen > 0) {
+                ProfileFrame preinfusion;
+                preinfusion.name = "preinfusion";
+                preinfusion.temperature = tempPreinfuse;
+                preinfusion.sensor = "coffee";
+                preinfusion.pump = "flow";
+                preinfusion.transition = "fast";
+                preinfusion.pressure = 1.0;
+                preinfusion.flow = params.preinfusionFlowRate;
+                preinfusion.seconds = remainLen;
+                preinfusion.volume = 0;
+                preinfusion.exitIf = true;
+                preinfusion.exitType = "pressure_over";
+                preinfusion.exitPressureOver = params.preinfusionStopPressure;
+                preinfusion.exitFlowOver = 6.0;
+                frames.append(preinfusion);
+            }
+        } else {
+            // Single preinfusion frame (no temp boost needed)
+            ProfileFrame preinfusion;
+            preinfusion.name = "preinfusion";
+            preinfusion.temperature = tempPreinfuse;
+            preinfusion.sensor = "coffee";
+            preinfusion.pump = "flow";
+            preinfusion.transition = "fast";
+            preinfusion.pressure = 1.0;
+            preinfusion.flow = params.preinfusionFlowRate;
+            preinfusion.seconds = params.preinfusionTime;
+            preinfusion.volume = 0;
+            preinfusion.exitIf = true;
+            preinfusion.exitType = "pressure_over";
+            preinfusion.exitPressureOver = params.preinfusionStopPressure;
+            preinfusion.exitFlowOver = 6.0;
+            frames.append(preinfusion);
+        }
+    }
+
+    // Rise and hold frame (pressure pump)
+    double holdTime = params.holdTime;
+    if (holdTime > 0) {
+        if (holdTime > 3) {
+            ProfileFrame rise;
+            rise.name = ProfileFrame::kForcedRiseName;
+            rise.temperature = tempHold;
+            rise.sensor = "coffee";
+            rise.pump = "pressure";
+            rise.transition = "fast";
+            rise.pressure = params.espressoPressure;
+            rise.seconds = 3.0;
+            rise.volume = 0;
+            rise.exitIf = false;
+            // Limited like the hold and decline: an unlimited rise lets a high-flow
+            // machine push unbounded flow while pressure ramps (de1app@fdd091f3).
+            if (params.limiterValue > 0) {
+                rise.maxFlowOrPressure = params.limiterValue;
+                rise.maxFlowOrPressureRange = params.limiterRange;
+            }
+            frames.append(rise);
+            holdTime -= 3;
+        }
+
+        ProfileFrame hold;
+        hold.name = "rise and hold";
+        hold.temperature = tempHold;
+        hold.sensor = "coffee";
+        hold.pump = "pressure";
+        hold.transition = "fast";
+        hold.pressure = params.espressoPressure;
+        hold.seconds = holdTime;
+        hold.volume = 0;
+        hold.exitIf = false;
+        if (params.limiterValue > 0) {
+            hold.maxFlowOrPressure = params.limiterValue;
+            hold.maxFlowOrPressureRange = params.limiterRange;
+        }
+        frames.append(hold);
+    }
+
+    // Decline frame (pressure pump, smooth transition)
+    double declineTime = params.simpleDeclineTime;
+    if (declineTime > 0) {
+        // Match de1app: add forced rise before decline when hold was short (< 3s after
+        // possible decrement) and decline is long enough to split off 3s.
+        // NOTE: holdTime is the post-decrement value (decremented above when > 3s),
+        // matching de1app's pressure_to_advanced_list() which also uses the mutated value.
+        if (holdTime < 3 && declineTime > 3) {
+            ProfileFrame rise;
+            rise.name = ProfileFrame::kForcedRiseName;
+            rise.temperature = tempDecline;
+            rise.sensor = "coffee";
+            rise.pump = "pressure";
+            rise.transition = "fast";
+            rise.pressure = params.espressoPressure;
+            rise.seconds = 3.0;
+            rise.volume = 0;
+            rise.exitIf = false;
+            // Limited, same as the rise in the hold branch above.
+            if (params.limiterValue > 0) {
+                rise.maxFlowOrPressure = params.limiterValue;
+                rise.maxFlowOrPressureRange = params.limiterRange;
+            }
+            frames.append(rise);
+            declineTime -= 3;
+        }
+
+        ProfileFrame decline;
+        decline.name = "decline";
+        decline.temperature = tempDecline;
+        decline.sensor = "coffee";
+        decline.pump = "pressure";
+        decline.transition = "smooth";
+        decline.pressure = params.pressureEnd;
+        decline.seconds = declineTime;
+        decline.volume = 0;
+        decline.exitIf = false;
+        if (params.limiterValue > 0) {
+            decline.maxFlowOrPressure = params.limiterValue;
+            decline.maxFlowOrPressureRange = params.limiterRange;
+        }
+        frames.append(decline);
+    }
+
+    // Fallback: add empty frame if no frames were created
+    if (frames.isEmpty()) {
+        DIAG_WARN(PROFILES, "ProfileGenerator") << "generatePressureFrames: all time parameters are zero, adding empty fallback frame";
+        ProfileFrame empty;
+        empty.name = "empty";
+        empty.temperature = 90.0;
+        empty.sensor = "coffee";
+        empty.pump = "flow";
+        empty.transition = "smooth";
+        empty.flow = 0;
+        empty.seconds = 0;
+        empty.volume = 0;
+        empty.exitIf = false;
+        frames.append(empty);
+    }
+
+    return frames;
+}
+
+// === Simple Flow Profile Frame Generation (settings_2b) ===
+// Matches de1app's flow_to_advanced_list():
+// Preinfusion → Hold → Decline
+
+QList<ProfileFrame> ProfileGenerator::generateFlowFrames(const ProfileParams& params) {
+    QList<ProfileFrame> frames;
+    double tempStart = params.tempStart;
+    double tempPreinfuse = params.tempPreinfuse;
+    double tempHold = params.tempHold;
+    double tempDecline = params.tempDecline;
+
+    // Preinfusion frame(s) (flow pump, exit on pressure_over)
+    // When tempStart != tempPreinfuse, split into a 2-second temp boost at tempStart
+    // followed by remaining time at tempPreinfuse (matches de1app's temp_bump_time_seconds)
+    if (params.preinfusionTime > 0) {
+        bool needTempBoost = !qFuzzyCompare(1.0 + tempStart, 1.0 + tempPreinfuse);
+        double boostDuration = 2.0;  // de1app: temp_bump_time_seconds
+
+        if (needTempBoost) {
+            double boostLen = qMin(boostDuration, params.preinfusionTime);
+            double remainLen = params.preinfusionTime - boostDuration;
+            if (remainLen < 0) remainLen = 0;
+
+            // Temp boost frame at tempStart (no flow exit)
+            ProfileFrame boost;
+            boost.name = "preinfusion boost";
+            boost.temperature = tempStart;
+            boost.sensor = "coffee";
+            boost.pump = "flow";
+            boost.transition = "fast";
+            boost.pressure = 1.0;
+            boost.flow = params.preinfusionFlowRate;
+            boost.seconds = boostLen;
+            boost.volume = 0;
+            boost.exitIf = true;
+            boost.exitType = "pressure_over";
+            boost.exitPressureOver = params.preinfusionStopPressure;
+            // exitFlowOver = 0 (default) - no flow exit during temp boost
+            frames.append(boost);
+
+            // Preinfusion frame at tempPreinfuse (no flow exit for flow profiles)
+            if (remainLen > 0) {
+                ProfileFrame preinfusion;
+                preinfusion.name = "preinfusion";
+                preinfusion.temperature = tempPreinfuse;
+                preinfusion.sensor = "coffee";
+                preinfusion.pump = "flow";
+                preinfusion.transition = "fast";
+                preinfusion.pressure = 1.0;
+                preinfusion.flow = params.preinfusionFlowRate;
+                preinfusion.seconds = remainLen;
+                preinfusion.volume = 0;
+                preinfusion.exitIf = true;
+                preinfusion.exitType = "pressure_over";
+                preinfusion.exitPressureOver = params.preinfusionStopPressure;
+                // exitFlowOver = 0 (default) - flow profiles don't use flow exit
+                frames.append(preinfusion);
+            }
+        } else {
+            // Single preinfusion frame (no temp boost needed)
+            ProfileFrame preinfusion;
+            preinfusion.name = "preinfusion";
+            preinfusion.temperature = tempPreinfuse;
+            preinfusion.sensor = "coffee";
+            preinfusion.pump = "flow";
+            preinfusion.transition = "fast";
+            preinfusion.pressure = 1.0;
+            preinfusion.flow = params.preinfusionFlowRate;
+            preinfusion.seconds = params.preinfusionTime;
+            preinfusion.volume = 0;
+            preinfusion.exitIf = true;
+            preinfusion.exitType = "pressure_over";
+            preinfusion.exitPressureOver = params.preinfusionStopPressure;
+            frames.append(preinfusion);
+        }
+    }
+
+    // Hold frame (flow pump)
+    if (params.holdTime > 0) {
+        ProfileFrame hold;
+        hold.name = "hold";
+        hold.temperature = tempHold;
+        hold.sensor = "coffee";
+        hold.pump = "flow";
+        hold.transition = "fast";
+        hold.flow = params.holdFlow;
+        hold.seconds = params.holdTime;
+        hold.volume = 0;
+        hold.exitIf = false;
+        hold.exitFlowOver = 6.0;
+        if (params.limiterValue > 0) {
+            hold.maxFlowOrPressure = params.limiterValue;
+            hold.maxFlowOrPressureRange = params.limiterRange;
+        }
+        frames.append(hold);
+    }
+
+    // Decline frame (flow pump, smooth transition)
+    // de1app: decline is only generated when holdTime > 0 (not declineTime > 0)
+    if (params.holdTime > 0) {
+        ProfileFrame decline;
+        decline.name = "decline";
+        decline.temperature = tempDecline;
+        decline.sensor = "coffee";
+        decline.pump = "flow";
+        decline.transition = "smooth";
+        decline.flow = params.flowEnd;
+        decline.seconds = params.simpleDeclineTime;
+        decline.volume = 0;
+        decline.exitIf = false;
+        if (params.limiterValue > 0) {
+            decline.maxFlowOrPressure = params.limiterValue;
+            decline.maxFlowOrPressureRange = params.limiterRange;
+        }
+        frames.append(decline);
+    }
+
+    // Fallback: add empty frame if no frames were created
+    if (frames.isEmpty()) {
+        DIAG_WARN(PROFILES, "ProfileGenerator") << "generateFlowFrames: all time parameters are zero, adding empty fallback frame";
+        ProfileFrame empty;
+        empty.name = "empty";
+        empty.temperature = 90.0;
+        empty.sensor = "coffee";
+        empty.pump = "flow";
+        empty.transition = "smooth";
+        empty.flow = 0;
+        empty.seconds = 0;
+        empty.volume = 0;
+        empty.exitIf = false;
+        frames.append(empty);
+    }
+
+    return frames;
+}

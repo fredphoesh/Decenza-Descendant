@@ -1,0 +1,3097 @@
+#include <QtTest>
+
+#include "ai/shotanalysis.h"
+#include "machine/frameexitreason.h"
+#include "history/shothistorystorage.h"
+#include "history/shotbadgeprojection.h"
+#include "shotcurvefixtures.h"
+
+class tst_ShotAnalysis : public QObject {
+    Q_OBJECT
+
+private:
+    // Thin forwarders to the shared fixtures in shotcurvefixtures.h — kept so
+    // the ~400 existing unqualified call sites below (phase(...),
+    // flatSeries(...), etc.) don't all need renaming to
+    // ShotCurveFixtures::phase(...) etc. The actual logic lives in the
+    // shared header so tst_dialing_blocks.cpp can reuse the same fixtures.
+    static HistoryPhaseMarker phase(double time, const QString& label, int frameNumber,
+                                     bool isFlowMode = false,
+                                     const QString& transitionReason = QString())
+    {
+        return ShotCurveFixtures::phase(time, label, frameNumber, isFlowMode, transitionReason);
+    }
+
+    static QVector<QPointF> flatSeries(double t0, double t1, double value, double rate = 10.0)
+    {
+        return ShotCurveFixtures::flatSeries(t0, t1, value, rate);
+    }
+
+    static QVector<QPointF> rampSeries(double t0, double t1, double v0, double v1,
+                                         double rate = 10.0)
+    {
+        return ShotCurveFixtures::rampSeries(t0, t1, v0, v1, rate);
+    }
+
+    static QVector<QPointF> concat(QVector<QPointF> a, const QVector<QPointF>& b)
+    {
+        return ShotCurveFixtures::concat(std::move(a), b);
+    }
+
+    static void expectSkipDetection(const QList<HistoryPhaseMarker>& phases,
+                                    int expectedFrameCount,
+                                    bool expected)
+    {
+        QCOMPARE(ShotAnalysis::detectSkipFirstFrame(phases, expectedFrameCount), expected);
+    }
+
+    static void expectSkipDetection(const QList<HistoryPhaseMarker>& phases,
+                                    int expectedFrameCount,
+                                    double firstFrameConfiguredSeconds,
+                                    bool expected)
+    {
+        QCOMPARE(ShotAnalysis::detectSkipFirstFrame(phases, expectedFrameCount,
+                                                     firstFrameConfiguredSeconds),
+                 expected);
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    void skipFirstFrameDetection()
+    {
+        expectSkipDetection({}, -1, false);
+
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(2.3, "Pour", 1),
+        }, 3, false);
+
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(1.4, "Pour", 1),
+        }, 3, true);
+
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.2, "Pour", 1),
+        }, 3, true);
+
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(2.0, "Pour", 1),
+        }, 3, false);
+
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.2, "Pour", 1),
+        }, 1, false);
+
+        // expectedFrameCount == 0: also suppresses (< 2 frames, no skip possible)
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.2, "Pour", 1),
+        }, 0, false);
+
+        // FW bug: machine never executed frame 0 — first marker arrives directly at frame 1.
+        // No "Start" or frame-0 entry at all. Mirrors the Tcl plugin's skipped_first_step_FW
+        // case where step1_registered is never set before a non-zero frame is seen.
+        expectSkipDetection({
+            phase(0.0, "Pour", 1),
+        }, 3, true);
+
+        // FW bug with no expectedFrameCount (default -1, unknown profile)
+        expectSkipDetection({
+            phase(0.0, "Pour", 1),
+        }, -1, true);
+
+        // --- Configured-first-frame-seconds path (option 1 fix) ---
+
+        // 80's Espresso shot 889 regression: profile configures frame[0].seconds = 2,
+        // BLE jitter delivers the frame-1 marker at 1.872 s (94 % of plan). The
+        // legacy hard 2 s window flagged this; with configured seconds known
+        // the cutoff is min(2.0, 0.5*2.0) = 1.0 s, so 1.872 must NOT flag.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "preinfusion start", 0),
+            phase(1.872, "preinfusion", 1),
+        }, 4, /*firstFrameConfiguredSeconds=*/2.0, false);
+
+        // Same profile, frame 0 actually skipped (e.g., transition at 0.3 s):
+        // 0.3 < 1.0 s cutoff → flag.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "preinfusion start", 0),
+            phase(0.3, "preinfusion", 1),
+        }, 4, /*firstFrameConfiguredSeconds=*/2.0, true);
+
+        // Profile with a deliberately short first step (0.5 s configured): a
+        // 0.4 s actual is 80 % of plan, not "skipped" — must NOT flag.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.4, "Pour", 1),
+        }, 3, /*firstFrameConfiguredSeconds=*/0.5, false);
+
+        // Same short-first-step profile but actual is even shorter (0.2 s on
+        // a 0.5 s plan = 40 %): cutoff = 0.25 s, 0.2 < 0.25 → flag.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.2, "Pour", 1),
+        }, 3, /*firstFrameConfiguredSeconds=*/0.5, true);
+
+        // Long configured first frame (4 s): cutoff capped at 2 s. A 2.5 s
+        // actual (early exit, e.g., pressure-over) → no flag.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(2.5, "Pour", 1),
+        }, 3, /*firstFrameConfiguredSeconds=*/4.0, false);
+
+        // Long configured first frame, actual under the 2 s cap → flag.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(1.5, "Pour", 1),
+        }, 3, /*firstFrameConfiguredSeconds=*/4.0, true);
+
+        // Firmware bug (no frame 0 marker) still flags regardless of
+        // configured seconds — frame 0 was genuinely never executed.
+        expectSkipDetection({
+            phase(0.0, "Pour", 1),
+        }, 3, /*firstFrameConfiguredSeconds=*/2.0, true);
+
+        // Exit-condition guard: a first frame that exited on its OWN confirmed
+        // pressure/flow/weight target executed as designed even if very short —
+        // it must NOT flag. Without the guard the short-first-step branch
+        // (0.3 < cutoff) false-positives on every early-exiting preinfusion frame.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.3, "Pour", 1, /*isFlowMode=*/false, /*transitionReason=*/"pressure"),
+        }, 3, false);
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.3, "Pour", 1, false, "flow"),
+        }, 3, false);
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.3, "Pour", 1, false, "weight"),
+        }, 3, false);
+
+        // Guard is reason-SPECIFIC, not a blanket suppress: a genuinely-too-short
+        // first frame that advanced on "time" (no confirmed sensor exit) still flags.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.3, "Pour", 1, false, "time"),
+        }, 3, true);
+
+        // Unconfirmed sensor exits do NOT suppress either: a genuinely skipped
+        // frame lands in MainController's unconfirmed branch, so trusting the
+        // hint would mask the very bug this detector exists to catch. Only
+        // exact confirmed "pressure"/"flow"/"weight" suppress.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.3, "Pour", 1, false, "pressure_unconfirmed"),
+        }, 3, true);
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Fill", 0),
+            phase(0.3, "Pour", 1, false, "flow_unconfirmed"),
+        }, 3, true);
+    }
+
+    // FrameExit::inferReason ----------------------------------------------
+    //
+    // Lives here rather than in its own file because the reason string it
+    // produces is what detectSkipFirstFrame (directly above) and
+    // analyzeFlowVsGoal's limiter-tail trim read as ground truth — the two are
+    // one behaviour, and the false positive in #1813 was only visible across
+    // the seam. Header-only helper, so no extra production source is linked.
+    void frameExitReasonInference()
+    {
+        auto pressureOverFrame = [](double threshold, double seconds) {
+            FrameExit::Inputs in;
+            in.exitIf = true;
+            in.exitType = QStringLiteral("pressure_over");
+            in.exitPressureOver = threshold;
+            in.configuredSeconds = seconds;
+            return in;
+        };
+
+        // Transition sample already at/over the threshold — confirmed outright,
+        // no extrapolation involved.
+        {
+            FrameExit::Inputs in = pressureOverFrame(2.10, 25.0);
+            in.pressure = 2.30;
+            in.prevPressure = 2.05;
+            in.prevValid = true;
+            in.frameElapsedSec = 1.9;
+            const auto r = FrameExit::inferReason(in);
+            QCOMPARE(r.reason, QStringLiteral("pressure"));
+            QVERIFY(!r.extrapolated);
+        }
+
+        // #1813's actual numbers: D-Flow frame 0 "Filling", exit_pressure_over
+        // 2.10, seconds 25. Transition sample 2.048 bar, preceding sample
+        // 1.869 bar 210 ms earlier. 2.048 + 0.179 = 2.227 >= 2.10, so the
+        // crossing fell inside one sample and the exit is confirmed. Before
+        // the tolerance this recorded pressure_unconfirmed, and
+        // detectSkipFirstFrame then badged a correct shot at 1.888 s.
+        {
+            FrameExit::Inputs in = pressureOverFrame(2.10, 25.0);
+            in.pressure = 2.048;
+            in.prevPressure = 1.869;
+            in.prevValid = true;
+            in.frameElapsedSec = 1.888;
+            const auto r = FrameExit::inferReason(in);
+            QCOMPARE(r.reason, QStringLiteral("pressure"));
+            QVERIFY(r.extrapolated);
+        }
+        // ... and the marker that shot produces no longer flags.
+        expectSkipDetection({
+            phase(0.0, "Start", 0),
+            phase(0.0, "Filling", 0),
+            phase(1.888, "Infusing", 1, false, "pressure"),
+        }, 3, /*firstFrameConfiguredSeconds=*/25.0, false);
+
+        // One sample short of reaching it: 1.90 + 0.05 = 1.95 < 2.10.
+        {
+            FrameExit::Inputs in = pressureOverFrame(2.10, 25.0);
+            in.pressure = 1.90;
+            in.prevPressure = 1.85;
+            in.prevValid = true;
+            in.frameElapsedSec = 1.5;
+            QCOMPARE(FrameExit::inferReason(in).reason,
+                     QStringLiteral("pressure_unconfirmed"));
+        }
+
+        // Flat sensor: no rise, so no tolerance however close the threshold is.
+        {
+            FrameExit::Inputs in = pressureOverFrame(2.10, 25.0);
+            in.pressure = 2.09;
+            in.prevPressure = 2.09;
+            in.prevValid = true;
+            in.frameElapsedSec = 1.5;
+            QCOMPARE(FrameExit::inferReason(in).reason,
+                     QStringLiteral("pressure_unconfirmed"));
+        }
+
+        // Falling toward a *_over threshold: moving away, no tolerance.
+        {
+            FrameExit::Inputs in = pressureOverFrame(2.10, 25.0);
+            in.pressure = 2.00;
+            in.prevPressure = 2.40;
+            in.prevValid = true;
+            in.frameElapsedSec = 1.5;
+            QCOMPARE(FrameExit::inferReason(in).reason,
+                     QStringLiteral("pressure_unconfirmed"));
+        }
+
+        // No preceding sample in this shot — nothing to extrapolate from, so a
+        // frame that ends on the very first sample stays unconfirmed. This is
+        // the genuine firmware-skip shape and must not be swallowed.
+        {
+            FrameExit::Inputs in = pressureOverFrame(2.10, 25.0);
+            in.pressure = 2.048;
+            in.prevPressure = 0.0;
+            in.prevValid = false;
+            in.frameElapsedSec = 0.2;
+            QCOMPARE(FrameExit::inferReason(in).reason,
+                     QStringLiteral("pressure_unconfirmed"));
+        }
+
+        // pressure_under, both ways. The `> 0` guard keeps a zeroed sensor from
+        // confirming an exit it never saw.
+        {
+            FrameExit::Inputs in;
+            in.exitIf = true;
+            in.exitType = QStringLiteral("pressure_under");
+            in.exitPressureUnder = 4.0;
+            in.configuredSeconds = 30.0;
+            in.pressure = 4.30;
+            in.prevPressure = 4.70;   // falling 0.40/sample → 3.90 <= 4.0
+            in.prevValid = true;
+            in.frameElapsedSec = 5.0;
+            const auto r = FrameExit::inferReason(in);
+            QCOMPARE(r.reason, QStringLiteral("pressure"));
+            QVERIFY(r.extrapolated);
+
+            in.prevPressure = 4.32;   // barely falling → 4.28, still above
+            QCOMPARE(FrameExit::inferReason(in).reason,
+                     QStringLiteral("pressure_unconfirmed"));
+
+            in.pressure = 0.0;        // sensor absent: guard refuses to confirm
+            in.prevPressure = 0.0;
+            QCOMPARE(FrameExit::inferReason(in).reason,
+                     QStringLiteral("pressure_unconfirmed"));
+        }
+
+        // flow_over / flow_under carry the same rule and the flow vocabulary.
+        {
+            FrameExit::Inputs in;
+            in.exitIf = true;
+            in.exitType = QStringLiteral("flow_over");
+            in.exitFlowOver = 2.0;
+            in.configuredSeconds = 20.0;
+            in.flow = 1.90;
+            in.prevFlow = 1.75;
+            in.prevValid = true;
+            in.frameElapsedSec = 3.0;
+            const auto r = FrameExit::inferReason(in);
+            QCOMPARE(r.reason, QStringLiteral("flow"));
+            QVERIFY(r.extrapolated);
+
+            in.exitType = QStringLiteral("flow_under");
+            in.exitFlowUnder = 1.0;
+            in.flow = 1.10;
+            in.prevFlow = 1.40;
+            QCOMPARE(FrameExit::inferReason(in).reason, QStringLiteral("flow"));
+
+            in.flow = 1.10;
+            in.prevFlow = 1.12;       // barely falling → 1.08, still above
+            QCOMPARE(FrameExit::inferReason(in).reason,
+                     QStringLiteral("flow_unconfirmed"));
+        }
+
+        // Precedence is unchanged by the tolerance: a weight skip wins over any
+        // sensor arm, time expiry (>= 90 % of configured) wins over the
+        // unconfirmed fallback, and a frame with no exit condition is "time".
+        {
+            FrameExit::Inputs in = pressureOverFrame(2.10, 25.0);
+            in.pressure = 2.048;
+            in.prevPressure = 1.869;
+            in.prevValid = true;
+            in.frameElapsedSec = 1.888;
+            in.weightExit = true;
+            QCOMPARE(FrameExit::inferReason(in).reason, QStringLiteral("weight"));
+        }
+        {
+            FrameExit::Inputs in = pressureOverFrame(9.0, 10.0);
+            in.pressure = 3.0;
+            in.prevPressure = 3.0;
+            in.prevValid = true;
+            in.frameElapsedSec = 9.5;
+            QCOMPARE(FrameExit::inferReason(in).reason, QStringLiteral("time"));
+        }
+        {
+            FrameExit::Inputs in;
+            in.exitIf = false;
+            in.configuredSeconds = 10.0;
+            in.frameElapsedSec = 1.0;
+            QCOMPARE(FrameExit::inferReason(in).reason, QStringLiteral("time"));
+        }
+    }
+
+    // buildChannelingWindows ---------------------------------------------
+
+    // A pressure-mode phase with flat plateau → steep ramp → flat plateau
+    // should produce windows that include the flat regions and exclude the
+    // ramp. Mirrors the lever family's "ramp between stationary targets"
+    // signature, where only the stationary plateaus are reliable for dC/dt
+    // analysis.
+    void channelingWindows_excludesRampBetweenPlateaus()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(3.0, "Pour", 0, /*isFlowMode=*/false),
+        };
+        // Goal: flat 8 from 3→10s, ramp 8→5 from 10→11.5s (2 bar/s),
+        // flat 5 from 11.5→20s. Actual tracks goal (converged).
+        // Late plateau at 5 bar (> WINDOW_MIN_EXTRACTION_BAR = 4.5) so the
+        // soak-exclusion gate doesn't suppress it — the test exercises ramp
+        // exclusion behaviour, not low-pressure soak exclusion.
+        QVector<QPointF> pressureGoal;
+        pressureGoal = concat(pressureGoal, flatSeries(3.0, 10.0 - 0.1, 8.0));
+        pressureGoal = concat(pressureGoal, rampSeries(10.0, 11.5, 8.0, 5.0));
+        pressureGoal = concat(pressureGoal, flatSeries(11.5 + 0.1, 20.0, 5.0));
+        auto pressure = pressureGoal;  // actual tracks goal exactly
+
+        auto flow = flatSeries(3.0, 20.0, 1.0);
+        QVector<QPointF> flowGoal;
+
+        const auto windows = ShotAnalysis::buildChannelingWindows(
+            pressure, flow, pressureGoal, flowGoal, phases,
+            /*pourStart=*/5.0, /*pourEnd=*/18.0);
+
+        QVERIFY2(!windows.isEmpty(), "expected plateau windows");
+
+        // The ramp itself (10–11.5 s) must be excluded from every window. At
+        // 2 bar/s the ±0.75 s stationarity fringe around the ramp start is
+        // already above 15 %, so no early fringe window bleeds into the ramp.
+        // The fringe at the ramp end (t ≈ 11.9 s) starts at w.start ≥ 11.5
+        // and is therefore not counted as intersecting the ramp core.
+        for (const auto& w : windows) {
+            const bool intersectsRampCore = !(w.end <= 10.0 || w.start >= 11.5);
+            QVERIFY2(!intersectsRampCore,
+                     qPrintable(QString("window [%1, %2] intersects ramp core 10–11.5 s")
+                                    .arg(w.start).arg(w.end)));
+        }
+
+        // At least one window should lie on each flat plateau.
+        bool sawEarlyPlateau = false, sawLatePlateau = false;
+        for (const auto& w : windows) {
+            if (w.start >= 7.0 && w.end <= 10.0) sawEarlyPlateau = true;
+            if (w.start <= 14.0 && w.end >= 14.0) sawLatePlateau = true;  // window spans t=14 s (well into late plateau)
+        }
+        QVERIFY2(sawEarlyPlateau, "expected a window inside the 7–10 s plateau");
+        QVERIFY2(sawLatePlateau, "expected a window over the late plateau (containing t=14 s)");
+    }
+
+    // A flow-mode phase with a stationary flow goal where actual flow is
+    // converged onto it should yield a single inclusion window covering the
+    // converged region. Series span 2 s beyond the pour bounds on each side
+    // so the ±0.75 s stationarity lookup doesn't fall off the edges.
+    void channelingWindows_includesFlowModeStationary()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(3.0, "Pour", 0, /*isFlowMode=*/true),
+        };
+        auto flow = flatSeries(3.0, 17.0, 1.7);
+        auto flowGoal = flatSeries(3.0, 17.0, 1.7);
+        auto pressure = flatSeries(3.0, 17.0, 6.0);
+        QVector<QPointF> pressureGoal;  // not relevant in flow mode
+
+        const auto windows = ShotAnalysis::buildChannelingWindows(
+            pressure, flow, pressureGoal, flowGoal, phases, /*pourStart=*/5.0, /*pourEnd=*/15.0);
+
+        QVERIFY2(!windows.isEmpty(), "expected at least one inclusion window");
+        // 2 s pour-start skip → window starts ≈ 7 s; 1.5 s pour-end skip →
+        // window ends ≈ pourEnd - 1.5 = 13.5 s.
+        QVERIFY2(windows.first().start >= 6.8 && windows.first().start <= 7.2,
+                 qPrintable(QString("window start: %1").arg(windows.first().start)));
+        QVERIFY2(windows.last().end >= 13.3 && windows.last().end <= 13.7,
+                 qPrintable(QString("window end: %1").arg(windows.last().end)));
+    }
+
+    // When actual pressure has not converged onto goal (> 15% off), samples
+    // are excluded even if the goal is stationary.
+    void channelingWindows_excludesUnconvergedActual()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(10.0, "Hold", 0, /*isFlowMode=*/false),
+        };
+        auto pressureGoal = flatSeries(10.0, 20.0, 8.0);
+        // Actual is at 5 bar — 37% off from 8 bar goal, above 15% tolerance.
+        auto pressure = flatSeries(10.0, 20.0, 5.0);
+        auto flow = flatSeries(10.0, 20.0, 1.0);
+        QVector<QPointF> flowGoal;
+
+        const auto windows = ShotAnalysis::buildChannelingWindows(
+            pressure, flow, pressureGoal, flowGoal, phases, 10.0, 20.0);
+
+        QVERIFY2(windows.isEmpty(),
+                 "Unconverged actual should produce no inclusion windows");
+    }
+
+    // Legacy-data contract: when no phase markers are available (older
+    // shots pre-phase-storage), the builder emits a single whole-pour
+    // window so detectChannelingFromDerivative runs unrestricted. This
+    // preserves detector coverage on historical shots instead of silently
+    // disabling. Distinguishes from the "phases exist but no stationary
+    // window qualifies" case, which returns empty (detector returns None).
+    void channelingWindows_emptyPhasesFallsBackToWholePour()
+    {
+        QVector<QPointF> empty;
+        QList<HistoryPhaseMarker> empty_phases;
+        auto flow = flatSeries(0.0, 10.0, 1.0);
+        auto pressure = flatSeries(0.0, 10.0, 6.0);
+
+        auto windows = ShotAnalysis::buildChannelingWindows(
+            pressure, flow, empty, empty, empty_phases, /*pourStart=*/2.0, /*pourEnd=*/10.0);
+        QCOMPARE(windows.size(), 1);
+        QCOMPARE(windows.first().start, 2.0);
+        QCOMPARE(windows.first().end, 10.0);
+    }
+
+    // detectChannelingFromDerivative with empty windows now reports None
+    // rather than falling back to unrestricted analysis. This is the
+    // "phases exist but no stationary ranges" silent-pass contract.
+    void channelingFromDerivative_emptyWindowsReturnsNone()
+    {
+        QVector<QPointF> dcdt;
+        for (double t = 0.0; t <= 20.0; t += 0.1) dcdt.append(QPointF(t, 8.0));
+        auto severity = ShotAnalysis::detectChannelingFromDerivative(
+            dcdt, /*pourStart=*/2.0, /*pourEnd=*/20.0, /*windows=*/{});
+        QCOMPARE(severity, ShotAnalysis::ChannelingSeverity::None);
+    }
+
+    // detectChannelingFromDerivative ----------------------------------------
+
+    // When windows mask out a dC/dt spike, the detector must return None.
+    // Without a mask (baseline whole-pour window) the same spike should
+    // register as Sustained. Validates that mode-aware window exclusion is
+    // what's doing the work, not some other property of the detector.
+    void channelingFromDerivative_windowMaskSuppressesRampSpike()
+    {
+        // dC/dt series with a sustained high region during 10–15s (ramp)
+        // and quiet elsewhere.
+        QVector<QPointF> dcdt;
+        for (double t = 0.0; t <= 25.0; t += 0.1) {
+            double v = 0.2;
+            if (t >= 10.0 && t <= 15.0) v = 8.0;  // 50 samples at |dC/dt|=8 > 3.0
+            dcdt.append(QPointF(t, v));
+        }
+
+        // Unrestricted-equivalent: single whole-pour window → should flag
+        // Sustained. (Empty-windows path now reports None — see
+        // channelingFromDerivative_emptyWindowsReturnsNone.)
+        {
+            QVector<ShotAnalysis::DetectionWindow> fullPour{
+                {2.0, 25.0},
+            };
+            auto severity = ShotAnalysis::detectChannelingFromDerivative(
+                dcdt, /*pourStart=*/2.0, /*pourEnd=*/25.0, fullPour);
+            QCOMPARE(severity, ShotAnalysis::ChannelingSeverity::Sustained);
+        }
+
+        // With a window that excludes 10–15s (the ramp), no elevated samples
+        // in mask → None. Use a half-second buffer so the window edges don't
+        // sit on elevated samples.
+        {
+            QVector<ShotAnalysis::DetectionWindow> windows{
+                {4.0, 9.5},
+                {15.5, 25.0},
+            };
+            auto severity = ShotAnalysis::detectChannelingFromDerivative(
+                dcdt, /*pourStart=*/2.0, /*pourEnd=*/25.0, windows);
+            QCOMPARE(severity, ShotAnalysis::ChannelingSeverity::None);
+        }
+    }
+
+    // Lever-style false-positive suppression: in a flow-mode phase whose
+    // flow goal is steady but actual pressure is rising fast (the pump is
+    // building toward a pressure-ceiling exit condition), the window
+    // builder must exclude those samples — the resulting dC/dt drop is the
+    // pressure-rise dynamic, not channeling. Falling pressure (bloom
+    // transitions, pump stops) must NOT be masked: those are legitimate
+    // channeling-like transients.
+    void channelingWindows_flowModeRisingPressure_isExcluded()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "End", -1, /*isFlowMode=*/false),
+        };
+
+        // Flow tracks goal cleanly, but pressure ramps from 2 → 10 bar over
+        // 4 s (≈ 2 bar/s — matches 80's Espresso preinfusion-late dynamic
+        // before the pressure-ceiling exit). After 4 s pressure stays flat
+        // at 10 bar so the test isolates the ramp effect.
+        const auto flow = flatSeries(0.0, 10.0, 7.5);
+        const auto flowGoal = flatSeries(0.0, 10.0, 7.5);
+        QVector<QPointF> pressure;
+        pressure.append(rampSeries(0.0, 4.0, 2.0, 10.0));
+        for (const auto& p : flatSeries(4.1, 10.0, 10.0)) pressure.append(p);
+
+        const auto windows = ShotAnalysis::buildChannelingWindows(
+            pressure, flow, /*pressureGoal=*/QVector<QPointF>{},
+            flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/10.0);
+
+        // The steep part of the ramp must be excluded; once the ±0.75 s
+        // lookup spans the post-ramp plateau the relative pressure rise
+        // drops below WINDOW_STATIONARY_REL and windows can re-open.
+        // Empirically that crossover lands near t = 3.3 s, so any window
+        // start before t = 3 indicates the gate stopped firing too early.
+        QVERIFY2(!windows.isEmpty(), "expected at least one window during the plateau");
+        QVERIFY2(windows.first().start >= 3.0,
+                 qPrintable(QString("expected first window past the steep ramp, got start=%1s")
+                                .arg(windows.first().start)));
+    }
+
+    // Inverse: in a flow-mode phase with falling pressure (the bloom
+    // transition shape — pump stops while flow trails to zero), pressure
+    // is changing rapidly but in the negative direction, so the lever-rise
+    // gate must NOT engage. Validates that the directional rule preserves
+    // the legacy detector's coverage of bloom-transition spikes.
+    void channelingWindows_flowModeFallingPressure_isIncluded()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Bloom", 0, /*isFlowMode=*/true),
+            phase(10.0, "End", -1, /*isFlowMode=*/false),
+        };
+
+        // Same setup but pressure falls from 8 → 2 bar.
+        const auto flow = flatSeries(0.0, 10.0, 1.5);
+        const auto flowGoal = flatSeries(0.0, 10.0, 1.5);
+        const auto pressure = rampSeries(0.0, 10.0, 8.0, 2.0);
+
+        const auto windows = ShotAnalysis::buildChannelingWindows(
+            pressure, flow, /*pressureGoal=*/QVector<QPointF>{},
+            flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/10.0);
+
+        double totalMaskSec = 0.0;
+        for (const auto& w : windows) totalMaskSec += (w.end - w.start);
+        // Most of the analysis range should be in-window. CHANNELING_DC_POUR_SKIP_SEC
+        // (2 s) and CHANNELING_DC_POUR_SKIP_END_SEC (1.5 s) are trimmed by
+        // the window builder, leaving 10 - 2 - 1.5 = 6.5 s of analysis range.
+        QVERIFY2(totalMaskSec > 5.0,
+                 qPrintable(QString("expected ~6.5 s of windows during pressure fall, got %1s")
+                                .arg(totalMaskSec)));
+    }
+
+    // analyzeFlowVsGoal / detectGrindIssue ----------------------------------
+
+    // 80's Espresso style: pour frames are all pressure-controlled. No
+    // flow-mode phase → grind check should report hasData=false and
+    // detectGrindIssue should return false regardless of flow delta.
+    void flowVsGoal_noFlowModePhaseInPour_returnsHasDataFalse()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),   // before pour, excluded
+            phase(5.0, "Rise", 1, /*isFlowMode=*/false),
+            phase(10.0, "Decline", 2, /*isFlowMode=*/false),
+        };
+        // Actual flow 1 ml/s, goal 7.5 ml/s across the pour (10-30s).
+        // Under legacy logic this would be a -6.5 ml/s delta → huge grind
+        // caution. Under mode-aware logic this does not run.
+        auto flow = flatSeries(5.0, 30.0, 1.0);
+        auto flowGoal = flatSeries(5.0, 30.0, 7.5);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 5.0, 30.0);
+        QVERIFY(!r.hasData);
+        QVERIFY(!r.skipped);
+
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 5.0, 30.0),
+                 false);
+    }
+
+    // D-Flow style: pour is flow-controlled. Large delta should fire.
+    void flowVsGoal_flowModePourWithDelta_fires()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "Pour", 1, /*isFlowMode=*/true),
+        };
+        // Actual flow 0.8 ml/s, goal 1.7 ml/s → delta -0.9 ml/s, beyond
+        // FLOW_DEVIATION_THRESHOLD (0.4).
+        auto flow = flatSeries(10.0, 30.0, 0.8);
+        auto flowGoal = flatSeries(10.0, 30.0, 1.7);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 10.0, 30.0);
+        QVERIFY(r.hasData);
+        QVERIFY(r.delta < -0.4);
+
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 10.0, 30.0),
+                 true);
+    }
+
+    // grind_check_skip flag short-circuits to skipped=true.
+    void flowVsGoal_grindCheckSkipFlag_skips()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(10.0, "Pour", 0, /*isFlowMode=*/true),
+        };
+        auto flow = flatSeries(10.0, 30.0, 0.8);
+        auto flowGoal = flatSeries(10.0, 30.0, 1.7);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 10.0, 30.0, /*beverage=*/"", {"grind_check_skip"});
+        QVERIFY(r.skipped);
+        QVERIFY(!r.hasData);
+
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases,
+                                                 10.0, 30.0, "", {"grind_check_skip"}),
+                 false);
+    }
+
+    // profileKbResolved=false skips Arm 1 entirely. Same shot setup as
+    // flowVsGoal_flowModePourWithDelta_fires (which fires Arm 1 with
+    // delta = -0.9), but with profileKbResolved=false Arm 1's flow-mode-
+    // range builder is gated off — sampleCount and delta stay zero, the
+    // function returns clean defaults, skipped stays false so Arm 2 can
+    // still run on top. Regression for openspec change
+    // skip-grind-arm1-when-kb-unresolved.
+    void flowVsGoal_unresolvedKb_skipsArm1ButLeavesArm2Active()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "Pour", 1, /*isFlowMode=*/true),
+        };
+        auto flow = flatSeries(10.0, 30.0, 0.8);
+        auto flowGoal = flatSeries(10.0, 30.0, 1.7);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 10.0, 30.0,
+            /*beverage=*/"", /*analysisFlags=*/{},
+            /*pressure=*/{}, /*targetWeightG=*/0.0, /*finalWeightG=*/0.0,
+            /*profileKbResolved=*/false);
+        QVERIFY(!r.skipped);                 // distinct from grind_check_skip path
+        QVERIFY(!r.hasData);                 // Arm 1 didn't run
+        QCOMPARE(r.sampleCount, qsizetype{0});
+        QCOMPARE(r.delta, 0.0);
+
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 10.0, 30.0),
+                 true);  // unchanged default-true contract still fires
+    }
+
+    // Full pipeline: unresolved KB on a flow-mode shot whose Arm 1 would
+    // otherwise fire (delta -0.9) AND whose pressure stays under 4 bar
+    // (Arm 2 silent) projects to grindCoverage="notAnalyzable" with the
+    // existing observation line and alternate verdict. The badge stays
+    // off. This is the false-positive surface the change targets — a
+    // user-created flow profile with no KB context no longer falsely
+    // accuses grind based on a flow-goal series whose meaning we can't
+    // verify.
+    void analyzeShot_unresolvedKb_armOneSilenced_projectsNotAnalyzable()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "pour",       1, /*isFlowMode=*/true),
+        };
+        // Pressure 3.5 bar everywhere — above pourTruncated (2.5) so the
+        // dominator cascade doesn't fire, below Arm 2's 4 bar gate so
+        // Arm 2 sees no pressurized samples. Without the new gate, Arm 1
+        // would average flow=0.8 vs goal=1.7 across [10.5, 30] and fire
+        // with delta ≈ -0.9.
+        QVector<QPointF> pressure = flatSeries(0.0, 30.0, 3.5);
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 0.8);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 1.7);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            pressureGoal, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/30.0,
+            /*expectedFrameCount=*/-1, /*expertBand=*/std::nullopt,
+            /*profileKbResolved=*/false);
+
+        const auto& d = result.detectors;
+        const auto badges = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(!d.pourTruncated);
+        QVERIFY(!d.grindHasData);
+        QVERIFY(!d.grindVerifiedClean);
+        QVERIFY(!badges.grindIssueDetected);
+        QCOMPARE(d.grindCoverage, QStringLiteral("notAnalyzable"));
+        // The verdictCategory drives the dialog tint and the structured
+        // MCP output — assert it directly so a future refactor of the
+        // cascade can't silently flip back to "clean" while the lines
+        // list still grep-matches.
+        QCOMPARE(d.verdictCategory, QStringLiteral("cleanGrindNotAnalyzable"));
+        QCOMPARE(d.grindFlowDeltaMlPerSec, 0.0);  // Arm 1 didn't run
+
+        bool sawObservation = false;
+        bool sawAlternateVerdict = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["type"].toString() == "observation"
+                && m["text"].toString().contains("Could not analyze grind", Qt::CaseInsensitive))
+                sawObservation = true;
+            if (m["type"].toString() == "verdict"
+                && m["text"].toString().contains("grind could not be evaluated", Qt::CaseInsensitive))
+                sawAlternateVerdict = true;
+        }
+        QVERIFY2(sawObservation,
+                 "unresolved-KB shot must emit [observation] line via notAnalyzable path");
+        QVERIFY2(sawAlternateVerdict,
+                 "unresolved-KB shot must emit alternate verdict via notAnalyzable path");
+    }
+
+    // Same shot as above, but with profileKbResolved=true: Arm 1 runs
+    // normally and the grind badge fires with delta < -0.4. Locks in the
+    // bit-for-bit "no behaviour change on resolved profiles" contract
+    // alongside its negated sibling test above.
+    void analyzeShot_resolvedKb_armOneRunsAndFires()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "pour",       1, /*isFlowMode=*/true),
+        };
+        QVector<QPointF> pressure = flatSeries(0.0, 30.0, 3.5);
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 0.8);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 1.7);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            pressureGoal, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/30.0,
+            /*expectedFrameCount=*/-1, /*expertBand=*/std::nullopt,
+            /*profileKbResolved=*/true);
+
+        const auto& d = result.detectors;
+        const auto badges = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(d.grindHasData);
+        QVERIFY(d.grindFlowDeltaMlPerSec < -ShotAnalysis::FLOW_DEVIATION_THRESHOLD);
+        QVERIFY(badges.grindIssueDetected);
+        QCOMPARE(d.grindCoverage, QStringLiteral("verified"));
+    }
+
+    // profileKbResolved=false does NOT suppress Arm 2's yield-shortfall
+    // arm. Even on a user-created profile we know nothing about, an
+    // 18g → 22g shot against a 36g target (yield ratio 0.61, below the
+    // 0.70 audit threshold) still fires the grind badge via Arm 2.
+    // Locks in the "we keep the profile-agnostic detectors" half of the
+    // change's contract.
+    void analyzeShot_unresolvedKb_yieldShortfallStillFiresArm2()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion", 0, /*isFlowMode=*/true),
+            phase(8.0, "pour",        1, /*isFlowMode=*/false),
+        };
+        // Pressure ≥ 4 bar throughout pour-mode phase so Arm 2 sees
+        // pressurized samples. Duration is short enough that the
+        // flow-arm gate fails (pressurizedDuration < 15s) — only the
+        // yield arm fires. Final 22 g vs target 36 g = 0.61.
+        QVector<QPointF> pressure = flatSeries(0.0, 12.0, 6.0);
+        QVector<QPointF> flow = flatSeries(0.0, 12.0, 1.5);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 12.0, 1.5);
+        QVector<QPointF> dCdt = flatSeries(0.0, 12.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 12.0,
+            pressureGoal, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/22.0,
+            /*expectedFrameCount=*/-1, /*expertBand=*/std::nullopt,
+            /*profileKbResolved=*/false);
+
+        const auto& d = result.detectors;
+        const auto badges = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(d.grindChokedPuck);          // yield-shortfall fired
+        QVERIFY(d.grindHasData);
+        QVERIFY(badges.grindIssueDetected);
+        QCOMPARE(d.grindCoverage, QStringLiteral("verified"));
+    }
+
+    // Direct callers omitting the new parameter get the default-true
+    // contract: Arm 1 runs as before. Guards against accidentally
+    // changing the default-arg value in a future refactor (which would
+    // silently affect every test in this file).
+    void flowVsGoal_defaultProfileKbResolvedIsTrue()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "Pour", 1, /*isFlowMode=*/true),
+        };
+        auto flow = flatSeries(10.0, 30.0, 0.8);
+        auto flowGoal = flatSeries(10.0, 30.0, 1.7);
+
+        // No profileKbResolved arg supplied — relies on default.
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 10.0, 30.0);
+        QVERIFY(r.hasData);                  // Arm 1 ran (default is true)
+        QVERIFY(r.sampleCount > 0);
+        QVERIFY(r.delta < -0.4);
+    }
+
+    // Arm-2-only verifiedClean on an unresolved profile must emit the
+    // honest "Puck sustained healthy pressure during pour" line, NOT
+    // the legacy "Grind tracked goal during pour" wording (Arm 1 didn't
+    // run, so we'd be citing a measurement that wasn't taken). Guards
+    // the sampleCount-based branch in analyzeShot's [good] line emission.
+    void analyzeShot_unresolvedKb_armTwoVerifiedClean_emitsSustainedPressureLine()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion", 0, /*isFlowMode=*/true),
+            phase(8.0, "pour",        1, /*isFlowMode=*/false),
+        };
+        // Pressure ≥ 4 bar for ≥ 15 s with mean flow ≥ 0.5 mL/s and
+        // yield ratio within the clean band — Arm 2's flow-arm gates
+        // pass and verifiedClean fires from Arm 2 alone. Arm 1 is
+        // skipped because profileKbResolved=false.
+        QVector<QPointF> pressure = flatSeries(0.0, 30.0, 8.0);
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            pressureGoal, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/36.0,
+            /*expectedFrameCount=*/-1, /*expertBand=*/std::nullopt,
+            /*profileKbResolved=*/false);
+
+        const auto& d = result.detectors;
+        QVERIFY(d.grindHasData);
+        QVERIFY(d.grindVerifiedClean);
+        QCOMPARE(d.grindSampleCount, qsizetype{0});  // Arm 1 didn't run
+        QCOMPARE(d.grindCoverage, QStringLiteral("verified"));
+
+        bool sawSustainedLine = false;
+        bool sawLegacyTrackedLine = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            const QString text = m["text"].toString();
+            if (m["type"].toString() == QStringLiteral("good")
+                && text.contains("Puck sustained healthy pressure",
+                                 Qt::CaseInsensitive))
+                sawSustainedLine = true;
+            if (text.contains("Grind tracked goal", Qt::CaseInsensitive))
+                sawLegacyTrackedLine = true;
+        }
+        QVERIFY2(sawSustainedLine,
+                 "Arm-2-only verifiedClean must emit the honest sustained-pressure line");
+        QVERIFY2(!sawLegacyTrackedLine,
+                 "Arm-2-only verifiedClean must NOT cite Arm 1's 'tracked goal' wording");
+    }
+
+    // grindCoverage="skipped" path through the full analyzeShot pipeline:
+    // when analysisFlags contains "grind_check_skip", the function
+    // early-returns with GrindCheck::skipped=true, distinct from the new
+    // profileKbResolved=false path (which leaves skipped=false and
+    // projects to "notAnalyzable"). The distinction is load-bearing for
+    // skip-grind-arm1-when-kb-unresolved — a future refactor that
+    // conflates the two paths (e.g. setting skipped=true in the
+    // unresolved branch) would silently regress Arm 2's behaviour on
+    // unresolved profiles. This test pins the "skipped" coverage value
+    // so the distinction stays visible.
+    void analyzeShot_grindCheckSkipFlag_projectsSkippedCoverage()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "pour",       1, /*isFlowMode=*/true),
+        };
+        // Same Arm-1-would-fire shape as the unresolved-KB test. With
+        // grind_check_skip the whole detector short-circuits before
+        // either arm runs.
+        QVector<QPointF> pressure = flatSeries(0.0, 30.0, 3.5);
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 0.8);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 1.7);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            pressureGoal, flowGoal,
+            QStringList{QStringLiteral("grind_check_skip")},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/30.0);
+
+        const auto& d = result.detectors;
+        QVERIFY(!d.grindHasData);
+        QVERIFY(!d.grindChecked);            // detector explicitly suppressed
+        QCOMPARE(d.grindCoverage, QStringLiteral("skipped"));
+        // verdictCategory must NOT be "cleanGrindNotAnalyzable" — that
+        // value is reserved for the unresolved-KB path.
+        QVERIFY(d.verdictCategory != QStringLiteral("cleanGrindNotAnalyzable"));
+
+        bool sawNotAnalyzableLine = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["text"].toString().contains("Could not analyze grind",
+                                              Qt::CaseInsensitive))
+                sawNotAnalyzableLine = true;
+        }
+        QVERIFY2(!sawNotAnalyzableLine,
+                 "grind_check_skip path must NOT emit the notAnalyzable observation");
+    }
+
+    // pourTruncated cascade dominates the unresolved-KB gate: when peak
+    // pressure stays below PRESSURE_FLOOR_BAR, analyzeShot sets
+    // grind = GrindCheck{} unconditionally before the gate is reached.
+    // The profileKbResolved flag is therefore irrelevant on a truncated
+    // shot. Locks in that ordering — a future refactor that gates the
+    // GrindCheck{} short-circuit on profileKbResolved would silently
+    // break the cascade dominator on unresolved profiles.
+    void analyzeShot_pourTruncated_dominatesUnresolvedKbGate()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0, "pour",              1, /*isFlowMode=*/true),
+        };
+        // Pressure capped at 0.6 bar — well below PRESSURE_FLOOR_BAR
+        // (2.5), so pourTruncated fires.
+        QVector<QPointF> pressure = flatSeries(0.0, 7.0, 0.6);
+        QVector<QPointF> flow = flatSeries(0.0, 7.0, 7.0);
+        QVector<QPointF> flowGoal = flatSeries(0.0, 7.0, 7.5);
+        QVector<QPointF> dCdt = flatSeries(0.0, 7.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 7.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/32.0, /*finalWeightG=*/36.5,
+            /*expectedFrameCount=*/-1, /*expertBand=*/std::nullopt,
+            /*profileKbResolved=*/false);
+
+        const auto& d = result.detectors;
+        QVERIFY(d.pourTruncated);
+        QCOMPARE(d.verdictCategory, QStringLiteral("puckTruncated"));
+        // pourTruncated cascade zeroes the grind block before the
+        // profileKbResolved gate is even consulted — grindCoverage
+        // stays empty (suppressed) on this path, NOT "notAnalyzable".
+        QVERIFY(d.grindCoverage.isEmpty());
+
+        bool sawNotAnalyzableLine = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["text"].toString().contains("Could not analyze grind",
+                                              Qt::CaseInsensitive))
+                sawNotAnalyzableLine = true;
+        }
+        QVERIFY2(!sawNotAnalyzableLine,
+                 "pourTruncated cascade must suppress the notAnalyzable observation "
+                 "regardless of profileKbResolved");
+    }
+
+    // 80's Espresso style: preinfusion is flow-mode 7.5 ml/s with a pressure
+    // ceiling that exits the frame on "pressure" transition once the puck
+    // builds. The trailing samples (pressure limiter engaged → controller
+    // stops tracking flow goal) and the pump-ramp at the very start must be
+    // excluded so the averaged flow matches the actual tracking window.
+    void flowVsGoal_flowModeExitingOnPressure_trimsLimiterTailAndPumpRamp()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(7.0, "Rise", 1, /*isFlowMode=*/false, /*tr=*/"pressure"),
+            phase(11.0, "End", -1, /*isFlowMode=*/false),
+        };
+
+        // Synthesize the lever preinfusion shape. Without the boundary trims
+        // the average pulls under goal by ~0.6 ml/s and FIRES grind issue.
+        // With both trims (skip 0-0.5 s ramp, skip 5.5-7 s limiter tail),
+        // the steady tracking window from 0.5-5.5 s reads ~7.5 ml/s and
+        // the check passes.
+        QVector<QPointF> flow;
+        QVector<QPointF> flowGoal;
+        for (double t = 0.0; t <= 11.0; t += 0.1) {
+            double f;
+            if (t < 0.5)        f = 4.0 + (7.5 - 4.0) * (t / 0.5);  // pump ramp 4 → 7.5
+            else if (t < 5.5)   f = 7.5;                             // steady tracking
+            else if (t < 7.0)   f = 6.0;                             // pressure limiter engaging
+            else                f = 4.5;                             // pressure-mode pour (excluded by isFlowMode)
+            flow.append(QPointF(t, f));
+            flowGoal.append(QPointF(t, 7.5));
+        }
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/11.0);
+        QVERIFY(r.hasData);
+        QVERIFY2(std::abs(r.delta) < ShotAnalysis::FLOW_DEVIATION_THRESHOLD,
+                 qPrintable(QString("expected |delta| < %1, got %2")
+                                .arg(ShotAnalysis::FLOW_DEVIATION_THRESHOLD)
+                                .arg(r.delta)));
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 0.0, 11.0),
+                 false);
+    }
+
+    // Extreme puck failure: a flow-mode phase shorter than
+    // (GRIND_PUMP_RAMP_SKIP_SEC + kMinPostTrimRangeSec) so the trim guard
+    // must take its bypass branch. Without the bypass, the pump-ramp trim
+    // (0.5 s) would push start past end (start=0.5, end=0.8 → 3 samples
+    // after time-window filter, < 5 → hasData=false → grind silent on a
+    // shot that's clearly a gusher). With the bypass, the full 0-0.8 s
+    // window stays and the detector fires.
+    void flowVsGoal_shortShot_skipsTrimToPreserveSignal()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Fill", 0, /*isFlowMode=*/true),
+            phase(0.8, "Pour", 1, /*isFlowMode=*/false),
+            phase(2.0, "End", -1, /*isFlowMode=*/false),
+        };
+        // Flow gushes (6 ml/s) against goal 4 ml/s during the 0.8 s
+        // flow-mode phase — clear coarse-grind signal. The phase length
+        // (0.8 s) minus the trim (0.5 s) equals 0.3 s, well below the
+        // 1.0 s post-trim minimum, so the bypass must engage.
+        auto flow = flatSeries(0.0, 2.0, 6.0);
+        auto flowGoal = flatSeries(0.0, 2.0, 4.0);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/2.0);
+        QVERIFY2(r.hasData,
+                 "expected the trim bypass to preserve enough samples");
+        QVERIFY2(r.delta > ShotAnalysis::FLOW_DEVIATION_THRESHOLD,
+                 qPrintable(QString("expected positive delta > %1, got %2")
+                                .arg(ShotAnalysis::FLOW_DEVIATION_THRESHOLD).arg(r.delta)));
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 0.0, 2.0),
+                 true);
+    }
+
+    // The limiter-tail trim is gated on transitionReason == "pressure" (or
+    // "pressure_unconfirmed" — see the tests below).
+    // Same flow shape as the lever test but with the next phase exiting on
+    // "time" — the trailing undershoot must remain in the average and the
+    // badge must still fire. Without this gate, a copy-paste regression
+    // that applied the trim unconditionally would silently suppress real
+    // grind signals on D-Flow / A-Flow profiles whose pour phases exit on
+    // time.
+    void flowVsGoal_flowModeExitingOnTime_keepsTrailingWindow_andFires()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(7.0, "Rise", 1, /*isFlowMode=*/false, /*tr=*/"time"),
+            phase(11.0, "End", -1, /*isFlowMode=*/false),
+        };
+
+        // Pump ramp 0-0.5 s, steady tracking 0.5-5.5 s, sustained dip
+        // 5.5-7.0 s. Under "pressure" exit the dip is trimmed and the
+        // average is clean; under "time" exit the dip stays in and pulls
+        // the average ~0.9 ml/s under goal.
+        QVector<QPointF> flow;
+        QVector<QPointF> flowGoal;
+        for (double t = 0.0; t <= 11.0; t += 0.1) {
+            double f;
+            if (t < 0.5)        f = 4.0 + (7.5 - 4.0) * (t / 0.5);
+            else if (t < 5.5)   f = 7.5;
+            else if (t < 7.0)   f = 3.5;
+            else                f = 4.5;
+            flow.append(QPointF(t, f));
+            flowGoal.append(QPointF(t, 7.5));
+        }
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/11.0);
+        QVERIFY(r.hasData);
+        QVERIFY2(r.delta < -ShotAnalysis::FLOW_DEVIATION_THRESHOLD,
+                 qPrintable(QString("expected delta < -%1, got %2")
+                                .arg(ShotAnalysis::FLOW_DEVIATION_THRESHOLD)
+                                .arg(r.delta)));
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 0.0, 11.0),
+                 true);
+    }
+
+    // An UNCONFIRMED pressure exit trims the limiter tail exactly like a
+    // confirmed one — it is usually a real limiter engagement whose threshold
+    // crossing fell between BLE samples, and trimming a maybe-clean tail is
+    // harmless while including a limiter-suppressed tail biases toward
+    // "too fine". Same lever shape as the confirmed-pressure test above.
+    void flowVsGoal_flowModeExitingOnPressureUnconfirmed_trimsLimiterTail()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(7.0, "Rise", 1, /*isFlowMode=*/false, /*tr=*/"pressure_unconfirmed"),
+            phase(11.0, "End", -1, /*isFlowMode=*/false),
+        };
+
+        QVector<QPointF> flow;
+        QVector<QPointF> flowGoal;
+        for (double t = 0.0; t <= 11.0; t += 0.1) {
+            double f;
+            if (t < 0.5)        f = 4.0 + (7.5 - 4.0) * (t / 0.5);  // pump ramp 4 → 7.5
+            else if (t < 5.5)   f = 7.5;                             // steady tracking
+            else if (t < 7.0)   f = 6.0;                             // pressure limiter engaging
+            else                f = 4.5;                             // pressure-mode pour (excluded by isFlowMode)
+            flow.append(QPointF(t, f));
+            flowGoal.append(QPointF(t, 7.5));
+        }
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/11.0);
+        QVERIFY(r.hasData);
+        QVERIFY2(std::abs(r.delta) < ShotAnalysis::FLOW_DEVIATION_THRESHOLD,
+                 qPrintable(QString("expected |delta| < %1, got %2")
+                                .arg(ShotAnalysis::FLOW_DEVIATION_THRESHOLD)
+                                .arg(r.delta)));
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 0.0, 11.0),
+                 false);
+    }
+
+    // "flow_unconfirmed" must NOT trigger the pressure-limiter tail trim —
+    // the trim exists specifically for pressure-limiter engagement. Same
+    // sustained-dip shape as the "time" test: the dip stays in the average
+    // and the badge fires.
+    void flowVsGoal_flowModeExitingOnFlowUnconfirmed_keepsTrailingWindow()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(7.0, "Rise", 1, /*isFlowMode=*/false, /*tr=*/"flow_unconfirmed"),
+            phase(11.0, "End", -1, /*isFlowMode=*/false),
+        };
+
+        QVector<QPointF> flow;
+        QVector<QPointF> flowGoal;
+        for (double t = 0.0; t <= 11.0; t += 0.1) {
+            double f;
+            if (t < 0.5)        f = 4.0 + (7.5 - 4.0) * (t / 0.5);
+            else if (t < 5.5)   f = 7.5;
+            else if (t < 7.0)   f = 3.5;
+            else                f = 4.5;
+            flow.append(QPointF(t, f));
+            flowGoal.append(QPointF(t, 7.5));
+        }
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/11.0);
+        QVERIFY(r.hasData);
+        QVERIFY2(r.delta < -ShotAnalysis::FLOW_DEVIATION_THRESHOLD,
+                 qPrintable(QString("expected delta < -%1, got %2")
+                                .arg(ShotAnalysis::FLOW_DEVIATION_THRESHOLD)
+                                .arg(r.delta)));
+        QCOMPARE(ShotAnalysis::detectGrindIssue(flow, flowGoal, phases, 0.0, 11.0),
+                 true);
+    }
+
+    // Issue #1128 — Extractamundo Dos!-style "dynamic bloom" frame
+    // configured pump=flow with flow=0 and exit_pressure_under. The frame
+    // is isFlowMode=true from the firmware's perspective, but its flow
+    // goal is a ramp-down command (firmware decays flow from preinfusion's
+    // high rate to ~0 to let the puck bleed pressure naturally), not a
+    // target the puck is supposed to track. Before PR Kulitorum/Decenza#1141, Arm 1 captured
+    // 5 samples inside that decay window and produced a confident +3.2
+    // ml/s "actual above goal" delta on a clean 90/100 shot. The
+    // stationarity gate (introduced in PR Kulitorum/Decenza#1141) must reject every sample
+    // inside the rapidly-decaying goal window.
+    void flowVsGoal_dynamicBloomDecay_silencedByStationarityGate()
+    {
+        // 6 s flow-mode bloom phase + 6 s pressure-mode tail. The bloom
+        // frame's flow goal decays from 7.5 → 0.1 ml/s over the first
+        // 3 s (firmware ramp-down), then stays near zero. Actual flow
+        // mirrors a real bloom: starts high (~6 ml/s decaying with
+        // pressure), drops below goal in the tail.
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "DynamicBloom", 0, /*isFlowMode=*/true,
+                  /*tr=*/"pressure"),
+            phase(6.0, "Pour", 1, /*isFlowMode=*/false),
+            phase(12.0, "End", -1, /*isFlowMode=*/false),
+        };
+        // Goal ramps 7.5 → 0.1 over 0-3s, then flat 0.1 through the rest
+        // of the bloom — same shape as the firmware-emitted flow goal on
+        // a `flow=0` bloom command. Concat into one series.
+        QVector<QPointF> flowGoal;
+        flowGoal = concat(flowGoal, rampSeries(0.0, 3.0 - 0.1, 7.5, 0.1));
+        flowGoal = concat(flowGoal, flatSeries(3.0, 12.0, 0.1));
+        // Actual flow tracks a real bloom: decays from 7 → 0.5 ml/s over
+        // 0-3s alongside the goal (loosely), then stays low through the
+        // pressure-mode tail. Substantially above the goal in the early
+        // bloom — exactly the shape that fooled Arm 1 pre-fix.
+        QVector<QPointF> flow;
+        flow = concat(flow, rampSeries(0.0, 3.0 - 0.1, 7.0, 0.5));
+        flow = concat(flow, flatSeries(3.0, 12.0, 0.5));
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/12.0);
+        // Every bloom sample fails stationarity because the goal moves
+        // >15% across the ±0.75 s half-window; the pressure-mode tail is
+        // excluded by inFlowMode. Arm 1 ends with count=0, hasData=false.
+        QVERIFY2(!r.hasData,
+                 qPrintable(QString("expected Arm 1 silent, got hasData=true "
+                                     "sampleCount=%1 delta=%2")
+                                .arg(r.sampleCount).arg(r.delta)));
+        QCOMPARE(r.sampleCount, qsizetype(0));
+    }
+
+    // Counterpart to the dynamic-bloom test: a real flow-mode pour with a
+    // flat goal (e.g., Malabar 1.88 ml/s pin, lever flow preinfusion at a
+    // steady rate) must pass the stationarity gate cleanly. The gate's
+    // purpose is to reject rapidly-changing decays, not to drop legitimate
+    // flat targets. Pair with the bloom-decay test above to lock in both
+    // directions of the new gate's contract.
+    void flowVsGoal_flatGoal_passesStationarityGate()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Preinfusion", 0, /*isFlowMode=*/true),
+            phase(10.0, "End", -1, /*isFlowMode=*/false),
+        };
+        // Goal flat 1.88 ml/s, actual flat 1.0 ml/s — delta -0.88, a
+        // legitimate "too fine" reading that must NOT be silenced by the
+        // stationarity gate.
+        auto flow = flatSeries(0.0, 10.0, 1.0);
+        auto flowGoal = flatSeries(0.0, 10.0, 1.88);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/0.0, /*pourEnd=*/10.0);
+        QVERIFY(r.hasData);
+        QVERIFY(r.delta < -ShotAnalysis::FLOW_DEVIATION_THRESHOLD);
+    }
+
+    // Filter beverage type also short-circuits.
+    void flowVsGoal_filterBeverage_skips()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(10.0, "Pour", 0, /*isFlowMode=*/true),
+        };
+        auto flow = flatSeries(10.0, 30.0, 0.8);
+        auto flowGoal = flatSeries(10.0, 30.0, 1.7);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 10.0, 30.0, /*beverage=*/"filter");
+        QVERIFY(r.skipped);
+    }
+
+    // End-of-pour skip ------------------------------------------------------
+
+    // Elevated samples inside the final CHANNELING_DC_POUR_SKIP_END_SEC
+    // window must be excluded. Mirrors the existing 2 s start-skip.
+    void channelingFromDerivative_endSkipSuppressesTailSpike()
+    {
+        // Long clean quiet dC/dt with a single burst of elevated samples in
+        // the last 1 s of pour. Without end-skip the burst tallies; with
+        // end-skip it's outside the analysis range.
+        QVector<QPointF> dcdt;
+        for (double t = 0.0; t <= 20.0; t += 0.1) {
+            double v = 0.2;
+            if (t >= 19.0) v = 8.0;  // tail burst in last second
+            dcdt.append(QPointF(t, v));
+        }
+        QVector<ShotAnalysis::DetectionWindow> fullPour{{2.0, 20.0}};
+        auto severity = ShotAnalysis::detectChannelingFromDerivative(
+            dcdt, /*pourStart=*/0.0, /*pourEnd=*/20.0, fullPour);
+        QCOMPARE(severity, ShotAnalysis::ChannelingSeverity::None);
+    }
+
+    // Choked-puck fallback (pressure-mode pours) ---------------------------
+
+    // Shot 890 signature: 80's Espresso (entire pour pressure-controlled),
+    // pressure held ~6.6 bar for 50 s with mean flow ~0.2 ml/s, yield 1.1 g.
+    // The flow-vs-goal path returns no data (no flow-mode window in the
+    // pour); the choked-puck fallback must fire and flag grindIssue.
+    void grindIssue_chokedPuckPressureMode_fires()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0,  "preinfusion",       1, /*isFlowMode=*/true),
+            phase(6.0,  "rise and hold",     2, /*isFlowMode=*/false),
+            phase(10.0, "decline",           3, /*isFlowMode=*/false),
+        };
+        // Pressure builds during preinfusion, then sits at 6.6 bar through
+        // the pressure-mode pour. Flow stays near zero from t=10 onward.
+        QVector<QPointF> pressure;
+        pressure = concat(pressure, rampSeries(0.0, 6.0, 0.5, 6.6));
+        pressure = concat(pressure, flatSeries(6.1, 60.0, 6.6));
+
+        QVector<QPointF> flow;
+        flow = concat(flow, flatSeries(0.0, 6.0, 7.5));        // preinfusion
+        flow = concat(flow, flatSeries(6.1, 10.0, 3.0));       // brief rise
+        flow = concat(flow, flatSeries(10.1, 60.0, 0.2));      // choked
+
+        QVector<QPointF> flowGoal = flatSeries(0.0, 60.0, 7.5);  // preinfusion goal only
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/6.0, /*pourEnd=*/60.0,
+            /*beverageType=*/"", /*analysisFlags=*/{}, pressure);
+        QVERIFY(r.hasData);
+        QVERIFY(r.chokedPuck);
+        QCOMPARE(ShotAnalysis::detectGrindIssue(
+                     flow, flowGoal, phases, 6.0, 60.0,
+                     "", {}, pressure), true);
+    }
+
+    // Lever-style clean shot (Cremina): pressure-mode pour, but flow is
+    // healthy — must NOT fire the choked-puck fallback.
+    void grindIssue_chokedPuckPressureMode_normalLeverDoesNotFire()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion", 0, /*isFlowMode=*/true),
+            phase(5.0,  "pour",        1, /*isFlowMode=*/false),
+        };
+        auto pressure = concat(rampSeries(0.0, 5.0, 0.0, 8.0),
+                                rampSeries(5.1, 30.0, 8.0, 4.0));
+        // Mean flow ~1.8 ml/s during the pressurized pour: well above the
+        // 0.5 ml/s choked threshold.
+        auto flow = concat(flatSeries(0.0, 5.0, 4.0),
+                            flatSeries(5.1, 30.0, 1.8));
+        QVector<QPointF> flowGoal;  // no flow goal during the pour
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/5.0, /*pourEnd=*/30.0,
+            "", {}, pressure);
+        QVERIFY(!r.chokedPuck);
+        QCOMPARE(ShotAnalysis::detectGrindIssue(
+                     flow, flowGoal, phases, 5.0, 30.0,
+                     "", {}, pressure), false);
+    }
+
+    // A flow-mode pour with healthy flow must not get tagged as choked,
+    // even though the choked-puck check now runs additively on every pour.
+    // With this fixture pressureModeRanges is empty (the only phase is
+    // isFlowMode=true), so inPressureMode returns true for every sample
+    // and the choked loop iterates the whole pour. The 1.7 ml/s flow is
+    // above CHOKED_FLOW_MAX_MLPS = 0.5, so chokedPuck stays false. Locks
+    // in the per-sample threshold gate as the real safeguard.
+    void grindIssue_flowModePourDoesNotTriggerChokedCheck()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "Pour", 0, /*isFlowMode=*/true),
+        };
+        auto flow = flatSeries(0.0, 30.0, 1.7);
+        auto flowGoal = flatSeries(0.0, 30.0, 1.7);
+        auto pressure = flatSeries(0.0, 30.0, 6.0);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/2.0, /*pourEnd=*/28.0,
+            "", {}, pressure);
+        QVERIFY(r.hasData);
+        QVERIFY(!r.chokedPuck);
+        QVERIFY(std::abs(r.delta) < ShotAnalysis::FLOW_DEVIATION_THRESHOLD);
+    }
+
+    // Yield-ratio arm: 80's Espresso-style signature — mean pressurized
+    // flow ~0.6 ml/s (just over the 0.5 flow threshold), with yield well
+    // below target. The flow arm doesn't fire; the yield arm catches this
+    // as the same diagnosis (grind too fine, just less severe than the
+    // catastrophic ~0.3 ml/s case). Yield ratio 24/36 = 0.67 sits below
+    // CHOKED_YIELD_RATIO_MAX (0.70 — tightened from a prior 0.85 by the
+    // 500-shot audit).
+    void grindIssue_chokedPuckPressureMode_yieldShortfallFires()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0,  "preinfusion",       1, /*isFlowMode=*/true),
+            phase(6.0,  "rise and hold",     2, /*isFlowMode=*/false),
+            phase(10.0, "decline",           3, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure;
+        pressure = concat(pressure, rampSeries(0.0, 6.0, 0.5, 6.5));
+        pressure = concat(pressure, flatSeries(6.1, 60.0, 6.5));
+        // Pressurized mean flow 0.6 ml/s — just above the 0.5 flow threshold.
+        QVector<QPointF> flow;
+        flow = concat(flow, flatSeries(0.0, 6.0, 7.0));
+        flow = concat(flow, flatSeries(6.1, 60.0, 0.6));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 60.0, 7.5);
+
+        // Without target/yield, neither arm fires (mean flow 0.6 > 0.5).
+        const auto rNoYield = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 6.0, 60.0, "", {}, pressure);
+        QVERIFY(!rNoYield.chokedPuck);
+
+        // With yield 24 / target 36 = 67 %, yield-ratio arm fires.
+        const auto rYield = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 6.0, 60.0, "", {}, pressure,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/24.0);
+        QVERIFY(rYield.chokedPuck);
+        QCOMPARE(ShotAnalysis::detectGrindIssue(
+                     flow, flowGoal, phases, 6.0, 60.0, "", {}, pressure,
+                     36.0, 24.0), true);
+    }
+
+    // Yield-ratio arm must NOT fire on a clean ristretto where yield ~ target.
+    // Shot 888 signature: 19.8 g of 20 g target (99 %).
+    void grindIssue_chokedPuckPressureMode_cleanRistrettoYieldDoesNotFire()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0,  "preinfusion",       1, /*isFlowMode=*/true),
+            phase(6.0,  "rise and hold",     2, /*isFlowMode=*/false),
+            phase(10.0, "decline",           3, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure;
+        pressure = concat(pressure, rampSeries(0.0, 6.0, 0.5, 6.5));
+        pressure = concat(pressure, flatSeries(6.1, 50.0, 6.5));
+        QVector<QPointF> flow;
+        flow = concat(flow, flatSeries(0.0, 6.0, 7.0));
+        flow = concat(flow, flatSeries(6.1, 50.0, 1.3));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 50.0, 7.5);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 6.0, 50.0, "", {}, pressure,
+            /*targetWeightG=*/20.0, /*finalWeightG=*/19.8);
+        QVERIFY(!r.chokedPuck);
+    }
+
+    // Choked-puck signature with no pressure passed: the fallback must
+    // short-circuit silently rather than evaluate findValueAtTime on empty
+    // data. Locks in the contract that pressure is optional.
+    void grindIssue_chokedPuckPressureMode_emptyPressureSkipsFallback()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0,  "preinfusion",       1, /*isFlowMode=*/true),
+            phase(6.0,  "rise and hold",     2, /*isFlowMode=*/false),
+            phase(10.0, "decline",           3, /*isFlowMode=*/false),
+        };
+        auto flow = concat(flatSeries(0.0, 6.0, 7.5),
+                            flatSeries(6.1, 60.0, 0.2));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 60.0, 7.5);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/6.0, /*pourEnd=*/60.0);
+        QVERIFY(!r.hasData);
+        QVERIFY(!r.chokedPuck);
+    }
+
+    // Yield arm decoupled from the 15s pressurized-duration gate. Shot 745
+    // signature: Adaptive v2, 35 s pour, brief pressurized window (~6 s
+    // ≥ 4 bar — under the 15 s flow-arm gate), yield 23 / 36 = 0.64.
+    // The shared gate previously hid this miss; now the yield arm fires
+    // standalone whenever flowSamples ≥ 5 (any meaningful pressurized
+    // samples) AND yield ratio < CHOKED_YIELD_RATIO_MAX.
+    void grindIssue_yieldArm_firesWithoutSustainedPressurized()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion", 0, /*isFlowMode=*/true),
+            phase(8.0,  "pour",        1, /*isFlowMode=*/false),
+        };
+        // Pressure ramps from 0.5 to 6.5 bar across the 8 s preinfusion
+        // (passes 4 bar partway up), then holds 9 bar from t=8.1-14.0,
+        // then drops to 2.5 bar for the rest of the shot. Total time
+        // above 4 bar ~6 s — under the 15 s flow-arm gate but well over
+        // the 5-sample minimum so the yield arm can fire.
+        QVector<QPointF> pressure;
+        pressure = concat(pressure, rampSeries(0.0, 8.0, 0.5, 6.5));
+        pressure = concat(pressure, flatSeries(8.1, 14.0, 9.0));
+        pressure = concat(pressure, flatSeries(14.1, 35.0, 2.5));
+        QVector<QPointF> flow;
+        flow = concat(flow, flatSeries(0.0, 8.0, 5.0));
+        flow = concat(flow, flatSeries(8.1, 35.0, 1.5));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 35.0, 5.0);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/8.0, /*pourEnd=*/35.0,
+            /*beverageType=*/"", /*analysisFlags=*/{},
+            pressure,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/23.0);
+        QVERIFY2(r.chokedPuck,
+                 "yield arm must fire on brief-pressurized + low-yield shot 745");
+        QVERIFY(r.hasData);
+        QVERIFY2(!r.verifiedClean,
+                 "verifiedClean must require sustained pressurized window");
+    }
+
+    // Borderline yield ratio between the new threshold (0.70) and the prior
+    // value (0.85) must stay silent. Locks in that the threshold tightening
+    // doesn't over-flag profiles that legitimately deliver 71-85% of target.
+    void grindIssue_yieldArm_doesNotFireOnBorderlineRatio()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion", 0, /*isFlowMode=*/true),
+            phase(8.0,  "pour",        1, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure;
+        pressure = concat(pressure, rampSeries(0.0, 8.0, 0.5, 6.5));
+        pressure = concat(pressure, flatSeries(8.1, 14.0, 9.0));
+        pressure = concat(pressure, flatSeries(14.1, 35.0, 2.5));
+        QVector<QPointF> flow;
+        flow = concat(flow, flatSeries(0.0, 8.0, 5.0));
+        flow = concat(flow, flatSeries(8.1, 35.0, 1.5));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 35.0, 5.0);
+
+        // Yield 27 / 36 = 0.75 — above the 0.70 threshold, below the prior 0.85.
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/8.0, /*pourEnd=*/35.0,
+            /*beverageType=*/"", /*analysisFlags=*/{},
+            pressure,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/27.0);
+        QVERIFY2(!r.chokedPuck,
+                 "0.75 yield ratio must not fire under the 0.70 threshold");
+    }
+
+    // Flow arm still requires the 15s sustained pressurized gate — only the
+    // yield arm decoupled. A low-mean-flow shot with insufficient pressurized
+    // duration must NOT fire chokedPuck via the flow arm; the yield arm only
+    // fires when target/final-weight metadata is present.
+    void grindIssue_flowArm_stillRequiresFifteenSecondsPressurized()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion", 0, /*isFlowMode=*/true),
+            phase(8.0,  "pour",        1, /*isFlowMode=*/false),
+        };
+        // 10 s of sustained pressure (under the 15 s gate), with very low
+        // mean flow (0.3 mL/s, well under the 0.5 flow threshold).
+        QVector<QPointF> pressure;
+        pressure = concat(pressure, rampSeries(0.0, 8.0, 0.5, 6.5));
+        pressure = concat(pressure, flatSeries(8.1, 18.0, 9.0));
+        pressure = concat(pressure, flatSeries(18.1, 25.0, 2.0));
+        QVector<QPointF> flow;
+        flow = concat(flow, flatSeries(0.0, 8.0, 5.0));
+        flow = concat(flow, flatSeries(8.1, 25.0, 0.3));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 25.0, 5.0);
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, /*pourStart=*/8.0, /*pourEnd=*/25.0,
+            /*beverageType=*/"", /*analysisFlags=*/{},
+            pressure);
+        QVERIFY2(!r.chokedPuck,
+                 "flow arm must keep its 15s pressurized gate — must not fire on 10s sustained");
+    }
+
+    // generateSummary on a choked-puck shot must emit the dedicated warning
+    // line and the "Puck choked — grind way too fine" verdict, NOT the
+    // generic "Puck integrity issue" verdict. Locks in the verdict ordering
+    // (chokedPuck branch must come before the hasWarning branch in the
+    // verdict if/else cascade).
+    void generateSummary_chokedPuck_emitsTailoredVerdict()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0,  "preinfusion",       1, /*isFlowMode=*/true),
+            phase(6.0,  "rise and hold",     2, /*isFlowMode=*/false),
+            phase(10.0, "decline",           3, /*isFlowMode=*/false),
+        };
+        // Mirror the real shot 890: pressure stays well under 4 bar during
+        // preinfusion, then jumps into the pressure-mode pour at 6.6 bar.
+        // Otherwise the preinfusion flow (7.5 ml/s) drags the choked-window
+        // mean above the 0.5 threshold.
+        QVector<QPointF> pressure = concat(flatSeries(0.0, 5.9, 1.7),
+                                            rampSeries(5.9, 6.0, 1.7, 6.6));
+        pressure = concat(pressure, flatSeries(6.1, 60.0, 6.6));
+        QVector<QPointF> flow = concat(flatSeries(0.0, 6.0, 7.5),
+                                        flatSeries(6.1, 60.0, 0.2));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 60.0, 7.5);
+        QVector<QPointF> temperature = flatSeries(0.0, 60.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 60.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 60.0, 0.0);
+        QVector<QPointF> weight;  // unused
+
+        const QVariantList lines = ShotAnalysis::generateSummary(
+            pressure, flow, weight,
+            dCdt, phases, /*beverageType=*/"espresso", /*duration=*/60.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{});
+
+        bool sawChokedWarning = false;
+        QString verdictText;
+        for (const QVariant& v : lines) {
+            const QVariantMap m = v.toMap();
+            const QString type = m["type"].toString();
+            const QString text = m["text"].toString();
+            if (type == "warning" && text.contains("puck choked", Qt::CaseInsensitive))
+                sawChokedWarning = true;
+            if (type == "verdict")
+                verdictText = text;
+        }
+        QVERIFY2(sawChokedWarning, "expected the choked-puck warning line");
+        QVERIFY2(verdictText.contains("Puck choked", Qt::CaseInsensitive),
+                 qPrintable("verdict was: " + verdictText));
+        QVERIFY2(!verdictText.contains("Puck integrity issue", Qt::CaseInsensitive),
+                 qPrintable("verdict fell through to puck-integrity branch: " + verdictText));
+    }
+
+    // Yield-overshoot ("gusher") arm ---------------------------------------
+
+    // Shot 835 signature: 18 g → 40 g target, 56.3 g actual (1.41 ratio) on
+    // grind 11. The puck offered too little resistance; the existing detectors
+    // are silent because flow tracks goal in flow-mode, the pressure-mode choke
+    // arms gate on 15 s × 4 bar (which a gusher never reaches), and detectPour-
+    // Truncated needs peak < 2.5 bar (a gusher can briefly exceed). The yield-
+    // overshoot arm fires on yield/target alone.
+    void grindIssue_yieldOvershoot_fires()
+    {
+        // Trivial flow/pressure curves — the arm runs purely off final/target.
+        auto flow = flatSeries(0.0, 35.0, 1.6);
+        auto flowGoal = flatSeries(0.0, 35.0, 1.8);
+        auto pressure = flatSeries(0.0, 35.0, 4.5);
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion", 0, /*isFlowMode=*/true),
+            phase(8.0, "pour",        1, /*isFlowMode=*/true),
+        };
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 8.0, 35.0, "espresso", {}, pressure,
+            /*targetWeightG=*/40.0, /*finalWeightG=*/56.3);
+        QVERIFY(r.hasData);
+        QVERIFY(r.yieldOvershoot);
+        QVERIFY(!r.chokedPuck);
+        QCOMPARE(ShotAnalysis::detectGrindIssue(
+                     flow, flowGoal, phases, 8.0, 35.0, "espresso", {},
+                     pressure, 40.0, 56.3), true);
+    }
+
+    // Boundary: 1.20 ratio is the threshold (open). Just under (1.19) must
+    // not fire; well over (1.41) must fire.
+    void grindIssue_yieldOvershoot_thresholdBoundary()
+    {
+        auto flow = flatSeries(0.0, 30.0, 1.5);
+        auto flowGoal = flatSeries(0.0, 30.0, 1.8);
+        auto pressure = flatSeries(0.0, 30.0, 6.0);
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "pour", 0, /*isFlowMode=*/true),
+        };
+
+        // 47.6 / 40 = 1.19 — just under the 1.20 threshold, must NOT fire.
+        const auto rUnder = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 0.0, 30.0, "espresso", {}, pressure,
+            40.0, 47.6);
+        QVERIFY(!rUnder.yieldOvershoot);
+
+        // 48.5 / 40 = 1.2125 — just over, must fire.
+        const auto rOver = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 0.0, 30.0, "espresso", {}, pressure,
+            40.0, 48.5);
+        QVERIFY(rOver.yieldOvershoot);
+    }
+
+    // Yield equal to target (clean shot) must not fire.
+    void grindIssue_yieldOvershoot_cleanShotDoesNotFire()
+    {
+        auto flow = flatSeries(0.0, 30.0, 1.6);
+        auto flowGoal = flatSeries(0.0, 30.0, 1.8);
+        auto pressure = flatSeries(0.0, 30.0, 6.0);
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "pour", 0, /*isFlowMode=*/true),
+        };
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 0.0, 30.0, "espresso", {}, pressure,
+            40.0, 40.0);
+        QVERIFY(!r.yieldOvershoot);
+    }
+
+    // Imported / partial shot with no target weight: arm correctly stays
+    // silent (target=0 disables the precondition).
+    void grindIssue_yieldOvershoot_zeroTargetSkips()
+    {
+        auto flow = flatSeries(0.0, 30.0, 1.6);
+        auto flowGoal = flatSeries(0.0, 30.0, 1.8);
+        auto pressure = flatSeries(0.0, 30.0, 6.0);
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "pour", 0, /*isFlowMode=*/true),
+        };
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 0.0, 30.0, "espresso", {}, pressure,
+            /*targetWeightG=*/0.0, /*finalWeightG=*/100.0);
+        QVERIFY(!r.yieldOvershoot);
+    }
+
+    // Non-espresso beverage types (filter / pourover / tea / steam / cleaning)
+    // legitimately yield much more than "target" weight relative to dose. The
+    // arm must skip — same hard-skip rule the rest of the grind detector uses.
+    void grindIssue_yieldOvershoot_nonEspressoSkips()
+    {
+        auto flow = flatSeries(0.0, 60.0, 5.0);
+        auto flowGoal = flatSeries(0.0, 60.0, 5.0);
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "pour", 0, /*isFlowMode=*/true),
+        };
+        QVector<QPointF> pressure;
+
+        for (const QString& bev : {QStringLiteral("filter"), QStringLiteral("pourover"),
+                                   QStringLiteral("tea"), QStringLiteral("steam"),
+                                   QStringLiteral("cleaning")}) {
+            const auto r = ShotAnalysis::analyzeFlowVsGoal(
+                flow, flowGoal, phases, 0.0, 60.0, bev, {}, pressure,
+                40.0, 200.0);
+            QVERIFY2(r.skipped, qPrintable(QString("expected skipped for %1").arg(bev)));
+            QVERIFY2(!r.yieldOvershoot,
+                     qPrintable(QString("yieldOvershoot must not fire for %1").arg(bev)));
+        }
+    }
+
+    // Empty pressure / empty flow — the arm runs off yield only and must
+    // still fire even with no curve data. Locks in the "no pressurized
+    // window gate" contract documented in shotanalysis.h.
+    void grindIssue_yieldOvershoot_firesWithEmptyCurves()
+    {
+        QVector<QPointF> flow;       // empty
+        QVector<QPointF> flowGoal;   // empty
+        QVector<QPointF> pressure;   // empty
+        QList<HistoryPhaseMarker> phases;
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 0.0, 0.0, "espresso", {}, pressure,
+            40.0, 56.3);
+        QVERIFY(r.yieldOvershoot);
+        QVERIFY(r.hasData);
+    }
+
+    // analysisFlags("grind_check_skip") suppresses the arm — same as the
+    // rest of the grind detector.
+    void grindIssue_yieldOvershoot_grindCheckSkipFlagSuppresses()
+    {
+        auto flow = flatSeries(0.0, 30.0, 1.6);
+        auto flowGoal = flatSeries(0.0, 30.0, 1.8);
+        auto pressure = flatSeries(0.0, 30.0, 6.0);
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "pour", 0, /*isFlowMode=*/true),
+        };
+
+        const auto r = ShotAnalysis::analyzeFlowVsGoal(
+            flow, flowGoal, phases, 0.0, 30.0, "espresso",
+            QStringList{"grind_check_skip"}, pressure, 40.0, 56.3);
+        QVERIFY(r.skipped);
+        QVERIFY(!r.yieldOvershoot);
+    }
+
+    // generateSummary on a gusher must emit the dedicated warning line and
+    // the "Pour gushed past target" verdict, NOT the generic "Puck integrity
+    // issue" or "Grind appears too coarse" caution. Locks in the verdict
+    // ordering: yieldOvershoot tier sits above hasWarning.
+    void generateSummary_yieldOvershoot_emitsTailoredVerdict()
+    {
+        // Mirror shot 835: 35 s duration, peak ~6 bar (briefly), gusher.
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0,  "preinfusion",       1, /*isFlowMode=*/true),
+            phase(8.0,  "pour",              2, /*isFlowMode=*/true),
+        };
+        QVector<QPointF> pressure;
+        pressure = concat(pressure, rampSeries(0.0, 4.0, 0.0, 6.0));
+        pressure = concat(pressure, rampSeries(4.1, 8.0, 6.0, 3.0));
+        pressure = concat(pressure, flatSeries(8.1, 35.0, 2.5));
+        QVector<QPointF> flow = flatSeries(0.0, 35.0, 1.8);
+        QVector<QPointF> flowGoal = flatSeries(0.0, 35.0, 1.8);
+        QVector<QPointF> temperature = flatSeries(0.0, 35.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 35.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 35.0, 0.0);
+        QVector<QPointF> weight;
+
+        const QVariantList lines = ShotAnalysis::generateSummary(
+            pressure, flow, weight,
+            dCdt, phases, /*beverageType=*/"espresso", /*duration=*/35.4,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/40.0, /*finalWeightG=*/56.3);
+
+        bool sawOvershootWarning = false;
+        QString verdictText;
+        for (const QVariant& v : lines) {
+            const QVariantMap m = v.toMap();
+            const QString type = m["type"].toString();
+            const QString text = m["text"].toString();
+            if (type == "warning" && text.contains("over target", Qt::CaseInsensitive))
+                sawOvershootWarning = true;
+            if (type == "verdict")
+                verdictText = text;
+        }
+        QVERIFY2(sawOvershootWarning, "expected the yield-overshoot warning line");
+        QVERIFY2(verdictText.contains("gushed past target", Qt::CaseInsensitive),
+                 qPrintable("verdict was: " + verdictText));
+        QVERIFY2(!verdictText.contains("Puck integrity issue", Qt::CaseInsensitive),
+                 qPrintable("verdict fell through to puck-integrity branch: " + verdictText));
+    }
+
+    // Pour-truncated detection ---------------------------------------------
+
+    // Shot 868 signature: 7 s duration, pressure never exceeded ~0.6 bar
+    // because the puck offered zero resistance. Must flag as truncated.
+    void pourTruncated_lowPeakPressure_fires()
+    {
+        auto pressure = flatSeries(0.0, 7.0, 0.5);
+        QCOMPARE(ShotAnalysis::detectPourTruncated(pressure, 0.0, 7.0), true);
+    }
+
+    // Normal shot with a real 9-bar peak must not flag.
+    void pourTruncated_normalPeak_doesNotFire()
+    {
+        QVector<QPointF> pressure;
+        // Ramp 0 -> 9 bar, sustain, decline. Peak 9 bar well above the
+        // PRESSURE_FLOOR_BAR threshold (2.5).
+        pressure = concat(pressure, rampSeries(0.0, 5.0, 0.0, 9.0));
+        pressure = concat(pressure, flatSeries(5.1, 25.0, 9.0));
+        pressure = concat(pressure, rampSeries(25.1, 30.0, 9.0, 3.0));
+        QCOMPARE(ShotAnalysis::detectPourTruncated(pressure, 0.0, 30.0), false);
+    }
+
+    // Non-espresso beverage types (tea, filter, cleaning, steam) are
+    // legitimately low-pressure — must not flag.
+    void pourTruncated_nonEspressoBeverage_skips()
+    {
+        auto pressure = flatSeries(0.0, 10.0, 0.5);
+        for (const QString& bev : {QStringLiteral("filter"), QStringLiteral("pourover"),
+                                   QStringLiteral("tea"), QStringLiteral("steam"),
+                                   QStringLiteral("cleaning")}) {
+            QCOMPARE(ShotAnalysis::detectPourTruncated(pressure, 0.0, 10.0, bev), false);
+        }
+        // Unknown / empty beverage type defaults to espresso-style check.
+        QCOMPARE(ShotAnalysis::detectPourTruncated(pressure, 0.0, 10.0, ""), true);
+    }
+
+    // Peak happening outside the pour window (e.g. during fill) should not
+    // count — we're diagnosing extraction pressure.
+    void pourTruncated_peakOutsidePourWindow_fires()
+    {
+        // Short fill spike at t=1 (10 bar), then pour at 0.5 bar.
+        QVector<QPointF> pressure;
+        pressure.append(QPointF(0.0, 0.0));
+        pressure.append(QPointF(0.5, 5.0));
+        pressure.append(QPointF(1.0, 10.0));
+        pressure.append(QPointF(1.5, 5.0));
+        for (double t = 2.0; t <= 8.0; t += 0.1) pressure.append(QPointF(t, 0.5));
+        // Pour window starts at 2 s — misses the fill spike.
+        QCOMPARE(ShotAnalysis::detectPourTruncated(pressure, 2.0, 8.0), true);
+    }
+
+    // ---- Suppression cascade in analyzeShot ----
+    //
+    // When pourTruncated fires, the channeling / flow-trend / grind blocks
+    // all read off curves the failed puck didn't produce, so
+    // their output is unreliable. The summary path suppresses those blocks
+    // entirely and emits a single "Pour never pressurized" warning + the
+    // "Don't tune off this shot" verdict instead. These tests lock in that
+    // behaviour so a future tweak to one of the suppressed blocks can't
+    // accidentally re-introduce a wrong-diagnosis line on a puck-failure
+    // shot. Mirror of issue #903 — see the issue for the user-visible bug
+    // (shot 868 firing "Temp unstable" while the actual signal was a 0.63
+    // bar peak puck failure).
+
+    // Warning line must include the actual peak pressure inside the pour
+    // window (the value the user looks at) and the verdict must lead with
+    // "Don't tune off this shot" rather than the old "Puck failed" wording.
+    void pourTruncated_summary_warningIncludesPeakAndVerdictNamesMetaAction()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0, "pour",              1, /*isFlowMode=*/true),
+        };
+        // Flat 0.6 bar across the pour — well below PRESSURE_FLOOR_BAR (2.5).
+        QVector<QPointF> pressure = flatSeries(0.0, 7.0, 0.6);
+        QVector<QPointF> flow = flatSeries(0.0, 7.0, 7.0);
+        QVector<QPointF> flowGoal = flatSeries(0.0, 7.0, 7.5);
+        QVector<QPointF> temperature = flatSeries(0.0, 7.0, 80.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 7.0, 82.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 7.0, 0.0);
+        QVector<QPointF> weight;
+
+        const QVariantList lines = ShotAnalysis::generateSummary(
+            pressure, flow, weight,
+            dCdt, phases, /*beverageType=*/"espresso", /*duration=*/7.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{});
+
+        bool sawTruncatedWarning = false;
+        QString warningText;
+        QString verdictText;
+        for (const QVariant& v : lines) {
+            const QVariantMap m = v.toMap();
+            const QString type = m["type"].toString();
+            const QString text = m["text"].toString();
+            if (type == "warning" && text.contains("never pressurized", Qt::CaseInsensitive)) {
+                sawTruncatedWarning = true;
+                warningText = text;
+            }
+            if (type == "verdict")
+                verdictText = text;
+        }
+        QVERIFY2(sawTruncatedWarning, "expected the pour-truncated warning line");
+        QVERIFY2(warningText.contains("peak 0.6 bar"),
+                 qPrintable("warning was: " + warningText));
+        QVERIFY2(verdictText.contains("Don't tune off this shot", Qt::CaseInsensitive),
+                 qPrintable("verdict was: " + verdictText));
+        QVERIFY2(verdictText.contains("unreliable", Qt::CaseInsensitive),
+                 qPrintable("verdict should name the unreliable signals: " + verdictText));
+    }
+
+    // Sustained dC/dt elevation must NOT produce a channeling line (or its
+    // green "Puck stable — no channeling spikes" companion) when
+    // pourTruncated fires — the conductance signal is unreliable when peak
+    // pressure stayed below floor.
+    void pourTruncated_summary_suppressesChannelingLines()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0, "pour",              1, /*isFlowMode=*/true),
+        };
+        QVector<QPointF> pressure = flatSeries(0.0, 7.0, 0.6);  // puck failure
+        QVector<QPointF> flow = flatSeries(0.0, 7.0, 7.0);
+        QVector<QPointF> flowGoal = flatSeries(0.0, 7.0, 7.5);
+        QVector<QPointF> temperature = flatSeries(0.0, 7.0, 82.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 7.0, 82.0);
+        // Synthetic dC/dt with a sustained run above the elevated threshold.
+        QVector<QPointF> dCdt;
+        for (double t = 2.0; t <= 7.0; t += 0.05)
+            dCdt.append(QPointF(t, 4.5));  // > CHANNELING_DC_ELEVATED (3.0)
+        QVector<QPointF> weight;
+
+        const QVariantList lines = ShotAnalysis::generateSummary(
+            pressure, flow, weight,
+            dCdt, phases, /*beverageType=*/"espresso", /*duration=*/7.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{});
+
+        for (const QVariant& v : lines) {
+            const QVariantMap m = v.toMap();
+            const QString text = m["text"].toString();
+            QVERIFY2(!text.contains("channeling", Qt::CaseInsensitive)
+                     || text.contains("never pressurized", Qt::CaseInsensitive)
+                     || text.contains("Don't tune off", Qt::CaseInsensitive),
+                     qPrintable("channeling line leaked through suppression: " + text));
+            QVERIFY2(!text.contains("Puck stable", Qt::CaseInsensitive),
+                     qPrintable("green puck-stable line leaked through suppression: " + text));
+        }
+    }
+    // ---- Structured detector results (analyzeShot) ----
+    //
+    // The structured `DetectorResults` struct exists so external consumers
+    // (MCP `shots_get_detail`, regression harnesses) can read the same
+    // signals the in-app dialog renders without parsing prose. These tests
+    // lock in the contract that `lines` and `detectors` describe the same
+    // evaluation — a detector flip moves both fields together. If you
+    // change a verdict string or detector phrasing, the matching field in
+    // DetectorResults must change with it (or these tests will fail).
+
+    // Choked-puck shot: structured fields must mirror the prose verdict.
+    void analyzeShot_chokedPuck_structuredFieldsMatchProse()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0,  "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0,  "preinfusion",       1, /*isFlowMode=*/true),
+            phase(6.0,  "rise and hold",     2, /*isFlowMode=*/false),
+            phase(10.0, "decline",           3, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure = concat(flatSeries(0.0, 5.9, 1.7),
+                                            rampSeries(5.9, 6.0, 1.7, 6.6));
+        pressure = concat(pressure, flatSeries(6.1, 60.0, 6.6));
+        QVector<QPointF> flow = concat(flatSeries(0.0, 6.0, 7.5),
+                                        flatSeries(6.1, 60.0, 0.2));
+        QVector<QPointF> flowGoal = flatSeries(0.0, 60.0, 7.5);
+        QVector<QPointF> temperature = flatSeries(0.0, 60.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 60.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 60.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 60.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{});
+
+        const auto& d = result.detectors;
+        QVERIFY(d.grindChecked);
+        QVERIFY(d.grindHasData);
+        QVERIFY(d.grindChokedPuck);
+        QCOMPARE(d.grindDirection, QStringLiteral("chokedPuck"));
+        QCOMPARE(d.verdictCategory, QStringLiteral("chokedPuck"));
+        QVERIFY(!d.pourTruncated);
+
+        // Cross-check: prose still names the same diagnosis. If this
+        // assertion fails alongside grindDirection still being "chokedPuck",
+        // the lines and detectors have drifted — analyzeShot must keep them
+        // in lockstep.
+        bool sawChokedVerdict = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["type"].toString() == "verdict"
+                && m["text"].toString().contains("Puck choked", Qt::CaseInsensitive))
+                sawChokedVerdict = true;
+        }
+        QVERIFY2(sawChokedVerdict, "structured chokedPuck verdict must match prose");
+    }
+
+    // Pour-truncated cascade: when pourTruncated fires, downstream detectors
+    // must report `checked == false` so MCP consumers don't read their
+    // default fields as "clean signal."
+    void analyzeShot_pourTruncated_suppressedDetectorsReportNotChecked()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0, "pour",              1, /*isFlowMode=*/true),
+        };
+        QVector<QPointF> pressure = flatSeries(0.0, 7.0, 0.6);  // puck failure
+        QVector<QPointF> flow = flatSeries(0.0, 7.0, 7.0);
+        QVector<QPointF> flowGoal = flatSeries(0.0, 7.0, 7.5);
+        QVector<QPointF> temperature = flatSeries(0.0, 7.0, 82.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 7.0, 82.0);
+        QVector<QPointF> dCdt;
+        for (double t = 2.0; t <= 7.0; t += 0.05)
+            dCdt.append(QPointF(t, 4.5));  // would normally trigger sustained channeling
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 7.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{});
+
+        const auto& d = result.detectors;
+        QVERIFY(d.pourTruncated);
+        QVERIFY(d.peakPressureBar > 0.0);
+        QCOMPARE(d.verdictCategory, QStringLiteral("puckTruncated"));
+        // Cascade: channeling/grind suppressed — must report not-checked
+        // (distinct from "checked, no signal"). Flow trend is also
+        // suppressed but its `checked` flag may stay false for the same
+        // reason; we don't require a specific value, only that the prose
+        // and structured fields agree.
+        QVERIFY2(!d.channelingChecked,
+                 "pourTruncated must suppress channeling check");
+        QVERIFY2(!d.grindChecked,
+                 "pourTruncated must suppress grind check");
+    }
+
+    // Clean shot: structured `verdictCategory == "clean"` must match the
+    // "Clean shot. Puck held well." prose verdict.
+    void analyzeShot_cleanShot_verdictCategoryMatches()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(8.0, "pour",              1, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure = concat(rampSeries(0.0, 8.0, 1.0, 9.0),
+                                            flatSeries(8.1, 30.0, 9.0));
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> temperature = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight = rampSeries(0.0, 30.0, 0.0, 36.0);
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            pressureGoal, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/36.0);
+
+        const auto& d = result.detectors;
+        QCOMPARE(d.verdictCategory, QStringLiteral("clean"));
+        QVERIFY(!d.pourTruncated);
+        QVERIFY(!d.skipFirstFrame);
+
+        bool sawCleanVerdict = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["type"].toString() == "verdict"
+                && m["text"].toString().contains("Clean shot", Qt::CaseInsensitive))
+                sawCleanVerdict = true;
+        }
+        QVERIFY2(sawCleanVerdict, "structured clean verdict must match prose");
+    }
+
+    // ---- Expert-recommended operating band (change: flag-off-expert-band-in-shot-summary) ----
+
+    static void bandFixture(double peakBar,
+                            QList<HistoryPhaseMarker>& phases,
+                            QVector<QPointF>& pressure, QVector<QPointF>& flow,
+                            QVector<QPointF>& weight, QVector<QPointF>& dCdt,
+                            QVector<QPointF>& pressureGoal,
+                            QVector<QPointF>& flowGoal)
+    {
+        ShotCurveFixtures::bandFixture(peakBar, phases, pressure, flow, weight, dCdt,
+                                        pressureGoal, flowGoal);
+    }
+
+    static ShotAnalysis::ExpertBand goldBand()
+    {
+        return ShotAnalysis::ExpertBand::pressureBand(
+            6.0, 9.0, QStringLiteral("[SRC:profile-notes]"),
+            QStringLiteral("high"));
+    }
+
+    static const QVariantMap* findKind(const QVariantList& lines,
+                                       const QString& kind, QVariantMap& out)
+    {
+        for (const QVariant& v : lines) {
+            const QVariantMap m = v.toMap();
+            if (m["kind"].toString() == kind) { out = m; return &out; }
+        }
+        return nullptr;
+    }
+
+    // A5.1 + A5.2a: peak below the cited band (by > margin) → one soft
+    // observation line + verdictCategory expertBandDeviation; the line is
+    // taste-deferring, never a grind direction; the verdict text likewise;
+    // A5.3: no limiter clause (deferred). Gates clear (not truncated/
+    // channeling).
+    void expertBand_outsideBand_firesObservation_andDeviationVerdict()
+    {
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/4.5, phases, pr, fl, wt, dc, pg, fg);
+
+        const auto r = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, goldBand());
+
+        QVariantMap line;
+        QVERIFY2(findKind(r.lines, QStringLiteral("expert_band_deviation"), line),
+                 "expected an expert_band_deviation line for a 4.5 bar peak vs 6-9 band");
+        QCOMPARE(line["type"].toString(), QStringLiteral("observation"));
+        const QString t = line["text"].toString();
+        QVERIFY2(t.contains("outside") && t.contains("judge by taste")
+                     && t.contains("[SRC:profile-notes]"),
+                 qPrintable("line text: " + t));
+        for (const QString& dir : { QStringLiteral("grind"), QStringLiteral("finer"),
+                                    QStringLiteral("coarser"), QStringLiteral("too fine"),
+                                    QStringLiteral("too coarse") })
+            QVERIFY2(!t.contains(dir, Qt::CaseInsensitive),
+                     qPrintable("band line must not state a grind direction: " + t));
+        QVERIFY2(!t.contains("limiter", Qt::CaseInsensitive),
+                 "limiter clause is deferred (A2.4) — line must not carry it");
+
+        QCOMPARE(r.detectors.verdictCategory, QStringLiteral("expertBandDeviation"));
+        QVERIFY(!r.detectors.pourTruncated);
+        bool sawVerdict = false;
+        for (const QVariant& v : r.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["type"].toString() == "verdict") {
+                sawVerdict = true;
+                const QString vt = m["text"].toString();
+                QVERIFY2(vt.contains("judge by taste", Qt::CaseInsensitive),
+                         qPrintable("verdict must defer to taste: " + vt));
+                QVERIFY2(!vt.contains("finer", Qt::CaseInsensitive)
+                             && !vt.contains("coarser", Qt::CaseInsensitive),
+                         qPrintable("verdict must not state a grind direction: " + vt));
+            }
+        }
+        QVERIFY(sawVerdict);
+    }
+
+    // A5.1: peak comfortably inside the band → silent.
+    void expertBand_insideBand_silent()
+    {
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/8.0, phases, pr, fl, wt, dc, pg, fg);
+        const auto r = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, goldBand());
+        QVariantMap line;
+        QVERIFY2(!findKind(r.lines, QStringLiteral("expert_band_deviation"), line),
+                 "8 bar is inside 6-9 — must not fire");
+        QVERIFY(r.detectors.verdictCategory != QStringLiteral("expertBandDeviation"));
+    }
+
+    // A5.1 margin gate: 5.85 bar is below lo (6.0) but within the 0.3
+    // margin (threshold 5.7) → silent.
+    void expertBand_subMargin_silent()
+    {
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/5.85, phases, pr, fl, wt, dc, pg, fg);
+        const auto r = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, goldBand());
+        QVariantMap line;
+        QVERIFY2(!findKind(r.lines, QStringLiteral("expert_band_deviation"), line),
+                 "5.85 bar is within the firing margin of the 6.0 floor — must not fire");
+    }
+
+    // A5.2 + A5.7: absent band → strict no-op. Omitting the param and
+    // passing std::nullopt both produce results byte-identical to
+    // each other AND identical four-boolean badge projection / verdict.
+    void expertBand_absent_strictNoOp()
+    {
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/4.5, phases, pr, fl, wt, dc, pg, fg);
+
+        const auto noParam = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0);
+        const auto absentBand = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, std::nullopt);
+
+        QVariantMap line;
+        QVERIFY(!findKind(noParam.lines, QStringLiteral("expert_band_deviation"), line));
+        QVERIFY(!findKind(absentBand.lines, QStringLiteral("expert_band_deviation"), line));
+        QCOMPARE(absentBand.lines, noParam.lines);  // byte-identical prose
+        QCOMPARE(absentBand.detectors.verdictCategory,
+                 noParam.detectors.verdictCategory);
+        const auto b0 = decenza::deriveBadgesFromAnalysis(noParam.detectors);
+        const auto b1 = decenza::deriveBadgesFromAnalysis(absentBand.detectors);
+        QCOMPARE(b1.pourTruncatedDetected, b0.pourTruncatedDetected);
+        QCOMPARE(b1.channelingDetected,    b0.channelingDetected);
+        QCOMPARE(b1.grindIssueDetected,    b0.grindIssueDetected);
+        QCOMPARE(b1.skipFirstFrameDetected,b0.skipFirstFrameDetected);
+    }
+
+    // A5.1 gate: a pour-truncated shot (peak < PRESSURE_FLOOR_BAR) with a
+    // present band that the peak is "outside" → the band line is suppressed
+    // and the dominant fault verdict wins.
+    void expertBand_pourTruncatedGate_suppresses()
+    {
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/1.5, phases, pr, fl, wt, dc, pg, fg);  // < 2.5 floor
+        const auto r = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, goldBand());
+        QVariantMap line;
+        QVERIFY2(!findKind(r.lines, QStringLiteral("expert_band_deviation"), line),
+                 "pour-truncated must hard-gate the band line");
+        QCOMPARE(r.detectors.verdictCategory, QStringLiteral("puckTruncated"));
+    }
+
+    // A5.2a (fault dominance) + A5.7: a real fault (yield overshoot) AND
+    // out-of-band → the band line still appears as a corroborating
+    // observation, but the verdict is the fault's, not expertBandDeviation;
+    // and the four-boolean badge projection is byte-identical with vs
+    // without the band.
+    void expertBand_realFaultDominates_lineStillCorroborates()
+    {
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/4.5, phases, pr, fl, wt, dc, pg, fg);
+
+        const auto withBand = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, /*targetWeightG=*/36.0, /*finalWeightG=*/50.0, -1, goldBand());
+        const auto noBand = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 50.0);
+
+        QCOMPARE(withBand.detectors.verdictCategory, QStringLiteral("yieldOvershoot"));
+        QVERIFY(withBand.detectors.verdictCategory != QStringLiteral("expertBandDeviation"));
+        QVariantMap line;
+        QVERIFY2(findKind(withBand.lines, QStringLiteral("expert_band_deviation"), line),
+                 "band line still present as a corroborating observation");
+        QCOMPARE(line["type"].toString(), QStringLiteral("observation"));
+
+        const auto b0 = decenza::deriveBadgesFromAnalysis(noBand.detectors);
+        const auto b1 = decenza::deriveBadgesFromAnalysis(withBand.detectors);
+        QCOMPARE(b1.pourTruncatedDetected, b0.pourTruncatedDetected);
+        QCOMPARE(b1.channelingDetected,    b0.channelingDetected);
+        QCOMPARE(b1.grindIssueDetected,    b0.grindIssueDetected);
+        QCOMPARE(b1.skipFirstFrameDetected,b0.skipFirstFrameDetected);
+    }
+
+    // PR-review (pr-test-analyzer): the extraction-flow axis is implemented
+    // in analyzeShot but Phase A seeds only pressure bands, so the flow
+    // branch shipped unexercised. Pin it with a synthetic ExpertBand so a
+    // bug in the flow peak-scan / EXPERT_BAND_FLOW_MARGIN_MLPS gate can't
+    // rot uncaught until a later phase ships a real flow band.
+    void expertBand_flowAxis_firesAndSilent_perBand()
+    {
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/8.0, phases, pr, fl, wt, dc, pg, fg);  // clean pressure; flow flat 1.8
+        using EB = ShotAnalysis::ExpertBand;
+
+        // Observed peak extraction flow (~1.8 ml/s) is well below a cited
+        // 4.0–6.0 ml/s band → fires on the FLOW axis: observation, ml/s
+        // wording, no grind direction, expertBandDeviation verdict.
+        const EB outBand = EB::flowBand(4.0, 6.0,
+                          QStringLiteral("[SRC:light-video]"),
+                          QStringLiteral("high"));
+        const auto fired = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, outBand);
+        QVariantMap line;
+        QVERIFY2(findKind(fired.lines, QStringLiteral("expert_band_deviation"), line),
+                 "flow ~1.8 ml/s vs 4.0–6.0 band must fire on the flow axis");
+        QCOMPARE(line["type"].toString(), QStringLiteral("observation"));
+        const QString t = line["text"].toString();
+        QVERIFY2(t.contains("ml/s"), qPrintable("flow-axis line names ml/s: " + t));
+        for (const QString& d : { QStringLiteral("grind"), QStringLiteral("finer"),
+                                  QStringLiteral("coarser") })
+            QVERIFY2(!t.contains(d, Qt::CaseInsensitive),
+                     qPrintable("flow band line must not state a grind direction: " + t));
+        QCOMPARE(fired.detectors.verdictCategory, QStringLiteral("expertBandDeviation"));
+
+        // Same shot, a band that contains ~1.8 ml/s → silent.
+        const EB inBand = EB::flowBand(1.0, 3.0,
+                         QStringLiteral("[SRC:light-video]"),
+                         QStringLiteral("high"));
+        const auto silent = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, inBand);
+        QVERIFY2(!findKind(silent.lines, QStringLiteral("expert_band_deviation"), line),
+                 "flow within the cited band must stay silent");
+        QVERIFY(silent.detectors.verdictCategory != QStringLiteral("expertBandDeviation"));
+    }
+
+    // The ExpertBand reshape exists to make a ONE-SIDED flow floor
+    // expressible (Allongé's cited "reach ~4.5 ml/s, no ceiling"). That
+    // path — flowFloor() + the `belowFloor` branch with hi==nullopt + the
+    // "below the ~X" prose arm — had no test; the flow-axis test above
+    // uses two-sided flowBand(). Pin it: observed peak flow below the
+    // floor (by > margin) fires a one-sided observation that names only
+    // the floor (no fabricated ceiling), no grind direction,
+    // expertBandDeviation verdict; at/above the floor stays silent.
+    void expertBand_flowFloor_firesAndSilent()
+    {
+        using EB = ShotAnalysis::ExpertBand;
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/8.0, phases, pr, fl, wt, dc, pg, fg);  // flow flat ~1.8
+
+        // ~1.8 ml/s observed, floor 4.5 → below by > margin → fires.
+        const EB floor = EB::flowFloor(4.5, QStringLiteral("[SRC:light-video]"),
+                                       QStringLiteral("medium"));
+        const auto fired = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, floor);
+        QVariantMap line;
+        QVERIFY2(findKind(fired.lines, QStringLiteral("expert_band_deviation"), line),
+                 "flow ~1.8 ml/s vs a 4.5 floor must fire");
+        QCOMPARE(line["type"].toString(), QStringLiteral("observation"));
+        const QString t = line["text"].toString();
+        QVERIFY2(t.contains("below the ~") && t.contains("ml/s"),
+                 qPrintable("floor-only line names only the floor: " + t));
+        QVERIFY2(!t.contains("–") && !t.contains("outside the"),
+                 qPrintable("one-sided line must NOT render a two-sided band: " + t));
+        for (const QString& d : { QStringLiteral("grind"), QStringLiteral("finer"),
+                                  QStringLiteral("coarser") })
+            QVERIFY2(!t.contains(d, Qt::CaseInsensitive),
+                     qPrintable("floor line must not state a grind direction: " + t));
+        QCOMPARE(fired.detectors.verdictCategory, QStringLiteral("expertBandDeviation"));
+
+        // Floor below the observed flow → at/above the floor → silent.
+        const EB lowFloor = EB::flowFloor(1.0, QStringLiteral("[SRC:light-video]"),
+                                          QStringLiteral("medium"));
+        const auto silent = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, lowFloor);
+        QVERIFY2(!findKind(silent.lines, QStringLiteral("expert_band_deviation"), line),
+                 "flow at/above the floor must stay silent");
+        QVERIFY(silent.detectors.verdictCategory != QStringLiteral("expertBandDeviation"));
+    }
+
+    // Regression lock for the sustained (median) vs peak fix. A
+    // flow-controlled profile (Rao Allongé) momentarily touches its
+    // commanded ~4.5 ml/s setpoint even when the pressure limiter has
+    // choked the SUSTAINED flow far below it. The OLD peak measure read
+    // ~4.6 and stayed silent on these genuinely-too-fine shots; the
+    // median measure reads the real sustained flow and fires. Pin both.
+    void expertBand_flowFloor_usesSustainedNotPeak()
+    {
+        using EB = ShotAnalysis::ExpertBand;
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/5.0, phases, pr, fl, wt, dc, pg, fg);
+        const EB floor = EB::flowFloor(4.5, QStringLiteral("[SRC:light-video]"),
+                                       QStringLiteral("medium"));
+
+        // Sustained ~2.5 ml/s with a brief ~1 s spike that touches 4.6
+        // (the commanded setpoint). Peak = 4.6 (>= 4.2 → old code SILENT,
+        // the bug). Median ≈ 2.5 (< 4.2 → fires, correct).
+        fl = concat(concat(flatSeries(0.0, 14.0, 2.5),
+                           flatSeries(14.1, 15.0, 4.6)),
+                    flatSeries(15.1, 30.0, 2.5));
+        const auto fired = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, floor);
+        QVariantMap line;
+        QVERIFY2(findKind(fired.lines, QStringLiteral("expert_band_deviation"), line),
+                 "sustained ~2.5 ml/s (brief 4.6 spike) must fire — median, not peak");
+        const QString t = line["text"].toString();
+        QVERIFY2(t.contains("below the ~") && t.contains("ml/s"),
+                 qPrintable("text: " + t));
+
+        // Genuinely sustained at the setpoint → median ~4.6 ≥ floor → silent.
+        QVector<QPointF> fl2 = flatSeries(0.0, 30.0, 4.6);
+        const auto silent = ShotAnalysis::analyzeShot(
+            pr, fl2, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, floor);
+        QVERIFY2(!findKind(silent.lines, QStringLiteral("expert_band_deviation"), line),
+                 "sustained ~4.6 ml/s reaches the floor — must stay silent");
+    }
+
+    // Phase D (D1) / A5.7: the extraction-flow band coexists with
+    // analyzeFlowVsGoal without interference. Even when the flowFloor
+    // FIRES, the four-boolean badge projection and the
+    // analyzeFlowVsGoal-derived grindIssue must be byte-identical to the
+    // std::nullopt run — the band only adds a summaryLine + sets
+    // verdictCategory, it never perturbs the mechanical detectors.
+    void expertBand_flowFloor_isStrictNoOpOnDetectors()
+    {
+        using EB = ShotAnalysis::ExpertBand;
+        QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+        bandFixture(/*peakBar=*/8.0, phases, pr, fl, wt, dc, pg, fg);  // flow flat ~1.8
+        const EB floor = EB::flowFloor(4.5, QStringLiteral("[SRC:light-video]"),
+                                       QStringLiteral("medium"));
+
+        const auto without = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, std::nullopt);
+        const auto with = ShotAnalysis::analyzeShot(
+            pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+            -1.0, 36.0, 36.0, -1, floor);
+
+        QVariantMap line;
+        QVERIFY2(!findKind(without.lines, QStringLiteral("expert_band_deviation"), line),
+                 "no band → no line");
+        QVERIFY2(findKind(with.lines, QStringLiteral("expert_band_deviation"), line),
+                 "flowFloor fires on ~1.8 ml/s vs 4.5 — the firing case is what we lock");
+
+        // Mechanical detectors must be byte-identical despite the fire.
+        const auto b0 = decenza::deriveBadgesFromAnalysis(without.detectors);
+        const auto b1 = decenza::deriveBadgesFromAnalysis(with.detectors);
+        QCOMPARE(b1.pourTruncatedDetected, b0.pourTruncatedDetected);
+        QCOMPARE(b1.channelingDetected,    b0.channelingDetected);
+        QCOMPARE(b1.grindIssueDetected,    b0.grindIssueDetected);  // analyzeFlowVsGoal arm
+        QCOMPARE(b1.skipFirstFrameDetected,b0.skipFirstFrameDetected);
+        // Only the band's own outputs may differ.
+        QVERIFY(with.detectors.verdictCategory == QStringLiteral("expertBandDeviation"));
+        QVERIFY(without.detectors.verdictCategory != QStringLiteral("expertBandDeviation"));
+    }
+
+    // Phase B: the A-Flow rail. Same pressure-axis 6–9 shape as the gold
+    // pair but `[SRC:aflow-repo]` / medium confidence (Janek's editor
+    // dial-in guidance "pressure peak 6–9 bar at extraction"). Pin the
+    // partition validated against the real community A-Flow / default-medium
+    // population (20 shots, 4 users — see tasks.md B2): a ~10 bar peak
+    // (grind too fine → pegs default-medium's 10-bar Flow-Extraction
+    // limiter, "10-bar A-Flow is normally terrible") MUST fire above-band;
+    // an on-target ~7 bar peak MUST stay silent. Guards against the
+    // withdrawn rating-led STOP regressing back in.
+    void expertBand_aflow_pegged10Fires_onTarget7Silent()
+    {
+        using EB = ShotAnalysis::ExpertBand;
+        const EB aflow = EB::pressureBand(6.0, 9.0,
+                        QStringLiteral("[SRC:aflow-repo]"),
+                        QStringLiteral("medium"));
+
+        // ~10.2 bar peak = too fine / limiter-pegged = the bad regime → fire.
+        {
+            QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+            bandFixture(/*peakBar=*/10.2, phases, pr, fl, wt, dc, pg, fg);
+            const auto r = ShotAnalysis::analyzeShot(
+                pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+                -1.0, 36.0, 36.0, -1, aflow);
+            QVariantMap line;
+            QVERIFY2(findKind(r.lines, QStringLiteral("expert_band_deviation"), line),
+                     "A-Flow ~10.2 bar (limiter-pegged, too fine) must fire above the 6-9 band");
+            QCOMPARE(line["type"].toString(), QStringLiteral("observation"));
+            const QString t = line["text"].toString();
+            QVERIFY2(t.contains("[SRC:aflow-repo]"),
+                     qPrintable("A-Flow line cites the author guidance: " + t));
+            for (const QString& d : { QStringLiteral("grind"), QStringLiteral("finer"),
+                                      QStringLiteral("coarser") })
+                QVERIFY2(!t.contains(d, Qt::CaseInsensitive),
+                         qPrintable("A-Flow band line must not state a grind direction: " + t));
+            QCOMPARE(r.detectors.verdictCategory, QStringLiteral("expertBandDeviation"));
+        }
+
+        // ~7.0 bar peak = on Janek's target, off the limiter → silent.
+        {
+            QList<HistoryPhaseMarker> phases; QVector<QPointF> pr, fl, wt, dc, pg, fg;
+            bandFixture(/*peakBar=*/7.0, phases, pr, fl, wt, dc, pg, fg);
+            const auto r = ShotAnalysis::analyzeShot(
+                pr, fl, wt, dc, phases, "espresso", 30.0, pg, fg, {},
+                -1.0, 36.0, 36.0, -1, aflow);
+            QVariantMap line;
+            QVERIFY2(!findKind(r.lines, QStringLiteral("expert_band_deviation"), line),
+                     "A-Flow ~7 bar is on-target (6-9) — must stay silent");
+            QVERIFY(r.detectors.verdictCategory != QStringLiteral("expertBandDeviation"));
+        }
+    }
+
+    // Grind coverage signal — verified clean: a healthy pressurized pour
+    // with no choke / no overshoot / on-target flow must set
+    // grindVerifiedClean=true, emit `grindCoverage="verified"`, and append
+    // a [good] line confirming the puck behaved. Without this signal the
+    // dialog falls back on inferring "Clean" from no-data, which is
+    // exactly the long-running gap on simple two-marker profiles. The
+    // fixture's flow-mode phase ends at pourStart=8 so Arm 1 sees no
+    // qualifying samples (sampleCount=0); verifiedClean is supplied by
+    // Arm 2's sustained-pressurized-flow gate alone. The [good] line
+    // text therefore SHALL be the honest "Puck sustained healthy
+    // pressure during pour" — NOT the legacy "Grind tracked goal" which
+    // would falsely cite an Arm 1 measurement that wasn't taken. See
+    // openspec change skip-grind-arm1-when-kb-unresolved.
+    void analyzeShot_grindCoverage_verifiedCleanEmitsPositiveLine()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(8.0, "pour",              1, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure = concat(rampSeries(0.0, 8.0, 1.0, 9.0),
+                                            flatSeries(8.1, 30.0, 9.0));
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 2.0);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 2.0);
+        QVector<QPointF> temperature = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            pressureGoal, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/36.0, /*finalWeightG=*/36.0);
+
+        const auto& d = result.detectors;
+        QVERIFY(d.grindHasData);
+        QVERIFY(d.grindVerifiedClean);
+        QVERIFY(!d.grindChokedPuck);
+        QVERIFY(!d.grindYieldOvershoot);
+        QCOMPARE(d.grindSampleCount, qsizetype{0});  // Arm 1 saw no samples
+        QCOMPARE(d.grindCoverage, QStringLiteral("verified"));
+        QCOMPARE(d.verdictCategory, QStringLiteral("clean"));
+
+        bool sawVerifiedLine = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["type"].toString() == "good"
+                && m["text"].toString().contains("Puck sustained healthy pressure",
+                                                 Qt::CaseInsensitive))
+                sawVerifiedLine = true;
+        }
+        QVERIFY2(sawVerifiedLine,
+                 "Arm-2-only verified-clean shot must emit the sustained-pressure [good] line");
+    }
+
+    // Grind coverage signal — not analyzable: a two-marker profile whose
+    // pour-mode phase never sustains 4 bar long enough to satisfy Arm 2
+    // (and whose flow-mode windows are entirely before pourStart, so Arm 1
+    // sees no qualifying samples) must produce a notAnalyzable coverage
+    // signal, the [observation] line, and the alternate verdict text.
+    // Regression for the 248-shot silent population in the audit.
+    void analyzeShot_grindCoverage_notAnalyzableEmitsObservation()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion", 0, /*isFlowMode=*/true),
+            phase(20.0, "pour",       1, /*isFlowMode=*/false),
+        };
+        // Pressure stays under 4 bar (CHOKED_PRESSURE_MIN_BAR) throughout
+        // — Arm 2 never accumulates pressurizedDuration. Arm 1's flow-mode
+        // window is [0, 20] entirely before pourStart=20. Use 3.5 bar to
+        // sit comfortably above pourTruncated's 2.5 bar floor and below
+        // Arm 2's 4 bar gate, avoiding boundary-value fragility.
+        QVector<QPointF> pressure = flatSeries(0.0, 25.0, 3.5);
+        QVector<QPointF> flow = flatSeries(0.0, 25.0, 1.5);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 25.0, 1.5);
+        QVector<QPointF> temperature = flatSeries(0.0, 25.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 25.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 25.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 25.0,
+            pressureGoal, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/0.0, /*finalWeightG=*/30.0);
+
+        const auto& d = result.detectors;
+        QVERIFY(!d.pourTruncated);  // 3.5 bar peak is above PRESSURE_FLOOR_BAR (2.5)
+        QVERIFY(!d.grindHasData);
+        QVERIFY(!d.grindVerifiedClean);
+        QCOMPARE(d.grindCoverage, QStringLiteral("notAnalyzable"));
+        QCOMPARE(d.verdictCategory, QStringLiteral("cleanGrindNotAnalyzable"));
+
+        bool sawObservation = false;
+        bool sawAlternateVerdict = false;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m["type"].toString() == "observation"
+                && m["text"].toString().contains("Could not analyze grind", Qt::CaseInsensitive))
+                sawObservation = true;
+            if (m["type"].toString() == "verdict"
+                && m["text"].toString().contains("grind could not be evaluated", Qt::CaseInsensitive))
+                sawAlternateVerdict = true;
+        }
+        QVERIFY2(sawObservation, "notAnalyzable shot must emit [observation] line");
+        QVERIFY2(sawAlternateVerdict, "notAnalyzable shot must emit alternate verdict");
+    }
+
+    // Grind coverage signal — pourTruncated cascade: when the pour never
+    // pressurized, the grind coverage signal must be absent (empty string),
+    // not "verified" or "notAnalyzable" — the cascade dominator already
+    // explains why the grind block was skipped, and emitting a coverage
+    // value would imply the detector ran.
+    void analyzeShot_grindCoverage_pourTruncatedSuppresses()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(2.0, "pour",              1, /*isFlowMode=*/true),
+        };
+        QVector<QPointF> pressure = flatSeries(0.0, 7.0, 0.6);  // puck failure
+        QVector<QPointF> flow = flatSeries(0.0, 7.0, 7.0);
+        QVector<QPointF> flowGoal = flatSeries(0.0, 7.0, 7.5);
+        QVector<QPointF> temperature = flatSeries(0.0, 7.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 7.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 7.0, 0.0);
+        QVector<QPointF> weight;
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 7.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{});
+
+        const auto& d = result.detectors;
+        QVERIFY(d.pourTruncated);
+        QVERIFY2(d.grindCoverage.isEmpty(),
+                 "pourTruncated cascade must omit grindCoverage");
+        QVERIFY(!d.grindVerifiedClean);
+
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            const QString text = m["text"].toString();
+            QVERIFY2(!text.contains("Grind tracked goal", Qt::CaseInsensitive),
+                     "pourTruncated cascade must not emit verified-clean line");
+            QVERIFY2(!text.contains("Could not analyze grind", Qt::CaseInsensitive),
+                     "pourTruncated cascade must not emit notAnalyzable line");
+        }
+    }
+
+    // Pour window exposure: `pourStartSec`/`pourEndSec` must reflect the
+    // phase-boundary range analyzeShot computed internally. MCP consumers
+    // (`shots_get_detail`) read these directly instead of re-deriving the
+    // window from phase markers; the previous `ShotSummarizer::computePourWindow`
+    // re-derivation is what let drift creep in (PR Kulitorum/Decenza#944 deleted it).
+    // MCP consumers read `pourStartSec` / `pourEndSec` directly off
+    // DetectorResults instead of re-deriving the window themselves.
+    void analyzeShot_pourWindow_matchesPhaseBoundaries()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(8.0, "pour",              1, /*isFlowMode=*/false),
+            phase(28.0, "end",              2, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure = concat(rampSeries(0.0, 8.0, 1.0, 9.0),
+                                            flatSeries(8.1, 30.0, 9.0));
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> pressureGoal = pressure;
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> temperature = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight = rampSeries(0.0, 30.0, 0.0, 36.0);
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            pressureGoal, flowGoal);
+        const auto& d = result.detectors;
+        QCOMPARE(d.pourStartSec, 8.0);
+        QCOMPARE(d.pourEndSec, 28.0);
+    }
+
+    // No-marker whole-shot fallback: when phases is empty but pressure data
+    // is present, analyzeShot still runs but the boundary loop produces no
+    // hits, so pourStart stays at 0 and pourEnd stays at the full shot
+    // duration — same behavior as the deleted computePourWindow's
+    // `pourEnd = summary.totalDuration` default. MCP consumers reading
+    // pourStartSec / pourEndSec from DetectorResults see the whole shot
+    // as the pour window on legacy / phase-marker-less shots.
+    void analyzeShot_pourWindow_noMarkers_spansWholeShot()
+    {
+        const double duration = 30.0;
+        QVector<QPointF> pressure = flatSeries(0.0, duration, 9.0);
+        QVector<QPointF> flow = flatSeries(0.0, duration, 1.8);
+        QVector<QPointF> temperature = flatSeries(0.0, duration, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, duration, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, duration, 0.0);
+        QVector<QPointF> weight = rampSeries(0.0, duration, 0.0, 36.0);
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, /*phases=*/{}, "espresso", duration);
+        const auto& d = result.detectors;
+        QCOMPARE(d.pourStartSec, 0.0);
+        QCOMPARE(d.pourEndSec, duration);
+    }
+
+    // Insufficient-data early return: when pressure.size() < 10, analyzeShot
+    // returns immediately with default detector fields. pourStartSec and
+    // pourEndSec stay at their `0.0` defaults — consumers must treat that
+    // as "no analysis was possible," not "valid window starting at 0."
+    void analyzeShot_pourWindow_insufficientData_defaultsToZero()
+    {
+        QVector<QPointF> pressure;  // empty — triggers early return
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, /*flow=*/{}, /*weight=*/{},
+            /*dCdt=*/{}, /*phases=*/{}, "espresso", 30.0);
+        const auto& d = result.detectors;
+        QCOMPARE(d.pourStartSec, 0.0);
+        QCOMPARE(d.pourEndSec, 0.0);
+    }
+
+    // Preinfusion-only fallback: when no "pour" phase is present, analyzeShot
+    // uses the first preinfusion/start boundary as pourStart. MCP consumers
+    // read this directly instead of re-deriving the window from phase markers
+    // (the previous `ShotSummarizer::computePourWindow` did exactly that and
+    // was the drift hazard PR Kulitorum/Decenza#944 closed).
+    void analyzeShot_pourWindow_preinfusionOnly_usesPreinfusionBoundary()
+    {
+        const double duration = 30.0;
+        QList<HistoryPhaseMarker> phases{
+            phase(2.0, "preinfusion", 0, /*isFlowMode=*/true),
+        };
+        QVector<QPointF> pressure = flatSeries(0.0, duration, 9.0);
+        QVector<QPointF> flow = flatSeries(0.0, duration, 1.8);
+        QVector<QPointF> temperature = flatSeries(0.0, duration, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, duration, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, duration, 0.0);
+        QVector<QPointF> weight = rampSeries(0.0, duration, 0.0, 36.0);
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", duration);
+        const auto& d = result.detectors;
+        QCOMPARE(d.pourStartSec, 2.0);
+        QCOMPARE(d.pourEndSec, duration);
+    }
+
+    // Backwards compatibility: the legacy generateSummary() wrapper must
+    // return the same line list as analyzeShot(...).lines. If this fails,
+    // the wrapper has drifted — every QML/AI consumer downstream is
+    // affected.
+    void generateSummary_isThinWrapperOverAnalyzeShot()
+    {
+        QList<HistoryPhaseMarker> phases{
+            phase(0.0, "preinfusion start", 0, /*isFlowMode=*/true),
+            phase(8.0, "pour",              1, /*isFlowMode=*/false),
+        };
+        QVector<QPointF> pressure = concat(rampSeries(0.0, 8.0, 1.0, 9.0),
+                                            flatSeries(8.1, 30.0, 9.0));
+        QVector<QPointF> flow = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> flowGoal = flatSeries(0.0, 30.0, 1.8);
+        QVector<QPointF> temperature = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> temperatureGoal = flatSeries(0.0, 30.0, 92.0);
+        QVector<QPointF> dCdt = flatSeries(0.0, 30.0, 0.0);
+        QVector<QPointF> weight = rampSeries(0.0, 30.0, 0.0, 36.0);
+
+        // Pass non-default expectedFrameCount on both call sites — locks in
+        // that the wrapper threads it through to analyzeShot identically.
+        // Without this assertion, a future change that drops the parameter
+        // from the wrapper would silently regress 1-frame-profile callers
+        // (the dialog and the live AI advisor). Pre-merge of PRs Kulitorum/Decenza#934/#935 the
+        // wrapper hardcoded -1 and the dialog/AI advisor diverged from
+        // save/load/MCP for 1-frame profiles — see SHOT_REVIEW.md §4.
+        const int frameCount = 2;
+        const QVariantList legacy = ShotAnalysis::generateSummary(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/0.0, /*finalWeightG=*/0.0,
+            frameCount);
+        const auto fresh = ShotAnalysis::analyzeShot(
+            pressure, flow, weight,
+            dCdt, phases, "espresso", 30.0,
+            /*pressureGoal=*/{}, flowGoal, /*analysisFlags=*/{},
+            /*firstFrameConfiguredSeconds=*/-1.0,
+            /*targetWeightG=*/0.0, /*finalWeightG=*/0.0,
+            frameCount);
+
+        QCOMPARE(legacy.size(), fresh.lines.size());
+        for (qsizetype i = 0; i < legacy.size(); ++i) {
+            QCOMPARE(legacy[i].toMap()["text"].toString(),
+                     fresh.lines[i].toMap()["text"].toString());
+            QCOMPARE(legacy[i].toMap()["type"].toString(),
+                     fresh.lines[i].toMap()["type"].toString());
+        }
+    }
+    // ---- Badge projection (decenza::deriveBadgesFromAnalysis) ----
+    //
+    // The four boolean quality-badge columns are now a deterministic
+    // projection of ShotAnalysis::DetectorResults via the helper in
+    // src/history/shotbadgeprojection.h. saveShot and loadShotRecordStatic
+    // both call analyzeShot once and apply the projection — the cascade
+    // lives in exactly one place. These table-driven cases lock in the
+    // projection contract documented in SHOT_REVIEW.md §4. If any cell of
+    // the mapping table is changed, the matching test case must change with
+    // it (or the test fails — which is the whole point of these locks).
+
+    void badgeProjection_cleanShot_allFalse()
+    {
+        // No detectors fired, no warnings — the canonical clean shot.
+        ShotAnalysis::DetectorResults d;
+        d.channelingChecked = true;
+        d.channelingSeverity = QStringLiteral("none");
+        d.flowTrendChecked = true;
+        d.flowTrend = QStringLiteral("stable");
+        d.grindChecked = true;
+        d.grindHasData = true;
+        d.grindDirection = QStringLiteral("onTarget");
+        d.grindFlowDeltaMlPerSec = 0.0;
+        d.verdictCategory = QStringLiteral("clean");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(!flags.pourTruncatedDetected);
+        QVERIFY(!flags.channelingDetected);
+        QVERIFY(!flags.grindIssueDetected);
+        QVERIFY(!flags.skipFirstFrameDetected);
+    }
+
+    // Badge projection — verifiedClean: the new positive grind signal must
+    // NOT fire grindIssueDetected. The badge column gates on actual issues
+    // (chokedPuck, yieldOvershoot, large delta), not on hasData. This locks
+    // in the invariant that adding the verified-clean branch can't sneak
+    // a false-positive grind badge into the cascade.
+    void badgeProjection_grindVerifiedClean_doesNotFireBadge()
+    {
+        ShotAnalysis::DetectorResults d;
+        d.channelingChecked = true;
+        d.channelingSeverity = QStringLiteral("none");
+        d.grindChecked = true;
+        d.grindHasData = true;
+        d.grindVerifiedClean = true;          // new positive signal
+        d.grindChokedPuck = false;
+        d.grindYieldOvershoot = false;
+        d.grindFlowDeltaMlPerSec = 0.0;
+        d.grindDirection = QStringLiteral("onTarget");
+        d.grindCoverage = QStringLiteral("verified");
+        d.verdictCategory = QStringLiteral("clean");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(!flags.grindIssueDetected,
+                 "verifiedClean must not fire grindIssueDetected — only "
+                 "chokedPuck/yieldOvershoot/large-delta should");
+    }
+
+    void badgeProjection_pourTruncated_onlyTruncatedFires()
+    {
+        // Cascade dominator: when pourTruncated fires, the suppressed
+        // detectors leave their flags at default. skipFirstFrameDetected is
+        // explicitly NOT suppressed by the cascade per the SHOT_REVIEW.md
+        // contract — it can independently fire on the same shot.
+        ShotAnalysis::DetectorResults d;
+        d.pourTruncated = true;
+        d.peakPressureBar = 1.2;
+        // analyzeShot would leave channelingChecked / grindChecked / etc.
+        // false in the truncated cascade (that's the cascade contract).
+        d.verdictCategory = QStringLiteral("puckTruncated");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(flags.pourTruncatedDetected,
+                 "pourTruncated must project to pourTruncatedDetected");
+        QVERIFY2(!flags.channelingDetected,
+                 "cascade must leave channelingDetected at false");
+        QVERIFY2(!flags.grindIssueDetected,
+                 "cascade must leave grindIssueDetected at false");
+        QVERIFY2(!flags.skipFirstFrameDetected,
+                 "skipFirstFrame is independent — must be false when not flagged");
+    }
+
+    void badgeProjection_pourTruncatedAndSkipFirstFrame_bothFire()
+    {
+        // skipFirstFrameDetected is NOT suppressed by the pourTruncated
+        // cascade — they can co-fire. Locks in the PR Kulitorum/Decenza#922 invariant.
+        ShotAnalysis::DetectorResults d;
+        d.pourTruncated = true;
+        d.skipFirstFrame = true;
+        d.verdictCategory = QStringLiteral("puckTruncated");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(flags.pourTruncatedDetected);
+        QVERIFY(flags.skipFirstFrameDetected);
+        QVERIFY(!flags.channelingDetected);
+        QVERIFY(!flags.grindIssueDetected);
+    }
+
+    void badgeProjection_sustainedChanneling_firesBadge()
+    {
+        ShotAnalysis::DetectorResults d;
+        d.channelingChecked = true;
+        d.channelingSeverity = QStringLiteral("sustained");
+        d.channelingSpikeTimeSec = 18.2;
+        d.verdictCategory = QStringLiteral("puckIntegrity");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(flags.channelingDetected,
+                 "Sustained channeling must fire the badge");
+    }
+
+    void badgeProjection_transientChanneling_doesNotFireBadge()
+    {
+        // Critical regression lock: Transient channeling shows in the dialog
+        // and in MCP detectorResults, but the boolean badge stays false.
+        // Matches PR Kulitorum/Decenza#922's invariant. If this test ever fails alongside
+        // a "transient" severity in DetectorResults, the projection drifted.
+        ShotAnalysis::DetectorResults d;
+        d.channelingChecked = true;
+        d.channelingSeverity = QStringLiteral("transient");
+        d.channelingSpikeTimeSec = 8.4;
+        d.verdictCategory = QStringLiteral("minorIssues");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(!flags.channelingDetected,
+                 "Transient channeling must NOT fire the badge (PR Kulitorum/Decenza#922 invariant)");
+    }
+
+    void badgeProjection_chokedPuck_firesGrindBadge()
+    {
+        ShotAnalysis::DetectorResults d;
+        d.grindChecked = true;
+        d.grindHasData = true;
+        d.grindChokedPuck = true;
+        d.grindDirection = QStringLiteral("chokedPuck");
+        d.verdictCategory = QStringLiteral("chokedPuck");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(flags.grindIssueDetected);
+    }
+
+    void badgeProjection_yieldOvershoot_firesGrindBadge()
+    {
+        ShotAnalysis::DetectorResults d;
+        d.grindChecked = true;
+        d.grindHasData = true;
+        d.grindYieldOvershoot = true;
+        d.grindDirection = QStringLiteral("yieldOvershoot");
+        d.verdictCategory = QStringLiteral("yieldOvershoot");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(flags.grindIssueDetected);
+    }
+
+    void badgeProjection_grindDeltaAboveThreshold_firesBadge()
+    {
+        ShotAnalysis::DetectorResults d;
+        d.grindChecked = true;
+        d.grindHasData = true;
+        d.grindFlowDeltaMlPerSec = ShotAnalysis::FLOW_DEVIATION_THRESHOLD + 0.1;
+        d.grindDirection = QStringLiteral("tooCoarse");
+        d.verdictCategory = QStringLiteral("minorIssuesGrindCoarse");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(flags.grindIssueDetected,
+                 "delta above FLOW_DEVIATION_THRESHOLD must fire the grind badge");
+    }
+
+    void badgeProjection_grindDeltaBelowThresholdNegative_firesBadge()
+    {
+        // Negative delta means flow ran below goal (grind too fine). The
+        // |delta| > threshold check uses absolute value.
+        ShotAnalysis::DetectorResults d;
+        d.grindChecked = true;
+        d.grindHasData = true;
+        d.grindFlowDeltaMlPerSec = -(ShotAnalysis::FLOW_DEVIATION_THRESHOLD + 0.1);
+        d.grindDirection = QStringLiteral("tooFine");
+        d.verdictCategory = QStringLiteral("minorIssuesGrindFine");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(flags.grindIssueDetected,
+                 "negative delta below threshold (|delta| > threshold) must fire the grind badge");
+    }
+
+    void badgeProjection_grindDeltaWithinTolerance_doesNotFireBadge()
+    {
+        ShotAnalysis::DetectorResults d;
+        d.grindChecked = true;
+        d.grindHasData = true;
+        d.grindFlowDeltaMlPerSec = 0.1;  // well within tolerance
+        d.grindDirection = QStringLiteral("onTarget");
+        d.verdictCategory = QStringLiteral("clean");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(!flags.grindIssueDetected,
+                 "delta within tolerance must NOT fire the grind badge");
+    }
+
+    void badgeProjection_grindNoData_doesNotFireBadge()
+    {
+        // hasData=false must short-circuit the grind projection — even if
+        // by some strange path one of the sub-flags is set, the badge stays
+        // false because the projection ANDs hasData with the OR of the arms.
+        ShotAnalysis::DetectorResults d;
+        d.grindChecked = true;
+        d.grindHasData = false;
+        d.grindChokedPuck = true;  // sub-flag set without hasData — defensive
+        d.grindFlowDeltaMlPerSec = 5.0;  // way above threshold
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY2(!flags.grindIssueDetected,
+                 "grind badge requires hasData=true (defensive against partial state)");
+    }
+
+    void badgeProjection_skipFirstFrame_firesBadge()
+    {
+        ShotAnalysis::DetectorResults d;
+        d.skipFirstFrame = true;
+        d.verdictCategory = QStringLiteral("skipFirstFrame");
+
+        const auto flags = decenza::deriveBadgesFromAnalysis(d);
+        QVERIFY(flags.skipFirstFrameDetected);
+    }
+
+    void badgeProjection_applyBadgesToTarget_writesAllFourFields()
+    {
+        // Compile-time + runtime check that the templated apply helper
+        // writes all four fields onto a target struct shape. Uses a local
+        // throwaway struct that mimics ShotSaveData / ShotRecord's badge
+        // surface — keeps this test independent of the storage TU layout.
+        struct FakeTarget {
+            bool pourTruncatedDetected = false;
+            bool channelingDetected = false;
+            bool grindIssueDetected = false;
+            bool skipFirstFrameDetected = false;
+        };
+        FakeTarget t;
+        ShotAnalysis::DetectorResults d;
+        d.pourTruncated = true;
+        d.skipFirstFrame = true;
+        d.channelingSeverity = QStringLiteral("sustained");
+        d.grindHasData = true;
+        d.grindChokedPuck = true;
+
+        decenza::applyBadgesToTarget(t, d);
+        QVERIFY(t.pourTruncatedDetected);
+        QVERIFY(t.channelingDetected);
+        QVERIFY(t.grindIssueDetected);
+        QVERIFY(t.skipFirstFrameDetected);
+    }
+};
+
+QTEST_MAIN(tst_ShotAnalysis)
+#include "tst_shotanalysis.moc"

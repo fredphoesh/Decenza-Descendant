@@ -1,0 +1,550 @@
+#include "core/diagnosticlogging.h"
+#include "locationprovider.h"
+#include "core/appsettings.h"
+#include "core/permissionrequests.h"
+
+#include <QGeoPositionInfo>
+#include <QNetworkReply>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QSettings>
+#include <QStringList>
+#include <QDebug>
+#include <cmath>
+
+#ifdef Q_OS_ANDROID
+#include <QJniObject>
+#endif
+
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+#include <QDesktopServices>
+#include <QPermissions>
+#endif
+
+LocationProvider::LocationProvider(QNetworkAccessManager* networkManager, QObject* parent)
+    : QObject(parent)
+    , m_networkManager(networkManager)
+{
+    Q_ASSERT(networkManager);
+    // Load saved manual city and coordinates
+    AppSettings settings;
+    m_manualCity = settings.value("shotMap/manualCity", "").toString();
+    m_manualLat = settings.value("shotMap/manualLat", 0.0).toDouble();
+    m_manualLon = settings.value("shotMap/manualLon", 0.0).toDouble();
+    m_manualCountryCode = settings.value("shotMap/manualCountryCode", "").toString();
+    m_manualGeocoded = settings.value("shotMap/manualGeocoded", false).toBool();
+
+    // Try to create a position source
+    m_source = QGeoPositionInfoSource::createDefaultSource(this);
+
+    if (m_source) {
+        connect(m_source, &QGeoPositionInfoSource::positionUpdated,
+                this, &LocationProvider::onPositionUpdated);
+        connect(m_source, &QGeoPositionInfoSource::errorOccurred,
+                this, &LocationProvider::onPositionError);
+
+        // Prefer low accuracy (network-based) for faster initial fix, especially indoors
+        m_source->setPreferredPositioningMethods(QGeoPositionInfoSource::AllPositioningMethods);
+
+        const auto methods = m_source->supportedPositioningMethods();
+        QStringList methodNames;
+        if (methods & QGeoPositionInfoSource::SatellitePositioningMethods) methodNames << QStringLiteral("satellite");
+        if (methods & QGeoPositionInfoSource::NonSatellitePositioningMethods) methodNames << QStringLiteral("network");
+        DIAG_DEBUG(APP, "LocationProvider") << "GPS source available:" << m_source->sourceName()
+                 << "methods:" << (methodNames.isEmpty() ? QStringLiteral("none") : methodNames.join(QLatin1Char('+')));
+
+        // Try to get last known position immediately (might be cached from previous app run)
+        // Use it right away so hasLocation is true and the UI doesn't flash "GPS disabled"
+        QGeoPositionInfo lastPos = m_source->lastKnownPosition();
+        if (lastPos.isValid()) {
+            QGeoCoordinate coord = lastPos.coordinate();
+            auto ageSecs = lastPos.timestamp().secsTo(QDateTime::currentDateTime());
+            DIAG_DEBUG(APP, "LocationProvider") << "Last known position available -"
+                     << "Lat:" << coord.latitude() << "Lon:" << coord.longitude()
+                     << "Age:" << ageSecs << "seconds";
+
+            // Use cached position immediately (even if stale) so the UI shows a location
+            // instead of "GPS disabled". A fresh fix will replace it shortly.
+            m_currentLocation.latitude = coord.latitude();
+            m_currentLocation.longitude = coord.longitude();
+            m_currentLocation.valid = true;
+            // Defer geocoding and fresh fix to avoid blocking constructor
+            QTimer::singleShot(0, this, [this, coord]() {
+                reverseGeocode(coord.latitude(), coord.longitude());
+                // Also request a fresh fix to replace the stale cached position
+                requestUpdate();
+            });
+        } else {
+            DIAG_DEBUG(APP, "LocationProvider") << "No last known position available";
+        }
+    } else {
+        DIAG_DEBUG(APP, "LocationProvider") << "No GPS source available";
+    }
+
+    // Re-request location when app returns to foreground (e.g. after user grants
+    // permission in System Settings on macOS/iOS)
+    connect(qApp, &QGuiApplication::applicationStateChanged,
+            this, &LocationProvider::onAppStateChanged);
+
+    if (!m_manualCity.isEmpty()) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Manual city configured:" << m_manualCity
+                 << "at" << m_manualLat << m_manualLon << m_manualCountryCode;
+
+        // Re-geocode if country code is missing (migration from older versions)
+        if (m_manualGeocoded && m_manualCountryCode.isEmpty()) {
+            DIAG_DEBUG(APP, "LocationProvider") << "Re-geocoding manual city to obtain country code";
+            QTimer::singleShot(0, this, &LocationProvider::geocodeManualCity);
+        }
+    }
+}
+
+LocationProvider::~LocationProvider()
+{
+    if (m_source) {
+        m_source->stopUpdates();
+    }
+}
+
+double LocationProvider::roundedLatitude() const
+{
+    // Manual city takes precedence over GPS
+    if (!m_manualCity.isEmpty() && m_manualGeocoded)
+        return std::round(m_manualLat * 10.0) / 10.0;
+    if (m_currentLocation.valid)
+        return std::round(m_currentLocation.latitude * 10.0) / 10.0;
+    return 0.0;
+}
+
+double LocationProvider::roundedLongitude() const
+{
+    // Manual city takes precedence over GPS
+    if (!m_manualCity.isEmpty() && m_manualGeocoded)
+        return std::round(m_manualLon * 10.0) / 10.0;
+    if (m_currentLocation.valid)
+        return std::round(m_currentLocation.longitude * 10.0) / 10.0;
+    return 0.0;
+}
+
+void LocationProvider::requestUpdate()
+{
+    if (!m_source) {
+        emit locationError("No GPS source available");
+        return;
+    }
+
+    // One outstanding request at a time. The source's own timeout is 60 s, and
+    // every applicationStateChanged → Active inside that window used to issue a
+    // second request against the same source: the 2026-08-30 SM-X210 session
+    // requested at 3.535 s, then again at 3.961 s from onAppStateChanged, for a
+    // fix that did not arrive until 11.110 s. The duplicate also re-drove the
+    // geocode and the weather fetch behind it (the weather client's own
+    // "Fetch already in progress, skipping" line is that second cascade).
+    if (m_updateInFlight) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Position request already in flight, skipping";
+        return;
+    }
+
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+    // Qt 6 requires explicit permission request before using CoreLocation
+    QLocationPermission locationPermission;
+    locationPermission.setAccuracy(QLocationPermission::Approximate);
+
+    auto status = qApp->checkPermission(locationPermission);
+    if (status == Qt::PermissionStatus::Undetermined) {
+        if (m_permissionRequested) {
+            DIAG_DEBUG(APP, "LocationProvider") << "Permission request already in-flight, skipping";
+            return;
+        }
+        m_permissionRequested = true;
+        DIAG_DEBUG(APP, "LocationProvider") << "Requesting location permission...";
+        PermissionRequests::request(locationPermission, this, [this](const QPermission& permission) {
+            m_permissionRequested = false;
+            if (permission.status() == Qt::PermissionStatus::Granted) {
+                DIAG_DEBUG(APP, "LocationProvider") << "Location permission granted";
+                m_updateInFlight = true;
+                m_source->requestUpdate(60000);
+            } else {
+                DIAG_DEBUG(APP, "LocationProvider") << "Location permission denied by user";
+                emit locationError("Location permission denied");
+            }
+        });
+        return;
+    } else if (status == Qt::PermissionStatus::Denied) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Location permission previously denied";
+        emit locationError("Location permission denied - enable in System Settings");
+        return;
+    }
+#endif
+
+    DIAG_DEBUG(APP, "LocationProvider") << "Requesting position update (60s timeout)...";
+    m_updateInFlight = true;
+    m_source->requestUpdate(60000);  // 60 second timeout (GPS cold start can take a while)
+}
+
+void LocationProvider::onPositionUpdated(const QGeoPositionInfo& info)
+{
+    // The request is over either way — an invalid fix ends it just as a valid
+    // one does, and leaving the flag set would block every later request.
+    m_updateInFlight = false;
+
+    if (!info.isValid()) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Received invalid position";
+        return;
+    }
+
+    QGeoCoordinate coord = info.coordinate();
+    DIAG_DEBUG(APP, "LocationProvider") << "Position updated -"
+             << "Lat:" << coord.latitude()
+             << "Lon:" << coord.longitude();
+
+    m_currentLocation.latitude = coord.latitude();
+    m_currentLocation.longitude = coord.longitude();
+    m_hasFreshFix = true;
+
+    // Check if we need to reverse geocode (position changed significantly)
+    double latDiff = std::abs(coord.latitude() - m_lastGeocodedLat);
+    double lonDiff = std::abs(coord.longitude() - m_lastGeocodedLon);
+
+    if (latDiff > GEOCODE_THRESHOLD_DEGREES || lonDiff > GEOCODE_THRESHOLD_DEGREES
+        || m_currentLocation.city.isEmpty()) {
+        reverseGeocode(coord.latitude(), coord.longitude());
+    } else {
+        // Position hasn't changed much, just update coordinates
+        m_currentLocation.valid = true;
+        emit locationChanged();
+    }
+}
+
+void LocationProvider::onPositionError(QGeoPositionInfoSource::Error error)
+{
+    QString errorStr;
+    switch (error) {
+    case QGeoPositionInfoSource::AccessError:
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+        // Qt's CoreLocation backend collapses every CLLocationManager failure
+        // to AccessError (see qgeopositioninfosource_cl.mm), so this fires for
+        // transient errors too. Only treat it as a real denial when the OS
+        // confirms it; otherwise let the UpdateTimeoutError path decide.
+        if (qApp->checkPermission(QLocationPermission{}) == Qt::PermissionStatus::Granted) {
+            DIAG_WARN(APP, "LocationProvider") << "Swallowing CoreLocation AccessError while permission is Granted "
+                          "(treating as transient); awaiting timeout or fresh fix";
+            return;
+        }
+#endif
+        errorStr = "Location permission denied";
+        break;
+    case QGeoPositionInfoSource::ClosedError:
+        errorStr = "Location source closed";
+        break;
+    case QGeoPositionInfoSource::NoError:
+        return;
+    case QGeoPositionInfoSource::UpdateTimeoutError:
+        // Try to use last known position as fallback
+        if (m_source) {
+            QGeoPositionInfo lastPos = m_source->lastKnownPosition();
+            if (lastPos.isValid()) {
+                DIAG_DEBUG(APP, "LocationProvider") << "GPS timeout, using last known position";
+                onPositionUpdated(lastPos);
+                return;
+            }
+        }
+        errorStr = "GPS timeout - no satellite fix (try outdoors or set city manually)";
+        break;
+    case QGeoPositionInfoSource::UnknownSourceError:
+        errorStr = "Unknown GPS source error";
+        break;
+    default:
+        errorStr = QString("Unknown location error (code: %1)").arg(static_cast<int>(error));
+        break;
+    }
+
+    // Cleared here rather than at the top of this function: the macOS
+    // AccessError swallow above returns early precisely because the request is
+    // still outstanding and awaiting its timeout.
+    m_updateInFlight = false;
+
+    emit locationError(errorStr);  // ShotReporter logs it with the prompt/GPS state
+}
+
+void LocationProvider::reverseGeocode(double lat, double lon)
+{
+    // Use Nominatim for reverse geocoding (free, no API key needed)
+    // Note: Must respect usage policy - max 1 request/second, include User-Agent
+    QString url = QString("https://nominatim.openstreetmap.org/reverse?format=json&lat=%1&lon=%2&zoom=10")
+                      .arg(lat, 0, 'f', 6)
+                      .arg(lon, 0, 'f', 6);
+
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader, "Decenza/1.0 (espresso app)");
+
+    DIAG_DEBUG(APP, "LocationProvider") << "Reverse geocoding...";
+
+    QNetworkReply* reply = m_networkManager->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        onReverseGeocodeFinished(reply);
+    });
+
+    // Remember this position to avoid re-geocoding
+    m_lastGeocodedLat = lat;
+    m_lastGeocodedLon = lon;
+}
+
+void LocationProvider::onReverseGeocodeFinished(QNetworkReply* reply)
+{
+    reply->deleteLater();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Reverse geocode failed -" << reply->errorString();
+        // Still mark as valid - we have coordinates, just no city name
+        m_currentLocation.valid = true;
+        emit locationChanged();
+        return;
+    }
+
+    QByteArray data = reply->readAll();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonObject obj = doc.object();
+
+    // Extract city and country from address
+    QJsonObject address = obj["address"].toObject();
+
+    // Try different fields for city (Nominatim uses different names depending on location)
+    QString city = address["city"].toString();
+    if (city.isEmpty()) city = address["town"].toString();
+    if (city.isEmpty()) city = address["village"].toString();
+    if (city.isEmpty()) city = address["municipality"].toString();
+    if (city.isEmpty()) city = address["county"].toString();
+    if (city.isEmpty()) city = address["state"].toString();
+
+    QString countryCode = address["country_code"].toString().toUpper();
+
+    DIAG_DEBUG(APP, "LocationProvider") << "Geocoded to" << city << countryCode;
+
+    m_currentLocation.city = city;
+    m_currentLocation.countryCode = countryCode;
+    m_currentLocation.valid = true;
+
+    emit locationChanged();
+}
+
+QString LocationProvider::countryCode() const
+{
+    // Manual city takes precedence over GPS
+    if (!m_manualCity.isEmpty() && !m_manualCountryCode.isEmpty())
+        return m_manualCountryCode;
+    return m_currentLocation.countryCode;
+}
+
+QString LocationProvider::city() const
+{
+    // Manual city takes precedence over GPS
+    if (!m_manualCity.isEmpty())
+        return m_manualCity;
+    if (m_currentLocation.valid)
+        return m_currentLocation.city;
+    return QString();
+}
+
+void LocationProvider::setManualCity(const QString& city)
+{
+    if (m_manualCity != city) {
+        m_manualCity = city;
+        m_manualGeocoded = false;
+        m_manualLat = 0.0;
+        m_manualLon = 0.0;
+        m_manualCountryCode.clear();
+
+        // Save to settings
+        AppSettings settings;
+        settings.setValue("shotMap/manualCity", city);
+        settings.setValue("shotMap/manualGeocoded", false);
+        settings.setValue("shotMap/manualLat", 0.0);
+        settings.setValue("shotMap/manualLon", 0.0);
+        settings.setValue("shotMap/manualCountryCode", "");
+
+        DIAG_DEBUG(APP, "LocationProvider") << "Manual city set to:" << city;
+
+        emit manualCityChanged();
+        emit locationChanged();
+
+        // Auto-geocode if city is not empty
+        if (!city.isEmpty()) {
+            geocodeManualCity();
+        }
+    }
+}
+
+void LocationProvider::geocodeManualCity()
+{
+    if (m_manualCity.isEmpty()) {
+        DIAG_DEBUG(APP, "LocationProvider") << "No manual city to geocode";
+        return;
+    }
+
+    forwardGeocode(m_manualCity);
+}
+
+void LocationProvider::forwardGeocode(const QString& city)
+{
+    // Use Nominatim for forward geocoding
+    QString encodedCity = QUrl::toPercentEncoding(city);
+    QString url = QString("https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&q=%1&limit=1")
+                      .arg(encodedCity);
+
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader, "Decenza/1.0 (espresso app)");
+
+    DIAG_DEBUG(APP, "LocationProvider") << "Forward geocoding:" << city;
+
+    QNetworkReply* reply = m_networkManager->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        onForwardGeocodeFinished(reply);
+    });
+}
+
+void LocationProvider::onForwardGeocodeFinished(QNetworkReply* reply)
+{
+    reply->deleteLater();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Forward geocode failed -" << reply->errorString();
+        emit locationError("Failed to geocode city: " + reply->errorString());
+        return;
+    }
+
+    QByteArray data = reply->readAll();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray results = doc.array();
+
+    if (results.isEmpty()) {
+        DIAG_DEBUG(APP, "LocationProvider") << "No geocoding results for" << m_manualCity;
+        emit locationError("City not found: " + m_manualCity);
+        return;
+    }
+
+    QJsonObject result = results.first().toObject();
+    m_manualLat = result["lat"].toString().toDouble();
+    m_manualLon = result["lon"].toString().toDouble();
+    m_manualCountryCode = result["address"].toObject()["country_code"].toString().toUpper();
+    m_manualGeocoded = true;
+
+    // Save to settings
+    AppSettings settings;
+    settings.setValue("shotMap/manualLat", m_manualLat);
+    settings.setValue("shotMap/manualLon", m_manualLon);
+    settings.setValue("shotMap/manualCountryCode", m_manualCountryCode);
+    settings.setValue("shotMap/manualGeocoded", true);
+
+    QString displayName = result["display_name"].toString();
+    DIAG_DEBUG(APP, "LocationProvider") << "Geocoded" << m_manualCity << "to"
+             << m_manualLat << m_manualLon << m_manualCountryCode << "-" << displayName;
+
+    emit locationChanged();
+}
+
+void LocationProvider::openLocationSettings()
+{
+#ifdef Q_OS_ANDROID
+    DIAG_DEBUG(APP, "LocationProvider") << "Opening Android Location Settings";
+
+    QJniObject activity = QJniObject::callStaticObjectMethod(
+        "org/qtproject/qt/android/QtNative",
+        "activity",
+        "()Landroid/app/Activity;");
+
+    if (!activity.isValid()) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Failed to get activity";
+        return;
+    }
+
+    // Create intent for Location Settings
+    QJniObject intent("android/content/Intent",
+                      "(Ljava/lang/String;)V",
+                      QJniObject::fromString("android.settings.LOCATION_SOURCE_SETTINGS").object<jstring>());
+
+    // Add flag for new task
+    intent.callObjectMethod("addFlags", "(I)Landroid/content/Intent;", 0x10000000); // FLAG_ACTIVITY_NEW_TASK
+
+    // Start the settings activity
+    activity.callMethod<void>("startActivity", "(Landroid/content/Intent;)V", intent.object());
+
+    DIAG_DEBUG(APP, "LocationProvider") << "Location Settings opened";
+#elif defined(Q_OS_MACOS)
+    DIAG_DEBUG(APP, "LocationProvider") << "Opening macOS Location Settings";
+    QDesktopServices::openUrl(QUrl("x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"));
+#elif defined(Q_OS_IOS)
+    DIAG_DEBUG(APP, "LocationProvider") << "Opening iOS Settings";
+    QDesktopServices::openUrl(QUrl("app-settings:"));
+#else
+    DIAG_DEBUG(APP, "LocationProvider") << "openLocationSettings() not supported on this platform";
+#endif
+}
+
+bool LocationProvider::isGpsEnabled() const
+{
+#ifdef Q_OS_ANDROID
+    // Get the activity context
+    QJniObject activity = QJniObject::callStaticObjectMethod(
+        "org/qtproject/qt/android/QtNative",
+        "activity",
+        "()Landroid/app/Activity;");
+
+    if (!activity.isValid()) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Failed to get activity for GPS check";
+        return false;
+    }
+
+    // Get LocationManager service
+    QJniObject locationServiceName = QJniObject::fromString("location");
+    QJniObject locationManager = activity.callObjectMethod(
+        "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        locationServiceName.object<jstring>());
+
+    if (!locationManager.isValid()) {
+        DIAG_DEBUG(APP, "LocationProvider") << "Failed to get LocationManager";
+        return false;
+    }
+
+    // Check if GPS provider is enabled
+    QJniObject gpsProvider = QJniObject::fromString("gps");
+    jboolean enabled = locationManager.callMethod<jboolean>(
+        "isProviderEnabled",
+        "(Ljava/lang/String;)Z",
+        gpsProvider.object<jstring>());
+
+    DIAG_DEBUG(APP, "LocationProvider") << "GPS provider enabled:" << enabled;
+    return enabled;
+#else
+    // On desktop, assume GPS is available if we have a source
+    return m_source != nullptr;
+#endif
+}
+
+void LocationProvider::onAppStateChanged(Qt::ApplicationState state)
+{
+    if (state != Qt::ApplicationActive)
+        return;
+
+    // If we have a fresh GPS fix or manual city, nothing to do
+    if (m_hasFreshFix || !m_manualCity.isEmpty())
+        return;
+
+    // No source yet (permission may have just been granted) — try creating one
+    if (!m_source) {
+        m_source = QGeoPositionInfoSource::createDefaultSource(this);
+        if (m_source) {
+            connect(m_source, &QGeoPositionInfoSource::positionUpdated,
+                    this, &LocationProvider::onPositionUpdated);
+            connect(m_source, &QGeoPositionInfoSource::errorOccurred,
+                    this, &LocationProvider::onPositionError);
+            m_source->setPreferredPositioningMethods(QGeoPositionInfoSource::AllPositioningMethods);
+            DIAG_DEBUG(APP, "LocationProvider") << "GPS source now available after app resume:" << m_source->sourceName();
+            emit availableChanged();
+        }
+    }
+
+    DIAG_DEBUG(APP, "LocationProvider") << "App resumed without location, re-requesting";
+    requestUpdate();
+}

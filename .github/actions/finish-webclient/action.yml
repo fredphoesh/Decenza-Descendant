@@ -1,0 +1,77 @@
+name: Finish native package with shared Wasm
+description: Wait for this run's Wasm producer, verify the bundle and finish the native link.
+
+inputs:
+  build-directory:
+    description: Configured native build directory relative to the checkout
+    required: true
+  relink:
+    description: Relink now; Android and iOS finish through their packaging build
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Wait for the shared Wasm producer
+      uses: actions/github-script@v8
+      with:
+        retries: 3
+        script: |
+          const {data: run} = await github.rest.actions.getWorkflowRun({
+            ...context.repo, run_id: context.runId
+          });
+          for (;;) {
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId, per_page: 100
+            });
+            // Publication follows bundle verification. Cache cleanup need not
+            // delay native packaging after the immutable artifact is ready.
+            if (artifacts.some(artifact => artifact.name === 'matched-wasm-bundle' && !artifact.expired)) break;
+            const checks = await github.paginate(github.rest.checks.listForSuite, {
+              ...context.repo, check_suite_id: run.check_suite_id, per_page: 100
+            });
+            const producer = checks.filter(check => check.name === 'Wasm bundle')
+              .sort((left, right) => right.id - left.id)[0];
+            if (producer?.status === 'completed') {
+              core.setFailed(`Shared Wasm build ended with ${producer.conclusion} without a bundle; refusing to package.`);
+              break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 15000));
+          }
+
+    - name: Download this run's verified bundle
+      uses: actions/download-artifact@v8
+      with:
+        name: matched-wasm-bundle
+        path: .ci/webclient
+
+    - name: Snapshot QML objects before embedding
+      if: ${{ inputs.relink == 'true' }}
+      shell: bash
+      env:
+        NATIVE_BUILD: ${{ inputs.build-directory }}
+      run: python3 tools/webclient/check_qml_object_reuse.py snapshot "$NATIVE_BUILD" "$RUNNER_TEMP/native-qml-objects.json"
+
+    - name: Verify package identity and enable embedding
+      shell: bash
+      env:
+        NATIVE_BUILD: ${{ inputs.build-directory }}
+      run: |
+        cmake -S "$GITHUB_WORKSPACE" -B "$GITHUB_WORKSPACE/$NATIVE_BUILD" \
+          -DDECENZA_WEB_BUNDLE_MODE=PREBUILT \
+          -DDECENZA_REQUIRE_WEB_BUNDLE=ON \
+          -DDECENZA_WEB_BUNDLE_DIR="$GITHUB_WORKSPACE/.ci/webclient"
+
+    - name: Finish native resource compilation and linking
+      if: ${{ inputs.relink == 'true' }}
+      shell: bash
+      env:
+        NATIVE_BUILD: ${{ inputs.build-directory }}
+      run: cmake --build "$GITHUB_WORKSPACE/$NATIVE_BUILD" --config Release --target Decenza --parallel
+
+    - name: Require QML object reuse after embedding
+      if: ${{ inputs.relink == 'true' }}
+      shell: bash
+      env:
+        NATIVE_BUILD: ${{ inputs.build-directory }}
+      run: python3 tools/webclient/check_qml_object_reuse.py check "$NATIVE_BUILD" "$RUNNER_TEMP/native-qml-objects.json"

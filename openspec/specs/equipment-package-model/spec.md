@@ -1,0 +1,422 @@
+# equipment-package-model Specification
+
+## Purpose
+The single source of truth for the `EquipmentPackage`/`EquipmentItem` data model: the underlying `equipment_packages`/`equipment_items` tables, how bags and shots reference a package by id with soft-delete reference semantics, and how each optional component (grinder, basket, puck prep) contributes to package identity, copy-on-write forking, and derived fields (`rpmCapable`, basket specs, distribution rollup). Also covers migration 22, `SettingsDye`'s bridging of the active package, and equipment's survival across backup restore and device-to-device transfer.
+
+## Requirements
+
+### Requirement: EquipmentPackage and EquipmentItem data model
+The system SHALL define an `EquipmentPackage` value type (a container) and an `EquipmentItem` value type (a typed component), where one package owns one or more items. A package's `id` is its database primary key, and its nullable `name` defaults for display to the grinder item's "{brand} {model}", or the basket item's for grinder-less packages.
+
+#### Scenario: A package owns at most one grinder
+- **WHEN** an equipment package is created with a grinder
+- **THEN** it SHALL contain exactly one `equipment_item` with `kind = "grinder"`
+- **AND** that item SHALL carry `brand`, `model`, and an `attrs_json` with `burrs` and `rpmCapable`
+
+#### Scenario: Basket-only package
+- **WHEN** a package is created with a basket and no grinder
+- **THEN** it saves, displays under the basket's brand+model, exposes no grind/rpm surfaces, and can be selected by recipes and bags
+
+#### Scenario: Adding a new component kind requires no schema migration
+- **WHEN** a future component kind (e.g. `"basket"`) is introduced
+- **THEN** it SHALL be stored as a new `equipment_items` row with that `kind` and a kind-specific `attrs_json`
+- **AND** no change to the `equipment_packages` or `equipment_items` table schema SHALL be required
+
+### Requirement: EquipmentPackage lifecycle and dial memory fields
+An `EquipmentPackage` SHALL carry `inInventory` (bool, default true), a nullable `lastUsed` timestamp, `createdAt`, and grinder-scoped dial memory: `lastGrindSetting` (nullable string) and `lastRpm` (nullable int).
+
+#### Scenario: New package is in inventory
+- **WHEN** an equipment package is created
+- **THEN** `inInventory` SHALL be true and `lastUsed` SHALL be empty
+
+### Requirement: EquipmentItem fields
+An `EquipmentItem` SHALL carry `id`, `packageId` (foreign key to `equipment_packages.id`), `kind` (a string enum, `"grinder"` today), `brand`, `model`, and `attrs_json`. For `kind="grinder"`, `attrs_json` SHALL carry `burrs` (string) and `rpmCapable` (bool).
+
+#### Scenario: Item stores kind-specific attributes
+- **WHEN** a grinder item is saved
+- **THEN** its `kind` SHALL be `"grinder"` and its `attrs_json` SHALL carry `burrs` and `rpmCapable`
+
+### Requirement: Grinder-less packages are accepted
+A package MAY be grinder-less, such as a basket-only tea setup. Create paths SHALL accept a package with no grinder item, and consumers SHALL tolerate an invalid grinder item, mirroring the existing optional-basket handling.
+
+#### Scenario: Invalid grinder item is tolerated
+- **WHEN** a package's grinder item is invalid or absent
+- **THEN** grind and rpm surfaces and dial memory SHALL be absent, and no error SHALL be raised
+
+### Requirement: equipment_packages and equipment_items database tables
+The system SHALL create `equipment_packages` and `equipment_items` SQLite tables in **migration 22** in `src/history/shothistorystorage.cpp` (current schema version is 21). DB access SHALL follow the `withTempDb()` background-thread pattern via a new `EquipmentStorage` class modeled on `CoffeeBagStorage`.
+
+#### Scenario: Tables created on upgrade
+- **WHEN** the app launches after upgrade at schema version < 22
+- **THEN** the `equipment_packages` and `equipment_items` tables SHALL be created
+- **AND** the schema version SHALL be set to 22 only after the migration transaction commits
+
+### Requirement: Reference semantics with soft-delete
+Equipment packages SHALL use reference semantics: editing a package's fields SHALL be reflected by every bag and shot pointing at it. Removing a package from use SHALL set `inInventory = 0` and SHALL NOT delete the row, so historical bags and shots continue to resolve.
+
+#### Scenario: Editing a package updates history
+- **WHEN** a user edits a package's grinder burrs
+- **THEN** every bag and shot pointing at that package SHALL resolve to the edited burrs
+
+#### Scenario: Replacing a grinder
+- **WHEN** a user replaces their grinder
+- **THEN** they SHALL create a new package and the old package SHALL be soft-deleted (`inInventory = 0`)
+- **AND** shots taken with the old grinder SHALL still resolve to the old package's identity
+
+### Requirement: rpmCapable is derived, not user-configured
+When a package's grinder item is created or its brand/model is edited, the system SHALL set `rpmCapable` from the `GrinderAliases` registry: a grinder matched in the registry SHALL use its `variableRpm` flag; a grinder not in the registry SHALL be treated as `rpmCapable = true`. The registry SHALL remain hardcoded and not user-editable.
+
+#### Scenario: Known non-variable grinder
+- **WHEN** a package is created for a registry grinder whose `variableRpm` is false
+- **THEN** `rpmCapable` SHALL be false and the RPM dial-in SHALL be hidden in Brew Settings
+
+#### Scenario: Custom grinder not in the registry
+- **WHEN** a user types a grinder brand/model that matches no registry alias
+- **THEN** `rpmCapable` SHALL be true and the RPM dial-in SHALL be shown
+
+#### Scenario: rpmCapable re-derives on edit
+- **WHEN** a package's grinder brand/model is changed
+- **THEN** `rpmCapable` SHALL be re-derived from the registry for the new identity
+
+### Requirement: Grinder-scoped dial memory and dual write-through
+Switching the active equipment package SHALL apply that package's `lastGrindSetting`/`lastRpm` to the live grind setting and RPM (and thereby Brew Settings), never leaving them blank but leaving them editable. Editing the grind setting or rpm SHALL write through to the active package's `lastGrindSetting`/`lastRpm`.
+
+#### Scenario: Switch equipment pre-fills the dial
+- **WHEN** the user switches to a different equipment package
+- **THEN** the live grind setting and RPM SHALL be set to that package's `lastGrindSetting`/`lastRpm`
+- **AND** the values SHALL remain editable
+
+#### Scenario: Editing the dial updates both memories
+- **WHEN** the user edits the grind setting or rpm in Brew Settings
+- **THEN** the new value SHALL be written to the active package's last-dial fields and not to the bag
+
+### Requirement: SettingsDye exposes resolved grinder identity and equipment selection
+`SettingsDye` SHALL expose `dyeGrinderBrand`, `dyeGrinderModel`, and `dyeGrinderBurrs` as **read-only** values resolved through the active equipment package. It SHALL expose `dyeGrinderSetting` and a new `dyeGrinderRpm` as writable dial-in values (writing through to the active package), and an `activeEquipmentId` for selecting/switching the package.
+
+#### Scenario: Read resolves via the package
+- **WHEN** `dyeGrinderModel` is read
+- **THEN** it SHALL return the model of the active package grinder item, or empty when no package is active
+
+### Requirement: Equipment survives backup restore and device-to-device transfer
+The DB import path (`ShotHistoryStorage::importDatabaseStatic`) SHALL migrate `equipment_packages` and `equipment_items` rows and remap `shots.equipment_id` to the new package ids (alongside the existing bag-id remap). `SettingsSerializer` SHALL exclude `dye/activeEquipmentId` from export.
+
+#### Scenario: Restoring a backup with equipment
+- **WHEN** a backup containing equipment tables is restored
+- **THEN** all packages and items SHALL be imported with new ids
+- **AND** imported shots' `equipment_id` SHALL point at the corresponding imported packages
+
+### Requirement: A package MAY own an optional basket component
+An equipment package SHALL be able to own at most one `equipment_items` row of
+`kind="basket"` (`brand`, `model`), in addition to its grinder item. A package with
+no basket item SHALL remain valid (grinder-only packages, including all packages
+that predate this change, are unaffected). Adding a basket SHALL NOT require a DB
+schema migration — it is a new row of an existing kind.
+
+#### Scenario: Package created with a grinder and a basket
+- **WHEN** a package is created with a grinder identity and a basket identity
+- **THEN** the package SHALL own one `kind="grinder"` item and one `kind="basket"` item
+- **AND** the package view SHALL resolve and expose both
+
+#### Scenario: Package created with no basket
+- **WHEN** a package is created with a grinder identity and no basket
+- **THEN** the package SHALL own only the grinder item
+- **AND** the package view SHALL expose an empty/absent basket without error
+
+### Requirement: Basket specs SHALL be derived from the registry, not stored
+The basket item SHALL persist only `kind`, `brand`, and `model` (empty `attrs`).
+Its physical characteristics — wall profile, relative flow class, precision flag,
+dose range, material — SHALL be derived at read time from
+`BasketAliases::findEntry(brand, model)`, mirroring how the grinder item derives
+`rpmCapable`. A basket whose identity does not match the registry (a custom basket)
+SHALL resolve with unknown specs and SHALL NOT block creation.
+
+#### Scenario: Registry basket resolves specs
+- **WHEN** a package's basket item is `{brand: "VST", model: "18g"}` and that entry exists in the registry
+- **THEN** resolving the package SHALL expose the registry's wall profile, relative flow, precision, dose range, and material
+
+#### Scenario: Custom basket resolves with unknown specs
+- **WHEN** a package's basket item does not match any registry entry
+- **THEN** resolving the package SHALL expose the basket brand/model with specs marked unknown/absent rather than fabricated
+
+### Requirement: Package identity SHALL include the basket
+The package identity used for dedup and copy-on-write SHALL be the tuple of the
+grinder identity (`brand/model/burrs`) **and** the basket identity (`brand/model`),
+where "no basket" is a distinct identity value. Two packages that share a grinder
+but differ in basket (or in basket-vs-no-basket) SHALL be distinct packages.
+
+#### Scenario: Switching basket on a used package forks
+- **WHEN** a package that has recorded shots has its basket changed to a different basket
+- **THEN** a new package SHALL be forked under copy-on-write (the old package preserved, `supersededBy` set), exactly as for a grinder identity edit
+
+#### Scenario: Switching back to a prior combo dedups
+- **WHEN** the user returns to a previously used grinder+basket combination
+- **THEN** the existing matching package SHALL be selected rather than a duplicate created
+
+#### Scenario: Editing basket on an unused package edits in place
+- **WHEN** a package with no recorded shots has its basket changed
+- **THEN** the package SHALL be edited in place (same id, no fork)
+
+### Requirement: SettingsDye SHALL bridge the basket registry and resolve the active basket
+`SettingsDye` SHALL expose `knownBasketBrands()` and `knownBasketModels(brand)`
+(registry-backed, plus distinct values from history where applicable) for the
+picker, and SHALL resolve the active package's basket identity for display. The
+basket identity SHALL be carried through create/update/switch alongside the grinder
+identity.
+
+#### Scenario: Basket suggestions sourced from the registry
+- **WHEN** the picker requests basket brands, then models for a chosen brand
+- **THEN** `knownBasketBrands()` SHALL return the registry's sorted unique brands
+- **AND** `knownBasketModels(brand)` SHALL return that brand's models
+
+### Requirement: Device import SHALL carry basket items
+Device-to-device equipment import SHALL copy `kind="basket"` items alongside grinder
+items when importing packages, preserving the package's basket identity in the
+destination.
+
+#### Scenario: Imported package retains its basket
+- **WHEN** a package with a basket item is imported from a source database
+- **THEN** the destination package SHALL own an equivalent basket item
+
+### Requirement: A package MAY own an optional puck-prep component
+A package SHALL be able to own at most one `equipment_items` row of
+`kind="puckprep"`, whose `attrs` is a checklist config of boolean flags
+(`wdt`, `shaker`, `puckScreen`, `paperFilter`, `rdt`). It SHALL have no brand/model.
+A package with no puck-prep item SHALL remain valid (it is optional, like the
+basket). Adding puck prep SHALL NOT require a DB schema migration — it is a new
+row of an existing kind.
+
+#### Scenario: Package with puck prep
+- **WHEN** a package is created/edited with one or more puck-prep flags set
+- **THEN** the package SHALL own one `kind="puckprep"` item carrying those flags
+
+#### Scenario: All flags unchecked = no puck-prep item
+- **WHEN** a package's puck prep has every flag cleared
+- **THEN** the package SHALL own no `kind="puckprep"` item (the item is deleted / not created)
+- **AND** the package SHALL remain valid
+
+### Requirement: The distribution rollup SHALL be derived, not stored
+The puck-prep item SHALL persist only its boolean flags. A `distribution` rollup
+(`none` | `light` | `thorough`) SHALL be derived at read time as a pure function of
+the flags (WDT or shaker → thorough; else RDT → light; else none — WDT and shaker
+weighted equally, not ranked), never stored. Adjusting
+the rollup logic SHALL NOT require any data change.
+
+#### Scenario: Distribution derived from flags
+- **WHEN** a package's puck prep has `wdt` set
+- **THEN** resolving the package SHALL expose `distribution = "thorough"`
+
+#### Scenario: Shaker without WDT
+- **WHEN** a package's puck prep has `shaker` set and `wdt` cleared
+- **THEN** resolving the package SHALL expose `distribution = "light"`
+
+### Requirement: Package identity SHALL include the normalized puck-prep config
+The package identity used for dedup and copy-on-write SHALL include the puck-prep
+config, compared as a NORMALIZED flag-set (canonical, order-independent), where "no
+puck prep" is a distinct identity value. Two packages identical in grinder + basket
+but differing in puck-prep flags SHALL be distinct packages.
+
+#### Scenario: Toggling a flag on a used package forks
+- **WHEN** a package that has recorded shots has a puck-prep flag toggled
+- **THEN** a new package SHALL be forked under copy-on-write (old preserved, `supersededBy` set), exactly as for a grinder or basket identity edit
+
+#### Scenario: Returning to a prior prep dedups
+- **WHEN** the user returns to a previously used grinder + basket + puck-prep combination
+- **THEN** the existing matching package SHALL be selected rather than a duplicate created
+
+#### Scenario: Order-independent comparison
+- **WHEN** two puck-prep configs set the same flags in any internal order
+- **THEN** they SHALL compare as the same identity
+
+### Requirement: SettingsDye SHALL resolve and bridge the active puck prep
+`SettingsDye` SHALL expose the active package's puck-prep flags (and derived
+`distribution`) for display, and SHALL carry the flags through create/update/switch
+alongside the grinder and basket identity.
+
+#### Scenario: Active puck prep resolved
+- **WHEN** the active package has a puck-prep item
+- **THEN** `SettingsDye` SHALL expose its flags and the derived `distribution`
+
+### Requirement: Device import SHALL carry puck-prep items
+Device-to-device equipment import SHALL copy `kind="puckprep"` items alongside
+grinder and basket items, and SHALL include the puck-prep config in the full-identity
+merge-dedup match.
+
+#### Scenario: Imported package retains its puck prep
+- **WHEN** a package with a puck-prep item is imported from a source database
+- **THEN** the destination package SHALL own an equivalent puck-prep item
+
+#### Scenario: Same gear, different prep does not merge on import
+- **WHEN** a source and dest package share grinder + basket but differ in puck-prep flags
+- **THEN** the import SHALL NOT merge them (the source imports as a distinct package)
+
+### Requirement: Filling in an empty identity component SHALL NOT fork
+Copy-on-write forking SHALL apply to identity changes only. When every differing component was EMPTY on the package and now carries a value, the edit SHALL be applied in place: same package id, `inInventory` unchanged, every referencing shot, bag and recipe still pointing at it, regardless of shot count. Replacing a component that already had a value, or clearing one, SHALL still fork a used package.
+
+#### Scenario: Recording burrs on a long-used grinder
+- **WHEN** a package with recorded shots and no burrs recorded has burrs filled in
+- **THEN** the package SHALL be edited in place, keep its id, stay in inventory, and keep every shot pointing at it
+
+#### Scenario: Swapping burrs still forks
+- **WHEN** a package with recorded shots has its burrs changed from one named set to another
+- **THEN** a new package SHALL be forked under copy-on-write, so the earlier shots keep the burrs they were pulled on
+
+#### Scenario: Clearing a component is a change, not enrichment
+- **WHEN** a package with recorded shots has a named identity component cleared
+- **THEN** the edit SHALL fork rather than being applied in place
+
+#### Scenario: Adding a technique to an existing puck prep forks
+- **WHEN** a package with recorded shots has a second puck-prep flag set alongside an existing one
+- **THEN** the edit SHALL fork, because the earlier shots were pulled with the shorter routine
+
+#### Scenario: A grinder-less package gaining a grinder forks
+- **WHEN** a package with recorded shots and no grinder component at all is given a grinder identity
+- **THEN** a new package SHALL be forked, and the earlier shots SHALL stay on the grinder-less package
+
+#### Scenario: Naming a basket that was never recorded is enrichment
+- **WHEN** a package with recorded shots and no basket recorded has a basket filled in
+- **THEN** the edit SHALL be applied in place, because every one of those shots used a basket that simply was not written down
+
+### Requirement: Puck prep and grinder-less identity compare as whole values
+Puck prep SHALL be compared as a whole canonical flag string, so adding a technique to an existing routine is a change and not enrichment. A package with NO grinder component SHALL fork when given a grinder, because its shots were pulled with nothing ground. That exception SHALL NOT extend to an absent basket or absent puck prep, which are enrichable like absent burrs.
+
+#### Scenario: Absent puck prep is enrichment
+- **WHEN** a package with recorded shots and no puck prep recorded has a puck-prep routine filled in
+- **THEN** the edit SHALL be applied in place, keeping the package id
+
+### Requirement: Two packages SHALL be mergeable into one
+The system SHALL provide a merge that folds a source package into a target package by explicit id. Every shot, bag and recipe referencing the source SHALL be repointed at the target, supersession pointers naming the source SHALL name the target instead, and the source package row and its items SHALL be deleted. The merge SHALL be atomic: a failure at any step SHALL leave both packages exactly as they were.
+
+#### Scenario: Undoing a fork
+- **WHEN** a grinder was split into two packages and the user merges the newer one into the package holding the history
+- **THEN** all shots, bags and recipes SHALL resolve to the surviving package
+- **AND** the surviving package SHALL be in inventory with no supersession pointer
+- **AND** the merged-away package SHALL no longer exist
+
+#### Scenario: A superseded target is not revived
+- **WHEN** the merge target is itself superseded by a third package
+- **THEN** it SHALL keep its supersession pointer and SHALL NOT be returned to the inventory
+
+#### Scenario: Lineage follows the merge
+- **WHEN** a third package was superseded by the package being merged away
+- **THEN** its supersession pointer SHALL name the surviving package rather than a deleted row
+
+#### Scenario: Merge refuses an unknown or self-referencing package
+- **WHEN** a merge names a package id that does not exist, or names the same package as both source and target
+- **THEN** nothing SHALL be moved or deleted and the refusal SHALL carry a machine-readable reason
+
+#### Scenario: Active package survives the merge
+- **WHEN** the package merged away was the active equipment
+- **THEN** the surviving package SHALL become the active equipment
+
+### Requirement: Merge inventory and supersession rules
+The target SHALL be returned to inventory ONLY when nothing else supersedes it, and a supersession pointer aimed at the deleted source SHALL be cleared. A target retired because a third package replaced it SHALL stay retired, because reviving it would duplicate its successor's derived name in the inventory.
+
+#### Scenario: Target returns to inventory after merge
+- **WHEN** the merge target was retired only by the source package
+- **THEN** the target SHALL be in inventory with no supersession pointer
+
+### Requirement: Merge accepts retired packages and refuses bad ids
+Merge SHALL accept a retired source or target, since undoing a fork is the case it exists for. It SHALL refuse, changing nothing, when either id is unknown or both ids name one package, and the refusal SHALL carry a machine-readable reason.
+
+#### Scenario: Retired source merges
+- **WHEN** the source package is retired and the user merges it into a target
+- **THEN** the merge SHALL complete and all references SHALL resolve to the target
+
+### Requirement: Merge is exposed only with both packages named
+Merge is destructive and not undoable: the source identity is gone afterwards and its shots then report the target's gear. It SHALL only be exposed where the user names both packages, and SHALL NOT run from inference.
+
+#### Scenario: Matching packages are not merged automatically
+- **WHEN** two packages share a grinder and no merge has been requested
+- **THEN** neither package SHALL be merged or deleted
+
+### Requirement: Heal leaves changed or cleared components untouched
+A pair SHALL be left untouched when a component changed between two non-empty values, when a component was cleared, or when no supersession links the two packages. A superseded package with NO grinder component SHALL NOT be folded into a successor that has one, because its shots were pulled with nothing ground.
+
+#### Scenario: Heal leaves a pair alone when a component was cleared
+- **WHEN** the superseded package had a component that the successor no longer carries
+- **THEN** both packages SHALL remain
+
+### Requirement: Hard delete SHALL count every reference to a package
+The pre-check that decides whether a package may be hard-deleted SHALL count references from `shots`, `coffee_bags` and `recipes`, plus packages superseded by it. A package with any reference SHALL be soft-deleted instead, so no row is left pointing at an id that no longer exists.
+
+#### Scenario: A recipe blocks a hard delete
+- **WHEN** a delete is requested for a package that only a recipe references
+- **THEN** the package SHALL NOT be hard-deleted
+
+### Requirement: Equipment decisions SHALL be retrievable from a submitted log
+Equipment package events SHALL log under the registered `[Equipment]` subsystem marker at INFO, so one filter returns the subsystem's whole narrative. Every identity edit SHALL log which branch it took: applied in place, forked (naming both package ids and the identity before and after), or merged.
+
+#### Scenario: A fork is explicable after the fact
+- **WHEN** an identity edit forks a package
+- **THEN** the log SHALL name both package ids and what changed, so a reader can tell why a grinder's history detached without reproducing the edit
+
+#### Scenario: A heal that finds nothing still reports
+- **WHEN** the one-time heal runs and matches no packages
+- **THEN** it SHALL log that it completed with a count of zero
+
+### Requirement: Merges and the heal are logged with their outcomes
+A completed merge SHALL be logged once, from a path shared by every entry point, with the number of shots, bags and recipes moved. The one-time heal SHALL log its outcome even when it merges nothing, because "ran and found nothing" and "never ran" are otherwise indistinguishable.
+
+#### Scenario: A completed merge is logged once
+- **WHEN** a merge completes through any entry point
+- **THEN** exactly one log line SHALL record it, with the counts of shots, bags and recipes moved
+
+### Requirement: An archived package SHALL be one the user removed, distinct from a forked one
+
+A package with `inInventory = 0` and no `supersededBy` SHALL be treated as **archived**:
+the user took it out of inventory and it can be restored. A package with
+`supersededBy` set was retired by a copy-on-write fork or merge and SHALL NOT be
+treated as archived. Neither kind SHALL ever be deleted while a shot references it.
+
+#### Scenario: Removing a used package archives it
+
+- **WHEN** the user archives a package that has shots
+- **THEN** it leaves the inventory with `inInventory = 0`, keeps its row, and has no `supersededBy`
+
+### Requirement: Recreating an archived package's gear SHALL restore it instead of duplicating it
+
+When a package is created whose full identity (grinder brand, model and burrs, basket
+brand and model, puck prep) matches an archived package and no in-inventory package,
+the archived package SHALL be returned to inventory and reused; no new row SHALL be
+created. An identity edit that matches an archived package SHALL merge into it and
+return it to inventory, as an edit matching an in-inventory package already merges.
+
+#### Scenario: Creating archived gear restores it
+
+- **GIVEN** an archived Niche Zero package
+- **WHEN** the user creates a package with the same grinder, burrs, basket and puck prep
+- **THEN** the archived package is back in inventory with its own id and history
+- **AND** no new package exists
+
+#### Scenario: A forked package is not revived
+
+- **GIVEN** a package retired by a fork (`supersededBy` set)
+- **WHEN** a package is created with its old identity
+- **THEN** a new package is created and the retired one stays retired
+
+### Requirement: Restoring a package SHALL be refused only for a forked package
+
+Restoring SHALL return an archived package to inventory unchanged, including its
+name, even when another in-inventory package has the same name: the unique-name rule
+applies to renames, and derived names repeat by design. Restoring SHALL be refused for
+a forked package.
+
+#### Scenario: Restore beside a same-named package
+
+- **GIVEN** an archived package and an in-inventory package both named "Niche Zero"
+- **WHEN** the user restores the archived package
+- **THEN** it returns to inventory with its name unchanged
+
+### Requirement: Shots retain their equipment and dial snapshots
+Shots SHALL retain their equipment reference, recorded grind and RPM independently of bags.
+
+#### Scenario: Load an existing shot
+- **WHEN** a shot recorded before the upgrade is opened
+- **THEN** its recorded equipment, grind and RPM remain available and unchanged
+
+### Requirement: Equipment lifecycle does not depend on bags
+Equipment deletion, merging and identity edits SHALL work without bag equipment references while preserving the existing protection of shots, recipes and package lineage.
+
+#### Scenario: Merge after upgrade
+- **WHEN** equipment packages are merged after bag fields are removed
+- **THEN** the operation applies its existing shot, recipe and lineage rules without querying a bag equipment field

@@ -1,0 +1,1213 @@
+// The two extraction-view Components read this file's `espressoPage` id; Bound makes it
+// statically resolvable. Neither takes an injected model role, so nothing here needs a
+// `required property`. (The `layer.effect` blocks read only `Theme`, a singleton, so
+// they need nothing from the pragma.)
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import QtQuick.Layouts
+import QtQuick.Effects
+import Decenza
+import "../components/OperationNavigationPolicy.js" as NavigationPolicy
+
+T.Page {
+    id: espressoPage
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: ProfileService.currentProfileSummary.name || ""
+
+    objectName: "espressoPage"
+    // suppressShotChart: this page draws its own graph, and the last-shot chart
+    // background would put a second set of curves behind it.
+    background: ThemedPageBackground { suppressShotChart: true }
+
+    // The host snapshot is the single weight source for both native and remote engines.
+    readonly property real currentWeight: MachineState.scaleWeight
+
+    readonly property bool canAdjustExtraction: MachineState.phase === MachineState.Phase.Preinfusion ||
+                                               MachineState.phase === MachineState.Phase.Pouring
+    readonly property bool machineActionPending: Object.keys(pendingMachineActions).length > 0
+
+    // Frame name shown in the phase pill; updated on every frame change.
+    property string displayedFrameName: ""
+    property var pendingMachineActions: ({})
+
+    // Accessibility: value announcement cycling (swipe left/right)
+    property int accessibilityValueIndex: 0
+    // Number of cases getAccessibilityValue() answers; keep in step with its switch.
+    readonly property int accessibilityValueCount: 7
+
+    // Enable keyboard focus for the page
+    focus: true
+
+    StackView.onActivated: {
+        displayedFrameName = MachineControlService.currentFrameName
+        espressoBackButton.forceActiveFocus()
+    }
+
+    // Accessibility: get current value for announcement
+    function getAccessibilityValue(index) {
+        switch (index) {
+            case 0: // Frame
+                let frameInfo = MachineControlService.currentFrameName || TranslationManager.translate("espresso.accessible.starting", "Starting")
+                return TranslationManager.translate("espresso.accessible.frame", "Frame:") + " " + frameInfo
+            case 1: // Time
+                return TranslationManager.translate("espresso.accessible.time", "Time:") + " " + MachineState.shotTime.toFixed(1) + " " + TranslationManager.translate("espresso.accessible.seconds", "seconds")
+            case 2: // Pressure
+                return TranslationManager.translate("espresso.accessible.pressure", "Pressure:") + " " + DE1Device.pressure.toFixed(1) + " " + TranslationManager.translate("espresso.accessible.bar", "bar")
+            case 3: // Flow
+                return TranslationManager.translate("espresso.accessible.flow", "Flow:") + " " + DE1Device.flow.toFixed(1) + " " + TranslationManager.translate("espresso.accessible.mlPerSec", "milliliters per second")
+            case 4: // Temperature
+                return TranslationManager.translate("espresso.accessible.temperature", "Temperature:") + " " + Theme.cToDisplay(DE1Device.temperature).toFixed(1) + " " + TranslationManager.translate("espresso.accessible.degrees", "degrees")
+            case 5: // Weight and/or Volume
+                let parts = []
+                if (MachineState.targetWeight > 0) parts.push(TranslationManager.translate("espresso.accessible.weight", "Weight:") + " " + espressoPage.currentWeight.toFixed(1) + " " + TranslationManager.translate("espresso.accessible.of", "of") + " " + MachineState.targetWeight.toFixed(0) + " " + TranslationManager.translate("espresso.accessible.grams", "grams"))
+                if (MachineState.targetVolume > 0) parts.push(TranslationManager.translate("espresso.accessible.volume", "Volume:") + " " + MachineState.pourVolume.toFixed(1) + " " + TranslationManager.translate("espresso.accessible.of", "of") + " " + MachineState.targetVolume.toFixed(0) + " " + TranslationManager.translate("espresso.accessible.milliliters", "milliliters"))
+                return parts.join(", ") || TranslationManager.translate("espresso.noStopTarget", "No stop target")
+            case 6: // Weight flow rate
+                return TranslationManager.translate("espresso.accessible.weightFlow", "Weight flow:") + " " + MachineState.smoothedScaleFlowRate.toFixed(1) + " " + TranslationManager.translate("espresso.accessible.gramsPerSecond", "grams per second")
+            default:
+                return ""
+        }
+    }
+
+    // Accessibility: announce next value
+    function announceNextValue() {
+        accessibilityValueIndex = (accessibilityValueIndex + 1) % accessibilityValueCount
+        if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+            AccessibilityManager.announce(getAccessibilityValue(accessibilityValueIndex), true)
+        }
+    }
+
+    // Accessibility: announce previous value
+    function announcePreviousValue() {
+        accessibilityValueIndex = (accessibilityValueIndex - 1 + accessibilityValueCount) % accessibilityValueCount
+        if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+            AccessibilityManager.announce(getAccessibilityValue(accessibilityValueIndex), true)
+        }
+    }
+
+    // Accessibility: announce full status
+    function announceFullStatus() {
+        if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+            let status = TranslationManager.translate("espresso.accessible.shotStatus", "Shot status.") + " "
+            status += getAccessibilityValue(0) + ". "  // Frame
+            status += getAccessibilityValue(1) + ". "  // Time
+            status += getAccessibilityValue(2) + ". "  // Pressure
+            status += getAccessibilityValue(3) + ". "  // Flow
+            status += getAccessibilityValue(5)         // Weight
+            AccessibilityManager.announce(status, true)
+        }
+    }
+
+    readonly property string stopName: MachineState.phase === MachineState.Phase.HotWater
+        ? TranslationManager.translate("hotwater.accessible.stopHotWater", "Stop hot water")
+        : TranslationManager.translate("espresso.accessible.stopShot", "Stop espresso shot")
+
+    function stopAndGoBack() {
+        if (Object.keys(pendingMachineActions).length > 0)
+            return
+        // A drink's hot water shown in the cup: Stop stops the water. Checked
+        // first because Skip clears the cup-view flag while the water still runs.
+        // A successful stop needs no navigation here: the hot water ending does it.
+        if (MachineState.phase === MachineState.Phase.HotWater) {
+            const waterRequestId = MachineControlService.stopHotWater(MachineState.controlContextId)
+            const pendingWater = Object.assign({}, pendingMachineActions)
+            pendingWater[waterRequestId] = { operation: "stop-hot-water" }
+            pendingMachineActions = pendingWater
+            return
+        }
+        if (NavigationPolicy.machineOperationPage(MachineState.phase, MachineState.Phase,
+                                                  AppShell.drinkInCupView) !== "espressoPage") {
+            AppShell.dismissRequested()
+            return
+        }
+        const previousStopReason = AppShell.stopReason
+        AppShell.stopReason = "manual"
+        const requestId = MachineControlService.stopEspresso(MachineState.controlContextId)
+        const pending = Object.assign({}, pendingMachineActions)
+        pending[requestId] = { operation: "stop-espresso", previousStopReason: previousStopReason }
+        pendingMachineActions = pending
+    }
+
+    function requestMachineAction(operation, argument) {
+        if (Object.keys(pendingMachineActions).length > 0)
+            return
+        let requestId = ""
+        if (operation === "bump-target-weight")
+            requestId = MachineControlService.bumpTargetWeight(MachineState.controlContextId, argument)
+        else if (operation === "skip-frame")
+            requestId = MachineControlService.skipFrame(MachineState.controlContextId)
+        else if (operation === "skip-drink-step")
+            requestId = MachineControlService.skipDrinkStep(MachineState.controlContextId)
+        const pending = Object.assign({}, pendingMachineActions)
+        pending[requestId] = { operation: operation }
+        pendingMachineActions = pending
+    }
+
+    // The host's own reason when it gave one, e.g. "There is no next step to skip."
+    function showActionFailure(message) {
+        actionToast.show(message || TranslationManager.translate(
+            "espresso.action.failed", "The espresso action could not be completed. Please try again."))
+    }
+
+    PreferenceWrite {
+        id: viewPreferenceWrite
+        onFailed: message => actionToast.show(message)
+    }
+    StatusToast { id: actionToast; error: true }
+
+    // Keyboard shortcuts to stop and go back
+    Keys.onEscapePressed: espressoPage.stopAndGoBack()
+    Keys.onSpacePressed: espressoPage.stopAndGoBack()
+
+    // Additional keyboard navigation for accessibility
+    Keys.onPressed: function(event) {
+        if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+            if (event.key === Qt.Key_Left) {
+                announcePreviousValue()
+                event.accepted = true
+            } else if (event.key === Qt.Key_Right) {
+                announceNextValue()
+                event.accepted = true
+            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                announceFullStatus()
+                event.accepted = true
+            }
+        }
+        // Backspace also goes back
+        if (event.key === Qt.Key_Backspace) {
+            espressoPage.stopAndGoBack()
+            event.accepted = true
+        }
+    }
+
+    // ========== ACCESSIBILITY ANNOUNCEMENTS ==========
+
+    // Track last announced weight for milestone announcements
+    property real lastAnnouncedWeight: 0
+
+    // Helper to check if accessibility announcements are enabled
+    function accessibilityEnabled() {
+        return typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+    }
+
+    // Get phase announcement text
+    function getPhaseAnnouncement(phase) {
+        switch (phase) {
+            case MachineState.Phase.EspressoPreheating:
+                return TranslationManager.translate("espresso.accessibility.preheating", "Preheating")
+            case MachineState.Phase.Preinfusion:
+                return TranslationManager.translate("espresso.accessibility.preinfusion", "Preinfusion started")
+            case MachineState.Phase.Pouring:
+                return TranslationManager.translate("espresso.accessibility.pouring", "Pouring")
+            case MachineState.Phase.Ending:
+                return TranslationManager.translate("espresso.accessibility.ending", "Extraction ending")
+            default:
+                return ""
+        }
+    }
+
+    // Announce phase transitions
+    Connections {
+        target: MachineControlService
+        function onPresentationEvent(sourceId, sequence, event, payload) {
+            if (event === "phaseChanged") {
+                if (!espressoPage.accessibilityEnabled()) return
+                const announcement = espressoPage.getPhaseAnnouncement(payload.phase)
+                if (announcement)
+                    AccessibilityManager.announce(announcement, true)
+            } else if (event === "shotStarted") {
+                espressoPage.displayedFrameName = ""
+                if (!espressoPage.accessibilityEnabled()) return
+                espressoPage.lastAnnouncedWeight = 0
+                AccessibilityManager.announce(
+                    TranslationManager.translate("espresso.accessibility.started", "Extraction started"), true)
+            } else if (event === "shotEnded") {
+                if (!espressoPage.accessibilityEnabled()) return
+                accessibilityUpdateTimer.stop()
+                Qt.callLater(function() {
+                    var finalStatus = TranslationManager.translate("espresso.accessibility.ended", "Extraction finished") + ". "
+                    finalStatus += espressoPage.getAccessibilityValue(1) + ". "
+                    finalStatus += espressoPage.getAccessibilityValue(5)
+                    AccessibilityManager.announce(finalStatus, true)
+                })
+            } else if (event === "targetWeightReached") {
+                if (espressoPage.accessibilityEnabled())
+                    AccessibilityManager.announce(
+                        TranslationManager.translate("espresso.accessibility.targetReached", "Target weight reached"), true)
+            } else if (event === "frameChanged") {
+                const frameName = payload.frameName || ""
+                if (frameName !== "")
+                    espressoPage.displayedFrameName = frameName
+                if (payload.transitionReason === "" || frameName === "") return
+                const text = espressoPage._transitionText(payload.transitionReason)
+                frameTransitionLifecycle.stop()
+                frameTransitionLabel.text = text
+                frameTransitionPill.color = espressoPage._transitionColor(payload.transitionReason)
+                frameTransitionPill.opacity = 1
+                frameTransitionPill.scale = 1.0
+                frameTransitionLifecycle.start()
+                if (espressoPage.accessibilityEnabled())
+                    AccessibilityManager.announce(text)
+            }
+        }
+        function onPresentationEventsMissed(count) {
+            if (count <= 0) return
+            espressoPage.displayedFrameName = MachineControlService.currentFrameName
+                if (espressoPage.accessibilityEnabled())
+                    AccessibilityManager.announce(TranslationManager.translate(
+                        "espresso.accessibility.eventsMissed",
+                        "Some extraction announcements may have been missed while reconnecting."))
+        }
+        function onCompleted(requestId, operation, success, message, result) {
+            if (!espressoPage.pendingMachineActions[requestId]) return
+            const pending = Object.assign({}, espressoPage.pendingMachineActions)
+            const action = pending[requestId]
+            delete pending[requestId]
+            espressoPage.pendingMachineActions = pending
+            if (!success) {
+                if (operation === "stop-espresso")
+                    AppShell.browserBackCancelled()
+                if (operation === "stop-espresso"
+                        && AppShell.stopReason === "manual")
+                    AppShell.stopReason = action.previousStopReason
+                if (espressoPage.StackView.status === StackView.Active)
+                    espressoPage.showActionFailure(message)
+            } else if (operation === "stop-espresso"
+                       && espressoPage.StackView.status === StackView.Active) {
+                AppShell.dismissRequested()
+            }
+        }
+        function onStateChanged() {
+            espressoPage.displayedFrameName = MachineControlService.currentFrameName
+        }
+    }
+
+    // Announce weight milestones (every 10g) - respects user settings
+    Connections {
+        target: MachineState
+        function onScaleWeightChanged() {
+            if (!espressoPage.accessibilityEnabled()) return
+            if (!AccessibilityManager.extractionAnnouncementsEnabled) return
+            // Only announce milestones if mode includes milestones
+            var mode = AccessibilityManager.extractionAnnouncementMode
+            if (mode !== "milestones_only" && mode !== "both") return
+
+            var w = MachineState.scaleWeight
+            // Announce every 10g milestone
+            if (Math.floor(w / 10) > Math.floor(espressoPage.lastAnnouncedWeight / 10) && w > 0) {
+                AccessibilityManager.announce(Math.floor(w) + " " +
+                    TranslationManager.translate("espresso.accessibility.grams", "grams"))
+                espressoPage.lastAnnouncedWeight = w
+            }
+        }
+    }
+
+    // Periodic update timer - uses configurable interval from AccessibilityManager
+    Timer {
+        id: accessibilityUpdateTimer
+        interval: AccessibilityManager.extractionAnnouncementInterval * 1000
+        repeat: true
+        running: espressoPage.accessibilityEnabled() &&
+                 AccessibilityManager.extractionAnnouncementsEnabled &&
+                 (AccessibilityManager.extractionAnnouncementMode === "timed" ||
+                  AccessibilityManager.extractionAnnouncementMode === "both") &&
+                 (MachineState.phase === MachineState.Phase.Preinfusion ||
+                  MachineState.phase === MachineState.Phase.Pouring)
+        onTriggered: {
+            var time = MachineState.shotTime.toFixed(0)
+            var weight = espressoPage.currentWeight.toFixed(1)
+            AccessibilityManager.announce(
+                TranslationManager.translate("espresso.accessibility.time", "Time") + " " + time + " " +
+                TranslationManager.translate("espresso.accessibility.seconds", "seconds") + ", " +
+                TranslationManager.translate("espresso.accessibility.weight", "weight") + " " + weight + " " +
+                TranslationManager.translate("espresso.accessibility.grams", "grams")
+            )
+        }
+    }
+
+    // ========== END ACCESSIBILITY ANNOUNCEMENTS ==========
+
+    // Unconfirmed sensor exits render like their confirmed counterpart — the
+    // confirmed/unconfirmed distinction matters to the shot-analysis detectors,
+    // not to the user mid-shot (and the hint is usually correct).
+    function _transitionText(reason) {
+        switch (reason) {
+            case "weight": return TranslationManager.translate("espresso.transition.weight", "Weight exit")
+            case "pressure":
+            case "pressure_unconfirmed": return TranslationManager.translate("espresso.transition.pressure", "Pressure exit")
+            case "flow":
+            case "flow_unconfirmed": return TranslationManager.translate("espresso.transition.flow", "Flow exit")
+            case "time": return TranslationManager.translate("espresso.transition.time", "Time exit")
+            default: return TranslationManager.translate("espresso.transition.next", "Next frame")
+        }
+    }
+
+    function _transitionColor(reason) {
+        switch (reason) {
+            case "weight": return Theme.weightColor
+            case "pressure":
+            case "pressure_unconfirmed": return Theme.pressureColor
+            case "flow":
+            case "flow_unconfirmed": return Theme.flowColor
+            case "time": return Theme.textSecondaryColor
+            default: return Theme.textSecondaryColor
+        }
+    }
+
+    // Extraction view mode setting
+    readonly property string extractionViewMode: RecipeContext.preferences.espressoExtractionView || "chart"
+    readonly property bool showPhaseIndicator: RecipeContext.preferences.espressoShowPhaseIndicator !== false
+    readonly property bool showStats: RecipeContext.preferences.espressoShowStats !== false
+    // Shared with the shot page via the same setting.
+
+    PortalReadout {
+        id: portalReadout
+        anchors.top: parent.top
+        anchors.topMargin: Theme.pageTopMargin
+        anchors.left: parent.left
+        anchors.leftMargin: Theme.spacingMedium
+        anchors.right: viewModeButton.left
+        anchors.rightMargin: Theme.spacingSmall
+        height: Math.max(implicitHeight, viewModeButton.height)
+        visible: BelkaPortal.owned
+    }
+
+    // Extraction view switcher (Loader swaps between ShotGraph and CupFill)
+    Loader {
+        id: extractionViewLoader
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: graphLegend.visible ? graphLegend.top
+                      : espressoStopButton.visible ? espressoStopButton.top
+                      : skipDrinkStepButton.visible ? skipDrinkStepButton.top : infoBar.top
+        anchors.topMargin: portalReadout.visible
+                         ? portalReadout.y + portalReadout.height + Theme.spacingSmall
+                         : Theme.scaled(50)
+        sourceComponent: {
+            switch (espressoPage.extractionViewMode) {
+                case "cupFill": return cupFillComponent
+                case "chart": return shotGraphComponent
+                default:
+                    WebDebugLogger.warn("Shot", "EspressoPage", ["Unknown extraction view mode:", espressoPage.extractionViewMode, "— falling back to chart"].map(String).join(" "))
+                    return shotGraphComponent
+            }
+        }
+    }
+
+    Component {
+        id: shotGraphComponent
+        ShotGraph {}
+    }
+
+    Component {
+        id: cupFillComponent
+        CupFillView {
+            currentWeight: espressoPage.currentWeight
+            targetWeight: MachineState.targetWeight
+            currentFlow: DE1Device.flow
+            currentPressure: DE1Device.pressure
+            goalPressure: MainController.filteredGoalPressure
+            goalFlow: MainController.filteredGoalFlow
+            shotTime: MachineState.shotTime
+            phase: MachineState.phase
+            waterTarget: AppShell.drinkInCupView ? MachineState.hotWaterTargetWeight : 0
+            waterFlow: MachineState.smoothedScaleFlowRate
+        }
+    }
+
+    // View mode selector button (top-right)
+    Rectangle {
+        id: viewModeButton
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.topMargin: Theme.pageTopMargin + (portalReadout.visible ? 0 : Theme.scaled(16))
+        anchors.rightMargin: Theme.spacingMedium
+        z: 10
+        width: Theme.scaled(44)
+        height: Theme.scaled(44)
+        radius: Theme.scaled(22)
+        color: Theme.cardBackgroundColor
+        border.color: Theme.borderColor
+        border.width: Theme.scaled(1)
+
+        Accessible.ignored: true
+
+        Image {
+            anchors.centerIn: parent
+            source: "qrc:/icons/Graph.svg"
+            sourceSize.width: Theme.scaled(22)
+            sourceSize.height: Theme.scaled(22)
+            Accessible.ignored: true
+
+            layer.enabled: true
+            layer.smooth: true
+            layer.effect: MultiEffect {
+                colorization: 1.0
+                colorizationColor: Theme.textColor
+            }
+        }
+
+        AccessibleMouseArea {
+            id: viewModeMouseArea
+            anchors.fill: parent
+            accessibleName: TranslationManager.translate("espresso.viewMode.button", "Change extraction view")
+            accessibleItem: viewModeButton
+            activeFocusOnTab: true
+            KeyNavigation.tab: skipDrinkStepButton.visible ? skipDrinkStepButton
+                             : espressoStopButton.visible ? espressoStopButton : espressoBackButton
+            KeyNavigation.backtab: skipFrameButton.visible ? skipFrameButton : espressoBackButton
+            Keys.onReturnPressed: function(event) { viewSelectorDialog.open(); event.accepted = true }
+            Keys.onSpacePressed:  function(event) { viewSelectorDialog.open(); event.accepted = true }
+            onAccessibleClicked: viewSelectorDialog.open()
+        }
+    }
+
+    // View selector dialog
+    ExtractionViewSelector {
+        id: viewSelectorDialog
+        enabled: viewPreferenceWrite.ready
+        currentMode: espressoPage.extractionViewMode
+        showPhaseIndicator: espressoPage.showPhaseIndicator
+        showStats: espressoPage.showStats
+        onModeSelected: function(mode) {
+            viewPreferenceWrite.submit("espressoExtractionView", mode)
+        }
+        onPhaseIndicatorToggled: function(enabled) {
+            viewPreferenceWrite.submit("espressoShowPhaseIndicator", enabled)
+        }
+        onStatsToggled: function(enabled) {
+            viewPreferenceWrite.submit("espressoShowStats", enabled)
+        }
+    }
+
+    // Phase indicator (centered over chart, top-left over cup fill)
+    Rectangle {
+        id: statusBanner
+        anchors.top: parent.top
+        anchors.topMargin: (portalReadout.visible ? extractionViewLoader.y : Theme.pageTopMargin) + Theme.scaled(20)
+        x: espressoPage.extractionViewMode === "chart"
+           ? (parent.width - width) / 2
+           : Theme.spacingMedium
+        z: 10
+        width: phaseRow.width + Theme.spacingMedium * 2
+        height: Theme.scaled(36)
+        radius: Theme.scaled(18)
+        color: {
+            switch (MachineState.phase) {
+                case MachineState.Phase.EspressoPreheating: return Theme.accentColor
+                case MachineState.Phase.Preinfusion: return Theme.pressureColor
+                case MachineState.Phase.Pouring: return Theme.flowColor
+                case MachineState.Phase.Ending: return Theme.successColor
+                default: return "transparent"
+            }
+        }
+        opacity: 0.85
+        visible: espressoPage.showPhaseIndicator &&
+                 (MachineState.phase === MachineState.Phase.EspressoPreheating ||
+                  MachineState.phase === MachineState.Phase.Preinfusion ||
+                  MachineState.phase === MachineState.Phase.Pouring ||
+                  MachineState.phase === MachineState.Phase.Ending)
+
+        Accessible.role: Accessible.Alert
+        Accessible.name: phaseLabelText.text
+
+        Row {
+            id: phaseRow
+            anchors.centerIn: parent
+            spacing: Theme.scaled(6)
+
+            // Phase dot
+            Rectangle {
+                width: Theme.scaled(8)
+                height: Theme.scaled(8)
+                radius: Theme.scaled(4)
+                color: Theme.textColor
+                anchors.verticalCenter: parent.verticalCenter
+                // Steady, not pulsing: a running animation redraws the whole window every
+                // frame, ~270 ms/s of the render thread through preheat on a Galaxy Tab A9+.
+            }
+
+            Text {
+                id: phaseLabelText
+                text: {
+                    switch (MachineState.phase) {
+                        case MachineState.Phase.EspressoPreheating:
+                            return TranslationManager.translate("espresso.phase.preheating", "Preheating")
+                        case MachineState.Phase.Preinfusion:
+                        case MachineState.Phase.Pouring:
+                        case MachineState.Phase.Ending:
+                            // Show frame name if available (advanced/flow profiles),
+                            // fall back to generic phase name
+                            let frameName = espressoPage.displayedFrameName
+                            if (frameName)
+                                return frameName
+                            if (MachineState.phase === MachineState.Phase.Preinfusion)
+                                return TranslationManager.translate("espresso.phase.preinfusion", "Pre-infusion")
+                            if (MachineState.phase === MachineState.Phase.Pouring)
+                                return TranslationManager.translate("espresso.phase.pouring", "Pouring")
+                            return TranslationManager.translate("espresso.phase.ending", "Ending")
+                        default: return ""
+                    }
+                }
+                color: Theme.textColor
+                font.family: Theme.bodyFont.family
+                font.pixelSize: Theme.bodyFont.pixelSize
+                font.weight: Font.Bold
+                Accessible.ignored: true
+            }
+        }
+    }
+
+    // Frame transition notification (anchored next to phase pill)
+    Rectangle {
+        id: frameTransitionPill
+        Accessible.ignored: true
+        anchors.verticalCenter: statusBanner.verticalCenter
+        anchors.left: statusBanner.right
+        anchors.leftMargin: Theme.scaled(8)
+        z: 10
+
+        width: frameTransitionLabel.width + Theme.spacingLarge * 2
+        height: Theme.scaled(36)
+        radius: Theme.scaled(18)
+        color: Theme.textSecondaryColor
+        opacity: 0
+        scale: 1.0
+
+        visible: espressoPage.showPhaseIndicator && opacity > 0
+
+        SequentialAnimation {
+            id: frameTransitionLifecycle
+            NumberAnimation {
+                target: frameTransitionPill
+                property: "scale"
+                from: 0.8
+                to: 1.08
+                duration: 150
+                easing.type: Easing.OutBack
+                easing.overshoot: 1.5
+            }
+            NumberAnimation {
+                target: frameTransitionPill
+                property: "scale"
+                from: 1.08
+                to: 1.0
+                duration: 300
+                easing.type: Easing.OutBack
+                easing.overshoot: 1.5
+            }
+            PauseAnimation { duration: 1500 }
+            NumberAnimation {
+                target: frameTransitionPill
+                property: "opacity"
+                to: 0
+                duration: 800
+                easing.type: Easing.InQuad
+            }
+        }
+
+        Text {
+            id: frameTransitionLabel
+            anchors.centerIn: parent
+            color: Theme.textColor
+            font.family: Theme.bodyFont.family
+            font.pixelSize: Theme.bodyFont.pixelSize
+            Accessible.ignored: true
+        }
+    }
+
+    // Stop button for headless machines (prominently placed above info bar)
+    Rectangle {
+        id: espressoStopButton
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: infoBar.top
+        anchors.bottomMargin: Theme.scaled(20)
+        width: Theme.scaled(200)
+        height: Theme.scaled(60)
+        visible: DE1Device.isHeadless
+        radius: Theme.cardRadius
+        color: stopTapHandler.isPressed ? Qt.darker(Theme.errorColor, 1.2) : Theme.errorColor
+        border.color: Theme.primaryContrastColor
+        border.width: Theme.scaled(2)
+
+        activeFocusOnTab: true
+        KeyNavigation.tab: espressoBackButton
+        KeyNavigation.backtab: skipDrinkStepButton.visible ? skipDrinkStepButton : viewModeMouseArea
+        Accessible.role: Accessible.Button
+        Accessible.name: espressoPage.stopName
+        Accessible.focusable: true
+        Accessible.onPressAction: espressoPage.stopAndGoBack()
+        Keys.onReturnPressed: function(event) {
+            espressoPage.stopAndGoBack()
+            event.accepted = true
+        }
+        Keys.onSpacePressed: function(event) {
+            espressoPage.stopAndGoBack()
+            event.accepted = true
+        }
+
+        Text {
+            anchors.centerIn: parent
+            text: TranslationManager.translate("espresso.button.stop", "STOP")
+            color: Theme.primaryContrastColor
+            font.pixelSize: Theme.scaled(24)
+            font.weight: Font.Bold
+            Accessible.ignored: true
+        }
+
+        AccessibleTapHandler {
+            id: stopTapHandler
+            anchors.fill: parent
+            accessibleName: espressoPage.stopName
+            accessibleItem: espressoStopButton
+            Accessible.ignored: true
+            onAccessibleClicked: {
+                espressoPage.stopAndGoBack()
+            }
+        }
+    }
+
+    // The drink's next step, skippable for this drink (recipe-drink-sequence). Shown
+    // here for an americano, and for a long black whose water the cup view shows.
+    AccessibleButton {
+        id: skipDrinkStepButton
+        visible: MachineControlService.pendingDrinkStep !== MachineControlService.DrinkStep.None
+        // Beside Stop, clear of the cup; in Stop's place when Stop is hidden (GHC).
+        anchors.left: espressoStopButton.visible ? espressoStopButton.right : undefined
+        anchors.leftMargin: Theme.spacingMedium
+        anchors.verticalCenter: espressoStopButton.visible ? espressoStopButton.verticalCenter : undefined
+        anchors.horizontalCenter: espressoStopButton.visible ? undefined : parent.horizontalCenter
+        anchors.bottom: espressoStopButton.visible ? undefined : infoBar.top
+        anchors.bottomMargin: Theme.scaled(20)
+        text: TranslationManager.translate("drinkSequence.button.skip", "Skip")
+        icon.source: MachineControlService.pendingDrinkStep === MachineControlService.DrinkStep.Espresso
+                     ? "qrc:/icons/espresso.svg" : "qrc:/icons/water.svg"
+        tintIcon: true
+        iconAfterText: true
+        accessibleName: MachineControlService.pendingDrinkStep === MachineControlService.DrinkStep.Espresso
+                        ? TranslationManager.translate("drinkSequence.accessible.skipEspresso", "Skip espresso")
+                        : TranslationManager.translate("drinkSequence.accessible.skipWater", "Skip water")
+        KeyNavigation.tab: espressoStopButton.visible ? espressoStopButton : espressoBackButton
+        KeyNavigation.backtab: viewModeMouseArea
+        onClicked: espressoPage.requestMachineAction("skip-drink-step")
+    }
+
+    // Tappable legend to toggle graph lines (only visible in chart mode)
+    GraphLegend {
+        id: graphLegend
+        liveMode: true
+        portalAvailable: LiveShotGraph.portalSampleCount > 0 || BelkaPortal.owned
+        visible: espressoPage.extractionViewMode === "chart"
+        width: parent.width
+        anchors.bottom: espressoStopButton.visible ? espressoStopButton.top
+                      : skipDrinkStepButton.visible ? skipDrinkStepButton.top : infoBar.top
+        anchors.bottomMargin: Theme.spacingSmall
+    }
+
+    // Bottom info bar with live values
+    Rectangle {
+        id: infoBar
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: weightAdjustmentGrid.visible
+                ? weightAdjustmentGrid.implicitHeight + 2 * Theme.spacingMedium
+                : Theme.scaled(100)
+        color: Theme.glassChrome
+               ? Theme.chromeFill(Theme.surfaceColor)
+               : Qt.darker(Theme.surfaceColor, 1.3)
+        // opacity < 1 forces the scrim through the alpha pass — QML_GOTCHAS.md
+        // "Translucent element renders opaque".
+        opacity: Theme.glassChrome ? 0.99 : 1.0
+
+        RowLayout {
+            id: infoBarRow
+            anchors.fill: parent
+            anchors.margins: Theme.spacingMedium
+            spacing: Theme.spacingSmall
+
+            // Keep the back target's width stable when the adjustment grid is shown.
+            Item {
+                id: espressoBackButton
+                Layout.fillHeight: true
+                Layout.preferredWidth: Theme.touchTargetLarge
+
+                activeFocusOnTab: true
+                KeyNavigation.tab: weightAdjustmentGrid.visible ? subtractFiveButton
+                                   : (skipFrameButton.visible ? skipFrameButton : viewModeMouseArea)
+                KeyNavigation.backtab: espressoStopButton.visible ? espressoStopButton
+                                     : skipDrinkStepButton.visible ? skipDrinkStepButton : viewModeMouseArea
+                Accessible.role: Accessible.Button
+                Accessible.name: TranslationManager.translate("espresso.accessible.stop", "Stop and go back")
+                Accessible.focusable: true
+                Accessible.onPressAction: {
+                    espressoPage.stopAndGoBack()
+                }
+                Keys.onReturnPressed: function(event) {
+                    espressoPage.stopAndGoBack()
+                    event.accepted = true
+                }
+                Keys.onSpacePressed: function(event) {
+                    espressoPage.stopAndGoBack()
+                    event.accepted = true
+                }
+
+                Image {
+                    anchors.centerIn: parent
+                    source: "qrc:/icons/back.svg"
+                    sourceSize.width: Theme.scaled(28)
+                    sourceSize.height: Theme.scaled(28)
+                    Accessible.ignored: true
+
+                    layer.enabled: true
+                    layer.smooth: true
+                    layer.effect: MultiEffect {
+                        colorization: 1.0
+                        colorizationColor: Theme.textColor
+                    }
+                }
+
+                // Using TapHandler for better touch responsiveness
+                AccessibleTapHandler {
+                    anchors.fill: parent
+                    accessibleName: TranslationManager.translate("espresso.accessible.stopAndGoBack", "Stop shot and go back")
+                    accessibleItem: espressoBackButton
+                    Accessible.ignored: true
+                    onAccessibleClicked: {
+                        espressoPage.stopAndGoBack()
+                    }
+                }
+            }
+
+            // Timer
+            ColumnLayout {
+                visible: espressoPage.showStats
+                Layout.preferredWidth: Theme.scaled(100)
+                spacing: Theme.scaled(2)
+
+                Accessible.role: Accessible.StaticText
+                Accessible.name: espressoPage.getAccessibilityValue(1)
+
+                Text {
+                    text: MachineState.shotTime.toFixed(1) + "s"
+                    color: Theme.textColor
+                    font.pixelSize: Theme.scaled(36)
+                    font.weight: Font.Bold
+                    Accessible.ignored: true
+                }
+                Tr {
+                    key: "espresso.label.time"
+                    fallback: "Time"
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    Accessible.ignored: true
+                }
+            }
+
+            // Divider
+            Rectangle {
+                visible: espressoPage.showStats
+                Layout.preferredWidth: Theme.scaled(1)
+                Layout.fillHeight: true
+                Layout.topMargin: Theme.chartMarginSmall
+                Layout.bottomMargin: Theme.chartMarginSmall
+                color: Theme.textSecondaryColor
+                opacity: 0.3
+            }
+
+            // Pressure
+            ColumnLayout {
+                id: pressureColumn
+                visible: espressoPage.showStats
+                Layout.preferredWidth: Theme.scaled(80)
+                spacing: Theme.scaled(2)
+
+                property real goal: MainController.filteredGoalPressure
+                property bool trackReady: goal > 0
+                property real delta: trackReady ? Math.abs(DE1Device.pressure - goal) : 0
+                property color trackColor: trackReady ? Theme.trackingColor(delta, goal, true) : Theme.textSecondaryColor
+
+                Accessible.role: Accessible.StaticText
+                Accessible.name: espressoPage.getAccessibilityValue(2)
+
+                Text {
+                    text: DE1Device.pressure.toFixed(1)
+                    color: Theme.pressureColor
+                    font.pixelSize: Theme.scaled(28)
+                    font.weight: Font.Medium
+                    Accessible.ignored: true
+                }
+                RowLayout {
+                    spacing: Theme.scaled(4)
+                    Rectangle {
+                        Layout.preferredWidth: Theme.scaled(6)
+                        Layout.preferredHeight: Theme.scaled(6)
+                        radius: Theme.scaled(3)
+                        color: pressureColumn.trackColor
+                        visible: pressureColumn.trackReady
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                    Text {
+                        text: pressureColumn.trackReady
+                            ? "→" + pressureColumn.goal.toFixed(1) + " " + TranslationManager.translate("espresso.unit.bar", "bar")
+                            : TranslationManager.translate("espresso.unit.bar", "bar")
+                        color: pressureColumn.trackReady ? pressureColumn.trackColor : Theme.textSecondaryColor
+                        font: Theme.captionFont
+                        Accessible.ignored: true
+                    }
+                }
+            }
+
+            // Flow
+            ColumnLayout {
+                id: flowColumn
+                visible: espressoPage.showStats
+                Layout.preferredWidth: Theme.scaled(80)
+                spacing: Theme.scaled(2)
+
+                property real goal: MainController.filteredGoalFlow
+                property bool trackReady: goal > 0
+                property real delta: trackReady ? Math.abs(DE1Device.flow - goal) : 0
+                property color trackColor: trackReady ? Theme.trackingColor(delta, goal, false) : Theme.textSecondaryColor
+
+                Accessible.role: Accessible.StaticText
+                Accessible.name: espressoPage.getAccessibilityValue(3)
+
+                Text {
+                    text: DE1Device.flow.toFixed(1)
+                    color: Theme.flowColor
+                    font.pixelSize: Theme.scaled(28)
+                    font.weight: Font.Medium
+                    Accessible.ignored: true
+                }
+                RowLayout {
+                    spacing: Theme.scaled(4)
+                    Rectangle {
+                        Layout.preferredWidth: Theme.scaled(6)
+                        Layout.preferredHeight: Theme.scaled(6)
+                        radius: Theme.scaled(3)
+                        color: flowColumn.trackColor
+                        visible: flowColumn.trackReady
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                    Text {
+                        text: flowColumn.trackReady
+                            ? "→" + flowColumn.goal.toFixed(1) + " " + TranslationManager.translate("espresso.unit.flowRate", "mL/s")
+                            : TranslationManager.translate("espresso.unit.flowRate", "mL/s")
+                        color: flowColumn.trackReady ? flowColumn.trackColor : Theme.textSecondaryColor
+                        font: Theme.captionFont
+                        Accessible.ignored: true
+                    }
+                }
+            }
+
+            // Temperature
+            ColumnLayout {
+                visible: espressoPage.showStats
+                Layout.preferredWidth: Theme.scaled(80)
+                spacing: Theme.scaled(2)
+
+                Accessible.role: Accessible.StaticText
+                Accessible.name: espressoPage.getAccessibilityValue(4)
+
+                Text {
+                    text: Theme.cToDisplay(DE1Device.temperature).toFixed(1)
+                    color: Theme.temperatureColor
+                    font.pixelSize: Theme.scaled(28)
+                    font.weight: Font.Medium
+                    Accessible.ignored: true
+                }
+                Text {
+                    text: Theme.tempUnitSuffix()
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    Accessible.ignored: true
+                }
+            }
+
+            // Weight flow rate (delta weight from scale)
+            ColumnLayout {
+                visible: espressoPage.showStats
+                Layout.preferredWidth: Theme.scaled(80)
+                spacing: Theme.scaled(2)
+
+                Accessible.role: Accessible.StaticText
+                Accessible.name: espressoPage.getAccessibilityValue(6)
+
+                Text {
+                    text: MachineState.smoothedScaleFlowRate.toFixed(1)
+                    color: Theme.weightFlowColor
+                    font.pixelSize: Theme.scaled(28)
+                    font.weight: Font.Medium
+                    Accessible.ignored: true
+                }
+                Tr {
+                    key: "espresso.unit.weightFlow"
+                    fallback: "g/s"
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    Accessible.ignored: true
+                }
+            }
+
+            // Divider
+            Rectangle {
+                visible: espressoPage.showStats
+                Layout.preferredWidth: Theme.scaled(1)
+                Layout.fillHeight: true
+                Layout.topMargin: Theme.chartMarginSmall
+                Layout.bottomMargin: Theme.chartMarginSmall
+                color: Theme.textSecondaryColor
+                opacity: 0.3
+            }
+
+            // Weight or Volume with progress
+            ColumnLayout {
+                id: weightVolumeColumn
+                Layout.fillWidth: true
+                Layout.minimumWidth: Theme.scaled(96)
+                spacing: Theme.scaled(4)
+
+                // Show volume display when only volume target is set (no weight target)
+                // A drink's hot water shown in the cup view: the readout follows the water.
+                readonly property bool waterMode: MachineState.phase === MachineState.Phase.HotWater
+                readonly property bool isVolumeMode: !waterMode && MachineState.targetVolume > 0 && MachineState.targetWeight <= 0
+                readonly property double currentValue: isVolumeMode ? MachineState.pourVolume : espressoPage.currentWeight
+                readonly property double targetValue: waterMode ? MachineState.hotWaterTargetWeight
+                                                    : isVolumeMode ? MachineState.targetVolume : MachineState.targetWeight
+                readonly property string unit: isVolumeMode ? "ml" : "g"
+                readonly property color displayColor: isVolumeMode ? Theme.flowColor : Theme.weightColor
+
+                Accessible.role: Accessible.StaticText
+                Accessible.name: espressoPage.getAccessibilityValue(5)
+
+                ColumnLayout {
+                    visible: espressoPage.showStats
+                    spacing: Theme.scaled(2)
+
+                    Text {
+                        text: weightVolumeColumn.currentValue.toFixed(1)
+                        color: weightVolumeColumn.displayColor
+                        font.pixelSize: Theme.scaled(28)
+                        font.weight: Font.Medium
+                        Accessible.ignored: true
+                    }
+                    Text {
+                        text: ProfileManager.brewByRatioActive && !weightVolumeColumn.isVolumeMode
+                              && !weightVolumeColumn.waterMode
+                            ? "1:" + ProfileManager.brewByRatio.toFixed(1) + " (" + MachineState.targetWeight.toFixed(0) + "g)"
+                            : "/ " + weightVolumeColumn.targetValue.toFixed(0) + " " + weightVolumeColumn.unit
+                        color: Theme.textSecondaryColor
+                        font.pixelSize: Theme.scaled(18)
+                        Accessible.ignored: true
+                    }
+                }
+
+                RowLayout {
+                    visible: espressoPage.showStats
+                    Layout.fillWidth: true
+                    spacing: Theme.spacingSmall
+
+                    ProgressBar {
+                        id: weightVolumeProgressBar
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Theme.spacingSmall
+                        from: 0
+                        to: weightVolumeColumn.targetValue
+                        value: weightVolumeColumn.currentValue
+
+                        background: Rectangle {
+                            color: Theme.surfaceColor
+                            radius: Theme.scaled(4)
+                        }
+
+                        contentItem: Item {
+                            Rectangle {
+                                width: weightVolumeProgressBar.visualPosition * parent.width
+                                height: parent.height
+                                radius: Theme.scaled(4)
+                                color: weightVolumeColumn.displayColor
+                            }
+                        }
+                    }
+                }
+            }
+
+            RowLayout {
+                id: extractionControls
+                Layout.alignment: Qt.AlignVCenter
+                spacing: Theme.spacingSmall
+                visible: espressoPage.canAdjustExtraction
+
+                GridLayout {
+                    id: weightAdjustmentGrid
+                    columns: 2
+                    uniformCellWidths: true
+                    rowSpacing: Theme.spacingSmall
+                    columnSpacing: Theme.spacingSmall
+                    visible: MachineState.targetWeight > 0 && espressoPage.canAdjustExtraction
+
+                    LiveAdjustButton {
+                        id: subtractFiveButton
+                        text: TranslationManager.translate("espresso.button.subtract5", "-5 g")
+                        accessibleName: TranslationManager.translate("espresso.accessible.subtract5", "Subtract 5 grams from weight target")
+                        enabled: MachineState.canDecreaseTargetWeight && !espressoPage.machineActionPending
+                        KeyNavigation.tab: addFiveButton
+                        KeyNavigation.backtab: espressoBackButton
+                        onClicked: espressoPage.requestMachineAction("bump-target-weight", -5.0)
+                    }
+
+                    LiveAdjustButton {
+                        id: addFiveButton
+                        text: TranslationManager.translate("espresso.button.add5", "+5 g")
+                        accessibleName: TranslationManager.translate("espresso.accessible.add5", "Add 5 grams to weight target")
+                        KeyNavigation.tab: subtractTenButton
+                        KeyNavigation.backtab: subtractFiveButton
+                        enabled: !espressoPage.machineActionPending
+                        onClicked: espressoPage.requestMachineAction("bump-target-weight", 5.0)
+                    }
+
+                    LiveAdjustButton {
+                        id: subtractTenButton
+                        text: TranslationManager.translate("espresso.button.subtract10", "-10 g")
+                        accessibleName: TranslationManager.translate("espresso.accessible.subtract10", "Subtract 10 grams from weight target")
+                        enabled: MachineState.canDecreaseTargetWeight && !espressoPage.machineActionPending
+                        KeyNavigation.tab: addTenButton
+                        KeyNavigation.backtab: addFiveButton
+                        onClicked: espressoPage.requestMachineAction("bump-target-weight", -10.0)
+                    }
+
+                    LiveAdjustButton {
+                        id: addTenButton
+                        text: TranslationManager.translate("espresso.button.add10", "+10 g")
+                        accessibleName: TranslationManager.translate("espresso.accessible.add10", "Add 10 grams to weight target")
+                        KeyNavigation.tab: skipFrameButton
+                        KeyNavigation.backtab: subtractTenButton
+                        enabled: !espressoPage.machineActionPending
+                        onClicked: espressoPage.requestMachineAction("bump-target-weight", 10.0)
+                    }
+                }
+
+                LiveAdjustButton {
+                    id: skipFrameButton
+                    text: TranslationManager.translate("espresso.button.skip", "Skip")
+                    accessibleName: TranslationManager.translate("espresso.accessible.skipFrame", "Skip to next frame")
+                    KeyNavigation.tab: viewModeMouseArea
+                    KeyNavigation.backtab: weightAdjustmentGrid.visible ? addTenButton : espressoBackButton
+                    enabled: !espressoPage.machineActionPending
+                    onClicked: espressoPage.requestMachineAction("skip-frame", 0)
+                }
+            }
+        }
+    }
+
+    // Keep announcement gestures over the readouts, clear of the shot controls.
+    MouseArea {
+        id: infoBarSwipeArea
+        anchors.fill: infoBar
+        anchors.leftMargin: infoBarRow.x + espressoBackButton.width + infoBarRow.spacing
+        anchors.rightMargin: extractionControls.visible
+                             ? infoBar.width - (infoBarRow.x + extractionControls.x)
+                             : Theme.spacingMedium
+        enabled: typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+        propagateComposedEvents: true
+
+        property real startX: 0
+        property real startY: 0
+        property bool swiped: false
+
+        onPressed: function(mouse) {
+            startX = mouse.x
+            startY = mouse.y
+            swiped = false
+        }
+
+        onReleased: function(mouse) {
+            var deltaX = mouse.x - startX
+            var deltaY = mouse.y - startY
+            var threshold = 50
+
+            // Horizontal swipe (left or right)
+            if (Math.abs(deltaX) > threshold && Math.abs(deltaX) > Math.abs(deltaY)) {
+                swiped = true
+                if (deltaX > 0) {
+                    espressoPage.announceNextValue()
+                } else {
+                    espressoPage.announcePreviousValue()
+                }
+            }
+        }
+
+        onClicked: function(mouse) {
+            // Pass through non-swipe taps to elements below
+            if (!swiped) {
+                mouse.accepted = false
+            }
+        }
+    }
+
+    // Two-finger tap for full status announcement over the same readouts.
+    MultiPointTouchArea {
+        anchors.fill: infoBarSwipeArea
+        enabled: typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+        minimumTouchPoints: 2
+        maximumTouchPoints: 2
+
+        onPressed: function(touchPoints) {
+            if (touchPoints.length === 2) {
+                espressoPage.announceFullStatus()
+            }
+        }
+    }
+
+    // Swipe gestures on chart for accessibility (swipe left/right to navigate values)
+    MouseArea {
+        id: chartTapArea
+        anchors.fill: extractionViewLoader
+        enabled: typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+
+        property real startX: 0
+        property real startY: 0
+
+        onPressed: function(mouse) {
+            startX = mouse.x
+            startY = mouse.y
+        }
+
+        onReleased: function(mouse) {
+            var deltaX = mouse.x - startX
+            var deltaY = mouse.y - startY
+            var threshold = 50
+
+            // Swipe gesture for accessibility navigation
+            if (Math.abs(deltaX) > threshold && Math.abs(deltaX) > Math.abs(deltaY)) {
+                if (deltaX > 0) {
+                    espressoPage.announceNextValue()
+                } else {
+                    espressoPage.announcePreviousValue()
+                }
+            }
+        }
+    }
+
+    // Two-finger tap on chart for full status announcement
+    MultiPointTouchArea {
+        anchors.fill: extractionViewLoader
+        enabled: typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+        minimumTouchPoints: 2
+        maximumTouchPoints: 2
+
+        onPressed: function(touchPoints) {
+            if (touchPoints.length === 2) {
+                espressoPage.announceFullStatus()
+            }
+        }
+    }
+
+}

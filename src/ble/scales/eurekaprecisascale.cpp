@@ -1,0 +1,199 @@
+#include "eurekaprecisascale.h"
+#include "../protocol/de1characteristics.h"
+#include "scalelogging.h"
+#include <QTimer>
+
+#define EUREKA_LOG(msg)  SCALE_LOG("EurekaPrecisaScale", msg)
+#define EUREKA_INFO(msg) SCALE_INFO("EurekaPrecisaScale", msg)
+#define EUREKA_WARN(msg) SCALE_WARN("EurekaPrecisaScale", msg)
+
+EurekaPrecisaScale::EurekaPrecisaScale(ScaleBleTransport* transport, QObject* parent)
+    : ScaleDevice(parent)
+    , m_transport(transport)
+{
+    if (m_transport) {
+        m_transport->setParent(this);
+
+        connect(m_transport, &ScaleBleTransport::connected,
+                this, &EurekaPrecisaScale::onTransportConnected);
+        connect(m_transport, &ScaleBleTransport::disconnected,
+                this, &EurekaPrecisaScale::onTransportDisconnected);
+        connect(m_transport, &ScaleBleTransport::error,
+                this, &EurekaPrecisaScale::onTransportError);
+        connect(m_transport, &ScaleBleTransport::serviceDiscovered,
+                this, &EurekaPrecisaScale::onServiceDiscovered);
+        connect(m_transport, &ScaleBleTransport::servicesDiscoveryFinished,
+                this, &EurekaPrecisaScale::onServicesDiscoveryFinished);
+        connect(m_transport, &ScaleBleTransport::characteristicsDiscoveryFinished,
+                this, &EurekaPrecisaScale::onCharacteristicsDiscoveryFinished);
+        connect(m_transport, &ScaleBleTransport::characteristicChanged,
+                this, &EurekaPrecisaScale::onCharacteristicChanged);
+        // Forward transport logs to scale log
+        connect(m_transport, &ScaleBleTransport::logMessage,
+                this, &ScaleDevice::logMessage);
+    }
+}
+
+EurekaPrecisaScale::~EurekaPrecisaScale() {
+    if (m_transport) {
+        m_transport->disconnectFromDevice();
+    }
+}
+
+void EurekaPrecisaScale::connectToDevice(const QBluetoothDeviceInfo& device) {
+    if (!m_transport) {
+        EUREKA_WARN("connectToDevice called with no transport");
+        return;
+    }
+
+    m_name = device.name();
+    m_serviceFound = false;
+    m_characteristicsReady = false;
+
+    EUREKA_LOG(QString("Connecting to %1 (%2)")
+               .arg(device.name())
+               .arg(device.address().toString()));
+
+    m_transport->connectToDevice(device);
+}
+
+void EurekaPrecisaScale::onTransportConnected() {
+    EUREKA_LOG(DECENZA_BLE_MSG_TRANSPORT_CONNECTED);
+    m_transport->discoverServices();
+}
+
+void EurekaPrecisaScale::onTransportDisconnected() {
+    EUREKA_LOG(DECENZA_BLE_MSG_TRANSPORT_DISCONNECTED);  // ScaleDevice reports the drop
+    setConnected(false);
+}
+
+void EurekaPrecisaScale::onTransportError(const QString& message) {
+    EUREKA_WARN(QString("Transport error: %1").arg(message));
+    setConnected(false);
+}
+
+void EurekaPrecisaScale::onServiceDiscovered(const QBluetoothUuid& uuid) {
+    EUREKA_LOG(QString("Service discovered: %1").arg(uuid.toString()));
+    if (uuid == Scale::Generic::SERVICE) {
+        EUREKA_LOG("Found Generic service (used by Eureka Precisa)");
+        m_serviceFound = true;
+    }
+}
+
+void EurekaPrecisaScale::onServicesDiscoveryFinished() {
+    EUREKA_LOG(QString("Service discovery finished, service found: %1").arg(m_serviceFound));
+    if (!m_serviceFound) {
+        EUREKA_WARN(QString("Eureka Precisa service %1 not found!").arg(Scale::Generic::SERVICE.toString()));
+        return;
+    }
+    m_transport->discoverCharacteristics(Scale::Generic::SERVICE);
+}
+
+void EurekaPrecisaScale::onCharacteristicsDiscoveryFinished(const QBluetoothUuid& serviceUuid) {
+    if (serviceUuid != Scale::Generic::SERVICE) return;
+    if (m_characteristicsReady) {
+        EUREKA_LOG(DECENZA_BLE_MSG_DUPLICATE_CHARACTERISTICS);
+        return;
+    }
+
+    EUREKA_LOG("Characteristics discovered");
+    m_characteristicsReady = true;
+    setConnected(true);
+
+    // de1app uses 200ms delay for Eureka Precisa
+    EUREKA_LOG("Scheduling notification enable in 200ms (de1app timing)");
+    QTimer::singleShot(200, this, [this]() {
+        if (!m_transport || !m_characteristicsReady) return;
+        EUREKA_LOG("Enabling notifications (200ms)");
+        m_transport->enableNotifications(Scale::Generic::SERVICE, Scale::Generic::STATUS);
+
+        // Set unit to grams
+        EUREKA_LOG("Setting unit to grams");
+        setUnitToGrams();
+    });
+}
+
+void EurekaPrecisaScale::onCharacteristicChanged(const QBluetoothUuid& characteristicUuid,
+                                                  const QByteArray& value) {
+    if (characteristicUuid == Scale::Generic::STATUS) {
+        // Eureka Precisa format (from de1app binary scan "cucucu cu su cu su"):
+        //   Bytes 0-2: header (0xAA, 0x09, 0x41)
+        //   Byte 3: timer_running
+        //   Bytes 4-5: timer (16-bit little-endian)
+        //   Byte 6: sign (1 = negative)
+        //   Bytes 7-8: weight (16-bit little-endian, tenths of gram)
+        if (value.size() >= 9) {
+            const uint8_t* d = reinterpret_cast<const uint8_t*>(value.constData());
+
+            // Check header
+            if (d[0] != 0xAA || d[1] != 0x09 || d[2] != 0x41) {
+                return;
+            }
+
+            // Weight is in bytes 7-8 as little-endian unsigned short (tenths of gram)
+            uint16_t weightRaw = d[7] | (d[8] << 8);
+            double weight = weightRaw / 10.0;
+
+            // Sign is in byte 6 (1 = negative)
+            if (d[6] == 1) {
+                weight = -weight;
+            }
+
+            setWeight(weight);
+        }
+    }
+}
+
+void EurekaPrecisaScale::sendCommand(const QByteArray& cmd) {
+    if (!m_transport || !m_characteristicsReady) {
+        EUREKA_WARN(QString("sendCommand(%1) skipped: transport=%2 ready=%3")
+                    .arg(cmd.toHex().constData())
+                    .arg(m_transport != nullptr)
+                    .arg(m_characteristicsReady));
+        return;
+    }
+    EUREKA_LOG(QString("sendCommand(%1) -> FFF2 WriteWithoutResponse")
+               .arg(cmd.toHex().constData()));
+    m_transport->writeCharacteristic(Scale::Generic::SERVICE, Scale::Generic::CMD, cmd,
+                                     ScaleBleTransport::WriteType::WithoutResponse);
+}
+
+void EurekaPrecisaScale::sendKeepAlive() {
+    // No keep-alive needed — this scale streams notifications continuously once
+    // subscribed; re-writing the CCCD causes AuthorizationError disconnects
+    // (de1app writes CCCD only once at connect time and never again).
+}
+
+void EurekaPrecisaScale::tare() {
+    sendCommand(QByteArray::fromHex("AA023131"));
+}
+
+void EurekaPrecisaScale::startTimer() {
+    sendCommand(QByteArray::fromHex("AA023333"));
+}
+
+void EurekaPrecisaScale::stopTimer() {
+    sendCommand(QByteArray::fromHex("AA023434"));
+}
+
+void EurekaPrecisaScale::resetTimer() {
+    sendCommand(QByteArray::fromHex("AA023535"));
+}
+
+void EurekaPrecisaScale::setUnitToGrams() {
+    sendCommand(QByteArray::fromHex("AA033600"));
+}
+
+void EurekaPrecisaScale::sleep() {
+    turnOff();
+    // WriteWithoutResponse: no BLE confirmation possible, emit immediately
+    emit sleepCompleted();
+}
+
+void EurekaPrecisaScale::turnOff() {
+    sendCommand(QByteArray::fromHex("AA023232"));
+}
+
+void EurekaPrecisaScale::beepTwice() {
+    sendCommand(QByteArray::fromHex("AA023737"));
+}

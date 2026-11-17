@@ -1,0 +1,140 @@
+#include "scalebletransport.h"
+
+#include "../blegattlogging.h"
+#include "../scales/scalelogging.h"
+#include "../refractometers/refractometerlogging.h"
+#include "../portallogging.h"
+
+ScaleBleTransport::ScaleBleTransport(QObject* parent, BleGattQueue* queue)
+    : QObject(parent)
+    , m_gattQueue(queue ? queue : &BleGattQueue::instance())
+{
+    m_operationTimeoutTimer.setSingleShot(true);
+    connect(&m_operationTimeoutTimer, &QTimer::timeout, this, [this]() {
+        if (!holdsGattSlot()) return;
+        // WARN, and self-contained: these logs are read by users and by their AI
+        // assistants. An operation the platform never answered did not just fail
+        // for this device — it held the shared radio for the whole interval, so
+        // every other device's traffic was blocked behind it. That is the half a
+        // reader would otherwise have to infer.
+        GQ_WARN(QString("A %1 operation on this scale/refractometer got no answer "
+                        "within %2 ms. The BLE radio was held for that whole time, "
+                        "delaying every other device including the machine. "
+                        "Reconnecting the device clears it.")
+                    .arg(heldGattKey().toString().mid(1, 8))
+                    .arg(m_operationTimeoutTimer.interval()));
+        onGattSlotReleased();
+        m_gattQueue->noteFailed(this);
+    });
+}
+
+ScaleBleTransport::~ScaleBleTransport() {
+    // Nothing may outlive this object in the queue: the requester tag is its
+    // address, and a later allocation could reuse it.
+    //
+    // releaseGattQueue() calls the virtual onGattSlotReleased(), and from here
+    // that resolves to the BASE no-op — the derived vtable is gone by the time a
+    // base destructor runs. That is correct rather than a bug to fix: the only
+    // override drops per-operation state belonging to an object that is already
+    // being destroyed. Do not "repair" it by moving cleanup into the override
+    // and expecting this path to reach it; put anything a teardown genuinely
+    // needs in the derived destructor, which runs first.
+    releaseGattQueue();
+}
+
+void ScaleBleTransport::submitGattOperation(const QBluetoothUuid& key,
+                                            const QString& label,
+                                            std::function<void()> issue,
+                                            int timeoutMs) {
+    BleGattQueue::Operation op;
+    op.requester = this;
+    op.key = key;
+    op.label = label;
+    // Policy left at its default: no retries. See the header.
+    op.issue = [this, timeoutMs, ownedIssue = std::move(issue)]() {
+        m_operationTimeoutTimer.start(timeoutMs);
+        ownedIssue();
+    };
+    op.onAbandoned = [this, key, label]() {
+        m_operationTimeoutTimer.stop();
+        onGattSlotReleased();
+        // INFO, not DEBUG: the connections view a user reads filters to INFO, and
+        // this is a terminal outcome. Per LOGGING.md the recurring failure is a
+        // fault whose resolution — or here, whose conclusion — sits a tier below
+        // the noise around it, leaving the reader with half the story.
+        GQ_INFO(QString("%1 failed and was not retried").arg(label));
+        emit gattOperationFailed(key);
+    };
+    m_gattQueue->submit(std::move(op));
+}
+
+void ScaleBleTransport::completeGattOperation(const QBluetoothUuid& key) {
+    if (heldGattKey() != key) return;
+    completeGattOperation();
+}
+
+void ScaleBleTransport::completeGattOperation() {
+    if (!holdsGattSlot()) return;
+    m_operationTimeoutTimer.stop();
+    onGattSlotReleased();
+    m_gattQueue->noteSucceeded(this);
+}
+
+void ScaleBleTransport::failGattOperation() {
+    if (!holdsGattSlot()) return;
+    m_operationTimeoutTimer.stop();
+    onGattSlotReleased();
+    m_gattQueue->noteFailed(this);
+}
+
+void ScaleBleTransport::releaseGattQueue() {
+    m_operationTimeoutTimer.stop();
+    onGattSlotReleased();
+    m_gattQueue->forget(this);
+}
+
+bool ScaleBleTransport::holdsGattSlot() const {
+    return m_gattQueue->inFlightRequester() == this;
+}
+
+QBluetoothUuid ScaleBleTransport::heldGattKey() const {
+    return holdsGattSlot() ? m_gattQueue->inFlightKey() : QBluetoothUuid();
+}
+
+QString ScaleBleTransport::gattLabel(const char* op) const
+{
+    QLatin1String who("scale");
+    switch (m_linkRole) {
+    case LinkRole::Scale:         who = QLatin1String("scale"); break;
+    case LinkRole::Refractometer: who = QLatin1String("refractometer"); break;
+    case LinkRole::Portal:        who = QLatin1String("portal"); break;
+    }
+    return QStringLiteral("%1 %2").arg(who, QLatin1String(op));
+}
+
+void ScaleBleTransport::logLine(const char* platformTag, const QString& message, LineLevel level)
+{
+    switch (m_linkRole) {
+    case LinkRole::Scale:
+        switch (level) {
+        case LineLevel::Debug: SCALE_LOG_TAGGED(platformTag, message); return;
+        case LineLevel::Info:  SCALE_INFO_TAGGED(platformTag, message); return;
+        case LineLevel::Warn:  SCALE_WARN_TAGGED(platformTag, message); return;
+        }
+        return;
+    case LinkRole::Refractometer:
+        switch (level) {
+        case LineLevel::Debug: REFRACTOMETER_LOG_TAGGED(platformTag, message); return;
+        case LineLevel::Info:  REFRACTOMETER_INFO_TAGGED(platformTag, message); return;
+        case LineLevel::Warn:  REFRACTOMETER_WARN_TAGGED(platformTag, message); return;
+        }
+        return;
+    case LinkRole::Portal:  // the portal's helpers are stderr-only; nothing listens for its logMessage
+        switch (level) {
+        case LineLevel::Debug: PORTAL_DEBUG(message); return;
+        case LineLevel::Info:  PORTAL_INFO(message); return;
+        case LineLevel::Warn:  PORTAL_WARN(message); return;
+        }
+        return;
+    }
+}

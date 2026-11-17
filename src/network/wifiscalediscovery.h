@@ -1,0 +1,258 @@
+#pragma once
+
+#include <QObject>
+
+#include <atomic>
+#include <memory>
+#include <QMap>
+#include <QStringList>
+#include <QString>
+
+#include "wifiscaleresult.h"
+#include "core/logcollapse.h"
+
+class QTimer;
+
+/**
+ * On-demand discovery of WiFi scales on the LAN. Two mechanisms, run together
+ * by a user-initiated scan:
+ *
+ *  - browse(): DNS-SD service browse for `_decentscale._tcp`. Finds every
+ *    advertising scale regardless of its mDNS name, which is the only way to
+ *    see a scale the user has renamed. Needs openscale >= v3.0.9.
+ *  - probe(): direct A-record lookup of specific hostnames. Covers older
+ *    firmware, which advertises no service at all.
+ *
+ * Nothing runs until a caller asks. That caller is USUALLY a user-initiated
+ * scan, but not always: BLEManager also owns a separate instance for the
+ * reconnect ladder, which browses when a saved WiFi scale's direct connect has
+ * already failed. So a browse can be open without the user having asked for one
+ * — bounded by that instance's own shorter deadline, gated on a saved WiFi
+ * primary, and invisible to the Scan button because isScanning() references
+ * only the scan's instance. See BLEManager::ensureReconnectDiscovery().
+ *
+ * A browse stops when its deadline elapses, when a new browse on the SAME
+ * instance supersedes it, or at teardown. Instances do not cancel each other,
+ * which is the whole reason the reconnect path has its own.
+ *
+ * Results arrive incrementally via resultFound() as each scale resolves, rather
+ * than in one batch at the end — a live scale typically answers in well under a
+ * second while the browse keeps running to its deadline.
+ *
+ * By default the A-record path uses QHostInfo (the OS resolver speaks mDNS);
+ * on Android it uses MdnsResolver on a worker thread, since Android's
+ * getaddrinfo does not resolve ".local". That default is now a runtime choice
+ * rather than an #ifdef — MdnsResolver::setHostnameResolver() can put a desktop
+ * build on Android's exact path, which is how a failing lookup gets attributed
+ * to the backend or to the device without deploying to one.
+ *
+ * The browse always goes through MdnsResolver::browseService() on every
+ * platform; which backend that picks (system Bonjour vs the mjansson raw-socket
+ * implementation) is decided inside. QHostInfo cannot browse on ANY platform —
+ * it resolves a name you already know. See mdnsresolver.h.
+ *
+ * On Android a SECOND browse runs beside it through NsdManager, feeding the same
+ * resultFound stream. Not a fallback: both start together, because the case it
+ * exists for is one where the mjansson browse returns cleanly and empty, which is
+ * indistinguishable from an empty LAN and so cannot be used as a trigger. See
+ * startNsdBrowse() and WifiScaleNsdHelper.java.
+ */
+class WifiScaleDiscovery : public QObject {
+    Q_OBJECT
+
+public:
+    explicit WifiScaleDiscovery(QObject* parent = nullptr);
+    ~WifiScaleDiscovery() override;
+
+    static constexpr int kDefaultTimeoutMs = 2000;
+
+    // How long to wait for an HDS A-record answer, for EVERY path that asks —
+    // this class's own probe() and DecentScaleWifi's Android reconnect resolve
+    // alike. It lives here, above both, because it is a property of the
+    // responder rather than of either caller.
+    //
+    // The HDS responder regularly takes 2-4 s to reply, likely the ESP32 waking
+    // from WiFi power-save, so MdnsResolver's 2000 ms default is too short for
+    // it. That is not a style preference: the reconnect path silently took the
+    // 2000 ms default while discovery passed 5000, the two disagreed about a
+    // documented property of the same device, and a tablet log showed 82
+    // consecutive reconnect misses over 7.5 h — every one ending at ~2003 ms
+    // having received nothing — against a scale that was awake and on mains
+    // power throughout. A user-initiated scan 3 minutes after one of those
+    // misses resolved the same hostname in 362 ms.
+    //
+    // Corroborated independently on macOS, which resolves through QHostInfo
+    // rather than this mDNS path: a hostname fallback there took 3.68 s to
+    // answer (log: "Resolving hdstest.local via QHostInfo..." at t=8.822 ->
+    // resolved at t=12.504). Different OS, different resolver, same 2-4 s
+    // band — so the latency is a property of the responder, not of any one
+    // resolver implementation, and a 2 s deadline is too short for it
+    // everywhere, not just on Android.
+    //
+    // Raising this is NOT free, and the binding constraint is on the reconnect
+    // side: see the worst-case chain derived at DecentScaleWifi's call site,
+    // which already consumes the whole of BLEManager's 20 s scale-connection
+    // timer. Read that before changing this number.
+    static constexpr int kHdsResolveTimeoutMs = 5000;
+
+    // The DNS-SD service openscale advertises (v3.0.9+).
+    static constexpr const char* kServiceType = "_decentscale._tcp.local";
+
+    // Hostnames tried by the A-record fallback when no specific name is known.
+    //
+    // "hds" is the firmware default. "hds-2"/"hds-3" are a HEURISTIC ABOUT USER
+    // HABIT, not protocol: nothing generates them. Neither openscale nor esp-idf
+    // renames on collision — esp-idf only detects collisions — so a second scale
+    // never becomes "hds-2.local" by itself. They are here because "hds-2" is a
+    // legal name (mdnsNameNormalize allows a-z 0-9 '-') and the obvious thing a
+    // person types for their second scale. Do not extend this list believing it
+    // mirrors firmware behaviour; it does not.
+    static QStringList defaultFallbackHostnames();
+
+    /**
+     * Resolve specific hostnames to addresses. Cancels any previous in-flight
+     * probe. Emits resultFound() per hostname that resolves, then
+     * probeFinished() exactly once when all have completed or timed out.
+     */
+    Q_INVOKABLE void probe(const QStringList& hostnames, int timeoutMs = kDefaultTimeoutMs);
+
+    /** Convenience single-name overload. */
+    Q_INVOKABLE void probe(const QString& hostname, int timeoutMs = kDefaultTimeoutMs);
+
+    /**
+     * Start a DNS-SD browse. Runs until stopBrowse() or `timeoutMs` elapses,
+     * emitting resultFound() as instances resolve, then browseFinished().
+     *
+     * Only fully-resolved instances are reported. A browse routinely returns
+     * instance names that never resolve — stale registrations from a device that
+     * rebooted or was renamed without sending a goodbye — and those are dropped
+     * rather than shown. Observed: four instances for two live scales.
+     */
+    Q_INVOKABLE void browse(int timeoutMs = 15000);
+
+    /** Stop an in-flight browse. Safe to call when none is running. */
+    Q_INVOKABLE void stopBrowse();
+
+    /**
+     * One line of WifiScaleNsdHelper's output, parsed.
+     *
+     * The helper's wire format is `instanceName\thost\tipv4\tport\tk=v|k=v`, plus
+     * a `!fail\t<code>` sentinel when discovery could not start. Tabs because a
+     * DNS-SD instance label may contain spaces and parentheses ("Half Decent
+     * Scale (hdstest)") but not a tab.
+     *
+     * Split out of the browse loop, and compiled on every platform, so the parser
+     * can be tested off-device: the loop that uses it is inside `#ifdef
+     * Q_OS_ANDROID` and would otherwise only ever be exercised on a tablet.
+     */
+    struct NsdLine {
+        bool startFailure = false;  // the "!fail" sentinel
+        QString failureCode;        // NsdManager error code, as text
+        bool valid = false;         // enough fields to be an instance
+        QString instanceName;
+        QString hostname;           // may be empty — see WifiScaleNsdHelper.srvHostname
+        QString address;
+        quint16 port = 0;
+        QMap<QString, QString> txt;
+    };
+    static NsdLine parseNsdLine(const QString& line);
+
+    /** True iff an A-record probe is currently in flight. */
+    bool isProbing() const { return m_outstanding > 0; }
+
+    /** True iff a browse is currently in flight. */
+    bool isBrowsing() const { return m_browseInFlight; }
+
+signals:
+    /**
+     * One discovered scale. May fire several times per scan — once per scale,
+     * as each resolves. A result is never retracted: callers append to their
+     * list and rebuild it on the next scan.
+     */
+    void resultFound(const WifiScaleResult& result);
+
+    /**
+     * An A-record probe finished. `ran` distinguishes "probed and found
+     * nothing" from "never probed" (e.g. cancelled before starting), which
+     * callers need in order to log the difference rather than conflating a
+     * silent network with a skipped step.
+     */
+    void probeFinished(bool ran);
+
+    /**
+     * A browse finished. `ran` is false when the browse could not actually run
+     * — no backend available, socket refused, Local Network denied — as opposed
+     * to running and finding nothing. Those look identical in the device list,
+     * so the difference has to travel with the signal.
+     */
+    void browseFinished(bool ran);
+
+    // Required by SCALE_INFO_TAGGED/SCALE_WARN_TAGGED at the call sites inside
+    // this class's own member functions (i.e. everywhere `this` is in scope) —
+    // that macro's `emit logMessage(...)` needs the signal declared even though
+    // nothing connects to it any more. Emitting with zero connections is a legal
+    // no-op; do NOT delete this just because grep finds no `connect()` to it.
+    // (Not to be confused with the STDERR_TAGGED sites inside this file's
+    // detached QMetaObject::invokeMethod lambdas, which have no `this` and so
+    // cannot use this signal at all — see the comment above the first one.)
+    void logMessage(const QString& message);
+
+private:
+    // Compare outcomes across repeating browse cycles; elapsed time is not a state change.
+    LogCollapse m_browseLog{LogCollapse::kChangesOnly};
+    void logLookupMiss(const QString& hostname, const QString& text, const QString& detail);
+    void logLookupResolved(const QString& hostname, const QString& address);
+    // Android's NsdManager browse, started alongside the mjansson one in browse().
+    // A no-op everywhere else: on those platforms the system resolver already owns
+    // port 5353, so there is no second, independent path to add. Full reasoning —
+    // and the measurements that motivate it — are at the definition.
+    //
+    // Shares m_browseCancel with the mjansson worker, so stopBrowse() ends both.
+    // The Java side is told to stop by the worker rather than by stopBrowse()
+    // directly, which keeps JNI off the main thread; the cost is up to one poll
+    // slice of extra discovery, not an unbounded wait.
+    void startNsdBrowse(int timeoutMs, int generation);
+
+    void cancelInFlight();
+    void finishOneLookup();
+
+    // A browse can have TWO independent workers in flight (mjansson, and on
+    // Android NsdManager beside it), finishing in either order. browseFinished()
+    // is terminal for callers, so it may only be emitted once both are done —
+    // otherwise the slower path emits resultFound() after the browse was declared
+    // over. Ending the browse on the FIRST completion instead would be worse than
+    // the ordering bug it looks like: the late results would be dropped, and the
+    // NSD path exists precisely because it finds scales the other one cannot.
+    void finishOneBrowsePath(int generation, bool ran);
+
+    int m_outstanding = 0;      // A-record lookups still pending
+    bool m_anyProbeRan = false; // whether the current probe actually started
+    QList<int> m_lookupIds;     // QHostInfo lookup ids (system-resolver path)
+    QTimer* m_timeoutTimer = nullptr;
+
+    // Same role as m_browseCancel below, for the direct A-record workers.
+    // Without it, cancelInFlight() bumped the generation so the RESULT was
+    // discarded, but three pool threads still blocked for the full timeout —
+    // and app quit waits on the pool.
+    std::shared_ptr<std::atomic<bool>> m_probeCancel;
+
+    bool m_browseInFlight = false;
+    int m_browseGeneration = 0;
+    // Browse workers still running for the current generation; see
+    // finishOneBrowsePath(). 1 everywhere, 2 on Android when NsdManager started.
+    int m_browsePathsOutstanding = 0;
+    // OR of what each path reported, so "ran" stays true when either path ran.
+    bool m_browseAnyRan = false;
+    // Polled by the blocking worker so stopBrowse() can actually stop it.
+    // Without this the worker holds a QThreadPool thread for its full deadline,
+    // and ~QCoreApplication's unconditional waitForDone() (verified:
+    // qtbase/src/corelib/kernel/qcoreapplication.cpp:954) turns that into a
+    // multi-second hang on quit with the UI already gone.
+    std::shared_ptr<std::atomic<bool>> m_browseCancel;
+
+    // Monotonically increasing generation, bumped by cancelInFlight(), so a
+    // late worker result from a cancelled or timed-out probe is dropped. The
+    // blocking mDNS worker cannot be interrupted mid-query, so it always
+    // finishes on its own and its result must be discarded by this check.
+    int m_probeGeneration = 0;
+};

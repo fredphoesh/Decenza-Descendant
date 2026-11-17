@@ -1,0 +1,272 @@
+# stop-at-weight-learning Specification
+
+## Purpose
+Define the post-shot stop-at-weight (SAW) prediction model that drives both the live SAW stop trigger and the per-shot accuracy log. The predictor estimates post-stop drip from recency-weighted, Gaussian-flow-similarity weighted historical (drip, flow) data, with a pre-graduation scalar bootstrap path and per-pair refinement once enough committed medians exist.
+
+## Requirements
+
+### Requirement: Drip Prediction Model
+
+The system SHALL predict drip after the SAW stop trigger as a recency-weighted Gaussian-flow-similarity weighted average of historical (drip, flow) shot data, with the Gaussian σ set to 0.25 ml/s.
+
+#### Scenario: At least one historical entry produces a weighted-average prediction
+- **WHEN** the predictor has at least 1 historical (drip, flow) entry for the relevant scale type and the entries' total weight does not collapse to below 0.01
+- **THEN** the predictor SHALL compute `weight_i = recencyWeight_i × exp(-(flow_i − queryFlow)² / 0.125)` for each entry
+- **AND** SHALL return `clamp(Σ(drip_i × weight_i) / Σ(weight_i), 0.5, 20.0)` g
+
+#### Scenario: Empty pool or collapsed weights fall back to lag model
+- **WHEN** the predictor has zero historical entries for the relevant scale type OR the entries' total weight collapses to below 0.01 (queries too far in flow from any sample)
+- **THEN** the predictor SHALL fall back to the legacy `flow × (sensorLag(scale) + 0.1)` formula
+- **AND** the result SHALL be capped at 8 g
+
+#### Scenario: Recency weighting matches existing convergence-aware schedule
+- **WHEN** the predictor evaluates the global-pool path (`Settings::getExpectedDrip`)
+- **THEN** point weights SHALL interpolate linearly from `recencyMax = 10` at the most recent point to `recencyMin = 3` (when the SAW model is converged for the scale type) or `1` (when not converged) at the oldest point used
+- **AND** at most 12 points (converged) or 8 points (unconverged) SHALL contribute to a single fit
+
+#### Scenario: Per-pair path uses fixed converged recency
+- **WHEN** the predictor evaluates the per-pair path (`Settings::getExpectedDripFor` with a graduated pair)
+- **THEN** point weights SHALL interpolate linearly from `recencyMax = 10` to `recencyMin = 3`
+- **AND** the convergence test SHALL NOT be consulted (per-pair history is treated as already representative)
+
+### Requirement: Per-Pair Prediction After Graduation
+For a `(profile, scale, basket)` triple with at least `kSawMinMediansForGraduation` committed medians, the predictor SHALL fit the weighted-average smoother over those medians, newest first, bounded by the per-pair trim. The documented value of `kSawMinMediansForGraduation` SHALL match the value the code uses. A committed median SHALL represent a `(drip, flow)` pair that a single shot in the batch actually produced.
+
+#### Scenario: Graduated pair uses its committed medians
+
+- **WHEN** a `(profile, scale, basket)` triple has at least `kSawMinMediansForGraduation`
+  committed medians
+- **THEN** the predictor SHALL build the smoother input from the most recent committed medians for
+  that triple (newest-first, bounded by the per-pair trim)
+- **AND** SHALL run the same Gaussian-weighted-average smoother as the global-pool path, with σ=0.25
+
+#### Scenario: The committed pair is one the batch actually contained
+
+- **WHEN** a batch reaches its commit size and passes the outlier gate
+- **THEN** the committed entry's `drip` and `flow` SHALL both come from the same shot in
+  that batch — the shot whose lag is nearest the median of the batch's per-shot lags
+
+#### Scenario: A batch in which no shot had a usable flow
+
+- **WHEN** every shot in a batch has a flow at or below the usable threshold
+- **THEN** the system SHALL drop the batch and report why
+- **AND** SHALL NOT append an entry to the committed history
+
+#### Scenario: A batch whose median drip and median flow come from different shots
+
+- **WHEN** the shot holding the batch's median drip is not the shot holding its median flow
+- **THEN** the committed entry SHALL still be a single shot's `(drip, flow)` pair
+- **AND** the entry's implied lag SHALL NOT be the quotient of the two independent medians
+
+### Requirement: A committed pair comes from one shot
+The system SHALL NOT commit a pair assembled from the drip of one shot and the flow of another, because the implied lag is one no shot exhibited. Where no shot in the batch has a usable flow, the system SHALL drop the batch rather than commit a pair.
+
+#### Scenario: A committed pair is one the batch contained
+- **WHEN** a batch reaches its commit size and passes the outlier gate
+- **THEN** the committed entry's drip and flow both come from the same shot, the one whose lag is nearest the median of the batch's per-shot lags
+
+### Requirement: Pre-Graduation Bootstrap Falls Through to Existing Scalar Path
+For a triple that has not graduated, the predictor SHALL retain the scalar bootstrap, `flow × globalSawBootstrapLag(scale)` capped at 8 g, followed by the scale-default lag fallback. A Gaussian-weighted aggregated pool SHALL NOT replace this path. The bootstrap key SHALL stay the per-transport scale type, and only its contributor set widens to cover per-basket buckets.
+
+#### Scenario: Non-graduated pair queries existing scalar bootstrap
+
+- **WHEN** a triple has fewer than `kSawMinMediansForGraduation` committed medians
+- **THEN** the predictor SHALL return `min(flow × globalSawBootstrapLag(scale), 8)` g if
+  `globalSawBootstrapLag(scale) > 0`
+- **AND** otherwise SHALL fall through to `min(flow × (sensorLag(scale) + 0.1), 8)` g
+
+#### Scenario: Bootstrap is pooled across baskets
+
+- **WHEN** the global bootstrap lag for a scale type is recomputed
+- **THEN** every `(profile, scale, basket)` bucket with committed history on that scale type SHALL
+  be eligible to contribute its most recent committed median lag, EXCEPT a bucket whose newest
+  median was copied forward by the pre-basket seed and the pre-basket bucket it was copied from
+  — neither has learned anything of its own, and counting them lets one batch vote repeatedly
+- **AND** the result SHALL remain a single scalar per scale type, so a brand-new basket still gets a
+  device-specific cold-start prior
+
+### Requirement: WeightProcessor Live Prediction Matches Settings Predictor
+
+The live SAW threshold computation in `WeightProcessor::getExpectedDrip` SHALL produce the same numeric output as `Settings::getExpectedDrip` when given the same flow and the same snapshot of pool data, so the post-shot accuracy log and the in-shot threshold are consistent.
+
+#### Scenario: Snapshot at configure time produces consistent predictions
+- **WHEN** `WeightProcessor::configure` is called with a `(learningDrips, learningFlows)` snapshot
+- **THEN** subsequent `getExpectedDrip(currentFlowRate)` calls SHALL apply the same recency-weighted Gaussian-flow-similarity smoother as `Settings::getExpectedDrip`, with σ=0.25
+- **AND** any divergence SHALL be considered a bug (covered by tests)
+
+### Requirement: Per-Shot Prediction Diagnostics
+
+The system SHALL log per-shot prediction state to support post-deploy validation of SAW predictions on
+real shots. The logged state SHALL identify the basket and the scale type the prediction was keyed
+on, so a saved shot's log is sufficient to reconstruct which bucket drove it.
+
+On commit, the logged entry SHALL carry its lag together with the `(drip, flow)` pair that
+lag came from, so a reader can confirm the two describe the same shot.
+
+#### Scenario: Accuracy log line is emitted on each SAW learning point
+
+- **WHEN** a SAW learning point is added
+- **THEN** the system SHALL emit a `[SAW] accuracy:` log line containing the predicted drip, actual
+  drip, delta, overshoot, flow at stop, scale type, profile filename, and basket
+
+#### Scenario: Model log line names the bucket that drove the prediction
+
+- **WHEN** the SAW model snapshot is taken at extraction start
+- **THEN** the emitted model line SHALL name the model source tier, the effective lag, the profile,
+  the scale type, the basket, and the number of committed medians in the bucket used
+
+#### Scenario: A commit records the pair behind its lag
+
+- **WHEN** a batch commits a median entry
+- **THEN** the emitted commit line SHALL carry that entry's lag and the `(drip, flow)` pair
+  it was taken from
+
+### Requirement: SAW Learning Is Keyed By Basket
+
+SAW learning history SHALL be isolated per `(profile, scale, basket)`. The basket key value
+SHALL be derived from the active equipment package's basket identity (brand and model), and a package
+with no basket SHALL key on a distinct "no basket" value rather than sharing a bucket with any real
+basket. Switching basket SHALL NOT contaminate another basket's learned drip model, in either
+direction.
+
+#### Scenario: Two baskets on the same profile and scale learn independently
+
+- **WHEN** shots are recorded on one profile and one scale type, alternating between two baskets
+  whose post-stop drip differs
+- **THEN** each basket SHALL accumulate its own pending batch and its own committed medians
+- **AND** a prediction made while one basket is active SHALL NOT be influenced by the other basket's
+  entries
+
+#### Scenario: A package with no basket is its own bucket
+
+- **WHEN** a shot is recorded while the active equipment package has no basket component
+- **THEN** the learning entry SHALL be keyed on the distinct "no basket" value
+- **AND** it SHALL NOT be readable as history for any package that has a basket
+
+#### Scenario: Changing basket mid-batch does not commit mixed data
+
+- **WHEN** a pending batch for one basket is incomplete and the user switches to a different basket
+- **THEN** the incomplete batch SHALL remain pending against its original basket
+- **AND** the new basket's entries SHALL accumulate separately, so no committed median mixes entries
+  from two baskets
+
+### Requirement: Copied buckets do not vote in the bootstrap
+Buckets holding only copied history SHALL NOT contribute to the cross-basket bootstrap lag. Neither SHALL the pre-basket bucket the copies came from, since nothing updates it again and it would vote a frozen snapshot of its own past forever.
+
+#### Scenario: Copied buckets are excluded from the bootstrap
+- **WHEN** the cross-basket bootstrap lag is recomputed
+- **THEN** buckets holding only copied history contribute nothing to it
+
+### Requirement: Batch Dispersion Gate
+
+Before a batch commits, the system SHALL reject it if any shot's lag deviates from the
+reference lag by more than the configured deviation bound. The reference SHALL be the lag of
+the shot the batch would commit, not the quotient of the batch's median drip and median flow —
+those two medians can come from different shots, making the comparison reference a lag no shot
+in the batch exhibited, and one that can fall outside the range of the lags being tested.
+
+#### Scenario: The gate compares against a lag some shot had
+
+- **WHEN** a batch reaches its commit size
+- **THEN** the reference each shot's lag is compared against SHALL be a lag one of the shots
+  in that batch produced
+- **AND** it SHALL be the lag of the pair the batch commits, so the gate and the committed
+  entry describe the same shot
+
+### Requirement: Final Weight Capture After Settling
+
+The system SHALL abandon settling on a cup lift or two consecutive disturbed readings, skip learning, and save the most recent clean settling average. Disturbances SHALL use the flow and espresso-only amount limits below, excluding recovered spike tails. A clean average SHALL require a full window and `SETTLING_CLEAN_CAPTURE_MS` of stable readings. Without one, the system SHALL apply the settle-base fallback below.
+
+#### Scenario: Clean settle uses the settled rolling-window average
+
+- **WHEN** settling completes via `SETTLING_STABLE_MS` accumulation or the BLE-silence override timer
+- **THEN** `finalWeightG` SHALL be the rolling-window average at the moment of completion (existing behavior, unchanged)
+
+#### Scenario: Cup lifted mid-settle falls back to the last clean average
+
+- **GIVEN** the rolling window is full and its stability gate (`avgDrift < SETTLING_AVG_THRESHOLD`, `weight ≤ avg + SETTLING_ABOVE_AVG_MARGIN`, `avg ≥ m_weightAtStop − 0.5`) has held *continuously* for at least `SETTLING_CLEAN_CAPTURE_MS` (250 ms)
+- **AND** the controller has captured that last clean average into `m_lastCleanSettlingAvg`
+- **WHEN** the cup-removal detector fires during settling
+- **THEN** `m_weight` SHALL be restored to that last clean average
+- **AND** `finalWeightG` SHALL equal that value when persisted by `MainController::onShotEnded`
+
+#### Scenario: A rise drip cannot produce falls back to the last clean average
+
+- **GIVEN** a captured `m_lastCleanSettlingAvg`
+- **AND** the amount limit is `maxPlausibleDripG(flowAtStop)` = `clamp(3 s × flow at the stop, 5 g, 12 g)`
+- **AND** the settle base is the higher of the SAW stop weight and the weight when settling started
+- **WHEN** two consecutive settling samples exceed the settle base by more than `maxPlausibleDripG(m_flowRateAtStop)`
+- **THEN** settling SHALL end on the second without learning
+- **AND** `m_weight` SHALL be restored to that last clean average
+
+#### Scenario: Weight rising faster than drip can run falls back to the last clean average
+
+- **GIVEN** a captured `m_lastCleanSettlingAvg` and readings still inside the amount limit
+- **AND** the settle flow reference is the higher of the short flow at the SAW stop and at the first settling sample
+- **WHEN** two consecutive settling samples have a short flow more than 4 g/s above the settle flow reference
+- **THEN** settling SHALL end on the second without learning
+- **AND** `m_weight` SHALL be restored to that last clean average
+
+#### Scenario: A filter bed's drain is not cut short
+
+- **GIVEN** a filter, pourover or tea profile
+- **WHEN** the reading drains 22 g past the stop weight with a slowing flow
+- **THEN** settling SHALL continue, since the amount test does not apply and the flow test does not fire
+
+#### Scenario: Legacy beverage values retain their group
+
+- **GIVEN** an imported profile with a brace-wrapped beverage value such as `{pourover}` or `{tea_portafilter}`
+- **WHEN** the amount-check policy is selected
+- **THEN** the shared beverage mapping SHALL remove the legacy braces before grouping
+- **AND** the filter or tea drain SHALL remain exempt from the espresso amount limit
+
+#### Scenario: A lone reading past the limit is dropped
+
+- **WHEN** one settling sample exceeds the limit and the next does not
+- **THEN** settling SHALL continue and the lone sample SHALL NOT become the current weight
+- **AND** if settling would complete before the next sample arrives, the lone sample SHALL count as an over-rise
+
+#### Scenario: A rejected packet cannot confirm itself through residual flow
+
+- **GIVEN** one disturbed reading followed by a return to the last accepted weight's 0.2 g band
+- **WHEN** the rejected reading still raises the worker's flow estimate
+- **THEN** the recovered reading SHALL NOT confirm the disturbance
+- **AND** flow-only candidates in that recovered band SHALL be ignored until normal flow or a fresh rise outside the band ends recovery
+- **AND** the amount test SHALL remain active throughout recovery
+
+#### Scenario: A fast stop's real drip is not an over-rise
+
+- **GIVEN** a stop at 8.5 g/s
+- **WHEN** the reading rises 7 g above the stop weight
+- **THEN** settling SHALL continue, since the limit at that flow is the 12 g ceiling
+
+#### Scenario: A late stop's extra pour is not an over-rise
+
+- **GIVEN** SAW fired at 30 g and the weight was 38 g when settling started
+- **WHEN** the reading rises to 42 g
+- **THEN** settling SHALL continue, since drip is measured from 38 g
+
+#### Scenario: Transient gate-fires during a noisy settle do not pollute the fallback
+
+- **GIVEN** settling samples whose rolling-window average transiently satisfies the stability gate but breaks again within a single sample (the gate's `m_settlingAvgStableSince` clock resets before `SETTLING_CLEAN_CAPTURE_MS` accumulates)
+- **WHEN** settling is abandoned
+- **THEN** `m_lastCleanSettlingAvg` SHALL still be zero
+- **AND** the fallback SHALL save the settle base as in "Cup lifted before any clean average is observed"
+
+#### Scenario: Implausible clean average is rejected as scale fault
+
+- **GIVEN** a reading frozen far above the stop weight (shot 825: ~75 g on a ~40 g target)
+- **WHEN** it arrives during settling and repeats on the next sample
+- **THEN** it SHALL abandon settling as an over-rise before it can enter the rolling window
+- **AND** so no clean average more than `maxPlausibleDripG(flowAtStop)` above the settle base SHALL ever be captured or saved
+
+#### Scenario: Cup lifted before any clean average is observed
+
+- **GIVEN** no clean average was captured and the settle base is above zero
+- **WHEN** settling is abandoned by an over-rise, OR by a cup lift with `m_weight` below the base
+- **THEN** `m_weight` SHALL be set to the settle base (drip only adds weight, and the reading before an over-rise may be the disturbance starting)
+
+#### Scenario: Cup-removal fallback state resets between shots
+
+- **WHEN** a new shot starts (via `startShot()`) or a new settling cycle begins (via `startSettlingTimer()`)
+- **THEN** the `m_lastCleanSettlingAvg` tracker SHALL be reset to 0 so a value from a prior shot cannot leak into the current shot's recorded weight

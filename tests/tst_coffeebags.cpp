@@ -1,0 +1,3680 @@
+#include <QtTest>
+#include <QLoggingCategory>
+#include "core/settings.h"
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QTemporaryDir>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QSettings>
+#include <QRegularExpression>
+#include <QCoreApplication>
+#include <QThread>
+#include <QNetworkAccessManager>
+
+#include "history/shothistorystorage.h"
+#include "history/coffeebagstorage.h"
+#include "history/equipmentstorage.h"
+#include "history/recipestorage.h"
+#include "history/shotreviewcommit.h"
+#include "core/shotreviewpersistentplan.h"
+#include "core/dbutils.h"
+#include "history/unifiedbeansearchmodel.h"
+#include "core/settings_dye.h"
+#include "shotrowfixtures.h"
+#include "network/visualizeruploader.h"
+#include "network/visualizersync.h"
+#include "network/beanbase_blob.h"
+
+using Tier = UnifiedBeanSearchModel::Tier;
+
+// Read a merged row's tier role back as the typed enum.
+static Tier tierOf(const QVariant& row) {
+    return static_cast<Tier>(row.toMap().value("tier").toInt());
+}
+
+// Coffee bag storage, transfer survival, and the unified bean search merge
+// logic (openspec change bean-bag-inventory).
+//
+// DB strategy mirrors tst_dbmigration: temp-dir SQLite files, raw scoped
+// connections, ShotHistoryStorage::initialize() to build the real schema.
+
+using ShotRowFixtures::withRawDb;
+
+using ShotRowFixtures::hasColumn;
+
+using ShotRowFixtures::hasTable;
+
+using ShotRowFixtures::restoreLegacyBagColumns;
+
+// Minimal shot row insert for link / history-lane tests.
+static qint64 insertShot(QSqlDatabase& db, const QString& brand, const QString& type,
+                         qint64 timestamp, const QString& beanBaseId = QString(),
+                         qint64 bagId = -1, const QString& beanBaseJson = QString()) {
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+              "bean_brand, bean_type, beanbase_id, beanbase_json, bag_id, grinder_setting, dose_weight) "
+              "VALUES (:uuid, :ts, 'Test', 30, :brand, :type, :bbid, :bbjson, :bag, '12', 18.0)");
+    q.bindValue(":uuid", QUuid::createUuid().toString(QUuid::WithoutBraces));
+    q.bindValue(":ts", timestamp);
+    q.bindValue(":brand", brand);
+    q.bindValue(":type", type);
+    q.bindValue(":bbid", beanBaseId.isEmpty() ? QVariant() : beanBaseId);
+    q.bindValue(":bbjson", beanBaseJson.isEmpty() ? QVariant() : beanBaseJson);
+    q.bindValue(":bag", bagId > 0 ? QVariant(bagId) : QVariant());
+    if (!q.exec()) {
+        qWarning() << "insertShot failed:" << q.lastError().text();
+        return -1;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+class tst_CoffeeBags : public QObject {
+    Q_OBJECT
+
+private:
+    QTemporaryDir m_tempDir;
+    int m_dbCounter = 0;
+
+    // initialize() + close(), draining the background thread. Mirrors
+    // tst_dbmigration::initAndClose: ShotHistoryStorage::close() removes its
+    // connection while the initialize()-spawned distinct-cache thread may
+    // still hold a QSqlQuery — Qt warns (harmless, ignored) and the thread
+    // MUST be drained before the storage destructs or it SIGSEGVs.
+    bool initAndClose(const QString& path, ShotHistoryStorage& storage) {
+        if (!storage.initialize(path))
+            return false;
+        storage.close();
+        // Poll the real condition rather than sleeping a fixed budget. Not
+        // QTRY_VERIFY: that macro returns void on failure and this returns bool.
+        for (int i = 0; i < 1000 && !storage.isDbWorkIdle(); i++) {
+            QCoreApplication::processEvents();
+            QThread::msleep(5);
+        }
+        return storage.isDbWorkIdle();
+    }
+
+    // Fresh fully-migrated DB via the real migration chain.
+    QString freshDb() {
+        const QString path = m_tempDir.filePath(QString("bags_%1.db").arg(m_dbCounter++));
+        ShotHistoryStorage storage;
+        return initAndClose(path, storage) ? path : QString();
+    }
+
+    // A DB awaiting migration 52: version 51 with the bag dial columns back.
+    QString freshLegacyDb() {
+        const QString path = freshDb();
+        bool ok = false;
+        withRawDb(path, "legacy_bag_fixture", [&](QSqlDatabase& db) {
+            ok = restoreLegacyBagColumns(db) && QSqlQuery(db).exec("UPDATE schema_version SET version = 51");
+        });
+        return ok ? path : QString();
+    }
+
+    // Under DECENZA_TESTING migration 52 reads the dye selection from here.
+    static void writeUpgradeSettings(const QString& dbPath, const QVariantMap& values) {
+        QSettings settings(dbPath + ".upgrade-settings", QSettings::IniFormat);
+        for (auto it = values.cbegin(); it != values.cend(); ++it)
+            settings.setValue(it.key(), it.value());
+        settings.sync();
+    }
+
+    // Two open dialled bags, one of them active: migration 52 owes a notice.
+    QString pendingNoticeLegacyDb() {
+        const QString path = freshLegacyDb();
+        if (path.isEmpty())
+            return {};
+        qint64 active = -1;
+        withRawDb(path, "pending_notice_seed", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            if (q.exec("INSERT INTO coffee_bags (roaster_name, coffee_name, grinder_setting) "
+                       "VALUES ('R', 'One', '7'), ('R', 'Two', '8')"))
+                active = q.lastInsertId().toLongLong();
+        });
+        if (active <= 0)
+            return {};
+        writeUpgradeSettings(path, {{"dye/activeBagId", active}});
+        return path;
+    }
+
+    static int schemaVersion(QSqlDatabase& db) {
+        QSqlQuery q(db);
+        return q.exec("SELECT MAX(version) FROM schema_version") && q.next() ? q.value(0).toInt() : -1;
+    }
+
+    static int bagGrindNoticeRows(QSqlDatabase& db) {
+        QSqlQuery q(db);
+        return q.exec("SELECT COUNT(*) FROM bag_grind_notice") && q.next() ? q.value(0).toInt() : -1;
+    }
+
+    // Isolate from dye state a previous test in this file left behind.
+    //
+    // Through the PID-scoped test store, NOT a bare QSettings: SettingsDye reads
+    // an AppSettings, which under DECENZA_TESTING resolves here, so a bare
+    // QSettings would clear a store nothing reads while writing to the
+    // developer's real preferences (TESTING.md). These tests were doing exactly
+    // that, which is why they never actually started clean.
+    static void clearDyeSettings() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        raw.remove(QStringLiteral("dye"));
+        raw.sync();
+    }
+
+    // Wait for CoffeeBagStorage's background worker to finish everything queued
+    // through it. ~SerialDbWorker discards queued-but-unstarted tasks and now
+    // warns when it does — several tests here call persistYieldSpecToBag()
+    // several times in a row and let `storage` go out of scope immediately
+    // after, with no wait for the async writes those calls queue. Call this
+    // right before such a test ends.
+    static void drainDbWork(CoffeeBagStorage& storage) {
+        QTRY_VERIFY(storage.isDbWorkIdle());
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+
+    void initTestCase() {
+        QVERIFY(m_tempDir.isValid());
+        // Past Qt Test's 2000-message cap the rest of the run's output is dropped;
+        // this suite's debug chatter alone crossed it.
+        QLoggingCategory::setFilterRules(QStringLiteral("default.debug=false"));
+    }
+
+    // ==========================================
+    // Migration 19 schema
+    // ==========================================
+
+    void migration19CreatesSchema() {
+        const QString path = freshDb();
+        QVERIFY(!path.isEmpty());
+        withRawDb(path, "schema_check", [&](QSqlDatabase& db) {
+            QVERIFY(hasTable(db, "coffee_bags"));
+            QVERIFY(hasColumn(db, "shots", "bag_id"));
+            QVERIFY(hasColumn(db, "shots", "frozen_date"));
+            QVERIFY(hasColumn(db, "shots", "defrost_date"));
+            QVERIFY(hasColumn(db, "shots", "beanbase_id"));
+        });
+    }
+
+    // ==========================================
+    // Bag CRUD statics
+    // ==========================================
+
+    void insertLoadUpdateRoundTrip() {
+        const QString path = freshDb();
+        withRawDb(path, "crud", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Prodigal";
+            bag.coffeeName = "First Batch";
+            bag.roastDate = "2026-06-01";
+            bag.beanBaseId = "canon-1";
+            bag.frozenDate = "2026-06-05";
+            bag.startWeightG = 150;
+            const qint64 id = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(id > 0);
+
+            CoffeeBag loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QVERIFY(loaded.isValid());
+            QCOMPARE(loaded.roasterName, QString("Prodigal"));
+            QCOMPARE(loaded.frozenDate, QString("2026-06-05"));
+            QCOMPARE(loaded.startWeightG, 150.0);
+            QVERIFY(loaded.inInventory);
+            QVERIFY(loaded.defrostDate.isEmpty());
+
+            // Partial update: only the named field changes; empty clears to NULL.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {
+                {"defrostDate", "2026-06-10"}}));
+            loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QCOMPARE(loaded.defrostDate, QString("2026-06-10"));
+            QCOMPARE(loaded.roasterName, QString("Prodigal"));  // untouched
+
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {{"inInventory", false}}));
+            QVERIFY(CoffeeBagStorage::loadInventoryStatic(db).isEmpty());
+        });
+    }
+
+    // Storage refuses a coffee-only value on a tea bag, so the web API and MCP
+    // can't store one; clearing it (what the forms send for tea) is allowed.
+    void teaBagRefusesCoffeeOnlyFields() {
+        const QString path = freshDb();
+        withRawDb(path, "teakind", [&](QSqlDatabase& db) {
+            CoffeeBag tea;
+            tea.roasterName = "Harney";
+            tea.kind = "tea";
+            const qint64 id = CoffeeBagStorage::insertBagStatic(db, tea);
+            QVERIFY(id > 0);
+
+            for (const auto& [key, value] : {std::pair<QString, QVariant>{"grinderSetting", "12"},
+                                             {"roastLevel", "Light"}, {"rpm", 800}, {"equipmentId", 4}}) {
+                QTest::ignoreMessage(QtWarningMsg, QRegularExpression(
+                    key == "roastLevel" ? "update refused:.*do not apply to tea bags"
+                                        : "update refused:.*is no longer stored on bags"));
+                QString refusal;
+                QVERIFY(!CoffeeBagStorage::updateBagFieldsStatic(db, id, {{key, value}}, &refusal));
+                QVERIFY2(refusal.contains(key), qPrintable(refusal));
+            }
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {{"grinderSetting", ""}, {"rpm", 0}}));
+            // A clear-only update still needs the bag to exist.
+            QVERIFY(!CoffeeBagStorage::updateBagFieldsStatic(db, 999999, {{"rpm", 0}}));
+            QVERIFY(!CoffeeBag::writeError({}, {{"kind", "tea"}, {"rpm", 800}}, QDate(2026, 10, 8)).isEmpty());
+            QVERIFY(!CoffeeBag::writeError({}, {{"kind", "coffee"}, {"rpm", 800}}, QDate(2026, 10, 8)).isEmpty());
+            QVERIFY(!CoffeeBag::writeError({}, {{"grinderSetting", "0"}}, QDate(2026, 10, 8)).isEmpty());
+        });
+    }
+
+    void loadBagOmitsLegacyGrinderFields() {
+        const QString path = freshDb();
+        withRawDb(path, "bag_grinder", [&](QSqlDatabase& db) {
+            CoffeeBag linked;
+            linked.roasterName = "Onyx";
+            linked.coffeeName = "Geometry";
+            const qint64 linkedId = CoffeeBagStorage::insertBagStatic(db, linked);
+            QVERIFY(linkedId > 0);
+
+            const QVariantMap loaded = CoffeeBagStorage::loadBagStatic(db, linkedId).toVariantMap();
+            QVERIFY(!loaded.contains("grinderBrand"));
+            QVERIFY(!loaded.contains("grinderSetting"));
+            QVERIFY(!loaded.contains("equipmentId"));
+            QVERIFY(!loaded.contains("rpm"));
+        });
+    }
+
+    void propagateBeanBaseFixesLinkedShots() {
+        // Linking a bag to Bean Base in the edit dialog rewrites the
+        // canonical snapshot of every shot pulled with that bag; clearing
+        // the link propagates the unlink the same way.
+        const QString path = freshDb();
+        withRawDb(path, "propagate", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Prodigal";
+            bag.coffeeName = "Espresso Milk Blend";
+            const qint64 bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+            const qint64 linkedShot = insertShot(db, "Prodigal", "Espresso Milk Blend", 1000, QString(), bagId);
+            const qint64 otherShot = insertShot(db, "Other", "Coffee", 1001);
+
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, bagId, {
+                {"beanBaseId", "canon-77"},
+                {"beanBaseData", R"({"id":"canon-77","origin":"Colombia"})"}}));
+            QCOMPARE(CoffeeBagStorage::propagateBeanBaseStatic(db, bagId), 1);
+
+            QSqlQuery q(db);
+            q.prepare("SELECT beanbase_id, beanbase_json FROM shots WHERE id = :id");
+            q.bindValue(":id", linkedShot);
+            QVERIFY(q.exec() && q.next());
+            QCOMPARE(q.value(0).toString(), QString("canon-77"));
+            QVERIFY(q.value(1).toString().contains("Colombia"));
+
+            q.bindValue(":id", otherShot);
+            QVERIFY(q.exec() && q.next());
+            QVERIFY(q.value(0).isNull());  // unrelated shot untouched
+
+            // Unlink propagates the clear.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, bagId, {
+                {"beanBaseId", ""}, {"beanBaseData", ""}}));
+            QCOMPARE(CoffeeBagStorage::propagateBeanBaseStatic(db, bagId), 1);
+            q.bindValue(":id", linkedShot);
+            QVERIFY(q.exec() && q.next());
+            QVERIFY(q.value(0).isNull());
+        });
+    }
+
+    void inventoryCarriesShotCount() {
+        // shotCount drives the card's single removal action (trash while 0,
+        // "Bag finished" once shots exist).
+        const QString path = freshDb();
+        withRawDb(path, "shotcount", [&](QSqlDatabase& db) {
+            CoffeeBag used;
+            used.roasterName = "Used";
+            used.coffeeName = "Bag";
+            const qint64 usedId = CoffeeBagStorage::insertBagStatic(db, used);
+            insertShot(db, "Used", "Bag", 1000, QString(), usedId);
+            insertShot(db, "Used", "Bag", 1001, QString(), usedId);
+            CoffeeBag fresh;
+            fresh.roasterName = "Fresh";
+            fresh.coffeeName = "Bag";
+            CoffeeBagStorage::insertBagStatic(db, fresh);
+
+            const QVector<InventoryBag> inventory = CoffeeBagStorage::loadInventoryStatic(db);
+            QCOMPARE(inventory.size(), 2);
+            QHash<QString, qint64> countByRoaster;
+            for (const InventoryBag& entry : inventory)
+                countByRoaster.insert(entry.bag.roasterName, entry.shotCount);
+            QCOMPARE(countByRoaster.value("Used"), qint64(2));
+            QCOMPARE(countByRoaster.value("Fresh"), qint64(0));
+        });
+    }
+
+    void requestInventoryInjectsShotCountIntoMap() {
+        // shotCount is no longer a CoffeeBag field: requestInventory injects it
+        // into the variant map the QML card reads. Assert that C++->QML contract
+        // through the async signal, not just the loader struct (the field could
+        // be present on InventoryBag yet dropped from the emitted map).
+        const QString path = freshDb();
+        withRawDb(path, "inv_map", [&](QSqlDatabase& db) {
+            CoffeeBag used;
+            used.roasterName = "Used";
+            used.coffeeName = "Bag";
+            const qint64 usedId = CoffeeBagStorage::insertBagStatic(db, used);
+            insertShot(db, "Used", "Bag", 1000, QString(), usedId);
+            insertShot(db, "Used", "Bag", 1001, QString(), usedId);
+            CoffeeBag fresh;
+            fresh.roasterName = "Fresh";
+            fresh.coffeeName = "Bag";
+            CoffeeBagStorage::insertBagStatic(db, fresh);
+        });
+
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+        QSignalSpy readySpy(&storage, &CoffeeBagStorage::inventoryReady);
+        storage.requestInventory();
+        QTRY_COMPARE(readySpy.count(), 1);
+
+        const QVariantList bags = readySpy.at(0).at(0).toList();
+        QCOMPARE(bags.size(), 2);
+        QHash<QString, qint64> countByRoaster;
+        QHash<QString, QStringList> actionsByRoaster;
+        for (const QVariant& v : bags) {
+            const QVariantMap map = v.toMap();
+            QVERIFY2(map.contains(QStringLiteral("shotCount")),
+                     "inventory map must carry the injected shotCount key");
+            countByRoaster.insert(map.value(QStringLiteral("roasterName")).toString(),
+                                  map.value(QStringLiteral("shotCount")).toLongLong());
+            actionsByRoaster.insert(map.value(QStringLiteral("roasterName")).toString(),
+                                    map.value(QStringLiteral("actions")).toStringList());
+        }
+        QCOMPARE(countByRoaster.value("Used"), qint64(2));
+        QCOMPARE(countByRoaster.value("Fresh"), qint64(0));
+        // Both card surfaces render these: a used bag is finished, never deleted.
+        QVERIFY(actionsByRoaster.value("Used").contains("bagFinished"));
+        QVERIFY(!actionsByRoaster.value("Used").contains("delete"));
+        QVERIFY(actionsByRoaster.value("Fresh").contains("delete"));
+    }
+
+    void findBagForShotPrefersLinkThenIdentity() {
+        const QString path = freshDb();
+        withRawDb(path, "findbag", [&](QSqlDatabase& db) {
+            CoffeeBag bagA;
+            bagA.roasterName = "Roaster";
+            bagA.coffeeName = "Coffee";
+            bagA.inInventory = false;  // older bag of the same coffee
+            const qint64 bagAId = CoffeeBagStorage::insertBagStatic(db, bagA);
+            CoffeeBag bagB = bagA;
+            bagB.inInventory = true;
+            const qint64 bagBId = CoffeeBagStorage::insertBagStatic(db, bagB);
+
+            // Linked shot -> its own bag wins even if not in inventory.
+            const qint64 linkedShot = insertShot(db, "Roaster", "Coffee", 1000, QString(), bagAId);
+            QCOMPARE(CoffeeBagStorage::findBagForShotStatic(db, linkedShot, "Roaster", "Coffee"), bagAId);
+
+            // Pre-bag shot -> identity match, in-inventory bag preferred.
+            const qint64 legacyShot = insertShot(db, "Roaster", "Coffee", 1001);
+            QCOMPARE(CoffeeBagStorage::findBagForShotStatic(db, legacyShot, "Roaster", "Coffee"), bagBId);
+
+            // No match at all.
+            QCOMPARE(CoffeeBagStorage::findBagForShotStatic(db, -1, "Unknown", "Bean"), qint64(-1));
+        });
+    }
+
+    // ==========================================
+    // Delete guard
+    // ==========================================
+
+    void reviewWritesRollbackTogetherOnRecipeFailure() {
+        const QString path = freshDb();
+        withRawDb(path, "review_atomic", [&](QSqlDatabase& db) {
+            CoffeeBag oldBag; oldBag.roasterName = "R"; oldBag.coffeeName = "Old";
+            const qint64 oldId = CoffeeBagStorage::insertBagStatic(db, oldBag);
+            CoffeeBag newBag; newBag.roasterName = "R"; newBag.coffeeName = "New";
+            newBag.doseWeightG = 16; newBag.yieldMode = QStringLiteral("absolute"); newBag.yieldValue = 39;
+            const qint64 newId = CoffeeBagStorage::insertBagStatic(db, newBag);
+            Recipe recipe; recipe.name = "Recipe"; recipe.profileTitle = "Profile";
+            recipe.bagId = oldId; recipe.doseG = 19; recipe.yieldMode = QStringLiteral("ratio"); recipe.yieldValue = 3;
+            const qint64 recipeId = RecipeStorage::insertRecipeStatic(db, recipe);
+            EquipmentPackage equipment; equipment.name = QStringLiteral("Review grinder");
+            equipment.lastGrindSetting = QStringLiteral("10"); equipment.lastRpm = 600;
+            const qint64 equipmentId = EquipmentStorage::createPackageWithGrinderStatic(db, equipment, "Niche", "Zero", "63mm");
+            QVERIFY(equipmentId > 0);
+            QVariantMap originalEquipment = EquipmentStorage::loadPackageStatic(db, equipmentId).toVariantMap();
+            const QVariantMap identity = EquipmentStorage::editableSnapshotStatic(db, equipmentId);
+            for (auto field = identity.cbegin(); field != identity.cend(); ++field)
+                originalEquipment.insert(field.key(), field.value());
+            QVERIFY(oldId > 0 && newId > 0 && recipeId > 0);
+            const qint64 shotId = insertShot(db, "R", "Old", 1000, {}, oldId);
+            QVERIFY(shotId > 0);
+            QVERIFY(ShotHistoryStorage::updateShotMetadataStatic(db, shotId,
+                {{"bagId", newId}, {"doseWeight", 20.0}, {"grinderSetting", "11"}, {"rpm", 700}}));
+            const QVariantMap originalBag = CoffeeBagStorage::loadBagStatic(db, newId).toVariantMap();
+            const QVariantMap originalRecipe = RecipeStorage::loadRecipeStatic(db, recipeId).toVariantMap();
+            ShotReviewSetup setup; setup.brew.activeBagId = oldId; setup.brew.activeRecipeId = recipeId;
+            setup.brew.activeEquipmentId = equipmentId;
+            const QVariantMap approvedPatch{{"bagId", newId}, {"doseWeight", 20.0}, {"grinderSetting", "11"}, {"rpm", 700}};
+            const QVariantMap plan = shotReviewPersistentPlan(setup,
+                approvedPatch, originalRecipe, originalBag, originalEquipment);
+            QVERIFY(plan.value("valid").toBool());
+            {
+                auto unsafePlan = plan;
+                auto unsafeBagPatch = plan.value("bagPatch").toMap();
+                unsafeBagPatch.insert("yieldValue", 60.0);
+                unsafePlan.insert("bagPatch", unsafeBagPatch);
+                auto txn = DbWriteTxn::begin(db, "test unapproved write");
+                QVERIFY(txn.ok());
+                QCOMPARE(stageShotReviewWrites(db, txn, shotId, unsafePlan, approvedPatch, originalBag, originalRecipe),
+                         QStringLiteral("invalid"));
+            }
+            {
+                auto unsafePlan = plan;
+                auto unsafeBagPatch = plan.value("bagPatch").toMap();
+                unsafeBagPatch.insert("grinderSetting", "11");
+                unsafePlan.insert("bagPatch", unsafeBagPatch);
+                auto txn = DbWriteTxn::begin(db, "test obsolete bag grind");
+                QVERIFY(txn.ok());
+                QCOMPARE(stageShotReviewWrites(db, txn, shotId, unsafePlan, approvedPatch, originalBag, originalRecipe),
+                         QStringLiteral("invalid"));
+            }
+            {
+                auto unsafePlan = plan;
+                unsafePlan.insert("bagId", oldId);
+                auto txn = DbWriteTxn::begin(db, "test mismatched bag");
+                QVERIFY(txn.ok());
+                QCOMPARE(stageShotReviewWrites(db, txn, shotId, unsafePlan, approvedPatch, originalBag, originalRecipe),
+                         QStringLiteral("invalid"));
+            }
+            {
+                auto unsafePlan = plan;
+                unsafePlan.insert("equipmentPatch", QVariantMap{{"name", "Not approved"}});
+                auto txn = DbWriteTxn::begin(db, "test unapproved equipment write");
+                QVERIFY(txn.ok());
+                QCOMPARE(stageShotReviewWrites(db, txn, shotId, unsafePlan, approvedPatch, originalBag, originalRecipe),
+                         QStringLiteral("invalid"));
+            }
+            QVERIFY(EquipmentStorage::updatePackageFieldsStatic(db, equipmentId, {{"lastRpm", 650}}));
+            {
+                auto txn = DbWriteTxn::begin(db, "test stale equipment");
+                QVERIFY(txn.ok());
+                QCOMPARE(stageShotReviewWrites(db, txn, shotId, plan, approvedPatch, originalBag, originalRecipe),
+                         QStringLiteral("staleEquipment"));
+            }
+            QVERIFY(EquipmentStorage::updatePackageFieldsStatic(db, equipmentId, {{"lastRpm", 600}}));
+            QSqlQuery trigger(db);
+            QVERIFY(trigger.exec("CREATE TRIGGER review_fail BEFORE UPDATE ON recipes BEGIN SELECT RAISE(ABORT, 'injected'); END"));
+            trigger.finish();
+            int publications = 0;
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(".*update failed:.*injected.*"));
+            QVERIFY(!commitShotReviewWrites(db, shotId, plan, approvedPatch, originalBag, originalRecipe,
+                [] { return true; }, [&](const QVariantMap&, const QVariantMap&) {
+                    ++publications;
+                    return true;
+                }).isEmpty());
+            QCOMPARE(publications, 0);
+            QCOMPARE(CoffeeBagStorage::loadBagStatic(db, newId).doseWeightG, 16.0);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, recipeId).bagId, oldId);
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, equipmentId).lastGrindSetting, QStringLiteral("10"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, equipmentId).lastRpm, 600);
+            QVERIFY(trigger.exec("DROP TRIGGER review_fail"));
+            trigger.finish();
+            // A lost client or a new operation can cancel at either owner
+            // callback. Neither boundary may publish or retain a partial patch.
+            for (bool cancelBeforeCommit : {true, false}) {
+                int publicationAttempts = 0;
+                QVERIFY(!commitShotReviewWrites(db, shotId, plan, approvedPatch, originalBag, originalRecipe,
+                    [=] { return !cancelBeforeCommit; }, [&](const QVariantMap&, const QVariantMap&) {
+                        ++publicationAttempts;
+                        return false;
+                    }).isEmpty());
+                QCOMPARE(publicationAttempts, cancelBeforeCommit ? 0 : 1);
+                QCOMPARE(CoffeeBagStorage::loadBagStatic(db, newId).toVariantMap(), originalBag);
+                QCOMPARE(RecipeStorage::loadRecipeStatic(db, recipeId).editableSnapshot(),
+                         Recipe::editableSnapshot(originalRecipe));
+                QCOMPARE(EquipmentStorage::loadPackageStatic(db, equipmentId).lastGrindSetting, QStringLiteral("10"));
+                QCOMPARE(EquipmentStorage::loadPackageStatic(db, equipmentId).lastRpm, 600);
+            }
+            QVariantMap publishedBag, publishedRecipe;
+            QCOMPARE(commitShotReviewWrites(db, shotId, plan, approvedPatch, originalBag, originalRecipe,
+                [] { return true; }, [&](const QVariantMap& committedBag, const QVariantMap& committedRecipe) {
+                    ++publications;
+                    publishedBag = committedBag;
+                    publishedRecipe = committedRecipe;
+                    return true;
+                }), QString());
+            QCOMPARE(publications, 1);
+            QCOMPARE(publishedBag.value("doseWeightG").toDouble(), 20.0);
+            QCOMPARE(publishedRecipe.value("bagId").toLongLong(), newId);
+            const CoffeeBag finalBag = CoffeeBagStorage::loadBagStatic(db, newId);
+            const Recipe finalRecipe = RecipeStorage::loadRecipeStatic(db, recipeId);
+            QCOMPARE(finalBag.doseWeightG, 20.0);
+            QCOMPARE(finalBag.yieldValue, 39.0);
+            QCOMPARE(finalBag.yieldMode, QStringLiteral("absolute"));
+            QCOMPARE(finalRecipe.bagId, newId);
+            QCOMPARE(finalRecipe.doseG, 20.0);
+            QCOMPARE(finalRecipe.yieldValue, 3.0);
+            QCOMPARE(finalRecipe.yieldMode, QStringLiteral("ratio"));
+            // Reselecting the same equipment must retain the approved dial,
+            // rather than restoring the package's pre-review values.
+            clearDyeSettings();
+            SettingsDye dye;
+            dye.switchToEquipment(EquipmentStorage::loadPackageStatic(db, equipmentId).toVariantMap());
+            QCOMPARE(dye.dyeGrinderSetting(), QStringLiteral("11"));
+            QCOMPARE(dye.dyeGrinderRpm(), 700);
+            clearDyeSettings();
+            {
+                auto txn = DbWriteTxn::begin(db, "test stale review");
+                QVERIFY(txn.ok());
+                QCOMPARE(stageShotReviewWrites(db, txn, shotId, plan, approvedPatch, originalBag, originalRecipe),
+                         QStringLiteral("staleBag"));
+            }
+            QVERIFY(RecipeStorage::updateRecipeFieldsStatic(db, recipeId, {{"name", "Edited elsewhere"}}));
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, newId, {{"notes", "Keep this note"}}));
+            QVERIFY(EquipmentStorage::updatePackageFieldsStatic(db, equipmentId, {{"name", "Keep this equipment name"}, {"lastRpm", 800}}));
+            QVERIFY(restoreShotReviewWrites(db, plan, originalBag, originalRecipe,
+                                            finalBag.toVariantMap(), finalRecipe.toVariantMap()));
+            QCOMPARE(CoffeeBagStorage::loadBagStatic(db, newId).doseWeightG, 16.0);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, recipeId).bagId, oldId);
+            QCOMPARE(RecipeStorage::loadRecipeStatic(db, recipeId).name, QStringLiteral("Edited elsewhere"));
+            QCOMPARE(CoffeeBagStorage::loadBagStatic(db, newId).notes, QStringLiteral("Keep this note"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, equipmentId).lastGrindSetting, QStringLiteral("10"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, equipmentId).lastRpm, 800);
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, equipmentId).name, QStringLiteral("Keep this equipment name"));
+            const qint64 newerId = insertShot(db, "R", "New", 1001, {}, newId);
+            QVERIFY(newerId > shotId);
+            {
+                auto txn = DbWriteTxn::begin(db, "test newer shot");
+                QVERIFY(txn.ok());
+                QCOMPARE(stageShotReviewWrites(db, txn, shotId, plan, approvedPatch, originalBag, originalRecipe),
+                         QStringLiteral("staleShot"));
+            }
+        });
+    }
+
+    void deleteGuardOnlyRemovesUnusedBags() {
+        // The guard lives in the async path; verify the underlying invariant
+        // the same way: bag with a linked shot must survive, unused bag goes.
+        const QString path = freshDb();
+        withRawDb(path, "delete", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "R";
+            bag.coffeeName = "C";
+            const qint64 usedId = CoffeeBagStorage::insertBagStatic(db, bag);
+            insertShot(db, "R", "C", 1000, QString(), usedId);
+
+            QSqlQuery count(db);
+            count.prepare("SELECT COUNT(*) FROM shots WHERE bag_id = :id");
+            count.bindValue(":id", usedId);
+            QVERIFY(count.exec() && count.next());
+            QCOMPARE(count.value(0).toInt(), 1);  // guard precondition holds
+        });
+
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+        qint64 usedBagId = -1, freshBagId = -1, scopedBagId = -1;
+        withRawDb(path, "delete_ids", [&](QSqlDatabase& db) {
+            usedBagId = CoffeeBagStorage::loadInventoryStatic(db).first().bag.id;
+            CoffeeBag fresh;
+            fresh.roasterName = "Mistake";
+            fresh.coffeeName = "Bag";
+            freshBagId = CoffeeBagStorage::insertBagStatic(db, fresh);
+            fresh.coffeeName = "Scoped";
+            scopedBagId = CoffeeBagStorage::insertBagStatic(db, fresh);
+        });
+
+        QSignalSpy deletedSpy(&storage, &CoffeeBagStorage::bagDeleted);
+        QSignalSpy removedSpy(&storage, &CoffeeBagStorage::bagRemoved);
+        // The guard logs its refusal — expected, assert+silence it.
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("refusing to delete bag"));
+        storage.requestDeleteBag(usedBagId);   // refused: has a linked shot
+        storage.requestDeleteBag(freshBagId);  // allowed
+        QTRY_COMPARE(deletedSpy.count(), 2);
+
+        QHash<qint64, bool> outcome;
+        for (const auto& args : deletedSpy)
+            outcome.insert(args[0].toLongLong(), args[1].toBool());
+        QCOMPARE(outcome.value(usedBagId), false);
+        QCOMPARE(outcome.value(freshBagId), true);
+        QCOMPARE(removedSpy.count(), 1);
+        QCOMPARE(removedSpy.first().at(0).toLongLong(), freshBagId);
+        bool scopedDone = false;
+        storage.requestDeleteBagWithCompletion(scopedBagId, &storage,
+            [&](qint64 id, bool success, const QString&) {
+                QCOMPARE(id, scopedBagId);
+                QVERIFY(success);
+                scopedDone = true;
+            });
+        QTRY_VERIFY(scopedDone);
+        QCOMPARE(removedSpy.count(), 2);
+        QCOMPARE(removedSpy.last().at(0).toLongLong(), scopedBagId);
+        QCOMPARE(deletedSpy.count(), 2); // Request-scoped completion stays private.
+
+        withRawDb(path, "delete_check", [&](QSqlDatabase& db) {
+            QVERIFY(CoffeeBagStorage::loadBagStatic(db, usedBagId).isValid());
+            QVERIFY(!CoffeeBagStorage::loadBagStatic(db, freshBagId).isValid());
+        });
+    }
+
+    // ==========================================
+    // Transfer / backup import
+    // ==========================================
+
+    void importDatabaseRemapsBagIdsAndKeepsSnapshotColumns() {
+        const QString srcPath = freshDb();
+        const QString destPath = freshDb();
+
+        qint64 srcBagId = -1;
+        withRawDb(srcPath, "imp_src", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Transfer";
+            bag.coffeeName = "Roast";
+            bag.frozenDate = "2026-06-01";
+            bag.storageHint = "airtight";       // bean-freshness-followup
+            bag.openedDate = "2026-06-05";
+            srcBagId = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(srcBagId > 0);
+            // Shot linked to the bag, carrying the once-dropped columns plus the
+            // out-of-freezer storage lifecycle snapshot (bean-freshness-followup).
+            QSqlQuery q(db);
+            q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+                      "bean_brand, bean_type, bag_id, stopped_by, beanbase_json, beanbase_id, frozen_date, "
+                      "storage_hint, opened_date, taste_balance, taste_body, decent_uploaded_at, decent_shot_id, "
+                      "decent_serial, decent_replace_pending, decent_rejected_status, decent_rejected_at, "
+                      "visualizer_dirty, visualizer_dirty_seq, decent_failed_at, visualizer_failed_at, "
+                      "visualizer_rejected_status, visualizer_rejected_at) "
+                      "VALUES ('src-uuid-1', 2000, 'P', 30, 'Transfer', 'Roast', :bag, 'weight', "
+                      "'{\"id\":\"canon-9\"}', 'canon-9', '2026-06-01', 'airtight', '2026-06-05', 'sour', 'heavy', "
+                      "1790000000, 'srv-7', '1812', 1, 400, 1790000100, 3, 7, 1790000200, 1790000300, 422, 1790000400)");
+            q.bindValue(":bag", srcBagId);
+            QVERIFY(q.exec());
+        });
+
+        // Occupy a dest row id so the remap is observable (src bag id 1 must
+        // NOT map to dest id 1).
+        withRawDb(destPath, "imp_dest_prep", [&](QSqlDatabase& db) {
+            CoffeeBag filler;
+            filler.roasterName = "Existing";
+            filler.coffeeName = "Bag";
+            QVERIFY(CoffeeBagStorage::insertBagStatic(db, filler) > 0);
+        });
+
+        QVERIFY(ShotHistoryStorage::importDatabaseStatic(destPath, srcPath, /*merge=*/true));
+
+        withRawDb(destPath, "imp_check", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT s.bag_id, s.stopped_by, s.beanbase_json, s.beanbase_id, s.frozen_date, "
+                           "b.roaster_name, s.storage_hint, s.opened_date, b.storage_hint, b.opened_date, "
+                           "s.taste_balance, s.taste_body, s.decent_uploaded_at, s.decent_shot_id, s.decent_serial, "
+                           "s.decent_replace_pending, s.decent_rejected_status, s.decent_rejected_at, "
+                           "s.visualizer_dirty, s.visualizer_dirty_seq, s.decent_failed_at, s.visualizer_failed_at, "
+                           "s.visualizer_rejected_status, s.visualizer_rejected_at "
+                           "FROM shots s JOIN coffee_bags b ON b.id = s.bag_id "
+                           "WHERE s.uuid = 'src-uuid-1'"));
+            QVERIFY(q.next());
+            QVERIFY(q.value(0).toLongLong() != srcBagId);          // remapped
+            QCOMPARE(q.value(1).toString(), QString("weight"));     // stopped_by restored
+            QCOMPARE(q.value(2).toString(), QString("{\"id\":\"canon-9\"}"));
+            QCOMPARE(q.value(3).toString(), QString("canon-9"));
+            QCOMPARE(q.value(4).toString(), QString("2026-06-01")); // frozen_date carried
+            QCOMPARE(q.value(5).toString(), QString("Transfer"));   // joined to the imported bag
+            QCOMPARE(q.value(6).toString(), QString("airtight"));   // shot storage_hint carried
+            QCOMPARE(q.value(7).toString(), QString("2026-06-05")); // shot opened_date carried
+            QCOMPARE(q.value(8).toString(), QString("airtight"));   // bag storage_hint carried
+            QCOMPARE(q.value(9).toString(), QString("2026-06-05")); // bag opened_date carried
+            // add-ai-taste-intake: taste columns carry across transfer.
+            QCOMPARE(q.value(10).toString(), QString("sour"));      // taste_balance carried
+            QCOMPARE(q.value(11).toString(), QString("heavy"));     // taste_body carried
+            // Decent upload state carries, so a migrated history is not uploaded again.
+            QCOMPARE(q.value(12).toLongLong(), qint64(1790000000));
+            QCOMPARE(q.value(13).toString(), QString("srv-7"));
+            QCOMPARE(q.value(14).toString(), QString("1812"));
+            QCOMPARE(q.value(15).toInt(), 1);
+            QCOMPARE(q.value(16).toInt(), 400);
+            QCOMPARE(q.value(17).toLongLong(), qint64(1790000100));
+            // Visualizer unsent edits (migration 43) and upload outcomes (migration 44),
+            // each a distinct value so a swapped bind shows.
+            QCOMPARE(q.value(18).toInt(), 3);
+            QCOMPARE(q.value(19).toInt(), 7);
+            QCOMPARE(q.value(20).toLongLong(), qint64(1790000200));
+            QCOMPARE(q.value(21).toLongLong(), qint64(1790000300));
+            QCOMPARE(q.value(22).toInt(), 422);
+            QCOMPARE(q.value(23).toLongLong(), qint64(1790000400));
+        });
+    }
+
+    void importingAHistoryFromBeforeDecentUploadState() {
+        // A backup or migration source from before migration 42 has none of the
+        // decent_* columns; decent_replace_pending is NOT NULL in the destination.
+        const QString srcPath = freshDb();
+        const QString destPath = freshDb();
+        withRawDb(srcPath, "pre42_src", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            for (const char* column : {"decent_uploaded_at", "decent_shot_id", "decent_serial",
+                                       "decent_replace_pending", "decent_rejected_status", "decent_rejected_at"})
+                QVERIFY2(q.exec(QStringLiteral("ALTER TABLE shots DROP COLUMN %1").arg(QLatin1String(column))),
+                         qPrintable(q.lastError().text()));
+            QVERIFY(q.exec("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds) "
+                           "VALUES ('old-uuid-1', 1000, 'P', 30)"));
+        });
+
+        QVERIFY(ShotHistoryStorage::importDatabaseStatic(destPath, srcPath, /*merge=*/true));
+
+        withRawDb(destPath, "pre42_check", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT decent_uploaded_at, decent_replace_pending FROM shots WHERE uuid = 'old-uuid-1'"));
+            QVERIFY(q.next());
+            QVERIFY(q.value(0).isNull());   // never uploaded
+            QCOMPARE(q.value(1).toInt(), 0);
+        });
+    }
+
+    void importDatabaseMergeDedupesBags() {
+        const QString srcPath = freshDb();
+        const QString destPath = freshDb();
+        withRawDb(srcPath, "dedup_src", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Same";
+            bag.coffeeName = "Coffee";
+            bag.roastDate = "2026-06-01";
+            QVERIFY(CoffeeBagStorage::insertBagStatic(db, bag) > 0);
+            insertShot(db, "Same", "Coffee", 3000, QString(), 1);
+        });
+        qint64 destBagId = -1;
+        withRawDb(destPath, "dedup_dest", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "same";  // case-insensitive identity
+            bag.coffeeName = "coffee";
+            bag.roastDate = "2026-06-01";
+            destBagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+
+        QVERIFY(ShotHistoryStorage::importDatabaseStatic(destPath, srcPath, /*merge=*/true));
+
+        withRawDb(destPath, "dedup_check", [&](QSqlDatabase& db) {
+            QCOMPARE(CoffeeBagStorage::loadInventoryStatic(db).size(), 1);  // no duplicate
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT bag_id FROM shots LIMIT 1"));
+            QVERIFY(q.next());
+            QCOMPARE(q.value(0).toLongLong(), destBagId);  // remapped to the existing bag
+        });
+    }
+
+    // Recipe transfer (finish-recipes-first-class): recipes ride in shots.db and
+    // must merge with equipment_id remapped and shots.recipe_id remapped — the
+    // provenance that used to dangle after transfer.
+    void importDatabaseRemapsRecipeIdsAndEquipment() {
+        const QString srcPath = freshDb();
+        const QString destPath = freshDb();
+
+        qint64 srcPkgId = -1, srcRecipeId = -1;
+        withRawDb(srcPath, "rec_imp_src", [&](QSqlDatabase& db) {
+            EquipmentPackage pkg;
+            srcPkgId = EquipmentStorage::createPackageWithGrinderStatic(db, pkg, "Niche", "Zero", "63mm");
+            QVERIFY(srcPkgId > 0);
+
+            Recipe r;
+            r.name = "Americano";
+            r.profileTitle = "Filter 2.0";
+            r.equipmentId = srcPkgId;
+            r.hotWaterJson = "{\"hasWater\":true,\"vesselName\":\"Cup\",\"volume\":120,"
+                             "\"mode\":\"volume\",\"flowRate\":40,\"temperatureC\":90,\"order\":\"after\"}";
+            srcRecipeId = RecipeStorage::insertRecipeStatic(db, r);
+            QVERIFY(srcRecipeId > 0);
+
+            QSqlQuery q(db);
+            q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, recipe_id) "
+                      "VALUES ('rec-uuid-1', 5000, 'Filter 2.0', 30, :rid)");
+            q.bindValue(":rid", srcRecipeId);
+            QVERIFY(q.exec());
+        });
+
+        // Occupy dest row ids so both remaps are observable (src ids must NOT
+        // map to the same dest ids).
+        withRawDb(destPath, "rec_imp_dest_prep", [&](QSqlDatabase& db) {
+            EquipmentPackage filler;
+            QVERIFY(EquipmentStorage::createPackageWithGrinderStatic(db, filler, "Filler", "Grinder", "40mm") > 0);
+            Recipe fillerR;
+            fillerR.name = "Filler";
+            fillerR.profileTitle = "X";
+            QVERIFY(RecipeStorage::insertRecipeStatic(db, fillerR) > 0);
+        });
+
+        QVERIFY(ShotHistoryStorage::importDatabaseStatic(destPath, srcPath, /*merge=*/true));
+
+        withRawDb(destPath, "rec_imp_check", [&](QSqlDatabase& db) {
+            QCOMPARE(RecipeStorage::loadInventoryStatic(db).size(), 2);  // filler + imported
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT s.recipe_id, r.name, r.equipment_id, r.hot_water_json "
+                           "FROM shots s JOIN recipes r ON r.id = s.recipe_id "
+                           "JOIN equipment_packages p ON p.id = r.equipment_id "
+                           "WHERE s.uuid = 'rec-uuid-1'"));
+            QVERIFY(q.next());                                     // JOINs matched → no dangling refs
+            QVERIFY(q.value(0).toLongLong() != srcRecipeId);      // recipe_id remapped
+            QCOMPARE(q.value(1).toString(), QString("Americano"));
+            QVERIFY(q.value(2).toLongLong() != srcPkgId);         // equipment_id remapped to a real package
+            QVERIFY(q.value(3).toString().contains("hasWater"));  // hot-water block carried verbatim
+        });
+    }
+
+    void importDatabaseMergeDedupesRecipes() {
+        const QString srcPath = freshDb();
+        const QString destPath = freshDb();
+        withRawDb(srcPath, "rec_dedup_src", [&](QSqlDatabase& db) {
+            Recipe r;
+            r.name = "Morning";
+            r.profileTitle = "D-Flow";
+            const qint64 rid = RecipeStorage::insertRecipeStatic(db, r);
+            QVERIFY(rid > 0);
+            // A shot must exist or importDatabaseStatic treats the source as an
+            // empty backup and skips the recipe merge entirely (same guard the
+            // bag dedup test satisfies). Link it so the remap is exercised too.
+            QSqlQuery q(db);
+            q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, recipe_id) "
+                      "VALUES ('rec-dedup-uuid', 3000, 'D-Flow', 30, :rid)");
+            q.bindValue(":rid", rid);
+            QVERIFY(q.exec());
+        });
+        qint64 destRecipeId = -1;
+        withRawDb(destPath, "rec_dedup_dest", [&](QSqlDatabase& db) {
+            Recipe r;
+            r.name = "morning";      // case-insensitive identity
+            r.profileTitle = "d-flow";
+            destRecipeId = RecipeStorage::insertRecipeStatic(db, r);
+            QVERIFY(destRecipeId > 0);
+        });
+
+        QVERIFY(ShotHistoryStorage::importDatabaseStatic(destPath, srcPath, /*merge=*/true));
+
+        withRawDb(destPath, "rec_dedup_check", [&](QSqlDatabase& db) {
+            QCOMPARE(RecipeStorage::loadInventoryStatic(db).size(), 1);  // no duplicate
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT recipe_id FROM shots WHERE uuid = 'rec-dedup-uuid'"));
+            QVERIFY(q.next());
+            QCOMPARE(q.value(0).toLongLong(), destRecipeId);  // remapped to the existing recipe
+        });
+    }
+
+    // Inventory lifecycle signals (recipe-bag-lifecycle triggers): any
+    // update carrying inInventory=false emits bagFinished (roll-on-finish
+    // hook); inInventory=true emits bagRestocked (wake-on-restock hook);
+    // updates not touching inventory — and failed updates — emit neither.
+    void inventoryLifecycleSignals() {
+        const QString path = freshDb();
+        qint64 bagId = 0;
+        withRawDb(path, "lifecycle_setup", [&](QSqlDatabase& db) {
+            CoffeeBag bag; bag.roasterName = "R"; bag.coffeeName = "C";
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QVERIFY(bagId > 0);
+
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+        QSignalSpy finished(&storage, &CoffeeBagStorage::bagFinished);
+        QSignalSpy restocked(&storage, &CoffeeBagStorage::bagRestocked);
+        QSignalSpy updated(&storage, &CoffeeBagStorage::bagUpdated);
+
+        // Mark empty (the card's Bag Finished button) → bagFinished, and the
+        // bag moves from the inventory to the finished shelf.
+        storage.requestMarkEmpty(bagId);
+        QTRY_COMPARE(updated.count(), 1);
+        QCOMPARE(finished.count(), 1);
+        QCOMPARE(finished.at(0).at(0).toLongLong(), bagId);
+        QCOMPARE(restocked.count(), 0);
+        withRawDb(path, "lifecycle_shelves", [&](QSqlDatabase& db) {
+            QVERIFY(CoffeeBagStorage::loadInventoryStatic(db).isEmpty());
+            const QVector<InventoryBag> shelf = CoffeeBagStorage::loadInventoryStatic(db, true);
+            QCOMPARE(shelf.size(), 1);
+            QCOMPARE(shelf.first().bag.id, bagId);
+        });
+
+        // Return to inventory (MCP/web-style update) → bagRestocked.
+        storage.requestUpdateBag(bagId, {{"inInventory", true}});
+        QTRY_COMPARE(updated.count(), 2);
+        QCOMPARE(restocked.count(), 1);
+        QCOMPARE(restocked.at(0).at(0).toLongLong(), bagId);
+        QCOMPARE(finished.count(), 1);
+
+        // An update that doesn't touch inventory → neither.
+        storage.requestUpdateBag(bagId, {{"notes", "tasty"}});
+        QTRY_COMPARE(updated.count(), 3);
+        QCOMPARE(finished.count(), 1);
+        QCOMPARE(restocked.count(), 1);
+
+        // A FAILED update (missing row) → neither.
+        storage.requestUpdateBag(999999, {{"inInventory", false}});
+        QTRY_COMPARE(updated.count(), 4);
+        QCOMPARE(updated.at(3).at(1).toBool(), false);
+        QCOMPARE(finished.count(), 1);
+        QCOMPARE(restocked.count(), 1);
+
+        // The signal counts above are delivered from the task body, which runs
+        // before the worker's outstanding count drops — so the last update can
+        // still be in flight when this slot returns.
+        drainDbWork(storage);
+    }
+
+    // A Visualizer pull decides on the row as it stands inside the write, merges
+    // what it saw into visualizer_seen rather than replacing it, and announces
+    // itself as a pull: bagUpdated would read to the MCP/web one-shot listeners
+    // as the result of their own write.
+    void visualizerPullDecidesOnCurrentRowAndSignalsAsAPull() {
+        const QString path = freshDb();
+        qint64 bagId = 0;
+        withRawDb(path, "pull_setup", [&](QSqlDatabase& db) {
+            CoffeeBag bag; bag.roasterName = "R"; bag.coffeeName = "C";
+            bag.notes = "local";
+            bag.roastDate = "2026-09-01";
+            bag.frozenDate = "2026-09-03";
+            bag.visualizerSeen = QStringLiteral(R"({"notes":"old"})");
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QVERIFY(bagId > 0);
+
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+        QSignalSpy pulled(&storage, &CoffeeBagStorage::bagPulledFromVisualizer);
+        QSignalSpy updated(&storage, &CoffeeBagStorage::bagUpdated);
+        QSignalSpy finished(&storage, &CoffeeBagStorage::bagFinished);
+
+        QString notesSeenByDecide;
+        storage.requestApplyVisualizerPull(bagId, [&notesSeenByDecide](const QVariantMap& current) {
+            notesSeenByDecide = current.value("notes").toString();
+            VisualizerSync::BagPull pull;
+            pull.fields.insert("inInventory", false);
+            pull.seen.insert("archived_at", "2026-10-01T09:00:00Z");
+            return pull;
+        });
+        QTRY_COMPARE(pulled.count(), 1);
+        QCOMPARE(notesSeenByDecide, QStringLiteral("local"));
+        QCOMPARE(finished.count(), 1);
+
+        // Seen only: recorded, but no field changed, so nothing is announced.
+        // A future thaw date is skipped rather than failing the whole pull.
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("pull from Visualizer skipped: Thaw date"));
+        storage.requestApplyVisualizerPull(bagId, [](const QVariantMap&) {
+            VisualizerSync::BagPull pull;
+            pull.seen.insert("region", "Huila");
+            pull.fields.insert("defrostDate", QDate::currentDate().addDays(1).toString(Qt::ISODate));
+            return pull;
+        });
+        drainDbWork(storage);
+        QCOMPARE(pulled.count(), 1);
+        QCOMPARE(updated.count(), 0);
+
+        // Roast and freeze moved together are judged as a pair, not each against
+        // the other's old value.
+        storage.requestApplyVisualizerPull(bagId, [](const QVariantMap&) {
+            VisualizerSync::BagPull pull;
+            pull.fields.insert("roastDate", "2026-10-01");
+            pull.fields.insert("frozenDate", "2026-10-03");
+            return pull;
+        });
+        QTRY_COMPARE(pulled.count(), 2);
+
+        withRawDb(path, "pull_verify", [&](QSqlDatabase& db) {
+            const CoffeeBag bag = CoffeeBagStorage::loadBagStatic(db, bagId);
+            QVERIFY(!bag.inInventory);
+            QVERIFY(bag.defrostDate.isEmpty());
+            QCOMPARE(bag.roastDate, QString("2026-10-01"));
+            QCOMPARE(bag.frozenDate, QString("2026-10-03"));
+            const QJsonObject seen = QJsonDocument::fromJson(bag.visualizerSeen.toUtf8()).object();
+            QCOMPARE(seen.value("notes").toString(), QStringLiteral("old"));
+            QCOMPARE(seen.value("archived_at").toString(), QStringLiteral("2026-10-01T09:00:00Z"));
+            QCOMPARE(seen.value("region").toString(), QStringLiteral("Huila"));
+        });
+    }
+
+    void importToleratesSourceWithoutNewerColumns() {
+        // A backup written by an older app version lacks newer coffee_bags
+        // columns; the import SELECT substitutes NULL so the restore still
+        // works (fields land on struct defaults).
+        const QString srcPath = freshDb();
+        const QString destPath = freshDb();
+        withRawDb(srcPath, "old_src", [&](QSqlDatabase& db) {
+            // Pre-52 backups still carry the bag dial columns.
+            QVERIFY(restoreLegacyBagColumns(db));
+            CoffeeBag bag;
+            bag.roasterName = "Old Backup";
+            bag.coffeeName = "Roast";
+            QVERIFY(CoffeeBagStorage::insertBagStatic(db, bag) > 0);
+            insertShot(db, "Old Backup", "Roast", 4000, QString(), 1);
+            QSqlQuery q(db);
+            // Strip columns newer than the pretend source version.
+            QVERIFY(q.exec("ALTER TABLE coffee_bags DROP COLUMN visualizer_sync_pending"));
+            // kind is NOT NULL DEFAULT 'coffee' in the dest: the missing
+            // source column reads as "" and must normalize at bind time
+            // (bindKind), not blow up the INSERT with an explicit NULL.
+            QVERIFY(q.exec("ALTER TABLE coffee_bags DROP COLUMN kind"));
+            // Non-frozen storage lifecycle (migration 32): a pre-32 source has
+            // neither column on shots or coffee_bags. The shots-side transfer
+            // path resolves the missing columns to NULL via source-column-index
+            // lookup (idx == -1), so the per-row INSERT must NOT warn — the
+            // armed QTest::failOnWarning() in init() catches any "unknown field".
+            QVERIFY(q.exec("ALTER TABLE shots DROP COLUMN storage_hint"));
+            QVERIFY(q.exec("ALTER TABLE shots DROP COLUMN opened_date"));
+            QVERIFY(q.exec("ALTER TABLE coffee_bags DROP COLUMN storage_hint"));
+            QVERIFY(q.exec("ALTER TABLE coffee_bags DROP COLUMN opened_date"));
+        });
+
+        QVERIFY(ShotHistoryStorage::importDatabaseStatic(destPath, srcPath, /*merge=*/true));
+
+        withRawDb(destPath, "old_src_check", [&](QSqlDatabase& db) {
+            const QVector<InventoryBag> bags = CoffeeBagStorage::loadInventoryStatic(db);
+            QCOMPARE(bags.size(), 1);
+            QCOMPARE(bags.first().bag.roasterName, QString("Old Backup"));
+            QVERIFY(!bags.first().bag.visualizerSyncPending);
+            QCOMPARE(bags.first().bag.kind, QString("coffee"));
+            // The new lifecycle fields land on their empty defaults.
+            QVERIFY(bags.first().bag.storageHint.isEmpty());
+            QVERIFY(bags.first().bag.openedDate.isEmpty());
+            // The shot imported cleanly (no per-row warning) with both columns NULL.
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT storage_hint, opened_date FROM shots LIMIT 1"));
+            QVERIFY(q.next());
+            QVERIFY(q.value(0).isNull());
+            QVERIFY(q.value(1).isNull());
+        });
+    }
+
+    // fix-storage-hint-freezer-independence: pins the storage layer's freeze
+    // INDEPENDENCE as an invariant. Note what this does and does not guard: the
+    // force-clear bug lived in ChangeBeansDialog.qml, never here, so this test
+    // would stay green if that QML regressed — it is not a regression guard for
+    // that fix (no QML test harness exists; see the change's tasks.md). What it
+    // does lock in is that the frozen + thawed + hint + opened combination the
+    // pre-fix dialog made unreachable survives storage intact, and that no
+    // freeze coupling is ever introduced into this layer.
+    void storageLayerDoesNotCoupleHintToFreezeState() {
+        const QString path = freshDb();
+        withRawDb(path, "freezer_plan", [&](QSqlDatabase& db) {
+            // Frozen, not yet thawed, with a plan for when it comes out.
+            CoffeeBag bag;
+            bag.roasterName = "Prodigal";
+            bag.coffeeName = "Milk Blend";
+            bag.roastDate = "2026-06-01";
+            bag.frozenDate = "2026-06-03";
+            bag.storageHint = "vacuum-sealed";
+            const qint64 id = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(id > 0);
+
+            CoffeeBag loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QCOMPARE(loaded.frozenDate, QString("2026-06-03"));
+            QVERIFY2(loaded.storageHint == QStringLiteral("vacuum-sealed"),
+                     "a frozen bag must keep its out-of-freezer plan — the two "
+                     "fields lie on independent axes and cannot disagree");
+            QVERIFY(loaded.defrostDate.isEmpty());
+            QVERIFY(loaded.openedDate.isEmpty());
+
+            // Thawed, then opened: all four coexist. bean-freshness-followup's
+            // design already called this legitimate ("A bag could in principle
+            // be frozen AND later show an openedDate once thawed and moved to a
+            // counter jar") — but that SAME design also specified hiding and
+            // clearing storageHint while frozen, which is the bug this test
+            // locks out. Trust this test, not that document.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {
+                {"defrostDate", "2026-06-11"}, {"openedDate", "2026-06-12"}}));
+            loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QCOMPARE(loaded.frozenDate, QString("2026-06-03"));
+            QCOMPARE(loaded.defrostDate, QString("2026-06-11"));
+            QCOMPARE(loaded.openedDate, QString("2026-06-12"));
+            QCOMPARE(loaded.storageHint, QString("vacuum-sealed"));
+
+            // Updating an unrelated field leaves the storage plan alone.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {{"notes", "fresh"}}));
+            loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QCOMPARE(loaded.storageHint, QString("vacuum-sealed"));
+            QCOMPARE(loaded.openedDate, QString("2026-06-12"));
+
+            // Unfreezing takes the thaw with it (a thaw needs a freezer), and
+            // nothing on the other axes.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {{"frozenDate", ""}}));
+            loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QVERIFY(loaded.defrostDate.isEmpty());
+            QCOMPARE(loaded.openedDate, QString("2026-06-12"));
+            QCOMPARE(loaded.storageHint, QString("vacuum-sealed"));
+        });
+    }
+
+    // bean-freshness-followup: the canonical storageHint set is the single
+    // C++ source of truth the MCP write boundary validates against. "" (unset)
+    // is valid; "frozen" is deliberately NOT — freeze state is frozenDate.
+    void storageHintValidation() {
+        QVERIFY(CoffeeBag::isValidStorageHint(QString()));           // unset
+        QVERIFY(CoffeeBag::isValidStorageHint(QStringLiteral("counter")));
+        QVERIFY(CoffeeBag::isValidStorageHint(QStringLiteral("airtight")));
+        QVERIFY(CoffeeBag::isValidStorageHint(QStringLiteral("vacuum-sealed")));
+        QVERIFY(CoffeeBag::isValidStorageHint(QStringLiteral("fridge")));
+        QVERIFY2(!CoffeeBag::isValidStorageHint(QStringLiteral("frozen")),
+                 "'frozen' must be rejected — freeze state is defined by frozenDate");
+        QVERIFY(!CoffeeBag::isValidStorageHint(QStringLiteral("Fridge")));   // case-sensitive
+        QVERIFY(!CoffeeBag::isValidStorageHint(QStringLiteral("junk")));
+    }
+
+    // A shot stamps the opened date once per portion: an unopened bag, or one
+    // whose opened date belongs to the portion before the latest thaw. A frozen
+    // bag with no thaw recorded is a serving taken out: never stamped.
+    void openedDateForShot_data() {
+        QTest::addColumn<QString>("roast");
+        QTest::addColumn<QString>("frozen");
+        QTest::addColumn<QString>("defrost");
+        QTest::addColumn<QString>("opened");
+        QTest::addColumn<QString>("expected");
+        const QString today = QStringLiteral("2026-10-08");
+        const QString roast = QStringLiteral("2026-08-30");
+        QTest::newRow("never frozen, unopened") << roast << "" << "" << "" << today;
+        QTest::newRow("never frozen, already opened") << roast << "" << "" << "2026-10-01" << "";
+        QTest::newRow("frozen, no thaw recorded") << roast << "2026-09-01" << "" << "" << "";
+        QTest::newRow("thawed, unopened") << roast << "2026-09-01" << "2026-10-05" << "" << today;
+        QTest::newRow("opened before latest thaw") << roast << "2026-09-01" << "2026-10-05" << "2026-09-20" << today;
+        QTest::newRow("opened the day of the thaw") << roast << "2026-09-01" << "2026-10-05" << "2026-10-05" << "";
+        QTest::newRow("legacy roast after today") << "2026-12-01" << "" << "" << "" << "";
+    }
+    void openedDateForShot() {
+        QFETCH(QString, roast);
+        QFETCH(QString, frozen);
+        QFETCH(QString, defrost);
+        QFETCH(QString, opened);
+        QFETCH(QString, expected);
+        QCOMPARE(CoffeeBag::openedDateForShot(roast, frozen, defrost, opened, QDate(2026, 10, 8)), expected);
+    }
+
+    // Every lifecycle date is checked, today is allowed, storage dates must be
+    // ISO, and storageHint must be on the list.
+    void lifecycleFieldError_data() {
+        QTest::addColumn<QString>("key");
+        QTest::addColumn<QString>("value");
+        QTest::addColumn<bool>("refused");
+        for (const char* key : {"roastDate", "frozenDate", "defrostDate", "openedDate"}) {
+            QTest::addRow("%s tomorrow", key) << key << "2026-10-09" << true;
+            QTest::addRow("%s today", key) << key << "2026-10-08" << false;
+        }
+        QTest::newRow("cleared") << "defrostDate" << "" << false;
+        QTest::newRow("thaw not ISO") << "defrostDate" << "10/5/2026" << true;
+        QTest::newRow("legacy roast text") << "roastDate" << "early October" << false;
+        QTest::newRow("storage hint off-list") << "storageHint" << "frozen" << true;
+        QTest::newRow("storage hint cleared") << "storageHint" << "" << false;
+        QTest::newRow("not a lifecycle field") << "notes" << "2027-01-01" << false;
+    }
+    void lifecycleFieldError() {
+        QFETCH(QString, key);
+        QFETCH(QString, value);
+        QFETCH(bool, refused);
+        const QString err = CoffeeBag::lifecycleFieldError({{key, value}}, QDate(2026, 10, 8));
+        QCOMPARE(!err.isEmpty(), refused);
+    }
+
+    // Dates out of order are refused, but only for the pairs a write touches.
+    void lifecycleOrderError() {
+        const QVariantMap stored{{"roastDate", "2026-09-01"}, {"frozenDate", "2026-09-03"}};
+        QVERIFY(!CoffeeBag::lifecycleOrderError(stored, {{"defrostDate", "2026-09-02"}}).isEmpty());
+        QVERIFY(CoffeeBag::lifecycleOrderError(stored, {{"defrostDate", "2026-09-03"}}).isEmpty());
+        QVERIFY(!CoffeeBag::lifecycleOrderError(stored, {{"openedDate", "2026-08-30"}}).isEmpty());
+        // An old out-of-order record doesn't block an unrelated edit.
+        const QVariantMap bad{{"roastDate", "2026-09-05"}, {"frozenDate", "2026-09-03"}};
+        QVERIFY(CoffeeBag::lifecycleOrderError(bad, {{"notes", "x"}}).isEmpty());
+    }
+
+    // Restock carries the storage plan and the freeze habit, and nothing dated.
+    void restockTemplateCarriesHabits() {
+        const QVariantMap t = CoffeeBag::restockTemplate(
+            {{"id", 7}, {"coffeeName", "Hometown"}, {"roastDate", "2026-09-01"}, {"frozenDate", "2026-09-03"},
+             {"defrostDate", "2026-10-07"}, {"storageHint", "vacuum-sealed"},
+             {"equipmentId", 5}, {"grinderSetting", "15"}, {"rpm", 900}}, QDate(2026, 10, 8));
+        QCOMPARE(t.value("frozenDate").toString(), QString("2026-10-08"));
+        QCOMPARE(t.value("storageHint").toString(), QString("vacuum-sealed"));
+        QVERIFY(!t.contains("id") && !t.contains("roastDate") && !t.contains("defrostDate"));
+        QVERIFY(!t.contains("equipmentId") && !t.contains("grinderSetting") && !t.contains("rpm"));
+    }
+
+    // The edit diff both editors send: unchanged fields drop out, and the blob
+    // goes as a key-level patch so a key someone else changed survives.
+    void editChangesSendsOnlyWhatChanged() {
+        const QVariantMap opened{{"coffeeName", "Guji"}, {"doseWeightG", 18.0},
+                                 {"beanBaseData", R"({"origin":"Ethiopia","process":"Washed"})"}};
+        QVariantMap current = opened;
+        current["doseWeightG"] = 18.5;
+        current["beanBaseData"] = R"({"origin":"Ethiopia","variety":"Heirloom"})";
+        const QVariantMap changed = CoffeeBag::editChanges(opened, current, false);
+        QCOMPARE(changed.keys(), (QStringList{"beanBaseDataPatch", "doseWeightG"}));
+        const QVariantMap patch = changed.value("beanBaseDataPatch").toMap();
+        QCOMPARE(patch.value("variety").toString(), QString("Heirloom"));
+        QVERIFY(patch.contains("process") && patch.value("process").isNull());
+        QVERIFY(!patch.contains("origin"));
+        // A link change replaces the blob whole.
+        QVERIFY(CoffeeBag::editChanges(opened, current, true).contains("beanBaseData"));
+    }
+
+    // The lifecycle line both surfaces word: a thawed portion shows its thaw and
+    // its opening, a future thaw shows no freezer part at all.
+    void lifecycleParts() {
+        const QDate today(2026, 10, 8);
+        auto kinds = [&](const QVariantMap& bag) {
+            QStringList k;
+            for (const QVariant& p : CoffeeBag::lifecycleParts(bag, today))
+                k << p.toMap().value("kind").toString();
+            return k;
+        };
+        QCOMPARE(kinds({{"roastDate", "2026-09-01"}, {"frozenDate", "2026-09-03"},
+                        {"defrostDate", "2026-10-07"}, {"openedDate", "2026-10-07"}}),
+                 (QStringList{"roasted", "thawed", "opened"}));
+        QCOMPARE(kinds({{"frozenDate", "2026-09-03"}}), QStringList{"frozen"});
+        QCOMPARE(kinds({{"frozenDate", "2026-09-03"}, {"defrostDate", "2027-06-13"}}), QStringList{});
+        QCOMPARE(CoffeeBag::lifecycleParts({{"defrostDate", "2026-10-07"}}, today)
+                     .first().toMap().value("ageDays").toInt(), 1);
+    }
+
+    void rankedProfilesForBean() {
+        const QString path = freshDb();
+        withRawDb(path, "ranked", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            const auto shot = [&](const QString& profile, qint64 ts, const QString& brand,
+                                  const QString& type, const QString& roast, qint64 bagId = -1) {
+                q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+                          "bean_brand, bean_type, roast_level, bag_id) VALUES (?,?,?,30,?,?,?,?)");
+                q.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+                q.addBindValue(ts);
+                q.addBindValue(profile);
+                q.addBindValue(brand);
+                q.addBindValue(type);
+                q.addBindValue(roast);
+                q.addBindValue(bagId > 0 ? QVariant(bagId) : QVariant());
+                QVERIFY(q.exec());
+            };
+
+            // Coffee: this bean (R/Ethiopia, Light) used P1 then P2; a similar
+            // Light bean used P3 and P2 (P2 must dedupe out of tier 2); a Dark
+            // bean used P4 (wrong roast, excluded).
+            shot("P1", 100, "R", "Ethiopia", "Light");
+            shot("P2", 200, "R", "Ethiopia", "Light");
+            shot("P3", 300, "R", "Colombia", "Light");
+            shot("P2", 250, "R", "Colombia", "Light");
+            shot("P4", 400, "R", "Brazil", "Dark");
+
+            QVariantMap r = ShotHistoryStorage::loadRankedProfilesForBeanStatic(
+                db, "R", "Ethiopia", "Light");
+            QVariantList withBean = r.value("withBean").toList();
+            QVariantList similar = r.value("similar").toList();
+            QCOMPARE(withBean.size(), 2);
+            QCOMPARE(withBean.at(0).toMap().value("profileName").toString(), QString("P2"));
+            QCOMPARE(withBean.at(0).toMap().value("lastUsed").toLongLong(), qint64(200));
+            QCOMPARE(withBean.at(1).toMap().value("profileName").toString(), QString("P1"));
+            QCOMPARE(similar.size(), 1);
+            QCOMPARE(similar.at(0).toMap().value("profileName").toString(), QString("P3"));
+
+            // Tea: similarity is the bag blob's teaType, not roast level.
+            CoffeeBag t1; t1.roasterName = "F&M"; t1.coffeeName = "Royal Blend";
+            t1.kind = "tea"; t1.beanBaseData = "{\"teaType\":\"black\"}";
+            CoffeeBag t2; t2.roasterName = "Harney"; t2.coffeeName = "Ceylon";
+            t2.kind = "tea"; t2.beanBaseData = "{\"teaType\":\"Black\"}";
+            CoffeeBag t3; t3.roasterName = "YS"; t3.coffeeName = "Bi Luo Chun";
+            t3.kind = "tea"; t3.beanBaseData = "{\"teaType\":\"green\"}";
+            const qint64 b1 = CoffeeBagStorage::insertBagStatic(db, t1);
+            const qint64 b2 = CoffeeBagStorage::insertBagStatic(db, t2);
+            const qint64 b3 = CoffeeBagStorage::insertBagStatic(db, t3);
+            QVERIFY(b1 > 0 && b2 > 0 && b3 > 0);
+            shot("TeaBlack", 500, "F&M", "Royal Blend", "", b1);
+            shot("TeaOther", 600, "Harney", "Ceylon", "", b2);
+            shot("TeaGreen", 700, "YS", "Bi Luo Chun", "", b3);
+
+            r = ShotHistoryStorage::loadRankedProfilesForBeanStatic(
+                db, "F&M", "Royal Blend", QString(), "black");
+            QCOMPARE(r.value("withBean").toList().size(), 1);
+            QCOMPARE(r.value("withBean").toList().at(0).toMap().value("profileName").toString(),
+                     QString("TeaBlack"));
+            QCOMPARE(r.value("similar").toList().size(), 1);
+            QCOMPARE(r.value("similar").toList().at(0).toMap().value("profileName").toString(),
+                     QString("TeaOther"));
+
+            // Bean-less request: no tiers, no noise.
+            r = ShotHistoryStorage::loadRankedProfilesForBeanStatic(db, "", "", "");
+            QVERIFY(r.value("withBean").toList().isEmpty());
+            QVERIFY(r.value("similar").toList().isEmpty());
+        });
+    }
+
+    void latestShotForBeanProfilePrefill() {
+        const QString path = freshDb();
+        withRawDb(path, "prefill", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            const auto shot = [&](qint64 ts, double dose, const QVariant& yieldOverride,
+                                  double finalW, const QString& grind) {
+                q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+                          "bean_brand, bean_type, dose_weight, yield_override, final_weight, "
+                          "temperature_override, grinder_setting, rpm) "
+                          "VALUES (?,?,'P',30,'R','Ethiopia',?,?,?,92.5,?,90)");
+                q.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+                q.addBindValue(ts);
+                q.addBindValue(dose);
+                q.addBindValue(yieldOverride);
+                q.addBindValue(finalW);
+                q.addBindValue(grind);
+                QVERIFY(q.exec());
+            };
+            shot(100, 17.0, 34.0, 35.2, "14");
+            shot(200, 18.0, 40.0, 41.1, "15");   // most recent wins
+            shot(150, 18.5, QVariant(), 39.0, "16");
+
+            QVariantMap s = ShotHistoryStorage::loadLatestShotForBeanProfileStatic(
+                db, "R", "Ethiopia", "P");
+            QCOMPARE(s.value("doseWeightG").toDouble(), 18.0);
+            QCOMPARE(s.value("targetWeightG").toDouble(), 40.0);  // SAW target, not final
+            QCOMPARE(s.value("temperatureOverrideC").toDouble(), 92.5);
+            QCOMPARE(s.value("grinderSetting").toString(), QString("15"));
+            QCOMPARE(s.value("rpm").toLongLong(), qint64(90));
+
+            // No yield override on the newest shot -> final weight fallback.
+            shot(300, 19.0, QVariant(), 42.3, "17");
+            s = ShotHistoryStorage::loadLatestShotForBeanProfileStatic(db, "R", "Ethiopia", "P");
+            QCOMPARE(s.value("targetWeightG").toDouble(), 42.3);
+
+            // Unknown pair -> empty map.
+            QVERIFY(ShotHistoryStorage::loadLatestShotForBeanProfileStatic(
+                        db, "R", "Kenya", "P").isEmpty());
+        });
+    }
+
+    // Migration 52's notice (design.md "Explain the change"). Every row stands
+    // on its own v51 DB; the bag "First" is dialled and "Blank" is not.
+    void bagGrindNoticeEligibility_data() {
+        QTest::addColumn<QString>("secondBag");  // coffee | tea | finished | owned | archivedOwner | none
+        QTest::addColumn<QString>("activeBag");  // first | blank | finished | owned | unset
+        QTest::addColumn<QString>("recipe");     // none | active | stale
+        QTest::addColumn<QString>("equipment");  // none | active | stale | inventory | retired
+        QTest::addColumn<bool>("notice");
+        QTest::newRow("two dialled bags, one active") << "coffee" << "first" << "none" << "none" << true;
+        QTest::newRow("active bag holds no grind") << "coffee" << "blank" << "none" << "none" << false;
+        QTest::newRow("no active bag") << "coffee" << "unset" << "none" << "none" << false;
+        QTest::newRow("a package in inventory") << "coffee" << "first" << "none" << "inventory" << false;
+        QTest::newRow("a recipe active") << "coffee" << "first" << "active" << "none" << false;
+        QTest::newRow("retired equipment active") << "coffee" << "first" << "none" << "active" << false;
+        QTest::newRow("retired equipment, not selected") << "coffee" << "first" << "none" << "retired" << true;
+        QTest::newRow("active bag finished, two others dialled") << "coffee" << "finished" << "none" << "none" << false;
+        QTest::newRow("active bag owned, two others dialled") << "coffee" << "owned" << "none" << "none" << false;
+        QTest::newRow("stale recipe id") << "coffee" << "first" << "stale" << "none" << true;
+        QTest::newRow("stale equipment id") << "coffee" << "first" << "none" << "stale" << true;
+        QTest::newRow("second bag is tea") << "tea" << "first" << "none" << "none" << false;
+        QTest::newRow("second bag finished") << "finished" << "first" << "none" << "none" << false;
+        QTest::newRow("second bag owned by a recipe") << "owned" << "first" << "none" << "none" << false;
+        QTest::newRow("second bag's recipe archived") << "archivedOwner" << "first" << "none" << "none" << true;
+        QTest::newRow("one dialled bag") << "none" << "first" << "none" << "none" << false;
+    }
+    void bagGrindNoticeEligibility() {
+        QFETCH(QString, secondBag);
+        QFETCH(QString, activeBag);
+        QFETCH(QString, recipe);
+        QFETCH(QString, equipment);
+        QFETCH(bool, notice);
+        clearDyeSettings();  // migration 22 seeds a package from the app's live grinder
+        const QString path = freshLegacyDb();
+        QVERIFY(!path.isEmpty());
+        QVariantMap selection;
+        withRawDb(path, "notice_seed", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            const auto bag = [&](const QString& name, const QString& kind, int inInventory,
+                                 const QString& grind) -> qint64 {
+                q.prepare("INSERT INTO coffee_bags (roaster_name, coffee_name, kind, in_inventory, "
+                          "grinder_setting) VALUES ('R', ?, ?, ?, ?)");
+                q.addBindValue(name); q.addBindValue(kind);
+                q.addBindValue(inInventory); q.addBindValue(grind);
+                return q.exec() ? q.lastInsertId().toLongLong() : -1;
+            };
+            const qint64 first = bag("First", "coffee", 1, "7");
+            const qint64 blank = bag("Blank", "coffee", 1, "  ");
+            QVERIFY(first > 0 && blank > 0);
+            const auto ownBy = [&](qint64 bagId, int archived) {
+                q.prepare("INSERT INTO recipes (name, profile_title, bag_id, archived) VALUES ('Owner', 'P', ?, ?)");
+                q.addBindValue(bagId);
+                q.addBindValue(archived);
+                QVERIFY(q.exec());
+            };
+            qint64 active = activeBag == "first" ? first : activeBag == "blank" ? blank : -1;
+            if (activeBag == "finished" || activeBag == "owned") {
+                // Dialled, but not counted: First and Second are the two that are.
+                active = bag("ActiveOther", "coffee", activeBag == "finished" ? 0 : 1, "9");
+                QVERIFY(active > 0);
+                if (activeBag == "owned")
+                    ownBy(active, 0);
+            }
+            if (activeBag != "unset")
+                selection.insert("dye/activeBagId", active);
+            if (secondBag != "none") {
+                const qint64 second = bag("Second", secondBag == "tea" ? "tea" : "coffee",
+                                          secondBag == "finished" ? 0 : 1, "8");
+                QVERIFY(second > 0);
+                if (secondBag == "owned" || secondBag == "archivedOwner")
+                    ownBy(second, secondBag == "archivedOwner" ? 1 : 0);
+            }
+            if (recipe == "active") {
+                QVERIFY(q.exec("INSERT INTO recipes (name, profile_title) VALUES ('Active', 'P')"));
+                selection.insert("dye/activeRecipeId", q.lastInsertId().toLongLong());
+            } else if (recipe == "stale") {
+                selection.insert("dye/activeRecipeId", qint64(999999));
+            }
+            if (equipment == "active" || equipment == "inventory" || equipment == "retired") {
+                EquipmentPackage package;
+                const qint64 id = EquipmentStorage::createPackageWithGrinderStatic(db, package, "Niche", "Zero", "");
+                QVERIFY(id > 0);
+                if (equipment != "inventory")
+                    QVERIFY(q.exec(QString("UPDATE equipment_packages SET in_inventory = 0 WHERE id = %1").arg(id)));
+                if (equipment == "active")
+                    selection.insert("dye/activeEquipmentId", id);
+            } else if (equipment == "stale") {
+                selection.insert("dye/activeEquipmentId", qint64(999999));
+            }
+        });
+        writeUpgradeSettings(path, selection);
+
+        ShotHistoryStorage storage;
+        QVERIFY(initAndClose(path, storage));
+        QCOMPARE(storage.bagGrindNoticePending(), notice);
+        withRawDb(path, "notice_check", [&](QSqlDatabase& db) {
+            QCOMPARE(bagGrindNoticeRows(db), notice ? 1 : 0);
+        });
+    }
+
+    void migration52DropsOnlyTheBagDialColumns() {
+        clearDyeSettings();
+        const QString path = freshLegacyDb();
+        qint64 bagId = -1, packageId = -1;
+        withRawDb(path, "m52_seed", [&](QSqlDatabase& db) {
+            EquipmentPackage package;
+            packageId = EquipmentStorage::createPackageWithGrinderStatic(db, package, "Niche", "Zero", "");
+            QVERIFY(packageId > 0);
+            QSqlQuery q(db);
+            // A column already gone is skipped, not a failed drop.
+            QVERIFY(q.exec("ALTER TABLE coffee_bags DROP COLUMN rpm"));
+            QVERIFY(q.exec(QString("INSERT INTO coffee_bags (roaster_name, coffee_name, dose_weight_g, yield_value, "
+                                   "yield_mode, grinder_setting, equipment_id) "
+                                   "VALUES ('Roaster', 'Coffee', 18.5, 40, 'absolute', '7', %1)").arg(packageId)));
+            bagId = q.lastInsertId().toLongLong();
+            QVERIFY(q.exec(QString("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, bag_id, "
+                                   "grinder_setting, rpm, equipment_id) "
+                                   "VALUES ('m52-shot', 1234, 'P', 30, %1, '6.5', 700, %2)").arg(bagId).arg(packageId)));
+        });
+        QVERIFY(bagId > 0);
+        ShotHistoryStorage storage;
+        QVERIFY(initAndClose(path, storage));
+        withRawDb(path, "m52_check", [&](QSqlDatabase& db) {
+            QCOMPARE(schemaVersion(db), ShotHistoryStorage::kCurrentSchemaVersion);
+            for (const char* column : {"grinder_setting", "equipment_id", "rpm"})
+                QVERIFY2(!hasColumn(db, "coffee_bags", column), column);
+            const CoffeeBag bag = CoffeeBagStorage::loadBagStatic(db, bagId);
+            QCOMPARE(bag.roasterName, QString("Roaster"));
+            QCOMPARE(bag.coffeeName, QString("Coffee"));
+            QCOMPARE(bag.doseWeightG, 18.5);
+            QCOMPARE(bag.yieldValue, 40.0);
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT bag_id, grinder_setting, rpm, equipment_id FROM shots WHERE uuid = 'm52-shot'"));
+            QVERIFY(q.next());
+            QCOMPARE(q.value(0).toLongLong(), bagId);
+            QCOMPARE(q.value(1).toString(), QString("6.5"));
+            QCOMPARE(q.value(2).toInt(), 700);
+            QCOMPARE(q.value(3).toLongLong(), packageId);
+        });
+    }
+
+    // The notice, the three drops and the version stamp commit together: a
+    // failed drop leaves a v51 DB that the next launch upgrades in full.
+    void migration52FailureRollsBackAndRetries() {
+        clearDyeSettings();
+        const QString path = pendingNoticeLegacyDb();
+        QVERIFY(!path.isEmpty());
+        withRawDb(path, "m52_block", [&](QSqlDatabase& db) {
+            // SQLite refuses to drop an indexed column, so the LAST drop fails.
+            QVERIFY(QSqlQuery(db).exec("CREATE INDEX m52_blocker ON coffee_bags(rpm)"));
+        });
+        {
+            ShotHistoryStorage storage;
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("migration 52 incomplete at rpm"));
+            QVERIFY(initAndClose(path, storage));
+            QVERIFY(!storage.bagGrindNoticePending());
+        }
+        withRawDb(path, "m52_rolled_back", [&](QSqlDatabase& db) {
+            QCOMPARE(schemaVersion(db), 51);
+            QVERIFY(hasColumn(db, "coffee_bags", "grinder_setting"));
+            QVERIFY(hasColumn(db, "coffee_bags", "equipment_id"));
+            QCOMPARE(bagGrindNoticeRows(db), 0);
+            QVERIFY(QSqlQuery(db).exec("DROP INDEX m52_blocker"));
+        });
+        {
+            ShotHistoryStorage storage;
+            QVERIFY(initAndClose(path, storage));
+            QVERIFY(storage.bagGrindNoticePending());
+        }
+        withRawDb(path, "m52_retried", [&](QSqlDatabase& db) {
+            QCOMPARE(schemaVersion(db), ShotHistoryStorage::kCurrentSchemaVersion);
+            QVERIFY(!hasColumn(db, "coffee_bags", "rpm"));
+        });
+    }
+
+    // Unreadable settings read as "nothing active", which would drop an
+    // eligible user's notice for good; the migration must wait instead.
+    void migration52WaitsForReadableSettings() {
+        clearDyeSettings();
+        const QString path = pendingNoticeLegacyDb();
+        QVERIFY(!path.isEmpty());
+        const QString settingsPath = path + QStringLiteral(".upgrade-settings");
+        QVariantMap saved;
+        {
+            QSettings settings(settingsPath, QSettings::IniFormat);
+            for (const QString& key : settings.allKeys())
+                saved.insert(key, settings.value(key));
+        }
+        QVERIFY(!saved.isEmpty());
+        // A path Qt cannot open is AccessError (qsettings.cpp:1388-1389). A
+        // directory also defeats Qt's per-path INI cache, which a chmod would
+        // not (size and mtime unchanged, qsettings.cpp:1338-1340).
+        QVERIFY(QFile::remove(settingsPath));
+        QVERIFY(QDir().mkdir(settingsPath));
+        {
+            ShotHistoryStorage storage;
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("migration 52 incomplete at settings read"));
+            QVERIFY(initAndClose(path, storage));
+            QVERIFY(!storage.bagGrindNoticePending());
+        }
+        QVERIFY(QDir().rmdir(settingsPath));
+        writeUpgradeSettings(path, saved);
+        withRawDb(path, "m52_settings_wait", [&](QSqlDatabase& db) {
+            QCOMPARE(schemaVersion(db), 51);
+            QVERIFY(hasColumn(db, "coffee_bags", "grinder_setting"));
+        });
+        {
+            ShotHistoryStorage storage;
+            QVERIFY(initAndClose(path, storage));
+            QVERIFY(storage.bagGrindNoticePending());
+        }
+    }
+
+    // A fresh install has no bags to explain and must not act on a stale
+    // selection: nothing is created and the settings are only read.
+    void migration52FreshInstallLeavesSettingsAlone() {
+        clearDyeSettings();
+        const QString path = m_tempDir.filePath(QString("bags_%1.db").arg(m_dbCounter++));
+        const QVariantMap stale{{"dye/activeBagId", qint64(3)}, {"dye/activeRecipeId", qint64(5)},
+                                {"dye/activeEquipmentId", qint64(7)}, {"dye/grinderSetting", "7.5"}};
+        writeUpgradeSettings(path, stale);
+        ShotHistoryStorage storage;
+        QVERIFY(initAndClose(path, storage));
+        QVERIFY(!storage.bagGrindNoticePending());
+        withRawDb(path, "m52_fresh", [&](QSqlDatabase& db) {
+            QCOMPARE(schemaVersion(db), ShotHistoryStorage::kCurrentSchemaVersion);
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT COUNT(*) FROM equipment_packages"));
+            QVERIFY(q.next());
+            QCOMPARE(q.value(0).toInt(), 0);
+        });
+        QSettings after(path + ".upgrade-settings", QSettings::IniFormat);
+        QVariantMap read;
+        for (const QString& key : after.allKeys())
+            read.insert(key, after.value(key));
+        QCOMPARE(read.keys(), stale.keys());
+        for (auto it = stale.cbegin(); it != stale.cend(); ++it)
+            QCOMPARE(read.value(it.key()).toString(), it.value().toString());
+    }
+
+    void bagGrindNoticeAcknowledgementPersists() {
+        clearDyeSettings();
+        const QString path = pendingNoticeLegacyDb();
+        QVERIFY(!path.isEmpty());
+        {
+            ShotHistoryStorage upgraded;
+            QVERIFY(initAndClose(path, upgraded));
+        }
+        {
+            // A later launch, past migration 52: pending only if the row was kept.
+            ShotHistoryStorage storage;
+            QVERIFY(storage.initialize(path));
+            QVERIFY(storage.bagGrindNoticePending());
+            storage.acknowledgeBagGrindNotice();
+            QVERIFY(!storage.bagGrindNoticePending());
+            QTRY_VERIFY(storage.isDbWorkIdle());
+            storage.close();
+        }
+        ShotHistoryStorage restarted;
+        QVERIFY(initAndClose(path, restarted));
+        QVERIFY(!restarted.bagGrindNoticePending());
+    }
+
+    void recipeGrindDefaultMatchesBeanIdentity() {
+        const QString path = freshDb();
+        withRawDb(path, "recipe_grind_default", [&](QSqlDatabase& db) {
+            auto shot = [&](qint64 timestamp, const QString& id, const QString& grind, int rpm) {
+                QSqlQuery q(db);
+                q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+                          "bean_brand, bean_type, beanbase_id, grinder_setting, rpm) "
+                          "VALUES (?, ?, 'Profile', 30, 'Roaster', 'Coffee', ?, ?, ?)");
+                q.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+                q.addBindValue(timestamp);
+                q.addBindValue(id);
+                q.addBindValue(grind);
+                q.addBindValue(rpm);
+                QVERIFY(q.exec());
+            };
+            shot(100, "A", "10", 800);
+            shot(200, "", "11", 900);
+            auto result = ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "A", " roaster ", "COFFEE");
+            QCOMPARE(result.value("grinderSetting").toString(), QString("11"));
+            QCOMPARE(result.value("rpm").toInt(), 900);
+
+            // A conflicting identity excludes the nameless fallback, not the
+            // explicit canonical match, even when the conflicting shot is newer.
+            shot(300, "B", "12", 1000);
+            result = ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "A", "Roaster", "Coffee");
+            QCOMPARE(result.value("grinderSetting").toString(), QString("10"));
+            QVERIFY(ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "", "Roaster", "Coffee").isEmpty());
+            QVERIFY(ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "", "Roaster", "").isEmpty());
+
+            // Equal timestamps use the later shot ID; an empty grind is skipped.
+            shot(400, "A", "13", 1100);
+            shot(400, "A", "14", 1200);
+            shot(500, "A", "", 1300);
+            result = ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "A", "Roaster", "Coffee");
+            QCOMPARE(result.value("grinderSetting").toString(), QString("14"));
+            QCOMPARE(result.value("rpm").toInt(), 1200);
+
+            EquipmentPackage equipment;
+            equipment.name = "Kitchen grinder";
+            const qint64 packageId = EquipmentStorage::createPackageWithGrinderStatic(
+                db, equipment, "Niche", "Zero", "");
+            QVERIFY(packageId > 0);
+            shot(600, "A", "15", 1400);
+            QSqlQuery context(db);
+            context.prepare("UPDATE shots SET equipment_id = ? WHERE timestamp = 600");
+            context.addBindValue(packageId);
+            QVERIFY(context.exec());
+            result = ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "A", "Roaster", "Coffee");
+            QCOMPARE(result.value("grinderSetting").toString(), QString("15"));
+            QCOMPARE(result.value("profileName").toString(), QString("Profile"));
+            QCOMPARE(result.value("equipmentName").toString(), QString("Kitchen grinder"));
+            QCOMPARE(result.value("timestamp").toLongLong(), qint64(600));
+            QVERIFY(context.exec("ALTER TABLE coffee_bags RENAME TO coffee_bags_unavailable"));
+            QString error;
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("recipe grind default: .* query failed"));
+            QVERIFY(ShotHistoryStorage::loadRecipeGrindDefaultStatic(
+                db, "A", "Roaster", "Coffee", &error).isEmpty());
+            QCOMPARE(error, QStringLiteral("queryFailed"));
+        });
+
+        // Bags alone can make the names ambiguous: two bags of the same
+        // roaster/coffee carry different Bean Base ids, and no shot says so.
+        withRawDb(freshDb(), "recipe_grind_default_bags", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            QVERIFY(q.exec("INSERT INTO coffee_bags (roaster_name, coffee_name, beanbase_id) "
+                           "VALUES ('Roaster', 'Coffee', 'X'), ('Roaster', 'Coffee', 'Y')"));
+            auto shot = [&](qint64 timestamp, const QString& brand, const QString& type,
+                            const QString& id, const QString& grind) {
+                q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+                          "bean_brand, bean_type, beanbase_id, grinder_setting) "
+                          "VALUES (?, ?, 'Profile', 30, ?, ?, ?, ?)");
+                q.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+                q.addBindValue(timestamp);
+                q.addBindValue(brand);
+                q.addBindValue(type);
+                q.addBindValue(id);
+                q.addBindValue(grind);
+                QVERIFY(q.exec());
+            };
+            shot(100, "Roaster", "Coffee", "X", "20");
+            shot(200, "Roaster", "Coffee", "", "21");
+            shot(300, "", "", "", "22");
+            QVERIFY(ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "", "Roaster", "Coffee").isEmpty());
+            QCOMPARE(ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "X", "Roaster", "Coffee")
+                         .value("grinderSetting").toString(), QString("20"));
+            // Empty names never match a nameless shot.
+            QVERIFY(ShotHistoryStorage::loadRecipeGrindDefaultStatic(db, "A", "", "").isEmpty());
+        });
+    }
+
+    void latestGrindForBean() {
+        const QString path = freshDb();
+        withRawDb(path, "beangrind", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            const auto shot = [&](qint64 ts, const QString& brand, const QString& type,
+                                  const QString& roast, const QString& grind,
+                                  const QString& profile) {
+                q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+                          "bean_brand, bean_type, roast_level, grinder_setting, rpm) "
+                          "VALUES (?,?,?,30,?,?,?,?,90)");
+                q.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+                q.addBindValue(ts);
+                q.addBindValue(profile);
+                q.addBindValue(brand);
+                q.addBindValue(type);
+                q.addBindValue(roast);
+                q.addBindValue(grind.isEmpty() ? QVariant() : QVariant(grind));
+                QVERIFY(q.exec());
+            };
+            shot(100, "R", "Ethiopia", "Light", "14", "D-Flow / default");
+            shot(200, "R", "Ethiopia", "Light", "15", "Blooming Espresso");  // newest for the bean
+            shot(300, "R", "Ethiopia", "Light", "",   "Default");            // no grind: skipped
+            shot(400, "R", "Kenya",    "Light", "16", "Rao Allongé");        // similar roast, newer
+
+            // Exact bean wins over the newer similar-roast shot, and the
+            // grind-less newest row is skipped.
+            QVariantMap g = ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                db, "R", "Ethiopia", "Light");
+            QCOMPARE(g.value("grinderSetting").toString(), QString("15"));
+            QCOMPARE(g.value("profileName").toString(), QString("Blooming Espresso"));
+            QCOMPARE(g.value("matchLevel").toString(), QString("bean"));
+
+            // Unknown bean falls back to the same-roast lane.
+            g = ShotHistoryStorage::loadLatestGrindForBeanStatic(db, "R", "Colombia", "Light");
+            QCOMPARE(g.value("grinderSetting").toString(), QString("16"));
+            QCOMPARE(g.value("matchLevel").toString(), QString("similarRoast"));
+
+            // Nothing matches: empty map.
+            QVERIFY(ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                        db, "X", "Y", "Dark").isEmpty());
+        });
+    }
+
+    // scope-recipe-grind-recommendations-to-equipment: with a selected package,
+    // the hint prefers that package, then packages sharing its grinder+basket
+    // identity (puck prep ignored); a different grinder or basket never supplies
+    // one, and equipmentId 0 stays unscoped.
+    void latestGrindForBeanScopedToEquipment() {
+        const QString path = freshDb();
+        withRawDb(path, "beangrind_equip", [&](QSqlDatabase& db) {
+            EquipmentPackage pkg;
+            // sel: the recipe's selected package. sib: SAME grinder+basket, a
+            // different puck prep → a distinct package the fallback must accept.
+            // g2 / b2: a different grinder / basket → must be rejected. burr:
+            // same grinder brand+model but different burrs → rejected (burrs are
+            // part of the grinder's identity).
+            const qint64 sel  = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Niche", "Zero", "54mm", "VST", "18g");
+            const qint64 sib  = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Niche", "Zero", "54mm", "VST", "18g", "rdt");
+            const qint64 g2   = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "DF64", "v", "64mm", "VST", "18g");
+            const qint64 b2   = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Niche", "Zero", "54mm", "IMS", "20g");
+            const qint64 burr = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Niche", "Zero", "SSP", "VST", "18g");
+            QVERIFY(sel > 0 && sib > 0 && g2 > 0 && b2 > 0 && burr > 0);
+            QVERIFY(sel != sib);  // distinct despite identical grinder+basket
+
+            const auto shot = [&](qint64 ts, const QString& brand, const QString& type,
+                                  const QString& roast, const QString& grind,
+                                  const QString& profile, qint64 equip) {
+                QSqlQuery q(db);
+                q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, "
+                          "bean_brand, bean_type, roast_level, grinder_setting, rpm, equipment_id) "
+                          "VALUES (?,?,?,30,?,?,?,?,90,?)");
+                q.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+                q.addBindValue(ts);
+                q.addBindValue(profile);
+                q.addBindValue(brand);
+                q.addBindValue(type);
+                q.addBindValue(roast);
+                q.addBindValue(grind.isEmpty() ? QVariant() : QVariant(grind));
+                q.addBindValue(equip > 0 ? QVariant(equip) : QVariant());
+                QVERIFY(q.exec());
+            };
+
+            // (b) Tier-B fallback: sel has no Ethiopia grind; the sibling (same
+            // grinder+basket) supplies it — and the newer different-grinder and
+            // different-basket shots must NOT, even though they are more recent.
+            shot(100, "R", "Ethiopia", "Light", "18", "Blooming Espresso", sib);
+            shot(110, "R", "Ethiopia", "Light", "99", "Rao Allonge",        g2);
+            shot(120, "R", "Ethiopia", "Light", "98", "Rao Allonge",        b2);
+            {
+                QVariantMap g = ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                    db, "R", "Ethiopia", "Light", sel);
+                QCOMPARE(g.value("grinderSetting").toString(), QString("18"));
+                QCOMPARE(g.value("matchLevel").toString(), QString("bean"));
+            }
+
+            // (a) Full-package priority over recency: an OLDER shot under sel
+            // itself wins over the newer sibling shot.
+            shot(50, "R", "Ethiopia", "Light", "15", "Default", sel);
+            {
+                QVariantMap g = ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                    db, "R", "Ethiopia", "Light", sel);
+                QCOMPARE(g.value("grinderSetting").toString(), QString("15"));
+            }
+
+            // (M1) Exact-bean beats same-package similar-roast ACROSS tiers: sel
+            // has only a similar-ROAST shot; the sibling has an exact-BEAN shot.
+            // The exact bean must win even from the fallback tier, because the
+            // grinder+basket are identical so the dial transfers losslessly.
+            shot(300, "R", "Guatemala", "Light", "22", "Blooming Espresso", sib);  // exact bean (sib)
+            shot(310, "R", "Brazil",    "Light", "40", "Default",           sel);  // roast-only (sel)
+            {
+                QVariantMap g = ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                    db, "R", "Guatemala", "Light", sel);
+                QCOMPARE(g.value("grinderSetting").toString(), QString("22"));
+                QCOMPARE(g.value("matchLevel").toString(), QString("bean"));
+            }
+
+            // (c) A bean seen ONLY under a different grinder / basket → no hint.
+            shot(400, "R", "Kenya", "Medium", "77", "Default", g2);
+            shot(410, "R", "Kenya", "Medium", "76", "Default", b2);
+            QVERIFY(ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                        db, "R", "Kenya", "Medium", sel).isEmpty());
+
+            // (M3) Same grinder brand+model, different burrs → rejected.
+            shot(500, "R", "Sumatra", "Dark", "33", "Default", burr);
+            QVERIFY(ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                        db, "R", "Sumatra", "Dark", sel).isEmpty());
+
+            // (M5) Only a package's first grinder row is its identity: a stale
+            // duplicate Niche row on the DF64 package must not admit g2.
+            {
+                QSqlQuery dup(db);
+                QVERIFY(dup.exec(QStringLiteral(
+                    "INSERT INTO equipment_items (package_id, kind, brand, model, attrs) "
+                    "VALUES (%1, 'grinder', 'Niche', 'Zero', '{\"burrs\":\"54mm\"}')").arg(g2)));
+                QVERIFY(ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                            db, "R", "Kenya", "Medium", sel).isEmpty());
+            }
+
+            // (M4) A sibling whose identity differs only by case/whitespace is
+            // the same grinder+basket, as grinderModelMatchSql() treats it.
+            const qint64 caseSib = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "niche", " Zero", "54MM", "vst", "18G", "wdt");
+            QVERIFY(caseSib > 0 && caseSib != sel && caseSib != sib);
+            shot(600, "R", "Peru", "Medium", "19", "Default", caseSib);
+            {
+                QVariantMap g = ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                    db, "R", "Peru", "Medium", sel);
+                QCOMPARE(g.value("grinderSetting").toString(), QString("19"));
+            }
+
+            // (d) equipmentId 0 → unscoped latest (compat): the Kenya bean from a
+            // different package is now visible regardless of equipment.
+            {
+                QVariantMap g = ShotHistoryStorage::loadLatestGrindForBeanStatic(
+                    db, "R", "Kenya", "Medium", 0);
+                QCOMPARE(g.value("grinderSetting").toString(), QString("76"));
+            }
+        });
+    }
+
+    void teaBrewingBlobParsing() {
+        // Full tea blob: everything lands typed and normalized.
+        const TeaBrewingData full = CoffeeBag::teaBrewingFromBlob(
+            "{\"teaType\":\"Black\",\"origin\":\"Sri Lanka\",\"brewTempC\":100,"
+            "\"leafGramsPer100Ml\":0.85,\"steepTime\":\"3-5 minutes\"}");
+        QCOMPARE(full.teaType, QString("black"));
+        QCOMPARE(full.brewTempC, 100.0);
+        QCOMPARE(full.leafGramsPer100Ml, 0.85);
+        QCOMPARE(full.steepTime, QString("3-5 minutes"));
+
+        // String-encoded numerics (the extraction fill + blob merge write
+        // strings — live-caught): parse identically to native numbers.
+        const TeaBrewingData strings = CoffeeBag::teaBrewingFromBlob(
+            "{\"teaType\":\"black\",\"brewTempC\":\"100\",\"leafGramsPer100Ml\":\"0.84\"}");
+        QCOMPARE(strings.brewTempC, 100.0);
+        QCOMPARE(strings.leafGramsPer100Ml, 0.84);
+
+        // Vendor stated nothing (Yunnan Sourcing case): defaults, no guesses.
+        const TeaBrewingData sparse = CoffeeBag::teaBrewingFromBlob(
+            "{\"teaType\":\"black\",\"origin\":\"Yunnan\"}");
+        QCOMPARE(sparse.teaType, QString("black"));
+        QCOMPARE(sparse.brewTempC, 0.0);
+        QCOMPARE(sparse.leafGramsPer100Ml, 0.0);
+        QVERIFY(sparse.steepTime.isEmpty());
+
+        // String-typed numbers (the extraction->form->blob path stores every
+        // value as a string) parse the same as native numbers.
+        const TeaBrewingData stringly = CoffeeBag::teaBrewingFromBlob(
+            "{\"teaType\":\"green\",\"brewTempC\":\"80\",\"leafGramsPer100Ml\":\"0.85\"}");
+        QCOMPARE(stringly.brewTempC, 80.0);
+        QCOMPARE(stringly.leafGramsPer100Ml, 0.85);
+
+        // Empty / invalid blobs are tolerated.
+        QVERIFY(CoffeeBag::teaBrewingFromBlob(QString()).teaType.isEmpty());
+        QVERIFY(CoffeeBag::teaBrewingFromBlob("not json").teaType.isEmpty());
+
+        // isTea reads the kind, empty kind = coffee.
+        CoffeeBag bag;
+        QVERIFY(!bag.isTea());
+        bag.kind = "tea";
+        QVERIFY(bag.isTea());
+        bag.kind.clear();
+        QVERIFY(!bag.isTea());
+    }
+
+    void bagKindRoundTripsAndTeaSurvivesImport() {
+        // Tea kind round-trips through insert/load, and rides a transfer
+        // import verbatim (kCols-driven SELECT + INSERT).
+        const QString srcPath = freshDb();
+        const QString destPath = freshDb();
+        withRawDb(srcPath, "tea_src", [&](QSqlDatabase& db) {
+            CoffeeBag tea;
+            tea.roasterName = "Fortnum & Mason";
+            tea.coffeeName = "Royal Blend";
+            tea.kind = "tea";
+            const qint64 id = CoffeeBagStorage::insertBagStatic(db, tea);
+            QVERIFY(id > 0);
+            QCOMPARE(CoffeeBagStorage::loadBagStatic(db, id).kind, QString("tea"));
+            insertShot(db, "Fortnum & Mason", "Royal Blend", 5000, QString(), id);
+        });
+
+        QVERIFY(ShotHistoryStorage::importDatabaseStatic(destPath, srcPath, /*merge=*/true));
+
+        withRawDb(destPath, "tea_check", [&](QSqlDatabase& db) {
+            const QVector<InventoryBag> bags = CoffeeBagStorage::loadInventoryStatic(db);
+            QCOMPARE(bags.size(), 1);
+            QCOMPARE(bags.first().bag.kind, QString("tea"));
+        });
+    }
+
+    // A bag edit made before any shot upload this session (CM state Unknown) is
+    // pushed, not parked until the next upload: on a device that never uploads a
+    // shot it used to wait forever, which is how an AI-filled bag never reached
+    // Visualizer. Only a definitive CM-off state holds a push back.
+    void bagEditPushPolicyByCmState() {
+        using S = VisualizerUploader::CmState;
+        QVERIFY(VisualizerUploader::bagEditPushAllowed(S::Unknown));
+        QVERIFY(VisualizerUploader::bagEditPushAllowed(S::Active));
+        QVERIFY(!VisualizerUploader::bagEditPushAllowed(S::NoCoffeeManagement));
+        QVERIFY(!VisualizerUploader::bagEditPushAllowed(S::PremiumNoCm));
+    }
+
+    // ==========================================
+    // History lane + merge logic
+    // ==========================================
+
+    void historyQueryGroupsAndMergesLinkedUnlinked() {
+        const QString path = freshDb();
+        withRawDb(path, "hist", [&](QSqlDatabase& db) {
+            // Same coffee, unlinked early shots then linked later shots.
+            insertShot(db, "Prodigal", "First Batch", 100);
+            insertShot(db, "Prodigal", "First Batch", 200, "canon-1", -1, R"({"id":"canon-1"})");
+            // A different coffee.
+            insertShot(db, "Other", "Beans", 150);
+
+            const QVariantList rows = UnifiedBeanSearchModel::queryHistoryStatic(db, QString());
+            QCOMPARE(rows.size(), 2);  // linked+unlinked merged into one
+
+            // The merged Prodigal row keeps the canonical link and the newest epoch.
+            QVariantMap prodigal;
+            for (const QVariant& v : rows)
+                if (v.toMap().value("roasterName") == "Prodigal")
+                    prodigal = v.toMap();
+            QCOMPARE(prodigal.value("beanBaseId").toString(), QString("canon-1"));
+            QCOMPARE(prodigal.value("lastUsedEpoch").toLongLong(), qint64(200));
+
+            // Filter narrows.
+            QCOMPARE(UnifiedBeanSearchModel::queryHistoryStatic(db, "Other").size(), 1);
+        });
+    }
+
+    // Tea re-buy lane (add-recipe-wizard-tea): the kind filter keeps only
+    // identities that belong to a known tea bag — matched by bag_id OR by
+    // case-insensitive roaster+coffee identity — while kind="" stays unfiltered.
+    void historyQueryTeaKindFilter() {
+        const QString path = freshDb();
+        withRawDb(path, "histkind", [&](QSqlDatabase& db) {
+            // A tea bag linked to its shot by bag_id.
+            CoffeeBag teaBag; teaBag.roasterName = "Harney"; teaBag.coffeeName = "Ceylon";
+            teaBag.kind = "tea";
+            const qint64 teaBagId = CoffeeBagStorage::insertBagStatic(db, teaBag);
+            insertShot(db, "Harney", "Ceylon", 100, QString(), teaBagId);
+
+            // A tea bag matched only by identity (different case, no bag_id link).
+            CoffeeBag teaBag2; teaBag2.roasterName = "Fortnum"; teaBag2.coffeeName = "Royal Blend";
+            teaBag2.kind = "tea";
+            QVERIFY(CoffeeBagStorage::insertBagStatic(db, teaBag2) > 0);
+            insertShot(db, "FORTNUM", "royal blend", 200);  // case differs
+
+            // A coffee bag + shot (must be excluded from the tea lane).
+            CoffeeBag coffeeBag; coffeeBag.roasterName = "Onyx"; coffeeBag.coffeeName = "Geometry";
+            const qint64 cId = CoffeeBagStorage::insertBagStatic(db, coffeeBag);
+            insertShot(db, "Onyx", "Geometry", 300, QString(), cId);
+
+            // Tea filter: exactly the two tea identities, coffee excluded.
+            const QVariantList tea = UnifiedBeanSearchModel::queryHistoryStatic(db, QString(), 50, "tea");
+            QCOMPARE(tea.size(), 2);
+            for (const QVariant& v : tea)
+                QVERIFY(v.toMap().value("roasterName").toString() != "Onyx");
+
+            // Unfiltered lane still returns all three (legacy behavior).
+            QCOMPARE(UnifiedBeanSearchModel::queryHistoryStatic(db, QString(), 50, QString()).size(), 3);
+        });
+    }
+
+    // Within a tier, a live product link outranks an archived-only one, which
+    // outranks an entry with no usable page at all — the case that started
+    // this: two Bean Base entries for one coffee whose every displayed
+    // attribute is identical and whose links are both dead.
+    // A resolution that does not move anything must not be published as a
+    // reset: doing so rebuilds every delegate and throws the user's scroll
+    // position to the top, once per resolved probe, while they are reading.
+    void orderByLinkStateIsIdenticalWhenNothingMoves() {
+        QVariantList rows;
+        for (int i = 0; i < 3; ++i) {
+            rows.append(QVariant(QVariantMap{
+                {"coffeeName", QStringLiteral("row%1").arg(i)}, {"tier", 2},
+                {"beanBaseData", QStringLiteral("{\"link\":\"https://r.example/%1\"}").arg(i)}}));
+        }
+        QHash<QString, QString> before;   // nothing probed yet: all "unknown"
+        QHash<QString, QString> after;
+        after.insert("https://r.example/1", "live");  // the common answer
+
+        QCOMPARE(UnifiedBeanSearchModel::orderByLinkState(rows, before),
+                 UnifiedBeanSearchModel::orderByLinkState(rows, after));
+    }
+
+    void orderByLinkStateRanksWithinTier() {
+        auto row = [](const QString& name, int tier, const QString& link) {
+            const QString blob = link.isEmpty()
+                ? QStringLiteral("{}")
+                : QStringLiteral("{\"link\":\"%1\"}").arg(link);
+            return QVariant(QVariantMap{{"coffeeName", name}, {"tier", tier},
+                                        {"beanBaseData", blob}});
+        };
+        QVariantList rows;
+        rows.append(row("no-link", 2, QString()));
+        rows.append(row("archived", 2, "https://r.example/archived"));
+        rows.append(row("live", 2, "https://r.example/live"));
+
+        QHash<QString, QString> states;
+        states.insert("https://r.example/archived", "archived");
+        states.insert("https://r.example/live", "live");
+
+        const QVariantList out = UnifiedBeanSearchModel::orderByLinkState(rows, states);
+        QCOMPARE(out[0].toMap().value("coffeeName").toString(), QString("live"));
+        QCOMPARE(out[1].toMap().value("coffeeName").toString(), QString("archived"));
+        QCOMPARE(out[2].toMap().value("coffeeName").toString(), QString("no-link"));
+    }
+
+    // An unresolved probe must not sink its row: results appear at once in
+    // tier-and-recency order and only ever move DOWN as answers arrive.
+    void orderByLinkStateTreatsUnknownAsLive() {
+        auto row = [](const QString& name, const QString& link) {
+            return QVariant(QVariantMap{
+                {"coffeeName", name}, {"tier", 2},
+                {"beanBaseData", QStringLiteral("{\"link\":\"%1\"}").arg(link)}});
+        };
+        QVariantList rows;
+        rows.append(row("archived", "https://r.example/archived"));
+        rows.append(row("unprobed", "https://r.example/unprobed"));
+
+        QHash<QString, QString> states;
+        states.insert("https://r.example/archived", "archived");
+
+        const QVariantList out = UnifiedBeanSearchModel::orderByLinkState(rows, states);
+        QCOMPARE(out[0].toMap().value("coffeeName").toString(), QString("unprobed"));
+        QCOMPARE(out[1].toMap().value("coffeeName").toString(), QString("archived"));
+    }
+
+    // Link state orders WITHIN a tier only — a dead link never demotes an
+    // inventory bag below a Bean Base entry.
+    void orderByLinkStateNeverCrossesTiers() {
+        QVariantList rows;
+        rows.append(QVariant(QVariantMap{{"coffeeName", "inventory-dead"}, {"tier", 0},
+                                         {"beanBaseData", "{\"link\":\"https://r.example/d\"}"}}));
+        rows.append(QVariant(QVariantMap{{"coffeeName", "canonical-live"}, {"tier", 2},
+                                         {"beanBaseData", "{\"link\":\"https://r.example/l\"}"}}));
+        QHash<QString, QString> states;
+        states.insert("https://r.example/d", "none");
+        states.insert("https://r.example/l", "live");
+
+        const QVariantList out = UnifiedBeanSearchModel::orderByLinkState(rows, states);
+        QCOMPARE(out[0].toMap().value("coffeeName").toString(), QString("inventory-dead"));
+    }
+
+    // Stability: rows the link state cannot separate keep mergeLanes' order.
+    void orderByLinkStateIsStable() {
+        QVariantList rows;
+        for (int i = 0; i < 4; ++i) {
+            rows.append(QVariant(QVariantMap{
+                {"coffeeName", QStringLiteral("row%1").arg(i)}, {"tier", 2},
+                {"beanBaseData", QStringLiteral("{\"link\":\"https://r.example/%1\"}").arg(i)}}));
+        }
+        QHash<QString, QString> states;
+        for (int i = 0; i < 4; ++i)
+            states.insert(QStringLiteral("https://r.example/%1").arg(i), QStringLiteral("live"));
+
+        const QVariantList out = UnifiedBeanSearchModel::orderByLinkState(rows, states);
+        for (int i = 0; i < 4; ++i)
+            QCOMPARE(out[i].toMap().value("coffeeName").toString(), QStringLiteral("row%1").arg(i));
+    }
+
+    void rowLinkReadsTheBlob() {
+        QCOMPARE(UnifiedBeanSearchModel::rowLink(
+                     QVariantMap{{"beanBaseData", "{\"link\":\" https://r.example/p \"}"}}),
+                 QString("https://r.example/p"));
+        QVERIFY(UnifiedBeanSearchModel::rowLink(QVariantMap{{"beanBaseData", "{}"}}).isEmpty());
+        QVERIFY(UnifiedBeanSearchModel::rowLink(QVariantMap{}).isEmpty());
+        // A corrupt blob is a missing link, not a crash.
+        QVERIFY(UnifiedBeanSearchModel::rowLink(
+                    QVariantMap{{"beanBaseData", "not json"}}).isEmpty());
+    }
+
+    void mergeLanesTiersAndAbsorption() {
+        // Inventory bag for coffee A; canonical results for A and B;
+        // history rows for B (linked) and C (free text).
+        QVariantList inventory;
+        inventory.append(QVariantMap{
+            {"id", 7}, {"roasterName", "Roaster"}, {"coffeeName", "A"},
+            {"beanBaseId", "canon-A"}, {"inInventory", true}, {"lastUsedEpoch", 500}});
+
+        QVariantList canonical;
+        canonical.append(QVariantMap{{"id", "canon-A"}, {"roasterName", "Roaster"}, {"roastName", "A"}});
+        canonical.append(QVariantMap{{"id", "canon-B"}, {"roasterName", "Roaster"}, {"roastName", "B"}});
+
+        QVariantList history;
+        history.append(QVariantMap{
+            {"roasterName", "Roaster"}, {"coffeeName", "B"}, {"beanBaseId", "canon-B"},
+            {"grinderSetting", "15"}, {"lastUsedEpoch", 300}});
+        history.append(QVariantMap{
+            {"roasterName", "Roaster"}, {"coffeeName", "C"}, {"beanBaseId", ""},
+            {"lastUsedEpoch", 400}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes(inventory, canonical, history, QString());
+
+        // Expect: Inventory A (canonical absorbed), HistoryCanonical B (merged),
+        // HistoryFreeText C. No CanonicalOnly row.
+        QCOMPARE(merged.size(), 3);
+        const QVariantMap first = merged[0].toMap();
+        QCOMPARE(tierOf(merged[0]), Tier::Inventory);
+        QCOMPARE(first.value("coffeeName").toString(), QString("A"));
+        QCOMPARE(first.value("id").toInt(), 7);
+        QCOMPARE(first.value("bagId").toInt(), 7);  // inventory rows mirror id into bagId
+
+        const QVariantMap second = merged[1].toMap();
+        QCOMPARE(tierOf(merged[1]), Tier::HistoryCanonical);
+        QCOMPARE(second.value("coffeeName").toString(), QString("B"));
+        QCOMPARE(second.value("sources").toString(), QString("beanbase+history"));
+        QCOMPARE(second.value("grinderSetting").toString(), QString("15"));  // history grinder carried
+
+        const QVariantMap third = merged[2].toMap();
+        QCOMPARE(tierOf(merged[2]), Tier::HistoryFreeText);
+        QCOMPARE(third.value("coffeeName").toString(), QString("C"));
+        QCOMPARE(third.value("sources").toString(), QString("history"));
+    }
+
+    void mergeLanesQueryFiltersInventoryAndHistory() {
+        QVariantList inventory;
+        inventory.append(QVariantMap{{"id", 1}, {"roasterName", "Alpha"}, {"coffeeName", "One"},
+                                     {"beanBaseId", ""}, {"lastUsedEpoch", 10}});
+        inventory.append(QVariantMap{{"id", 2}, {"roasterName", "Beta"}, {"coffeeName", "Two"},
+                                     {"beanBaseId", ""}, {"lastUsedEpoch", 20}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes(inventory, {}, {}, "alpha");
+        QCOMPARE(merged.size(), 1);
+        QCOMPARE(merged[0].toMap().value("roasterName").toString(), QString("Alpha"));
+    }
+
+    // The previous test deliberately has "No tier2" and no standalone tier3.
+    // Cover both: a canonical-only result (tier 2) and a linked-history result
+    // that matches neither inventory nor a canonical result (tier 3), alongside
+    // a free-text history row (tier 4). Order is tier0+tier1+tier2+tier34.
+    void mergeLanesTier2AndTier3() {
+        QVariantList canonical;  // canonical-only X → tier 2
+        canonical.append(QVariantMap{{"id", "canon-X"}, {"roasterName", "R"}, {"roastName", "X"}});
+
+        QVariantList history;
+        history.append(QVariantMap{  // linked but unabsorbed → tier 3
+            {"roasterName", "R"}, {"coffeeName", "Y"}, {"beanBaseId", "canon-Y"},
+            {"lastUsedEpoch", 200}});
+        history.append(QVariantMap{  // free text → tier 4
+            {"roasterName", "R"}, {"coffeeName", "Z"}, {"beanBaseId", ""},
+            {"lastUsedEpoch", 100}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes({}, canonical, history, QString());
+        QCOMPARE(merged.size(), 3);
+
+        QCOMPARE(tierOf(merged[0]), Tier::CanonicalOnly);
+        QCOMPARE(merged[0].toMap().value("coffeeName").toString(), QString("X"));
+        QCOMPARE(merged[0].toMap().value("sources").toString(), QString("beanbase"));
+
+        QCOMPARE(tierOf(merged[1]), Tier::HistoryLinked);  // HistoryLinked before HistoryFreeText
+        QCOMPARE(merged[1].toMap().value("coffeeName").toString(), QString("Y"));
+        QCOMPARE(merged[1].toMap().value("sources").toString(), QString("history"));
+
+        QCOMPARE(tierOf(merged[2]), Tier::HistoryFreeText);
+        QCOMPARE(merged[2].toMap().value("coffeeName").toString(), QString("Z"));
+    }
+
+    // Bean Base's canonical DB holds near-duplicate submissions: same roaster+
+    // name under distinct canonical ids, differing only in descriptive attrs.
+    // Each must stay its own row (distinct id = distinct pick target) and carry
+    // a "detail" line (degree · origin · tastingNotes) so the UI can tell them
+    // apart — the exact bug of identical-looking same-name rows.
+    void mergeLanesCanonicalDuplicatesCarryDetail() {
+        QVariantList canonical;
+        canonical.append(QVariantMap{
+            {"id", "canon-1"}, {"roasterName", "Sweet Bloom"}, {"roastName", "Hometown"},
+            {"degree", "Medium-light"}, {"origin", "Colombia, Ethiopia"},
+            {"tastingNotes", "Blackberries, Praline"}});
+        canonical.append(QVariantMap{
+            {"id", "canon-2"}, {"roasterName", "Sweet Bloom"}, {"roastName", "Hometown"},
+            {"degree", "Light To Medium"}, {"origin", "Colombia, Ethiopia"},
+            {"tastingNotes", "Blackberries, Cocoa"}});
+        canonical.append(QVariantMap{  // no descriptive attrs at all
+            {"id", "canon-3"}, {"roasterName", "Sweet Bloom"}, {"roastName", "Hometown"}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes({}, canonical, {}, "hometown");
+        QCOMPARE(merged.size(), 3);
+
+        QCOMPARE(merged[0].toMap().value("detail").toString(),
+                 QString("Medium-light · Colombia, Ethiopia · Blackberries, Praline"));
+        QCOMPARE(merged[1].toMap().value("detail").toString(),
+                 QString("Light To Medium · Colombia, Ethiopia · Blackberries, Cocoa"));
+        QCOMPARE(merged[2].toMap().value("detail").toString(), QString());
+        for (const QVariant& v : merged)
+            QCOMPARE(tierOf(v), Tier::CanonicalOnly);
+    }
+
+    // A bag created from a canonical row must carry the full descriptive blob,
+    // not just the canonical id: with an empty blob the bag renders an empty
+    // details popup, and BagCard's link backfill then persists `{"link":…}` as
+    // the whole blob (the "broken details after adding Hometown" bug).
+    void mergeLanesCanonicalRowsCarryBlob() {
+        QVariantList canonical;
+        canonical.append(QVariantMap{
+            {"id", "canon-X"}, {"roasterName", "Sweet Bloom"}, {"roastName", "Hometown"},
+            {"degree", "Light"}, {"origin", "Colombia"},
+            {"link", "https://sweetbloomcoffee.com/product/hometown/"}});
+        canonical.append(QVariantMap{
+            {"id", "canon-Y"}, {"roasterName", "Sweet Bloom"}, {"roastName", "Other"},
+            {"degree", "Dark"}});
+
+        QVariantList history;  // canon-Y also in history, with an empty blob
+        history.append(QVariantMap{
+            {"roasterName", "Sweet Bloom"}, {"coffeeName", "Other"}, {"beanBaseId", "canon-Y"},
+            {"beanBaseData", ""}, {"lastUsedEpoch", 100}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes({}, canonical, history, QString());
+        QCOMPARE(merged.size(), 2);
+
+        // Tier 1 (canon-Y merged with history): empty history blob falls back
+        // to the serialized entry. The detail line rides on tier 1 rows too.
+        QCOMPARE(tierOf(merged[0]), Tier::HistoryCanonical);
+        const QVariantMap tier1Blob = QJsonDocument::fromJson(
+            merged[0].toMap().value("beanBaseData").toString().toUtf8()).object().toVariantMap();
+        QCOMPARE(tier1Blob.value("degree").toString(), QString("Dark"));
+        QCOMPARE(merged[0].toMap().value("detail").toString(), QString("Dark"));
+
+        // Tier 2 (canon-X): blob is the entry itself — id, identity, attrs, link.
+        QCOMPARE(tierOf(merged[1]), Tier::CanonicalOnly);
+        const QVariantMap tier2Blob = QJsonDocument::fromJson(
+            merged[1].toMap().value("beanBaseData").toString().toUtf8()).object().toVariantMap();
+        QCOMPARE(tier2Blob.value("id").toString(), QString("canon-X"));
+        QCOMPARE(tier2Blob.value("roastName").toString(), QString("Hometown"));
+        QCOMPARE(tier2Blob.value("roasterName").toString(), QString("Sweet Bloom"));
+        QCOMPARE(tier2Blob.value("degree").toString(), QString("Light"));
+        QCOMPARE(tier2Blob.value("origin").toString(), QString("Colombia"));
+        QCOMPARE(tier2Blob.value("link").toString(),
+                 QString("https://sweetbloomcoffee.com/product/hometown/"));
+    }
+
+    // A history snapshot holding only BagCard's `{"link":…}` backfill artifact
+    // (a bag created while canonical rows carried no blob) must NOT shadow the
+    // fresh entry — otherwise the pre-fix corruption re-persists into every
+    // new bag created from that Tier 1 row.
+    void mergeLanesTier1ReplacesLinkOnlyBlob() {
+        QVariantList canonical;
+        canonical.append(QVariantMap{
+            {"id", "canon-W"}, {"roasterName", "R"}, {"roastName", "W"},
+            {"degree", "Light"}, {"link", "https://roaster.example/w"}});
+        QVariantList history;
+        history.append(QVariantMap{
+            {"roasterName", "R"}, {"coffeeName", "W"}, {"beanBaseId", "canon-W"},
+            {"beanBaseData", "{\"link\":\"https://roaster.example/w\"}"},
+            {"lastUsedEpoch", 100}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes({}, canonical, history, QString());
+        QCOMPARE(merged.size(), 1);
+        QCOMPARE(tierOf(merged[0]), Tier::HistoryCanonical);
+        const QVariantMap blob = QJsonDocument::fromJson(
+            merged[0].toMap().value("beanBaseData").toString().toUtf8()).object().toVariantMap();
+        QCOMPARE(blob.value("degree").toString(), QString("Light"));  // fresh entry won
+        QCOMPARE(blob.value("link").toString(), QString("https://roaster.example/w"));
+    }
+
+    // Tier 1 keeps a non-empty history blob (it may carry legacy-only fields
+    // like a CDN image URL) instead of replacing it with the fresh entry.
+    void mergeLanesTier1PrefersHistoryBlob() {
+        QVariantList canonical;
+        canonical.append(QVariantMap{
+            {"id", "canon-Z"}, {"roasterName", "R"}, {"roastName", "Z"}, {"degree", "Light"}});
+        QVariantList history;
+        history.append(QVariantMap{
+            {"roasterName", "R"}, {"coffeeName", "Z"}, {"beanBaseId", "canon-Z"},
+            {"beanBaseData", "{\"degree\":\"Light\",\"image\":\"https://cdn/legacy.jpg\"}"},
+            {"lastUsedEpoch", 100}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes({}, canonical, history, QString());
+        QCOMPARE(merged.size(), 1);
+        QCOMPARE(tierOf(merged[0]), Tier::HistoryCanonical);
+        QCOMPARE(merged[0].toMap().value("beanBaseData").toString(),
+                 QString("{\"degree\":\"Light\",\"image\":\"https://cdn/legacy.jpg\"}"));
+    }
+
+    // Within-tier MRU ordering: two inventory bags out of epoch order must come
+    // back most-recently-used first (guards the stable_sort comparator).
+    void mergeLanesOrdersByMruWithinTier() {
+        QVariantList inventory;
+        inventory.append(QVariantMap{{"id", 1}, {"roasterName", "R"}, {"coffeeName", "Old"},
+                                     {"beanBaseId", ""}, {"lastUsedEpoch", 100}});
+        inventory.append(QVariantMap{{"id", 2}, {"roasterName", "R"}, {"coffeeName", "New"},
+                                     {"beanBaseId", ""}, {"lastUsedEpoch", 900}});
+
+        const QVariantList merged = UnifiedBeanSearchModel::mergeLanes(inventory, {}, {}, QString());
+        QCOMPARE(merged.size(), 2);
+        QCOMPARE(merged[0].toMap().value("coffeeName").toString(), QString("New"));  // MRU first
+        QCOMPARE(merged[1].toMap().value("coffeeName").toString(), QString("Old"));
+    }
+
+    // The TierRole int values are a hard cross-language contract: the emitted
+    // role is the raw enum value and ChangeBeansDialog.qml compares it against
+    // these literals (notably `model.tier === 0` for Inventory). Pin the
+    // numbers so a future enumerator reorder can't silently break QML — the
+    // enum-vs-enum assertions elsewhere would not catch that.
+    void tierEnumValuesMatchQmlContract() {
+        QCOMPARE(static_cast<int>(Tier::Inventory), 0);
+        QCOMPARE(static_cast<int>(Tier::HistoryCanonical), 1);
+        QCOMPARE(static_cast<int>(Tier::CanonicalOnly), 2);
+        QCOMPARE(static_cast<int>(Tier::HistoryLinked), 3);
+        QCOMPARE(static_cast<int>(Tier::HistoryFreeText), 4);
+    }
+
+    // BagIdRole must expose the real bag id for an inventory row (mirrored from
+    // "id"), not -1. ChangeBeansDialog.qml compares `model.bagId ===
+    // Settings.dye.activeBagId` to mark the active bag, so a -1 here would
+    // never highlight it. Drives the model through data() directly.
+    void modelBagIdRoleExposesInventoryBagId() {
+        UnifiedBeanSearchModel model;
+        model.m_inventory = QVariantList{
+            QVariantMap{{"id", 7}, {"roasterName", "Roaster"}, {"coffeeName", "A"},
+                        {"beanBaseId", ""}, {"inInventory", true}, {"lastUsedEpoch", 100}}};
+        model.rebuild();
+
+        QCOMPARE(model.rowCount(), 1);
+        const QModelIndex idx = model.index(0);
+        QCOMPARE(model.data(idx, UnifiedBeanSearchModel::TierRole).toInt(),
+                 static_cast<int>(Tier::Inventory));
+        QCOMPARE(model.data(idx, UnifiedBeanSearchModel::BagIdRole).toLongLong(), qint64(7));
+    }
+
+    // ==========================================
+    // Dose/yield stamp primitive
+    // ==========================================
+
+    void doseStampUpdatesBagWithoutTouchingIdentity() {
+        const QString path = freshDb();
+        qint64 bagId = -1;
+        withRawDb(path, "stamp", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Stamp";
+            bag.coffeeName = "Test";
+            bag.doseWeightG = 18.0;
+            bag.yieldValue = 38.0;
+            bag.yieldMode = QStringLiteral("absolute");
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+
+            // The shot-save stamp is dose + MRU only (add-yield-ratio-anchor):
+            // the bag's yield spec is button-protected and must survive the
+            // stamp untouched.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, bagId, {
+                {"doseWeightG", 18.5}, {"lastUsedEpoch", 9999}}));
+            const CoffeeBag stamped = CoffeeBagStorage::loadBagStatic(db, bagId);
+            QCOMPARE(stamped.doseWeightG, 18.5);
+            QCOMPARE(stamped.yieldValue, 38.0);
+            QCOMPARE(stamped.yieldMode, QString("absolute"));
+            QCOMPARE(stamped.lastUsedEpoch, qint64(9999));
+            QCOMPARE(stamped.roasterName, QString("Stamp"));
+        });
+    }
+
+    // The yield spec round-trips through kCols with mode normalization: junk
+    // and NULL modes read as "none", and a ratio spec survives insert + update.
+    void yieldSpecRoundTrip() {
+        const QString path = freshDb();
+        withRawDb(path, "spec_rt", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Spec";
+            bag.coffeeName = "Ratio";
+            bag.yieldValue = 2.0;
+            bag.yieldMode = QStringLiteral("ratio");
+            const qint64 id = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(id > 0);
+
+            CoffeeBag loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QCOMPARE(loaded.yieldValue, 2.0);
+            QCOMPARE(loaded.yieldMode, QString("ratio"));
+
+            // Switching the anchor to absolute replaces the ratio wholesale —
+            // one value column + a mode, so no stale sibling can survive.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {
+                {"yieldValue", 40.0}, {"yieldMode", "absolute"}}));
+            loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QCOMPARE(loaded.yieldValue, 40.0);
+            QCOMPARE(loaded.yieldMode, QString("absolute"));
+
+            // Junk mode from a wire surface normalizes to "none" — it can
+            // never arm an anchor.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, id, {
+                {"yieldMode", "bogus"}}));
+            loaded = CoffeeBagStorage::loadBagStatic(db, id);
+            QCOMPARE(loaded.yieldMode, QString("none"));
+        });
+    }
+
+    // touchesVisualizerFields drives the bagVisualizerFieldsChanged signal, so
+    // it must fire for fields Visualizer stores on the bean and stay silent for
+    // local-only columns (grinder/dose/yield/lastUsed/sync state) —
+    // otherwise a grinder dial-in write-through or a dose/yield stamp would
+    // trigger a needless Visualizer PATCH.
+    void touchesVisualizerFieldsMembership() {
+        // Each Visualizer-stored key fires on its own.
+        const QStringList visualizerKeys = {
+            "roasterName", "coffeeName", "roastDate", "roastLevel",
+            "frozenDate", "defrostDate", "notes", "beanBaseId", "beanBaseData", "inInventory"};
+        for (const QString& key : visualizerKeys)
+            QVERIFY2(CoffeeBagStorage::touchesVisualizerFields({{key, "x"}}),
+                     qPrintable("expected " + key + " to be a Visualizer field"));
+
+        // Local-only keys never fire, alone or together. yieldValue/yieldMode
+        // (the bag's yield spec) are deliberately local-only: an anchor edit
+        // must never trigger a Visualizer PATCH (add-yield-ratio-anchor).
+        const QStringList localKeys = {
+            "grinderBrand", "grinderModel", "grinderBurrs", "grinderSetting",
+            "doseWeightG", "yieldValue", "yieldMode", "startWeightG", "lastUsedEpoch",
+            "visualizerBagId", "visualizerRoasterId",
+            "visualizerSyncPending", "visualizerSeen"};
+        for (const QString& key : localKeys)
+            QVERIFY2(!CoffeeBagStorage::touchesVisualizerFields({{key, "x"}}),
+                     qPrintable("expected " + key + " to be local-only"));
+        QVERIFY(!CoffeeBagStorage::touchesVisualizerFields({
+            {"grinderSetting", "5"}, {"doseWeightG", 18.0}, {"lastUsedEpoch", 1}}));
+        QVERIFY(!CoffeeBagStorage::touchesVisualizerFields({}));
+
+        // A mixed update (dose stamp alongside a roast-date edit) still fires.
+        QVERIFY(CoffeeBagStorage::touchesVisualizerFields({
+            {"doseWeightG", 18.0}, {"roastDate", "2026-06-01"}}));
+    }
+
+    // SettingsDye is the bag-as-bean-state orchestrator. This drives the real
+    // async apply chain (setActiveBagId -> bagReady -> applyActiveBag ->
+    // activeBagYieldSpecApplied), the Update Bag persist, and the clamp —
+    // using only the public API (add-yield-ratio-anchor).
+    void reviewBagPublicationPreservesLiveDialAndIgnoresOldReads() {
+        clearDyeSettings();
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+        CoffeeBag bag;
+        withRawDb(path, "review_bag_seed", [&](QSqlDatabase& db) {
+            CoffeeBag seed; seed.roasterName = "New"; seed.coffeeName = "Coffee";
+            seed.doseWeightG = 16;
+            seed.yieldMode = QStringLiteral("absolute"); seed.yieldValue = 39;
+            const qint64 id = CoffeeBagStorage::insertBagStatic(db, seed);
+            bag = CoffeeBagStorage::loadBagStatic(db, id);
+        });
+        QVERIFY(bag.isValid());
+        SettingsDye dye;
+        dye.setDyeBeanWeight(19);
+        dye.setDyeGrinderSetting(QStringLiteral("10"));
+        dye.setDyeGrinderRpm(600);
+        dye.setBagStorage(&storage);
+        QSignalSpy yieldApplied(&dye, &SettingsDye::activeBagYieldSpecApplied);
+        const QVariantMap patch{{"bagId", bag.id}, {"beanBrand", "New"}, {"beanType", "Coffee"}};
+        QVERIFY(dye.applyShotReviewPatch(patch, bag.toVariantMap()));
+        QCOMPARE(dye.activeBagId(), int(bag.id));
+        QCOMPARE(dye.dyeBeanWeight(), 19.0);
+        QCOMPARE(dye.dyeGrinderSetting(), QStringLiteral("10"));
+        QCOMPARE(dye.dyeGrinderRpm(), 600);
+        QCOMPARE(yieldApplied.count(), 0);
+        emit storage.bagReady(bag.id, bag.toVariantMap());
+        emit storage.bagUpdateCommitted(bag.id, bag.toVariantMap());
+        emit storage.bagUpdateFinished(bag.id, true);
+        drainDbWork(storage);
+        QCOMPARE(dye.dyeBeanWeight(), 19.0);
+        QCOMPARE(dye.dyeGrinderSetting(), QStringLiteral("10"));
+        QCOMPARE(yieldApplied.count(), 0);
+        drainDbWork(storage);
+        withRawDb(path, "review_bag_check", [&](QSqlDatabase& db) {
+            const CoffeeBag stored = CoffeeBagStorage::loadBagStatic(db, bag.id);
+            QCOMPARE(stored.doseWeightG, 16.0);
+            QCOMPARE(stored.yieldValue, 39.0);
+        });
+        bool updateDone = false;
+        storage.requestUpdateBagWithCompletion(bag.id, {{"notes", "Changed elsewhere"}}, false, &storage,
+            [&](qint64, bool success, const QString&, const QString&) {
+                QVERIFY(success);
+                updateDone = true;
+            });
+        QTRY_VERIFY(updateDone);
+        drainDbWork(storage);
+        QCOMPARE(dye.dyeBeanWeight(), 19.0);
+        QCOMPARE(dye.dyeGrinderSetting(), QStringLiteral("10"));
+        updateDone = false;
+        storage.requestUpdateBagWithCompletion(bag.id, {{"doseWeightG", 17.0}}, false, &storage,
+            [&](qint64, bool success, const QString&, const QString&) {
+                QVERIFY(success);
+                updateDone = true;
+            });
+        QTRY_VERIFY(updateDone);
+        drainDbWork(storage);
+        QCOMPARE(dye.dyeBeanWeight(), 17.0);
+        QCOMPARE(dye.dyeGrinderSetting(), QStringLiteral("10"));
+        QCOMPARE(yieldApplied.count(), 0);
+        clearDyeSettings();
+    }
+
+    void settingsDyeYieldSpecPath() {
+        // Isolate from any developer/CI dye state in the test app's QSettings.
+        clearDyeSettings();
+
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+
+        // A bag WITH a ratio anchor and one WITHOUT, inserted directly.
+        qint64 bagRatio = -1, bagPlain = -1;
+        withRawDb(path, "dye_seed", [&](QSqlDatabase& db) {
+            CoffeeBag a; a.roasterName = "R"; a.coffeeName = "Ratio";
+            a.yieldValue = 3.0; a.yieldMode = QStringLiteral("ratio");
+            bagRatio = CoffeeBagStorage::insertBagStatic(db, a);
+            CoffeeBag b; b.roasterName = "R"; b.coffeeName = "Plain";  // mode defaults "none"
+            bagPlain = CoffeeBagStorage::insertBagStatic(db, b);
+        });
+        QVERIFY(bagRatio > 0 && bagPlain > 0);
+
+        SettingsDye dye;
+        dye.setBagStorage(&storage);
+
+        // Selecting the anchored bag re-applies its spec and exposes it.
+        QSignalSpy specSpy(&dye, &SettingsDye::activeBagYieldSpecApplied);
+        dye.setActiveBagId(static_cast<int>(bagRatio));
+        QTRY_VERIFY(specSpy.count() >= 1);
+        QCOMPARE(specSpy.last().at(0).toDouble(), 3.0);
+        QCOMPARE(specSpy.last().at(1).toString(), QString("ratio"));
+        QCOMPARE(dye.activeBagYieldValue(), 3.0);
+        QCOMPARE(dye.activeBagYieldMode(), QString("ratio"));
+
+        // Switching to the plain bag emits mode "none" (follow the profile).
+        specSpy.clear();
+        dye.setActiveBagId(static_cast<int>(bagPlain));
+        QTRY_VERIFY(specSpy.count() >= 1);
+        QCOMPARE(specSpy.last().at(1).toString(), QString("none"));
+        QCOMPARE(dye.activeBagYieldMode(), QString("none"));
+
+        // persistYieldSpecToBag (the Update Bag write) stores the spec and
+        // clamps degenerate input to "none". The cache is set synchronously;
+        // asserting it (rather than racing a DB read against the storage's
+        // background writers) keeps this deterministic.
+        dye.persistYieldSpecToBag(2.5, QStringLiteral("ratio"));
+        QCOMPARE(dye.activeBagYieldValue(), 2.5);
+        QCOMPARE(dye.activeBagYieldMode(), QString("ratio"));
+        dye.persistYieldSpecToBag(44.0, QStringLiteral("absolute"));
+        QCOMPARE(dye.activeBagYieldValue(), 44.0);
+        QCOMPARE(dye.activeBagYieldMode(), QString("absolute"));
+        dye.persistYieldSpecToBag(-5.0, QStringLiteral("absolute"));
+        QCOMPARE(dye.activeBagYieldValue(), 0.0);
+        QCOMPARE(dye.activeBagYieldMode(), QString("none"));
+        dye.persistYieldSpecToBag(2.0, QStringLiteral("none"));
+        QCOMPARE(dye.activeBagYieldMode(), QString("none"));
+
+        dye.persistYieldSpecToBag(16.0, QStringLiteral("ratio"));  // a filter ratio fits
+        QCOMPARE(dye.activeBagYieldValue(), 16.0);
+        // An OUT-OF-RANGE ratio normalizes to the bounds the session resolves
+        // within — the degenerate cases above only exercise the value>0 gate,
+        // which predates the clamp and passes without it. A bag holding 1:150
+        // while every session consumer clamps to 1:100 would mean its stored
+        // design and the brewed shot disagree permanently.
+        dye.persistYieldSpecToBag(150.0, QStringLiteral("ratio"));
+        QCOMPARE(dye.activeBagYieldValue(), 100.0);
+        QCOMPARE(dye.activeBagYieldMode(), QString("ratio"));
+        dye.persistYieldSpecToBag(0.1, QStringLiteral("ratio"));
+        QCOMPARE(dye.activeBagYieldValue(), 0.5);
+        QCOMPARE(dye.activeBagYieldMode(), QString("ratio"));
+        // An absolute is NOT a ratio and must not be clamped into 0.5–100.
+        dye.persistYieldSpecToBag(44.0, QStringLiteral("absolute"));
+        QCOMPARE(dye.activeBagYieldValue(), 44.0);
+
+        drainDbWork(storage);
+        clearDyeSettings();
+    }
+
+    // A bag read that FAILS is not a missing bag: the selection survives it,
+    // and the inventory reports a failure rather than "no bags". Reproduced
+    // from a dev database whose coffee_bags lacked a column the code selects —
+    // every read failed, the Beans page said "No bags yet", and SettingsDye
+    // cleared the user's active bag.
+    void settingsDyeKeepsActiveBagWhenItsReadFails() {
+        clearDyeSettings();
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+        qint64 bagId = -1;
+        withRawDb(path, "readfail_seed", [&](QSqlDatabase& db) {
+            CoffeeBag bag; bag.roasterName = "R"; bag.coffeeName = "Kept";
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+            QSqlQuery q(db);
+            QVERIFY(q.exec("ALTER TABLE coffee_bags DROP COLUMN visualizer_seen"));
+        });
+        QVERIFY(bagId > 0);
+
+        SettingsDye dye;
+        dye.setBagStorage(&storage);
+        QSignalSpy failed(&storage, &CoffeeBagStorage::bagReadFailed);
+        QSignalSpy ready(&storage, &CoffeeBagStorage::bagReady);
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("bag \\d+ unreadable"));
+        dye.setActiveBagId(static_cast<int>(bagId));
+        QTRY_COMPARE(failed.count(), 1);
+        QCOMPARE(ready.count(), 0);
+        QCOMPARE(dye.activeBagId(), static_cast<int>(bagId));
+
+        QSignalSpy inventoryFailed(&storage, &CoffeeBagStorage::inventoryFailed);
+        QSignalSpy inventoryReady(&storage, &CoffeeBagStorage::inventoryReady);
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("inventory query failed"));
+        storage.requestInventory();
+        QTRY_COMPARE(inventoryFailed.count(), 1);
+        QCOMPARE(inventoryReady.count(), 0);
+
+        drainDbWork(storage);
+        clearDyeSettings();
+    }
+
+    // A reload of the SAME active bag (post-shot dose stamp, bag-dialog or MCP
+    // edit) refreshes the yield cache but must NOT re-arm the session anchor:
+    // that is how a Brew Settings 52 g went back to the bag's 42 g after every
+    // shot (#1960). Only a bag CHANGE arms it.
+    void settingsDyeSameBagReloadDoesNotRearmYield() {
+        clearDyeSettings();
+
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+
+        qint64 bagA = -1, bagB = -1;
+        withRawDb(path, "rearm_seed", [&](QSqlDatabase& db) {
+            CoffeeBag a; a.roasterName = "R"; a.coffeeName = "A";
+            a.yieldValue = 42.0; a.yieldMode = QStringLiteral("absolute");
+            bagA = CoffeeBagStorage::insertBagStatic(db, a);
+            CoffeeBag b; b.roasterName = "R"; b.coffeeName = "B";
+            b.yieldValue = 36.0; b.yieldMode = QStringLiteral("absolute");
+            bagB = CoffeeBagStorage::insertBagStatic(db, b);
+        });
+        QVERIFY(bagA > 0 && bagB > 0);
+
+        SettingsDye dye;
+        dye.setBagStorage(&storage);
+        QSignalSpy appliedSpy(&dye, &SettingsDye::activeBagYieldSpecApplied);
+        QSignalSpy changedSpy(&dye, &SettingsDye::activeBagYieldSpecChanged);
+        QSignalSpy readySpy(&storage, &CoffeeBagStorage::bagReady);
+        QSignalSpy committedSpy(&storage, &CoffeeBagStorage::bagUpdateCommitted);
+
+        dye.setActiveBagId(static_cast<int>(bagA));
+        QTRY_COMPARE(appliedSpy.count(), 1);
+        QCOMPARE(readySpy.count(), 1);
+
+        // The post-shot stamp is reconciled from the committed row directly;
+        // it must not enqueue a redundant bagReady read.
+        qsizetype readyBeforeUpdate = readySpy.size();
+        storage.requestUpdateBag(bagA, {{QStringLiteral("doseWeightG"), 18.0}});
+        QTRY_COMPARE(committedSpy.size(), 1);
+        QTRY_VERIFY(storage.isDbWorkIdle());
+        QCOMPARE(readySpy.size(), readyBeforeUpdate);
+        QCOMPARE(appliedSpy.count(), 1);
+        QCOMPARE(dye.activeBagYieldValue(), 42.0);
+
+        // An external yield edit still lands in the cache — and its NOTIFY
+        // still fires, which is what Update Bag's enable-gate binds to.
+        const qsizetype changedBefore = changedSpy.count();
+        readyBeforeUpdate = readySpy.size();
+        storage.requestUpdateBag(bagA, {{QStringLiteral("yieldValue"), 50.0},
+                                        {QStringLiteral("yieldMode"), QStringLiteral("absolute")}});
+        QTRY_COMPARE(committedSpy.size(), 2);
+        QTRY_VERIFY(storage.isDbWorkIdle());
+        QCOMPARE(readySpy.size(), readyBeforeUpdate);
+        QCOMPARE(appliedSpy.count(), 1);
+        QCOMPARE(dye.activeBagYieldValue(), 50.0);
+        QVERIFY(changedSpy.count() > changedBefore);
+
+        // A bag CHANGE arms, in both directions.
+        dye.setActiveBagId(static_cast<int>(bagB));
+        QTRY_COMPARE(appliedSpy.count(), 2);
+        QCOMPARE(appliedSpy.last().at(0).toDouble(), 36.0);
+        dye.setActiveBagId(static_cast<int>(bagA));
+        QTRY_COMPARE(appliedSpy.count(), 3);
+        QCOMPARE(appliedSpy.last().at(0).toDouble(), 50.0);
+
+        // Two switches before the first row lands: B's row is dropped as stale
+        // and A's must still apply as a switch — the activeBagIdChanged clear
+        // has already wiped the session anchor.
+        dye.setActiveBagId(static_cast<int>(bagB));
+        dye.setActiveBagId(static_cast<int>(bagA));
+        QTRY_COMPARE(readySpy.count(), 5);
+        QCOMPARE(appliedSpy.count(), 4);
+
+        // A historical-shot load with no matched bag drops the link
+        // keep-fields; re-selecting the bag afterwards is a switch.
+        dye.setActiveBagKeepFields(-1);
+        dye.setActiveBagId(static_cast<int>(bagA));
+        QTRY_COMPARE(appliedSpy.count(), 5);
+        QCOMPARE(readySpy.count(), 6);
+        QCOMPARE(appliedSpy.last().at(0).toDouble(), 50.0);
+
+        drainDbWork(storage);
+        clearDyeSettings();
+    }
+
+    // Recipe activation applies the recipe's package over a bag selected
+    // keep-fields; a package that is already active is never written onto the
+    // row, so the row may name none or another package. The same-bag reload
+    // that follows must leave the active package alone, or the equipment
+    // watcher deactivates the recipe after every shot.
+    void settingsDyeSameBagReloadKeepsEquipment() {
+        clearDyeSettings();
+
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+
+        qint64 bagNoPackage = -1;
+        withRawDb(path, "keep_equipment_seed", [&](QSqlDatabase& db) {
+            CoffeeBag a; a.roasterName = "R"; a.coffeeName = "No package";
+            bagNoPackage = CoffeeBagStorage::insertBagStatic(db, a);
+        });
+        QVERIFY(bagNoPackage > 0);
+
+        SettingsDye dye;
+        dye.setBagStorage(&storage);
+        QSignalSpy readySpy(&storage, &CoffeeBagStorage::bagReady);
+        QSignalSpy committedSpy(&storage, &CoffeeBagStorage::bagUpdateCommitted);
+        QSignalSpy appliedSpy(&dye, &SettingsDye::activeBagYieldSpecApplied);
+
+        // The recipe's package is active before its bag is selected keep-fields,
+        // so nothing writes the package onto the row.
+        dye.setActiveEquipmentId(26);
+        dye.setActiveBagKeepFields(static_cast<int>(bagNoPackage));
+        QTRY_COMPARE(readySpy.count(), 1);
+        QCOMPARE(dye.activeEquipmentId(), 26);
+
+        // The post-shot stamp reloads the row: its empty package must not win,
+        // and the bag's yield is not armed over the recipe's either.
+        storage.requestUpdateBag(bagNoPackage, {{QStringLiteral("doseWeightG"), 18.0}});
+        QTRY_COMPARE(committedSpy.size(), 1);
+        QTRY_VERIFY(storage.isDbWorkIdle());
+        QCOMPARE(readySpy.count(), 1);
+        QCOMPARE(dye.activeEquipmentId(), 26);
+        QCOMPARE(appliedSpy.count(), 0);
+
+        // A real bag switch also keeps the current equipment.
+        dye.setActiveBagId(-1);
+        dye.setActiveBagId(static_cast<int>(bagNoPackage));
+        QTRY_COMPARE(readySpy.count(), 2);
+        QCOMPARE(dye.activeEquipmentId(), 26);
+
+        // A same-bag reload leaves equipment alone as well.
+        storage.requestUpdateBag(bagNoPackage, {{QStringLiteral("notes"), QStringLiteral("updated")}});
+        QTRY_COMPARE(committedSpy.size(), 2);
+        QTRY_VERIFY(storage.isDbWorkIdle());
+        QCOMPARE(readySpy.count(), 2);
+        QCOMPARE(dye.activeEquipmentId(), 26);
+
+        drainDbWork(storage);
+        clearDyeSettings();
+    }
+
+    // The dose ladder (dose-source-precedence): recipe → bag → profile, resolved
+    // by SettingsDye::doseOwner(). Drives the real async bag apply, so the bag
+    // rung is armed the way a bag selection actually arms it.
+    void settingsDyeDoseLadder() {
+        clearDyeSettings();
+
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+
+        qint64 bagWithDose = -1, bagNoDose = -1;
+        withRawDb(path, "dose_ladder_seed", [&](QSqlDatabase& db) {
+            CoffeeBag a; a.roasterName = "R"; a.coffeeName = "Dosed";
+            a.doseWeightG = 20.0;
+            bagWithDose = CoffeeBagStorage::insertBagStatic(db, a);
+            CoffeeBag b; b.roasterName = "R"; b.coffeeName = "Never dialed";
+            bagNoDose = CoffeeBagStorage::insertBagStatic(db, b);   // doseWeightG 0
+        });
+        QVERIFY(bagWithDose > 0 && bagNoDose > 0);
+
+        SettingsDye dye;
+        dye.setBagStorage(&storage);
+
+        // Nothing active: the profile is the owner.
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Profile);
+
+        // A bag WITH a dose takes the rung, and applies its dose.
+        dye.setActiveBagId(static_cast<int>(bagWithDose));
+        QTRY_COMPARE(dye.dyeBeanWeight(), 20.0);
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Bag);
+
+        // A bag WITHOUT one is SKIPPED, not read as zero — the ladder falls
+        // through to the profile, and the live dose is left alone (the bag
+        // adopts it on the first edit; coffee-bag-model).
+        dye.setActiveBagId(static_cast<int>(bagNoDose));
+        QCOMPARE(dye.activeBagId(), static_cast<int>(bagNoDose));
+        // Let this bag's row land before reading the rung. Unresolved reads as
+        // "no dose" here, so a check taken mid-flight would pass for the wrong
+        // reason — and a row still in flight would land on top of the dose
+        // dialed just below, taking the rung back to empty.
+        QTRY_VERIFY(dye.doseLadderResolved());
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Profile);
+        QCOMPARE(dye.dyeBeanWeight(), 20.0);
+
+        // Dialing a dose onto that bag makes it the owner: the write-through
+        // gives the bag a dose, so the rung must stop reading empty. Without
+        // this the next profile load would overwrite what was just dialed.
+        dye.setDyeBeanWeight(21.5);
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Bag);
+
+        // A recipe outranks the bag — but only one that supplies a dose.
+        dye.setActiveRecipe(7, 0.0);             // grind-only recipe
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Bag);
+        dye.setActiveRecipe(7, 19.0);
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Recipe);
+
+        // With the recipe on the top rung, re-applying the bag must NOT write
+        // its dose over the recipe's. This is the path an external bag edit
+        // takes (bag dialog / Next Portion / post-shot stamp → bagReady →
+        // applyActiveBag) — and since dyeBeanWeightChanged stamps the active
+        // recipe, an unguarded write would overwrite the recipe's stored dose,
+        // not merely the session value.
+        dye.setDyeBeanWeight(19.0);              // the recipe's dose is live
+        dye.setActiveBagId(static_cast<int>(bagWithDose));
+        QCOMPARE(dye.activeBagId(), static_cast<int>(bagWithDose));
+        // Wait on the ROW landing, not on a duration: the rung reports itself
+        // unresolved until bagReady arrives, so this is the event the queued
+        // apply is gated behind. A fixed wait passes locally and fails on a
+        // sanitizer runner where the storage worker takes longer than it.
+        QTRY_VERIFY(dye.doseLadderResolved());
+        QCOMPARE(dye.dyeBeanWeight(), 19.0);     // NOT the bag's 20.0
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Recipe);
+
+        // Deactivating the recipe clears its rung, so the bag takes over.
+        dye.setActiveRecipeId(-1);
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Bag);
+        // And clearing the bag drops to the profile.
+        dye.setActiveBagId(-1);
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Profile);
+
+        // setActiveBagId posts TWO tasks (settings_dye.cpp): requestBag, whose
+        // bagReady resolves the rung above, and requestTouchLastUsed, which
+        // nothing waits on. Draining on doseLadderResolved() therefore leaves
+        // the touch write queued, and ~SerialDbWorker discards and warns about
+        // it under failOnWarning — intermittently, since the write usually wins
+        // the race with the destructor.
+        drainDbWork(storage);
+    }
+
+    // Selecting a source is not the same as knowing what it designs: both rows
+    // load on a storage worker. Until the row lands the ladder must refuse to
+    // answer, because an unresolved rung reads exactly like a source that
+    // designs no dose — and the caller that acts on that reading (the profile's
+    // recommended dose) writes THROUGH to the bag's stored doseWeightG.
+    void settingsDyeDoseLadderIsUnresolvedUntilTheRowLands() {
+        clearDyeSettings();
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+
+        qint64 bagWithDose = -1, otherBag = -1;
+        withRawDb(path, "dose_resolve_seed", [&](QSqlDatabase& db) {
+            CoffeeBag a; a.roasterName = "R"; a.coffeeName = "Dosed";
+            a.doseWeightG = 20.0;
+            bagWithDose = CoffeeBagStorage::insertBagStatic(db, a);
+            CoffeeBag b; b.roasterName = "R"; b.coffeeName = "Other";
+            b.doseWeightG = 22.0;
+            otherBag = CoffeeBagStorage::insertBagStatic(db, b);
+        });
+        QVERIFY(bagWithDose > 0 && otherBag > 0);
+
+        SettingsDye dye;
+        dye.setBagStorage(&storage);
+
+        // Nothing set: vacuously resolved, so a profile load may proceed.
+        QVERIFY(dye.doseLadderResolved());
+
+        // Select the bag. Its row is in flight — the ladder would say "Profile"
+        // here, which is the wrong answer, so it must report itself unanswerable.
+        dye.setActiveBagId(static_cast<int>(bagWithDose));
+        QVERIFY(!dye.doseLadderResolved());
+        QTRY_VERIFY(dye.doseLadderResolved());
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Bag);
+
+        // Switching to ANOTHER bag must un-resolve it again. This is the case
+        // the first selection cannot prove — the rung starts unresolved, so a
+        // missing reset is invisible until a resolved rung has to go back. It is
+        // also the live one: bag switch, then a profile load a beat later, and
+        // the profile's dose lands on the new bean before its row arrives.
+        dye.setActiveBagId(static_cast<int>(otherBag));
+        QVERIFY(!dye.doseLadderResolved());
+        QTRY_VERIFY(dye.doseLadderResolved());
+        QCOMPARE(dye.dyeBeanWeight(), 22.0);
+
+        // Same for a recipe: the id is set by the activation/restore path before
+        // MainController has read the row and can name the dose.
+        dye.setActiveRecipeId(7);
+        QVERIFY(!dye.doseLadderResolved());
+        dye.setActiveRecipe(7, 19.0);
+        QVERIFY(dye.doseLadderResolved());
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Recipe);
+
+        // Deactivation needs no row to confirm it.
+        dye.setActiveRecipeId(-1);
+        QVERIFY(dye.doseLadderResolved());
+        dye.setActiveBagId(-1);
+        QVERIFY(dye.doseLadderResolved());
+
+        // Same unwaited requestTouchLastUsed as settingsDyeDoseLadder.
+        drainDbWork(storage);
+    }
+
+    // setActiveBagKeepFields is the shot-replay path: it adopts the bag link
+    // without applying the bag's fields. The dose rung must still follow the
+    // row — keep-fields means "do not APPLY the dose", not "do not know it".
+    void settingsDyeKeepFieldsStillResolvesTheDoseRung() {
+        clearDyeSettings();
+        const QString path = freshDb();
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+
+        qint64 bagId = -1;
+        withRawDb(path, "dose_keepfields_seed", [&](QSqlDatabase& db) {
+            CoffeeBag a; a.roasterName = "R"; a.coffeeName = "Kept";
+            a.doseWeightG = 17.5;
+            bagId = CoffeeBagStorage::insertBagStatic(db, a);
+        });
+        QVERIFY(bagId > 0);
+
+        SettingsDye dye;
+        dye.setBagStorage(&storage);
+        dye.setDyeBeanWeight(21.0);              // the replay's own dose
+
+        dye.setActiveBagKeepFields(static_cast<int>(bagId));
+        QTRY_VERIFY(dye.doseLadderResolved());
+        // The bag's dose was NOT applied — keep-fields leaves the live value to
+        // the caller — but the rung knows the bag has one.
+        QCOMPARE(dye.dyeBeanWeight(), 21.0);
+        QCOMPARE(dye.doseOwner(), SettingsDye::DoseOwner::Bag);
+
+        // setActiveBagKeepFields posts the same requestBag + requestTouchLastUsed
+        // pair, and only the first is waited on above.
+        drainDbWork(storage);
+    }
+
+    // Selecting a bag leaves the live dial alone; switching equipment applies
+    // the package's identity and last dial, and dial edits write back to it.
+    void settingsDyeEquipmentSwitchWritesDialToPackage() {
+        clearDyeSettings();
+
+        const QString path = freshDb();
+        withRawDb(path, "eqdye_tables", [&](QSqlDatabase& db) {
+            CoffeeBagStorage::ensureTableStatic(db);
+            EquipmentStorage::ensureTablesStatic(db);
+        });
+        qint64 bagId = -1, pkgId = -1;
+        withRawDb(path, "eqdye_seed", [&](QSqlDatabase& db) {
+            CoffeeBag b; b.roasterName = "R"; b.coffeeName = "C";
+            bagId = CoffeeBagStorage::insertBagStatic(db, b);
+            EquipmentPackage p; p.lastGrindSetting = "3.0"; p.lastRpm = 1200;
+            pkgId = EquipmentStorage::createPackageWithGrinderStatic(db, p, "Turin", "DF83V", "83mm flat steel");
+        });
+        QVERIFY(bagId > 0 && pkgId > 0);
+
+        CoffeeBagStorage bagStorage; bagStorage.initialize(path);
+        EquipmentStorage eqStorage; eqStorage.initialize(path);
+        SettingsDye dye;
+        dye.setBagStorage(&bagStorage);
+        dye.setEquipmentStorage(&eqStorage);
+
+        // Select the bag and let its async apply settle. Wait on the WORK,
+        // not on a duration: idle is
+        // false until run()'s done callback has been delivered on this thread,
+        // which is what applyActiveBag runs from — and it also covers the
+        // requestTouchLastUsed that setActiveBagId posts behind requestBag. The
+        // 400 ms fixed loop this replaces was the "timers as guards" pattern
+        // CLAUDE.md forbids, and isDbWorkIdle() exists precisely to retire it.
+        dye.setDyeGrinderSetting("9.0");
+        dye.setActiveBagId(static_cast<int>(bagId));
+        drainDbWork(bagStorage);
+        QCOMPARE(dye.dyeGrinderSetting(), QString("9.0"));
+
+        // Switch equipment: identity + last dial applied synchronously from the map.
+        QVariantMap pkg;
+        pkg["id"] = static_cast<qlonglong>(pkgId);
+        pkg["grinderBrand"] = "Turin"; pkg["grinderModel"] = "DF83V"; pkg["grinderBurrs"] = "83mm flat steel";
+        pkg["lastGrindSetting"] = "3.0"; pkg["lastRpm"] = static_cast<qlonglong>(1200);
+        dye.switchToEquipment(pkg);
+        QCOMPARE(dye.activeEquipmentId(), static_cast<int>(pkgId));
+        QCOMPARE(dye.dyeGrinderModel(), QString("DF83V"));
+        QCOMPARE(dye.dyeGrinderSetting(), QString("3.0"));
+        QCOMPARE(dye.dyeGrinderRpm(), 1200);
+
+        // Edit one field at a time and let each land (as the user would) —
+        // firing both at once would race two background writes to the same DB.
+        // 15 s, not the default 5: these cross-thread write-throughs spike under
+        // full-suite load, and a real logic failure still fails.
+        auto pkgGrind = [&]() { QString v; withRawDb(path, "eqdye_pg",
+            [&](QSqlDatabase& db) { v = EquipmentStorage::loadPackageStatic(db, pkgId).lastGrindSetting; }); return v; };
+        auto pkgRpm = [&]() { qint64 v = -1; withRawDb(path, "eqdye_pr",
+            [&](QSqlDatabase& db) { v = EquipmentStorage::loadPackageStatic(db, pkgId).lastRpm; }); return v; };
+
+        dye.setDyeGrinderSetting("2.5");
+        QTRY_COMPARE_WITH_TIMEOUT(pkgGrind(), QString("2.5"), 15000);
+
+        dye.setDyeGrinderRpm(1350);
+        QTRY_COMPARE_WITH_TIMEOUT(pkgRpm(), static_cast<qint64>(1350), 15000);
+
+        drainDbWork(bagStorage);
+        QTRY_VERIFY(eqStorage.isDbWorkIdle());
+        clearDyeSettings();
+    }
+
+    // Regression for the same-row write reorder that SerialDbWorker fixes. Fire
+    // many writes at ONE package row back-to-back with NO settle between them and
+    // assert the LAST submitted value is the one that SETTLES. Under the old
+    // fresh-thread-per-request dispatch the OS scheduler could run an earlier
+    // write last, clobbering the newer value (SQLite serializes commits, but not
+    // in submission order); the single FIFO worker makes submission order the
+    // commit order. We assert the settled value (drain, then re-read) rather than
+    // first-observation: QTRY passes the instant it sees "49", and a reverted
+    // per-thread build could expose "49" transiently mid-race before an earlier
+    // write commits last — only the post-drain re-read distinguishes "49 is final"
+    // (FIFO) from "49 was briefly seen" (reordered). (The existing write-through test
+    // above has a settle loop that mostly closes the window, so it only caught the
+    // bug flakily — this one is deterministic.)
+    void packageWritesApplyInSubmissionOrder() {
+        const QString path = freshDb();
+        withRawDb(path, "fifo_tables", [&](QSqlDatabase& db) {
+            EquipmentStorage::ensureTablesStatic(db);
+        });
+        qint64 pkgId = -1;
+        withRawDb(path, "fifo_seed", [&](QSqlDatabase& db) {
+            EquipmentPackage p; p.lastGrindSetting = "seed";
+            pkgId = EquipmentStorage::createPackageWithGrinderStatic(db, p, "Turin", "DF83V", "83mm flat steel");
+        });
+        QVERIFY(pkgId > 0);
+
+        EquipmentStorage eqStorage; eqStorage.initialize(path);
+
+        const int kWrites = 50;
+        for (int i = 0; i < kWrites; i++)
+            eqStorage.requestUpdatePackage(pkgId,
+                {{QStringLiteral("lastGrindSetting"), QString::number(i)}});
+
+        auto pkgGrind = [&]() { QString v; withRawDb(path, "fifo_read",
+            [&](QSqlDatabase& db) { v = EquipmentStorage::loadPackageStatic(db, pkgId).lastGrindSetting; }); return v; };
+        QTRY_COMPARE_WITH_TIMEOUT(pkgGrind(), QString::number(kWrites - 1), 15000);
+
+        // Drain every write, then re-assert the SETTLED value is still the last
+        // submitted. This must be a fixed drain + one-shot compare, NOT a
+        // QTRY: QTRY_COMPARE passes the instant it observes "49", and a reordered
+        // build can expose "49" transiently mid-race (right after this point the
+        // QTRY above first saw it) before a later-scheduled write commits last.
+        // Only waiting for full quiescence and then comparing distinguishes
+        // "49 is final" (FIFO) from "49 was briefly seen" (reordered).
+        for (int i = 0; i < 40; i++) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        QCOMPARE(pkgGrind(), QString::number(kWrites - 1));
+    }
+
+    // A DB-open FAILURE must not be delivered to readers as an empty result.
+    // SettingsDye reads an empty packageReady/bagReady as "row vanished" and
+    // clears the active selection, so a transient open failure would silently
+    // wipe valid state — hence runAsync gates the read emit on dbOpened. A
+    // GENUINE not-found (db opens, row absent) must still emit empty, since that
+    // real clear is how a deleted selection gets cleared.
+    void readEmitSuppressedOnDbOpenFailure() {
+        // (a) Unopenable path (parent dir absent) -> requestPackage stays silent.
+        EquipmentStorage bad;
+        bad.initialize(m_tempDir.filePath(QStringLiteral("no_such_dir/eq.db")));
+        QSignalSpy badSpy(&bad, &EquipmentStorage::packageReady);
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("withTempDb: DB open failed"));
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("SerialDbWorker.*failed to open DB"));
+        bad.requestPackage(1);
+        for (int i = 0; i < 60; i++) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        QCOMPARE(badSpy.count(), 0);
+
+        // (b) Real DB, missing row -> the empty result IS delivered (real clear).
+        const QString path = freshDb();
+        withRawDb(path, "nf_tables", [&](QSqlDatabase& db) { EquipmentStorage::ensureTablesStatic(db); });
+        EquipmentStorage ok; ok.initialize(path);
+        QSignalSpy okSpy(&ok, &EquipmentStorage::packageReady);
+        ok.requestPackage(999999);
+        QTRY_COMPARE_WITH_TIMEOUT(okSpy.count(), 1, 15000);
+        QVERIFY(okSpy.at(0).at(1).toMap().isEmpty());
+
+    }
+
+    // Same contract for ShotHistoryStorage::requestShot, which uses a DIFFERENT
+    // code path (post() + hand-rolled `if (!opened) return`, not run()'s gate); a
+    // consumer reads an invalid shotReady as "shot gone". requestShot's own !m_ready guard shares m_dbPath with the worker, so
+    // initialize() can't produce "ready but worker-open-fails" — we set that state
+    // directly via the DECENZA_TESTING friend seam.
+    void requestShotEmitSuppressedOnDbOpenFailure() {
+        // (a) m_ready=true + unopenable path (parent dir absent) -> no shotReady.
+        ShotHistoryStorage bad;
+        bad.m_ready = true;
+        bad.m_dbPath = m_tempDir.filePath(QStringLiteral("no_such_dir/shots.db"));
+        QSignalSpy badSpy(&bad, &ShotHistoryStorage::shotReady);
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("withTempDb: DB open failed"));
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("requestShot.*DB open failed"));
+        bad.requestShot(1);
+        for (int i = 0; i < 60; i++) { QCoreApplication::processEvents(); QThread::msleep(5); }
+        QCOMPARE(badSpy.count(), 0);
+
+        // (b) m_ready + real schema DB (0 shots), missing row -> shotReady STILL
+        // fires (genuine not-found, db opened). Point m_dbPath at a freshDb()
+        // schema file rather than re-initialize() — that would re-open the shared
+        // ShotHistoryConnection freshDb() already used and warn "still in use".
+        ShotHistoryStorage ok;
+        ok.m_ready = true;
+        ok.m_dbPath = freshDb();
+        QSignalSpy okSpy(&ok, &ShotHistoryStorage::shotReady);
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("shotId=\\s*999999.*result=missingRow"));
+        ok.requestShot(999999);
+        QTRY_COMPARE_WITH_TIMEOUT(okSpy.count(), 1, 15000);
+
+    }
+
+    // VisualizerUploader::buildBagEnrichBody — the pure fill-blanks diff that
+    // decides which descriptive fields get PATCHed onto the server's coffee bag.
+    // Locks the blob->API field mapping (a typo here silently drops a field) and
+    // the never-clobber contract.
+    void enrichBody_fillsOnlyServerBlanksFromLocalBlob() {
+        QVariantMap bag;
+        bag.insert("beanBaseData", QStringLiteral(
+            R"({"origin":"Brazil","region":"Carmo De Minas","producer":"Smallholders",)"
+            R"("process":"Natural","tastingNotes":"Cacao","elevation":"1100m"})"));
+        bag.insert("beanBaseId", "canon-123");
+        bag.insert("notes", "my notes");
+
+        QJsonObject remote;                              // server bag, mostly bare
+        remote.insert("country", "Peru");                // already set by user
+        remote.insert("region", QJsonValue(QJsonValue::Null));
+        remote.insert("farmer", "");                     // empty string == blank
+
+        const QJsonObject body = VisualizerUploader::buildBagEnrichBody(remote, bag);
+
+        QVERIFY(!body.contains("country"));              // server value wins, untouched
+        QCOMPARE(body.value("region").toString(), QStringLiteral("Carmo De Minas"));
+        QCOMPARE(body.value("farmer").toString(), QStringLiteral("Smallholders"));
+        QCOMPARE(body.value("processing").toString(), QStringLiteral("Natural"));
+        QCOMPARE(body.value("tasting_notes").toString(), QStringLiteral("Cacao"));
+        QCOMPARE(body.value("elevation").toString(), QStringLiteral("1100m"));
+        QCOMPARE(body.value("notes").toString(), QStringLiteral("<p>my notes</p>"));
+        QCOMPARE(body.value("canonical_coffee_bag_id").toString(), QStringLiteral("canon-123"));
+        QVERIFY(!body.contains("variety"));              // absent in blob -> nothing to send
+    }
+
+    void enrichBody_treatsWhitespaceRemoteAsBlank_andSkipsEmptyLocal() {
+        QVariantMap bag;
+        bag.insert("beanBaseData", QStringLiteral(R"({"origin":"Brazil"})"));  // country only
+        QJsonObject remote;
+        remote.insert("country", "   ");                 // whitespace -> blank
+
+        const QJsonObject body = VisualizerUploader::buildBagEnrichBody(remote, bag);
+
+        QCOMPARE(body.value("country").toString(), QStringLiteral("Brazil"));  // filled over whitespace
+        QVERIFY(!body.contains("region"));               // no local region -> nothing
+    }
+
+    void enrichBody_returnsEmptyWhenServerAlreadyComplete() {
+        QVariantMap bag;
+        bag.insert("beanBaseData", QStringLiteral(R"({"origin":"Brazil","region":"Sul"})"));
+        QJsonObject remote;
+        remote.insert("country", "Brazil");
+        remote.insert("region", "Sul");
+
+        // Nothing to fill -> empty body -> the caller skips the PATCH entirely.
+        QVERIFY(VisualizerUploader::buildBagEnrichBody(remote, bag).isEmpty());
+    }
+
+    void enrichBody_fillsEditorOnlyFields() {
+        // The add-bag-detail-editing fields (farm/quality_score/
+        // place_of_purchase/url) ride the same fill-blanks contract.
+        QVariantMap bag;
+        bag.insert("beanBaseData", QStringLiteral(
+            "{\"farm\":\"Gora Kone\",\"qualityScore\":\"88\",\"placeOfPurchase\":\"Local cafe\","
+            "\"link\":\"https://roaster.example/bag\"}"));
+        const QJsonObject body = VisualizerUploader::buildBagEnrichBody(QJsonObject(), bag);
+        QCOMPARE(body.value("farm").toString(), QStringLiteral("Gora Kone"));
+        QCOMPARE(body.value("quality_score").toString(), QStringLiteral("88"));
+        QCOMPARE(body.value("place_of_purchase").toString(), QStringLiteral("Local cafe"));
+        QCOMPARE(body.value("url").toString(), QStringLiteral("https://roaster.example/bag"));
+    }
+
+    // The bag editor saves its detail blob as a key-by-key patch merged into the
+    // stored blob: an empty string removes its key, an object (the canonical
+    // snapshot) is stored, and untouched keys stay as stored.
+    void beanBaseDataPatchMergesIntoStoredBlob() {
+        const QString path = freshDb();
+        withRawDb(path, "blob_patch", [&](QSqlDatabase& db) {
+            CoffeeBag bag; bag.roasterName = "R"; bag.coffeeName = "C";
+            bag.beanBaseData = QStringLiteral(R"({"origin":"Colombia","region":"Huila","farm":"El Paraiso"})");
+            const qint64 bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(bagId > 0);
+            const QVariantMap patch{{"region", QString()}, {"farm", "Las Flores"},
+                                    {"canonical", QVariantMap{{"origin", "Colombia"}}}};
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(db, bagId, {{"beanBaseDataPatch", patch}}));
+            const QJsonObject blob = QJsonDocument::fromJson(
+                CoffeeBagStorage::loadBagStatic(db, bagId).beanBaseData.toUtf8()).object();
+            QCOMPARE(blob.value("origin").toString(), QStringLiteral("Colombia"));
+            QVERIFY(!blob.contains("region"));
+            QCOMPARE(blob.value("farm").toString(), QStringLiteral("Las Flores"));
+            QCOMPARE(blob.value("canonical").toObject().value("origin").toString(), QStringLiteral("Colombia"));
+        });
+    }
+
+    // VisualizerSync::bagPushBody: a bag never seen sends every field set here
+    // (locking the blob->API mapping incl. the add-bag-detail-editing fields);
+    // a seen one sends only what changed here since.
+    void pushBody_sendsChangesSinceSeen() {
+        QVariantMap bag;
+        bag.insert("coffeeName", "First Batch");
+        bag.insert("roastDate", "2026-06-01");
+        bag.insert("roastLevel", "Medium");
+        bag.insert("frozenDate", "2026-06-10");
+        bag.insert("defrostDate", "2026-07-01");
+        // A bag PATCH reads notes as HTML, where a bare newline is whitespace.
+        bag.insert("notes", "line one\nline two");
+        bag.insert("beanBaseId", "canon-123");
+        bag.insert("beanBaseData", QStringLiteral(
+            "{\"origin\":\"Colombia\",\"region\":\"Huila\",\"farm\":\"El Paraiso\",\"producer\":\"Diego\","
+            "\"variety\":\"Caturra\",\"process\":\"Washed\",\"harvest\":\"Late 2025\",\"qualityScore\":\"87\","
+            "\"placeOfPurchase\":\"Roaster site\",\"tastingNotes\":\"cherry\",\"elevation\":\"1900 m\","
+            "\"link\":\"https://roaster.example/bag\",\"canonical\":{\"origin\":\"Colombia\"}}"));
+
+        QVariantMap sent;
+        const QJsonObject body = VisualizerSync::bagPushBody(bag, &sent);
+
+        QCOMPARE(body.value("name").toString(), QStringLiteral("First Batch"));
+        QCOMPARE(body.value("roast_date").toString(), QStringLiteral("2026-06-01"));
+        QCOMPARE(body.value("roast_level").toString(), QStringLiteral("Medium"));
+        QCOMPARE(body.value("frozen_date").toString(), QStringLiteral("2026-06-10"));
+        QCOMPARE(body.value("defrosted_date").toString(), QStringLiteral("2026-07-01"));
+        QCOMPARE(body.value("notes").toString(), QStringLiteral("<p>line one<br>line two</p>"));
+        QCOMPARE(body.value("canonical_coffee_bag_id").toString(), QStringLiteral("canon-123"));
+        QCOMPARE(body.value("country").toString(), QStringLiteral("Colombia"));
+        QCOMPARE(body.value("region").toString(), QStringLiteral("Huila"));
+        QCOMPARE(body.value("farm").toString(), QStringLiteral("El Paraiso"));
+        QCOMPARE(body.value("farmer").toString(), QStringLiteral("Diego"));
+        QCOMPARE(body.value("variety").toString(), QStringLiteral("Caturra"));
+        QCOMPARE(body.value("processing").toString(), QStringLiteral("Washed"));
+        QCOMPARE(body.value("harvest_time").toString(), QStringLiteral("Late 2025"));
+        QCOMPARE(body.value("quality_score").toString(), QStringLiteral("87"));
+        QCOMPARE(body.value("place_of_purchase").toString(), QStringLiteral("Roaster site"));
+        QCOMPARE(body.value("tasting_notes").toString(), QStringLiteral("cherry"));
+        QCOMPARE(body.value("elevation").toString(), QStringLiteral("1900 m"));
+        QCOMPARE(body.value("url").toString(), QStringLiteral("https://roaster.example/bag"));
+        QVERIFY(!body.contains("roaster_id"));   // caller-owned
+        QVERIFY(!body.contains("canonical"));    // snapshot never leaves the device
+
+        // Never seen: an empty field is OMITTED, since Decenza cannot know it
+        // was cleared rather than never set — and must not null a value the user
+        // set on visualizer.coffee.
+        QVariantMap sparse;
+        sparse.insert("coffeeName", "Bare");
+        QVariantMap sparseSent;
+        const QJsonObject sparseBody = VisualizerSync::bagPushBody(sparse, &sparseSent);
+        QCOMPARE(sparseBody.value("name").toString(), QStringLiteral("Bare"));
+        QCOMPARE(sparseBody.size(), 1);
+
+        // Seen: only what changed here goes, and a clear goes as null.
+        QVariantMap seenBag = bag;
+        seenBag.insert("visualizerSeen", QString::fromUtf8(QJsonDocument(QJsonObject::fromVariantMap(sent)).toJson()));
+        seenBag.insert("notes", QString());
+        seenBag.insert("roastLevel", "Dark");
+        QVariantMap seenSent;
+        const QJsonObject delta = VisualizerSync::bagPushBody(seenBag, &seenSent);
+        QCOMPARE(delta.keys(), (QStringList{"notes", "roast_level"}));
+        QVERIFY(delta.value("notes").isNull());
+        QCOMPARE(delta.value("roast_level").toString(), QStringLiteral("Dark"));
+
+        // A name or canonical link cleared here is never nulled there; a blob
+        // field cleared here is.
+        QVariantMap cleared = bag;
+        cleared.insert("visualizerSeen", seenBag.value("visualizerSeen"));
+        cleared.insert("coffeeName", QString());
+        cleared.insert("beanBaseId", QString());
+        cleared.insert("beanBaseData", QStringLiteral("{\"origin\":\"Colombia\"}"));
+        QVariantMap clearedSent;
+        const QJsonObject clears = VisualizerSync::bagPushBody(cleared, &clearedSent);
+        QVERIFY(!clears.contains("name"));
+        QVERIFY(!clears.contains("canonical_coffee_bag_id"));
+        QVERIFY(clears.contains("region"));
+        QVERIFY(clears.value("region").isNull());
+        QVERIFY(!clears.contains("country"));
+    }
+
+    // A bag may carry a canonical id only while its own roaster/coffee still
+    // name the record. Reproduced from the shipped defect: a bag linked to
+    // another roaster's record for the same coffee republished every one of its
+    // shots under that roaster on visualizer.coffee.
+    // The rule that governs every write the repair pass makes: only a real
+    // disagreement earns a PATCH to the user's cloud account. Trim and case are
+    // not disagreements — the server squishes what it stores.
+    void beanRepairOnlyWritesOnARealDisagreement() {
+        using Action = VisualizerUploader::BeanRepairAction;
+        QCOMPARE(VisualizerUploader::decideBeanRepair("Coava Coffee Roasters", "Las Capucas",
+                                                      "Stavanger Kaffebrenneri", "Las Capucas"),
+                 Action::NeedsPatch);
+        QCOMPARE(VisualizerUploader::decideBeanRepair("Prodigal Coffee", "Milk Blend",
+                                                      "Prodigal Coffee", "Milk Blend"),
+                 Action::AlreadyCorrect);
+        QCOMPARE(VisualizerUploader::decideBeanRepair(" prodigal coffee ", "MILK BLEND",
+                                                      "Prodigal Coffee", "Milk Blend"),
+                 Action::AlreadyCorrect);
+        // The coffee half counts too — the server rewrites both fields.
+        QCOMPARE(VisualizerUploader::decideBeanRepair("Prodigal Coffee", "Milk Blend",
+                                                      "Prodigal Coffee", "Buenos Aires"),
+                 Action::NeedsPatch);
+        // A blank server value is a difference, not a match. (The endpoint that
+        // caused this OMITS the keys rather than blanking them — the app read
+        // the missing keys back as empty QStrings — but the predicate sees the
+        // same empty string either way, and treating it as "agrees" would leave
+        // a renamed shot unrepaired.)
+        QCOMPARE(VisualizerUploader::decideBeanRepair("", "", "Prodigal Coffee", "Milk Blend"),
+                 Action::NeedsPatch);
+        // Blank on the LOCAL side is also a difference — which is why this
+        // predicate must not be the last word before a write. Sending it would
+        // blank the server's names. sendNextBeanRepair drops such a shot before
+        // it ever gets here; this pins WHY that guard has to exist.
+        QCOMPARE(VisualizerUploader::decideBeanRepair("Prodigal Coffee", "Milk Blend", "", ""),
+                 Action::NeedsPatch);
+    }
+
+    // What the pass is ALLOWED to do to a shot, which decideBeanRepair above is
+    // deliberately not trusted to decide alone: it scores a blank local name as
+    // a difference, and acting on that blanks the user's cloud value.
+    void planBeanRepairNeverWritesAnEmptyNameOrAPointlessClear() {
+        using Plan = VisualizerUploader::BeanRepairPlan;
+        // Complete names AND no server bag: the only case that may assert an
+        // identity. (The `true` variant used to assert RestoreNames here — that
+        // line locked in the futile write this pass now declines.)
+        QCOMPARE(VisualizerUploader::planBeanRepair(false, "Stavanger", "Las Capucas"),
+                 Plan::RestoreNames);
+        // Per FIELD, not both-empty. A brand with no type must never reach the
+        // name PATCH — sending bean_type:"" wipes a real value on the server.
+        QCOMPARE(VisualizerUploader::planBeanRepair(false, "Stavanger", ""),
+                 Plan::ClearCanonicalOnly);
+        QCOMPARE(VisualizerUploader::planBeanRepair(false, "", "Las Capucas"),
+                 Plan::ClearCanonicalOnly);
+        QCOMPARE(VisualizerUploader::planBeanRepair(false, "   ", "Las Capucas"),
+                 Plan::ClearCanonicalOnly);
+        QCOMPARE(VisualizerUploader::planBeanRepair(false, "Las Capucas", "   "),
+                 Plan::ClearCanonicalOnly);
+        QCOMPARE(VisualizerUploader::planBeanRepair(false, "", ""),
+                 Plan::ClearCanonicalOnly);
+        // A server-side coffee_bag decides FIRST, complete names or not: the
+        // shot takes refresh_coffee_bag_fields' first branch, so nothing sent to
+        // it survives, and the attempt re-renders roast_date into the user's
+        // date format. Measured on a live account.
+        QCOMPARE(VisualizerUploader::planBeanRepair(true, "Stavanger", ""),
+                 Plan::NothingToDo);
+        QCOMPARE(VisualizerUploader::planBeanRepair(true, "", ""),
+                 Plan::NothingToDo);
+        QCOMPARE(VisualizerUploader::planBeanRepair(true, "Stavanger", "Las Capucas"),
+                 Plan::NothingToDo);
+    }
+
+    // The input that actually decides whether this pass writes. The predicate
+    // above is four lines and obviously right; THIS is where the wrong premise
+    // lived — a comment claimed coffee_bag_id was always present, so the read
+    // tested !isNull(), which is true for an absent key too.
+    void remoteCoffeeBagStateNeverGuessesFromAnUnreadableField() {
+        using State = VisualizerUploader::RemoteBagState;
+        auto parse = [](const char* json) {
+            return VisualizerUploader::remoteCoffeeBagState(
+                QJsonDocument::fromJson(QByteArray(json)).object());
+        };
+        // The two shapes the server actually emits. `visualizer_attributes` ends
+        // in `attributes.compact` (shot/jsonable.rb:80), so a bag-less shot omits
+        // the key entirely rather than sending null.
+        QCOMPARE(parse("{\"coffee_bag_id\":\"2e1c0de9-1b96-46d6-b4c0-db59e2f78363\"}"),
+                 State::Present);
+        QCOMPARE(parse("{\"bean_brand\":\"Prodigal\"}"), State::Absent);
+        // Tolerated, though the server does not produce them.
+        QCOMPARE(parse("{\"coffee_bag_id\":null}"), State::Absent);
+        QCOMPARE(parse("{\"coffee_bag_id\":\"\"}"), State::Absent);
+        // The ones that must NOT read as "no bag": QJsonValue::toString() returns
+        // an empty QString for every non-string type, so treating them as absent
+        // would turn an unparseable field into a licence to write.
+        QCOMPARE(parse("{\"coffee_bag_id\":12345}"), State::Unreadable);
+        QCOMPARE(parse("{\"coffee_bag_id\":true}"), State::Unreadable);
+        QCOMPARE(parse("{\"coffee_bag_id\":{\"id\":\"x\"}}"), State::Unreadable);
+        QCOMPARE(parse("{\"coffee_bag_id\":[\"x\"]}"), State::Unreadable);
+    }
+
+    void renamingALinkedBagDropsTheBorrowedCanonicalRecord() {
+        const QString path = freshDb();
+        QVERIFY(!path.isEmpty());
+        const QString linkedBlob = QStringLiteral(
+            "{\"id\":\"canon-coava\",\"visualizerCanonicalId\":\"canon-coava\","
+            "\"canonicalRoasterId\":\"roaster-coava\",\"roasterName\":\"Coava Coffee Roasters\","
+            "\"roastName\":\"Las Capucas\",\"origin\":\"Honduras\",\"process\":\"Washed\"}");
+
+        qint64 bagId = -1;
+        withRawDb(path, "canon_seed", [&](QSqlDatabase& db) {
+            CoffeeBag b;
+            b.roasterName = "Coava Coffee Roasters";
+            b.coffeeName = "Las Capucas";
+            b.beanBaseId = "canon-coava";
+            b.beanBaseData = linkedBlob;
+            bagId = CoffeeBagStorage::insertBagStatic(db, b);
+            // Consistent identity: the link is kept on insert.
+            const CoffeeBag stored = CoffeeBagStorage::loadBagStatic(db, bagId);
+            QCOMPARE(stored.beanBaseId, QStringLiteral("canon-coava"));
+
+            // An uploaded shot of that bag, and a local-only one: the rename must
+            // reach the first (its snapshot re-asserts the id on every upload)
+            // and queue only the first (the server can only have renamed what it
+            // has).
+            ShotRowFixtures::ShotRow uploaded;
+            uploaded.uuid = "rename-uploaded";
+            uploaded.timestamp = QDateTime::currentSecsSinceEpoch();
+            uploaded.profileName = "Test";
+            uploaded.beanBrand = "Coava Coffee Roasters";
+            uploaded.beanType = "Las Capucas";
+            const qint64 uploadedId = ShotRowFixtures::insertShot(db, uploaded);
+            ShotRowFixtures::ShotRow localOnly = uploaded;
+            localOnly.uuid = "rename-local";
+            localOnly.timestamp = uploaded.timestamp - 60;
+            const qint64 localOnlyId = ShotRowFixtures::insertShot(db, localOnly);
+            QVERIFY(uploadedId > 0 && localOnlyId > 0);
+            QSqlQuery bind(db);
+            bind.prepare("UPDATE shots SET bag_id = :bag, beanbase_id = :id, beanbase_json = :blob, "
+                         "visualizer_id = CASE WHEN id = :uploaded THEN 'viz-rename' ELSE '' END "
+                         "WHERE id IN (:uploaded, :local)");
+            bind.bindValue(":bag", bagId);
+            bind.bindValue(":id", QStringLiteral("canon-coava"));
+            bind.bindValue(":blob", linkedBlob);
+            bind.bindValue(":uploaded", uploadedId);
+            bind.bindValue(":local", localOnlyId);
+            QVERIFY(bind.exec());
+
+            // The user corrects the roaster to the one they actually bought from.
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(
+                db, bagId, {{"roasterName", "Stavanger Kaffebrenneri"}}));
+            const CoffeeBag renamed = CoffeeBagStorage::loadBagStatic(db, bagId);
+            QVERIFY(renamed.beanBaseId.isEmpty());
+            QVERIFY(!BeanBaseBlob::isLinked(renamed.beanBaseData));
+            // The details the user wanted from that record are NOT collateral.
+            const QJsonObject blob =
+                QJsonDocument::fromJson(renamed.beanBaseData.toUtf8()).object();
+            QCOMPARE(blob.value("origin").toString(), QStringLiteral("Honduras"));
+            QCOMPARE(blob.value("process").toString(), QStringLiteral("Washed"));
+            QVERIFY(!blob.contains("canonicalRoasterId"));
+
+            // The unlink reached the shots' own snapshots — without this the
+            // uploader keeps re-asserting the borrowed id from the shot — and
+            // queued the uploaded one alone.
+            QSqlQuery shots(db);
+            shots.prepare("SELECT COALESCE(beanbase_id,''), bean_repair_pending FROM shots "
+                          "WHERE id = :id");
+            shots.bindValue(":id", uploadedId);
+            QVERIFY(shots.exec() && shots.next());
+            QVERIFY(shots.value(0).toString().isEmpty());
+            QCOMPARE(shots.value(1).toInt(), 1);
+            shots.bindValue(":id", localOnlyId);
+            QVERIFY(shots.exec() && shots.next());
+            QVERIFY(shots.value(0).toString().isEmpty());
+            QCOMPARE(shots.value(1).toInt(), 0);
+        });
+        QVERIFY(bagId > 0);
+    }
+
+    // The create path is the one the bug shipped through: pick a near-match in
+    // the Bean Base search (which fills the roaster from the record), type your
+    // own roaster over it, save. A bag must never ENTER the table holding a
+    // record that names another coffee.
+    void creatingABagWithABorrowedRecordStoresItUnlinked() {
+        const QString path = freshDb();
+        QVERIFY(!path.isEmpty());
+        withRawDb(path, "canon_insert", [&](QSqlDatabase& db) {
+            CoffeeBag borrowed;
+            borrowed.roasterName = "Stavanger Kaffebrenneri";   // typed over the prefill
+            borrowed.coffeeName = "Las Capucas";
+            borrowed.beanBaseId = "canon-coava";
+            borrowed.beanBaseData = QStringLiteral(
+                "{\"id\":\"canon-coava\",\"visualizerCanonicalId\":\"canon-coava\","
+                "\"roasterName\":\"Coava Coffee Roasters\",\"roastName\":\"Las Capucas\","
+                "\"origin\":\"Honduras\"}");
+            const qint64 id = CoffeeBagStorage::insertBagStatic(db, borrowed);
+            QVERIFY(id > 0);
+            const CoffeeBag stored = CoffeeBagStorage::loadBagStatic(db, id);
+            QVERIFY(stored.beanBaseId.isEmpty());
+            QVERIFY(!BeanBaseBlob::isLinked(stored.beanBaseData));
+            QCOMPARE(QJsonDocument::fromJson(stored.beanBaseData.toUtf8())
+                         .object().value("origin").toString(), QStringLiteral("Honduras"));
+
+            // A bag whose identity MATCHES its record keeps the link.
+            CoffeeBag consistent = borrowed;
+            consistent.roasterName = "Coava Coffee Roasters";
+            const qint64 keptId = CoffeeBagStorage::insertBagStatic(db, consistent);
+            QCOMPARE(CoffeeBagStorage::loadBagStatic(db, keptId).beanBaseId,
+                     QStringLiteral("canon-coava"));
+        });
+    }
+
+    // A corrupt blob must not open the guard. Returning "no conflict" there is
+    // the permissive answer — it exports the borrowed id and lets the server
+    // rename the shot, which is the whole defect.
+    void aCorruptBlobIsTreatedAsConflicted() {
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("[Cc]orrupt blob"));
+        QVERIFY(BeanBaseBlob::canonicalIdentityConflicts(
+            QStringLiteral("{\"id\":\"canon-coava\",\"roasterName\":"),  // truncated
+            {QStringLiteral("Stavanger Kaffebrenneri"), QStringLiteral("Las Capucas")}));
+    }
+
+    // Guards the numRowsAffected() ordering in updateBagFieldsStatic. It has to
+    // be a bag with NO shots: the propagation that follows the update runs on the
+    // same connection, and sqlite3_changes() is read live, so a post-propagation
+    // read returns 0 here and the save reports failure. A fixture with shots
+    // returns a non-zero count either way and stays green on the bug.
+    void renamingABagWithNoShotsStillReportsSuccess() {
+        const QString path = freshDb();
+        QVERIFY(!path.isEmpty());
+        withRawDb(path, "canon_noshots", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Coava Coffee Roasters";
+            bag.coffeeName = "Las Capucas";
+            bag.beanBaseId = "canon-coava";
+            bag.beanBaseData = QStringLiteral(
+                "{\"id\":\"canon-coava\",\"visualizerCanonicalId\":\"canon-coava\","
+                "\"roasterName\":\"Coava Coffee Roasters\",\"roastName\":\"Las Capucas\"}");
+            const qint64 bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+            QVERIFY(bagId > 0);
+            QVERIFY(CoffeeBagStorage::updateBagFieldsStatic(
+                db, bagId, {{"roasterName", "Stavanger Kaffebrenneri"}}));
+            QVERIFY(CoffeeBagStorage::loadBagStatic(db, bagId).beanBaseId.isEmpty());
+        });
+    }
+
+    void beanBaseBlobCompareAndUpdateRejectsStaleSnapshot() {
+        const QString path = freshDb();
+        QVERIFY(!path.isEmpty());
+        const QString original = QStringLiteral("{\"link\":\"https://roaster.example/old\"}");
+        const QString current = QStringLiteral("{\"link\":\"https://roaster.example/new\"}");
+        const QString staleWrite = QStringLiteral("{\"link\":\"https://archive.example/stale\"}");
+        qint64 bagId = 0;
+        withRawDb(path, "beanbase_cas_setup", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Roaster";
+            bag.coffeeName = "Coffee";
+            bag.beanBaseId = "bean-old";
+            bag.beanBaseData = original;
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QVERIFY(bagId > 0);
+
+        CoffeeBagStorage storage;
+        storage.initialize(path);
+        bool done = false;
+        bool success = false;
+        QString reason;
+        storage.requestUpdateBeanBaseDataIfCurrent(bagId, QStringLiteral("bean-old"), original,
+            current, &storage,
+            [&](qint64 completedId, bool ok, const QString&, const QString& failure) {
+                QCOMPARE(completedId, bagId);
+                success = ok;
+                reason = failure;
+                done = true;
+            });
+        QTRY_VERIFY(done);
+        QVERIFY(success);
+        QCOMPARE(reason, QString());
+
+        done = false;
+        success = true;
+        reason.clear();
+        storage.requestUpdateBeanBaseDataIfCurrent(bagId, QStringLiteral("bean-old"), original,
+            staleWrite, &storage,
+            [&](qint64 completedId, bool ok, const QString&, const QString& failure) {
+                QCOMPARE(completedId, bagId);
+                success = ok;
+                reason = failure;
+                done = true;
+            });
+        QTRY_VERIFY(done);
+        QVERIFY(!success);
+        QCOMPARE(reason, QStringLiteral("staleData"));
+
+        withRawDb(path, "beanbase_cas_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(CoffeeBagStorage::loadBagStatic(db, bagId).beanBaseData, current);
+        });
+
+        // A relink can change the identity without touching the raw JSON blob.
+        // The same transaction guard must reject the old result in that case.
+        bool relinkDone = false;
+        bool relinkSuccess = false;
+        storage.requestUpdateBagWithCompletion(bagId,
+            {{QStringLiteral("beanBaseId"), QStringLiteral("bean-new")}}, false, &storage,
+            [&](qint64 completedId, bool ok, const QString&, const QString&) {
+                QCOMPARE(completedId, bagId);
+                relinkSuccess = ok;
+                relinkDone = true;
+            });
+        QTRY_VERIFY(relinkDone);
+        QVERIFY(relinkSuccess);
+
+        done = false;
+        success = true;
+        reason.clear();
+        storage.requestUpdateBeanBaseDataIfCurrent(bagId, QStringLiteral("bean-old"), current,
+            staleWrite, &storage,
+            [&](qint64 completedId, bool ok, const QString&, const QString& failure) {
+                QCOMPARE(completedId, bagId);
+                success = ok;
+                reason = failure;
+                done = true;
+            });
+        QTRY_VERIFY(done);
+        QVERIFY(!success);
+        QCOMPARE(reason, QStringLiteral("staleData"));
+
+        withRawDb(path, "beanbase_cas_relink_verify", [&](QSqlDatabase& db) {
+            const CoffeeBag currentBag = CoffeeBagStorage::loadBagStatic(db, bagId);
+            QCOMPARE(currentBag.beanBaseId, QStringLiteral("bean-new"));
+            QCOMPARE(currentBag.beanBaseData, current);
+        });
+        drainDbWork(storage);
+    }
+};
+
+QTEST_MAIN(tst_CoffeeBags)
+#include "tst_coffeebags.moc"

@@ -1,0 +1,412 @@
+// The compact and expanded hourly-forecast delegates read this file's ids (`root`,
+// `compactList`, `hourlyList`) and its formatting helpers; Bound makes them statically
+// resolvable. Each declares both injected roles it uses, `modelData` and `index`,
+// required in the same edit -- without that, Bound stops role injection and the whole
+// forecast strip renders blank at RUNTIME, silently.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Layouts
+import Decenza
+
+LayoutWidgetItem {
+    id: root
+
+    // Read once: each read of hourlyForecast converts every forecast hour to JS, and this item
+    // read it in eight places (22-70 ms per weather update on an M-series Mac debug build, #1976).
+    readonly property var forecast: HostStatusService.state.weather.hourlyForecast || []
+
+    implicitWidth: isCompact ? compactContent.implicitWidth : fullContent.implicitWidth
+    implicitHeight: isCompact ? compactContent.implicitHeight : fullContent.implicitHeight
+
+    Accessible.role: Accessible.StaticText
+    Accessible.name: {
+        if (!HostStatusService.state.weather.valid)
+            return TranslationManager.translate("weather.accessible.unavailable", "Weather: not available")
+        var forecast = root.forecast
+        if (forecast.length > 0) {
+            let rawTemp = forecast[0].temperature || 0
+            let temp = HostStatusService.state.weather.useImperialUnits
+                ? Math.round(rawTemp * 9 / 5 + 32) : Math.round(rawTemp)
+            let loc = HostStatusService.state.weather.locationName || ""
+            return TranslationManager.translate("weather.accessible.summary", "Weather: %1 degrees").arg(temp)
+                   + (loc ? ", " + loc : "")
+        }
+        return TranslationManager.translate("weather.accessible.title", "Weather")
+    }
+    Accessible.focusable: true
+
+    // Moon phase emoji based on date (synodic month = 29.53059 days)
+    function moonEmoji(timeStr) {
+        // Reference new moon: Jan 6, 2000 18:14 UTC
+        var refNew = Date.UTC(2000, 0, 6, 18, 14, 0) / 86400000
+        var now = new Date(timeStr).getTime() / 86400000
+        var phase = ((now - refNew) / 29.53059) % 1
+        if (phase < 0) phase += 1
+        // 8 phases: 🌑🌒🌓🌔🌕🌖🌗🌘
+        var phases = [
+            "\uD83C\uDF11", "\uD83C\uDF12", "\uD83C\uDF13", "\uD83C\uDF14",
+            "\uD83C\uDF15", "\uD83C\uDF16", "\uD83C\uDF17", "\uD83C\uDF18"
+        ]
+        return phases[Math.floor(phase * 8) % 8]
+    }
+
+    // Map WMO weather icon names to unicode symbols
+    function weatherEmoji(iconName, isDaytime, timeStr) {
+        if (typeof isDaytime === "undefined") isDaytime = true
+        switch (iconName) {
+            case "clear":         return isDaytime ? "\u2600" : moonEmoji(timeStr)     // ☀ / moon phase
+            case "partly-cloudy": return isDaytime ? "\u26C5" : moonEmoji(timeStr)     // ⛅ / moon phase
+            case "overcast":      return "\u2601"   // ☁
+            case "fog":           return "\uD83C\uDF2B"  // 🌫
+            case "drizzle":       return "\uD83C\uDF26"  // 🌦
+            case "rain":          return "\uD83C\uDF27"  // 🌧
+            case "freezing-rain": return "\u2744"   // ❄ (with rain)
+            case "snow":          return "\u2744"   // ❄
+            case "showers":       return "\uD83C\uDF26"  // 🌦
+            case "snow-showers":  return "\uD83C\uDF28"  // 🌨
+            case "thunderstorm":  return "\u26A1"   // ⚡
+            default:              return "\u2601"   // ☁
+        }
+    }
+
+    // Format temperature with degree sign (F for US, C otherwise)
+    function formatTemp(temp) {
+        if (HostStatusService.state.weather.useImperialUnits)
+            return Math.round(temp * 9 / 5 + 32) + "\u00B0"
+        return Math.round(temp) + "\u00B0"
+    }
+
+    // Format hour string: 12h for locales that use it, 24h otherwise
+    // Input is "HH:mm" from the model
+    function formatHour(hourStr) {
+        if (!Settings.app.use12HourTime)
+            return hourStr
+        var parts = (hourStr || "").split(":")
+        if (parts.length < 2) return hourStr
+        var h = parseInt(parts[0])
+        var suffix = h >= 12 ? "pm" : "am"
+        if (h === 0) h = 12
+        else if (h > 12) h -= 12
+        return h + suffix
+    }
+
+    // Wind direction arrow from degrees
+    function windArrow(degrees) {
+        var arrows = ["\u2193", "\u2199", "\u2190", "\u2196", "\u2191", "\u2197", "\u2192", "\u2198"]
+        var index = Math.round(degrees / 45) % 8
+        return arrows[index]
+    }
+
+    // --- COMPACT MODE (bar zone - flickable hourly forecast) ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: Theme.scaled(160)
+        implicitHeight: Theme.bottomBarHeight
+
+        ListView {
+            id: compactList
+            anchors.fill: parent
+            anchors.topMargin: Theme.scaled(2)
+            anchors.bottomMargin: Theme.scaled(2)
+            orientation: ListView.Horizontal
+            spacing: Theme.scaled(8)
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            visible: HostStatusService.state.weather.valid === true
+
+            model: root.forecast
+
+            delegate: Item {
+                id: compactHour
+                required property var modelData
+                required property int index
+
+                width: Theme.scaled(32)
+                height: compactList.height
+
+                // Day-alternating background
+                Rectangle {
+                    anchors.fill: parent
+                    color: parseInt((compactHour.modelData.time || "").substring(8, 10)) % 2 === 0
+                        ? Qt.rgba(1, 1, 1, 0.06) : "transparent"
+                    radius: Theme.scaled(3)
+                }
+                // Daytime yellow overlay
+                Rectangle {
+                    anchors.fill: parent
+                    color: Qt.rgba(1, 0.9, 0.3, 0.1)
+                    radius: Theme.scaled(3)
+                    visible: compactHour.modelData.isDaytime || false
+                }
+
+                Column {
+                    anchors.centerIn: parent
+                    spacing: Theme.scaled(1)
+
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: root.formatHour(compactHour.modelData.hour || "")
+                        color: compactHour.index === 0 ? Theme.textColor : Theme.textSecondaryColor
+                        font: Theme.captionFont
+                    }
+                    Image {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        source: Theme.emojiToImage(root.weatherEmoji(compactHour.modelData.weatherIcon || "", compactHour.modelData.isDaytime, compactHour.modelData.time || ""))
+                        sourceSize.width: Theme.scaled(16)
+                        sourceSize.height: Theme.scaled(16)
+                    }
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: root.formatTemp(compactHour.modelData.temperature || 0)
+                        color: Theme.textColor
+                        font: Theme.captionFont
+                    }
+                }
+            }
+        }
+
+        // Loading / no data fallback
+        Text {
+            visible: !HostStatusService.state.weather.valid
+            anchors.centerIn: parent
+            text: HostStatusService.state.weather.loading ? "..." : "--"
+            color: Theme.textSecondaryColor
+            font: Theme.bodyFont
+        }
+    }
+
+    // --- FULL MODE (center zone - next 24 hours) ---
+    Item {
+        id: fullContent
+        visible: !root.isCompact
+        anchors.fill: parent
+        implicitWidth: fullColumn.implicitWidth
+        implicitHeight: fullColumn.implicitHeight
+
+        ColumnLayout {
+            id: fullColumn
+            anchors.fill: parent
+            spacing: Theme.scaled(4)
+
+            // Header: current conditions
+            RowLayout {
+                Layout.alignment: Qt.AlignHCenter
+                spacing: Theme.scaled(8)
+                visible: HostStatusService.state.weather.valid === true
+
+                Image {
+                    source: {
+                        var forecast = root.forecast
+                        if (forecast.length > 0)
+                            return Theme.emojiToImage(root.weatherEmoji(forecast[0].weatherIcon || "", forecast[0].isDaytime, forecast[0].time || ""))
+                        return ""
+                    }
+                    sourceSize.width: Theme.scaled(28)
+                    sourceSize.height: Theme.scaled(28)
+                }
+
+                Text {
+                    text: {
+                        var forecast = root.forecast
+                        if (forecast.length > 0)
+                            return root.formatTemp(forecast[0].temperature || 0)
+                        return "--"
+                    }
+                    color: Theme.textColor
+                    font.family: Theme.valueFont.family
+                    font.pixelSize: Theme.scaled(28)
+                    font.bold: true
+                }
+
+                ColumnLayout {
+                    spacing: 0
+
+                    Text {
+                        text: {
+                            var forecast = root.forecast
+                            if (forecast.length > 0)
+                                return forecast[0].weatherDescription || ""
+                            return ""
+                        }
+                        color: Theme.textSecondaryColor
+                        font: Theme.captionFont
+                    }
+
+                    Text {
+                        text: {
+                            var forecast = root.forecast
+                            if (forecast.length > 0) {
+                                let f = forecast[0]
+                                let parts = []
+                                if (f.relativeHumidity > 0) parts.push(f.relativeHumidity + "%")
+                                if (f.windSpeed > 0) {
+                                    if (HostStatusService.state.weather.useImperialUnits)
+                                        parts.push(root.windArrow(f.windDirection) + Math.round(f.windSpeed * 0.621371) + "mph")
+                                    else
+                                        parts.push(root.windArrow(f.windDirection) + Math.round(f.windSpeed) + "km/h")
+                                }
+                                return parts.join("  ")
+                            }
+                            return ""
+                        }
+                        color: Theme.textSecondaryColor
+                        font: Theme.captionFont
+                    }
+                }
+            }
+
+            // Hourly forecast scroll
+            ListView {
+                id: hourlyList
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.preferredHeight: Theme.scaled(60)
+                orientation: ListView.Horizontal
+                spacing: Theme.scaled(2)
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                visible: HostStatusService.state.weather.valid === true
+
+                model: root.forecast
+
+                delegate: Item {
+                    id: hourlyCell
+                    required property var modelData
+                    required property int index
+
+                    width: Theme.scaled(38)
+                    height: hourlyList.height
+
+                    // Day-alternating background
+                    Rectangle {
+                        anchors.fill: parent
+                        color: parseInt((hourlyCell.modelData.time || "").substring(8, 10)) % 2 === 0
+                            ? Qt.rgba(1, 1, 1, 0.06) : "transparent"
+                        radius: Theme.scaled(3)
+                    }
+                    // Daytime yellow overlay
+                    Rectangle {
+                        anchors.fill: parent
+                        color: Qt.rgba(1, 0.9, 0.3, 0.1)
+                        radius: Theme.scaled(3)
+                        visible: hourlyCell.modelData.isDaytime || false
+                    }
+
+                    Column {
+                        anchors.centerIn: parent
+                        spacing: Theme.scaled(1)
+
+                        // Hour
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: root.formatHour(hourlyCell.modelData.hour || "")
+                            color: hourlyCell.index === 0 ? Theme.textColor : Theme.textSecondaryColor
+                            font: Theme.captionFont
+                        }
+
+                        // Weather icon
+                        Image {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            source: Theme.emojiToImage(root.weatherEmoji(hourlyCell.modelData.weatherIcon || "", hourlyCell.modelData.isDaytime, hourlyCell.modelData.time || ""))
+                            sourceSize.width: Theme.scaled(16)
+                            sourceSize.height: Theme.scaled(16)
+                        }
+
+                        // Temperature
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: root.formatTemp(hourlyCell.modelData.temperature || 0)
+                            color: Theme.textColor
+                            font.family: Theme.captionFont.family
+                            font.pixelSize: Theme.captionFont.pixelSize
+                            font.bold: hourlyCell.index === 0
+                        }
+
+                        // Precipitation probability (only if > 0)
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: (hourlyCell.modelData.precipitationProbability || 0) > 0
+                                  ? (hourlyCell.modelData.precipitationProbability + "%")
+                                  : ""
+                            color: Theme.textColor
+                            font.family: Theme.captionFont.family
+                            font.pixelSize: Theme.scaled(10)
+                            visible: (hourlyCell.modelData.precipitationProbability || 0) > 0
+                        }
+                    }
+                }
+            }
+
+            // Location + provider label
+            Text {
+                Layout.alignment: Qt.AlignHCenter
+                visible: HostStatusService.state.weather.valid === true
+                text: {
+                    var parts = []
+                    if (HostStatusService.state.weather.locationName) parts.push(HostStatusService.state.weather.locationName)
+                    parts.push(HostStatusService.state.weather.provider)
+                    return parts.join(" \u00B7 ")
+                }
+                color: Theme.textSecondaryColor
+                font.family: Theme.captionFont.family
+                font.pixelSize: Theme.scaled(10)
+            }
+
+            // Loading / no-data state
+            RowLayout {
+                Layout.alignment: Qt.AlignHCenter
+                visible: !HostStatusService.state.weather.valid
+                spacing: Theme.scaled(4)
+
+                Image {
+                    visible: !HostStatusService.state.weather.loading
+                    source: Theme.emojiToImage("\u26C5")
+                    sourceSize.width: Theme.scaled(18)
+                    sourceSize.height: Theme.scaled(18)
+                }
+
+                Text {
+                    text: HostStatusService.state.weather.loading
+                          ? TranslationManager.translate("weather.loading", "Loading weather...")
+                          : TranslationManager.translate("weather.setCity", "Set city in Settings \u2192 Options")
+                    color: Theme.textSecondaryColor
+                    font: Theme.labelFont
+                }
+
+                Image {
+                    visible: !HostStatusService.state.weather.loading
+                    source: Theme.emojiToImage("\u{1F327}")
+                    sourceSize.width: Theme.scaled(18)
+                    sourceSize.height: Theme.scaled(18)
+                }
+            }
+        }
+
+        // Accessibility only - don't block flick gestures on the hourly list
+        MouseArea {
+            anchors.fill: parent
+            enabled: typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+            onClicked: {
+                var forecast = root.forecast
+                if (forecast.length > 0) {
+                    let f = forecast[0]
+                    let imperial = HostStatusService.state.weather.useImperialUnits
+                    let tempVal = imperial ? Math.round(f.temperature * 9 / 5 + 32) : Math.round(f.temperature)
+                    let windVal = imperial ? Math.round(f.windSpeed * 0.621371) : Math.round(f.windSpeed)
+                    let windUnit = imperial
+                        ? TranslationManager.translate("weather.accessible.mph", "miles per hour")
+                        : TranslationManager.translate("weather.accessible.kmh", "kilometers per hour")
+                    let msg = TranslationManager.translate("weather.accessible.announce",
+                                  "Weather: %1, %2 degrees, humidity %3 percent, wind %4 %5")
+                              .arg(f.weatherDescription
+                                   || TranslationManager.translate("weather.accessible.unknown", "unknown"))
+                              .arg(tempVal).arg(f.relativeHumidity).arg(windVal).arg(windUnit)
+                    AccessibilityManager.announceLabel(msg)
+                }
+            }
+        }
+    }
+}

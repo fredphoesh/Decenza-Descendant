@@ -1,0 +1,382 @@
+#pragma once
+
+#include "../blegattqueue.h"
+
+#include <QObject>
+#include <QBluetoothUuid>
+#include <QBluetoothDeviceInfo>
+#include <QBluetoothAddress>
+#include <QByteArray>
+#include <QString>
+#include <QTimer>
+
+#include <functional>
+
+/**
+ * Abstract BLE transport interface for scales.
+ *
+ * This abstraction allows different BLE implementations:
+ * - QtScaleBleTransport: Uses Qt's QLowEnergyController (Android, desktop)
+ * - CoreBluetoothScaleBleTransport: Uses native CoreBluetooth (iOS, macOS)
+ *
+ * Scale classes use this interface for all BLE operations.
+ * Protocol parsing remains in each scale class.
+ */
+class ScaleBleTransport : public QObject {
+    Q_OBJECT
+
+public:
+    /**
+     * BLE write types - must match Android BluetoothGattCharacteristic constants
+     */
+    enum class WriteType {
+        WithResponse = 2,    // WRITE_TYPE_DEFAULT - waits for acknowledgment
+        WithoutResponse = 1  // WRITE_TYPE_NO_RESPONSE - fire and forget
+    };
+
+    /**
+     * @param queue  The process-wide GATT queue by default. Injected in tests so
+     *               ordering can be asserted without sharing state between test
+     *               functions.
+     */
+    explicit ScaleBleTransport(QObject* parent = nullptr, BleGattQueue* queue = nullptr);
+    ~ScaleBleTransport() override;
+
+    /**
+     * Connect to a BLE device by address (for Android/desktop).
+     * Emits connected() on success, error() on failure.
+     */
+    virtual void connectToDevice(const QString& address, const QString& name) = 0;
+
+    /**
+     * Connect to a BLE device using full device info (required for iOS).
+     * Default implementation extracts address - override for iOS support.
+     */
+    virtual void connectToDevice(const QBluetoothDeviceInfo& device) {
+        connectToDevice(device.address().toString(), device.name());
+    }
+
+    /**
+     * Disconnect from the current device.
+     * Qt tears down synchronously without emitting disconnected(). Native
+     * transports may finish later; isDisconnecting() covers that interval.
+     */
+    virtual void disconnectFromDevice() = 0;
+    virtual bool isDisconnecting() const { return false; }
+
+    /**
+     * Stop tracking whatever device disconnectFromDevice() last targeted, so a
+     * later adapter power-cycle does not silently reconnect to it. Callers
+     * that only want a routine disconnect (retry ladders, timeouts) must NOT
+     * call this — the target staying live across a plain disconnect is what
+     * lets a saved device reconnect after Bluetooth toggles off and on. Only a
+     * caller that means "forget this device" should call it. Default is a
+     * no-op: only transports that track a reconnect target need to override
+     * it (CoreBluetoothScaleBleTransport).
+     */
+    virtual void forgetTarget() {}
+
+    /**
+     * Start service discovery.
+     * Emits serviceDiscovered() for each service found.
+     * Emits servicesDiscoveryFinished() when complete.
+     */
+    virtual void discoverServices() = 0;
+
+    /**
+     * Discover characteristics for a specific service.
+     * Emits characteristicDiscovered() for each characteristic found.
+     */
+    virtual void discoverCharacteristics(const QBluetoothUuid& serviceUuid) = 0;
+
+    /**
+     * Enable notifications for a characteristic.
+     * This is the critical operation that differs between Qt and native:
+     * - Qt: writeDescriptor(CCCD, 0x0100) - fails on some scales
+     * - Native Android: setCharacteristicNotification + CCCD write (more robust)
+     */
+    virtual void enableNotifications(const QBluetoothUuid& serviceUuid,
+                                     const QBluetoothUuid& characteristicUuid) = 0;
+
+    /**
+     * Write data to a characteristic.
+     * @param writeType Controls acknowledgment behavior:
+     *   - WithResponse (default): Wait for acknowledgment (WRITE_TYPE_DEFAULT)
+     *   - WithoutResponse: Fire and forget (WRITE_TYPE_NO_RESPONSE)
+     * Note: IPS (older Acaia/Lunar) requires WithoutResponse,
+     *       Pyxis (newer Lunar 2021) requires WithResponse.
+     */
+    virtual void writeCharacteristic(const QBluetoothUuid& serviceUuid,
+                                     const QBluetoothUuid& characteristicUuid,
+                                     const QByteArray& data,
+                                     WriteType writeType = WriteType::WithResponse) = 0;
+
+    /**
+     * Read data from a characteristic.
+     * Result comes via characteristicRead() signal.
+     */
+    virtual void readCharacteristic(const QBluetoothUuid& serviceUuid,
+                                    const QBluetoothUuid& characteristicUuid) = 0;
+
+    /**
+     * Check if currently connected.
+     */
+    virtual bool isConnected() const = 0;
+
+    /**
+     * True while the transport is holding a connection attempt that has not
+     * yet resolved — a controller in Connecting, not yet Connected and not
+     * yet failed.
+     *
+     * Distinct from isConnected(), and the distinction is load-bearing: a
+     * connect held in Connecting occupies the platform's connection slot, so
+     * every retry against it is rejected as a duplicate, while isConnected()
+     * reports false the whole time. A teardown gated on isConnected() alone
+     * therefore never fires for exactly the case that needs it.
+     *
+     * Default false for transports that do not park a controller.
+     */
+    virtual bool isConnecting() const { return false; }
+
+    // What this link serves. Shared by scales, refractometers and the Belka portal; it
+    // picks the log marker and GATT queue label, and only a scale's link runs the
+    // connection-priority + feed-stall machinery: a refractometer forced to
+    // CONNECTION_PRIORITY_HIGH is a third HIGH link, and the platform GATT scheduler
+    // tears the weakest one (the refractometer) down mid-discovery. One setter so the
+    // two facts cannot disagree. Set before connecting.
+    enum class LinkRole { Scale, Refractometer, Portal };
+    void setLinkRole(LinkRole role)
+    {
+        m_linkRole = role;
+        setConnectionPriorityManaged(role == LinkRole::Scale);
+    }
+
+public slots:
+    /**
+     * Detection inputs wired in main.cpp from the (stable) DE1Device and the
+     * WeightProcessor. Default no-op; QtScaleBleTransport correlates them
+     * against its own HIGH-request window and triggers the skip-HIGH +
+     * self-reconnect backoff. Scale-agnostic — no driver code involved.
+     */
+    virtual void onDe1LinkFault(const QString& kind) { Q_UNUSED(kind); }
+    // SUSPECTED stall (gap > kScaleStaleMs). `gapMs` = silence at detection.
+    // No longer drives the backoff — it is the observe/diagnostic breadcrumb;
+    // the latch trigger is onScaleFeedStallConfirmed. Default no-op.
+    virtual void onScaleFeedStalled(qint64 gapMs) { Q_UNUSED(gapMs); }
+    // CONFIRMED stall (epoch-scope-and-stall-confirm): persisted past
+    // kScaleStallConfirmMs with no recovery. THIS is what enforce latches on
+    // and what observe records as the real "would back off". Default no-op;
+    // only QtScaleBleTransport acts.
+    virtual void onScaleFeedStallConfirmed(qint64 gapMs) { Q_UNUSED(gapMs); }
+    // Recovery counterpart (observe-mode change): a previously-stalled feed
+    // resumed on its own. `gapMs` is the measured silent duration. Default
+    // no-op; only QtScaleBleTransport logs it (observe mode).
+    virtual void onScaleFeedResumed(qint64 gapMs) { Q_UNUSED(gapMs); }
+    // Espresso-cycle bracket (#1176): true from EspressoPreheating through
+    // shot end, false at idle/between shots. QtScaleBleTransport uses it so a
+    // backoff DEFERS the skip-HIGH teardown while a shot is in progress (latch
+    // only, apply at the next natural reconnect) instead of bouncing the scale
+    // mid-shot; an idle backoff still reconnects immediately. Default no-op.
+    virtual void setShotActive(bool active) { Q_UNUSED(active); }
+
+signals:
+    /**
+     * Emitted when BLE connection is established.
+     */
+    void connected();
+
+    /**
+     * Emitted when BLE connection is lost or closed.
+     */
+    void disconnected();
+
+    /**
+     * Emitted for each service discovered during discoverServices().
+     */
+    void serviceDiscovered(const QBluetoothUuid& serviceUuid);
+
+    /**
+     * Emitted when service discovery is complete.
+     */
+    void servicesDiscoveryFinished();
+
+    /**
+     * Emitted for each characteristic discovered during discoverCharacteristics().
+     * Properties is a bitmask of QLowEnergyCharacteristic::PropertyType.
+     */
+    void characteristicDiscovered(const QBluetoothUuid& serviceUuid,
+                                  const QBluetoothUuid& characteristicUuid,
+                                  int properties);
+
+    /**
+     * Emitted when characteristic discovery is complete for a service.
+     */
+    void characteristicsDiscoveryFinished(const QBluetoothUuid& serviceUuid);
+
+    /**
+     * Emitted when a characteristic value changes (notifications).
+     * This is the primary way scales receive weight data.
+     */
+    void characteristicChanged(const QBluetoothUuid& characteristicUuid,
+                               const QByteArray& value);
+
+    /**
+     * Emitted when a characteristic read completes.
+     */
+    void characteristicRead(const QBluetoothUuid& characteristicUuid,
+                            const QByteArray& value);
+
+    /**
+     * Emitted when a write operation completes successfully.
+     */
+    void characteristicWritten(const QBluetoothUuid& characteristicUuid);
+
+    // Terminal failure (including the shared operation timeout), after releasing the slot.
+    void gattOperationFailed(const QBluetoothUuid& key);
+
+    /**
+     * Emitted when notifications are successfully enabled.
+     */
+    void notificationsEnabled(const QBluetoothUuid& characteristicUuid);
+
+    /**
+     * The notify-enable has been ISSUED to the platform — it left the shared
+     * queue and reached the radio. Distinct from notificationsEnabled above,
+     * which fires at SUBMIT and deliberately does not wait for the CCCD ACK.
+     *
+     * The difference used to be nothing and is now up to a second: a scale
+     * connecting alongside the DE1 has its enable queued behind the machine's
+     * connect burst. Measured on a tablet, a driver called enableNotifications
+     * at 7.221 s and the queue dispatched it at 8.483 s. Any driver timing "did
+     * data start flowing after I enabled notifications" has to start counting
+     * from THIS, or it is counting time the scale never saw.
+     */
+    void notificationsIssued(const QBluetoothUuid& characteristicUuid);
+
+    /**
+     * Emitted on any BLE error.
+     */
+    void error(const QString& message);
+
+
+    /**
+     * Emitted for debug logging (shown in UI and written to log file).
+     */
+    void logMessage(const QString& message);
+
+protected:
+    // Default no-op: only QtScaleBleTransport (Android/desktop) requests connection
+    // priority. Reached through setLinkRole() only.
+    virtual void setConnectionPriorityManaged(bool managed) { Q_UNUSED(managed); }
+
+    // Shared-queue label for an operation on this link ("refractometer write"), so a
+    // radio-contention report names the device that actually waited.
+    QString gattLabel(const char* op) const;
+    // A transport line under the marker of what this link serves.
+    enum class LineLevel { Debug, Info, Warn };
+    void logLine(const char* platformTag, const QString& message, LineLevel level = LineLevel::Debug);
+
+    LinkRole m_linkRole = LinkRole::Scale;
+
+    // -- This transport's half of the shared GATT queue --------------------
+    //
+    // Scale and refractometer transports had NO concept of an outstanding
+    // operation: writeCharacteristic() and friends called straight through to
+    // the platform with no in-flight flag, no completion matching and no retry.
+    // That asymmetry IS issue #1819 — the DE1 side could tell an operation was
+    // outstanding and this side could not, so it had nothing to yield.
+    //
+    // Everything here is shared by both implementations rather than written
+    // twice: the Qt one and the CoreBluetooth one must order operations
+    // identically, and two copies of a sequencing rule are two rules.
+
+    /**
+     * Queue one operation.
+     *
+     * @param key        Discard key and completion matcher — the characteristic
+     *                   for reads/writes/CCCD, the service for characteristic
+     *                   discovery, null for service discovery.
+     * @param timeoutMs  The outer bound for an operation the platform never
+     *                   answers at all. Discovery legitimately takes seconds
+     *                   (6.0 s in the #1819 capture), so it gets its own.
+     *
+     * No retries, by design: that reproduces exactly what these transports did
+     * before they were queued, and inheriting the DE1's budget would let a dead
+     * scale hold the shared slot through a ~32 s retry sequence, starving the
+     * machine that budget exists to protect.
+     */
+    void submitGattOperation(const QBluetoothUuid& key,
+                             const QString& label,
+                             std::function<void()> issue,
+                             int timeoutMs = OPERATION_TIMEOUT_MS);
+
+    /** Terminal success for the operation on `key`; no-op if it isn't ours. */
+    void completeGattOperation(const QBluetoothUuid& key);
+
+    /**
+     * Terminal success for whatever operation we hold, without matching a key.
+     *
+     * For the two completions that carry no usable identity: service discovery
+     * finishing, and a descriptor write ACK (QLowEnergyDescriptor names no
+     * characteristic). The guard that matters — never releasing ANOTHER
+     * device's slot — still holds. What it cannot catch is a late ACK for an
+     * operation of ours that already timed out, releasing our next one early;
+     * that needs a timed-out operation to answer afterwards, which is the case
+     * the per-operation clock exists to make rare rather than impossible.
+     */
+    void completeGattOperation();
+
+    /** Terminal failure for whatever operation we hold. */
+    void failGattOperation();
+
+    /** Release the slot and drop our queued work. Call on disconnect and teardown. */
+    void releaseGattQueue();
+
+    /**
+     * Called on EVERY path that gives up the slot — success, failure, timeout,
+     * abandonment and teardown alike. Override to drop per-operation state that
+     * would otherwise be read against a later operation.
+     *
+     * It exists because the CoreBluetooth transport cleared its "which read is
+     * outstanding" key in four release SHIMS, and the two paths that do not go
+     * through them (the operation clock firing, and disconnectFromDevice()
+     * calling releaseGattQueue() directly) left it stale — after which an
+     * unsolicited notification on that characteristic would complete whatever
+     * held the slot next, releasing a write still on the wire. One hook, every
+     * path, rather than four call sites and a standing invitation to miss one.
+     */
+    virtual void onGattSlotReleased() {}
+
+    /** True while the slot holds an operation of ours. */
+    bool holdsGattSlot() const;
+
+    /** The characteristic/service the held operation targets, or a null UUID. */
+    QBluetoothUuid heldGattKey() const;
+
+    // Connect-time operations: notify-enable, and anything else without its own
+    // budget. Nothing time-critical is running while these are outstanding.
+    static constexpr int OPERATION_TIMEOUT_MS = 5000;
+
+    // Reads and writes, which are the operations that can be outstanding DURING
+    // a shot — the Decent Scale's 1 Hz heartbeat is the common one. Shorter than
+    // the above because this clock is what bounds the worst case for a
+    // stop-at-weight: nothing can preempt an operation the platform has already
+    // accepted, so a scale that stops answering holds the shared radio, and the
+    // DE1's stop write waits out this interval behind it.
+    //
+    // 3000 is not a guess and not a tuning knob. It is Qt's own per-job timeout
+    // on Android (RUNNABLE_TIMEOUT, QtBluetoothLE.java:69), after which Qt
+    // abandons the job and DISCARDS any late reply (:580-589) — so past this
+    // point there is provably no answer coming on that platform, and holding the
+    // shared radio longer buys nothing on any platform.
+    //
+    // It bounds the exposure rather than removing it; 3 s is still a ruined
+    // shot. Removing it means not having optional scale writes outstanding
+    // during a shot at all, which is a per-driver change and wants the
+    // measurement in task 9.7 first.
+    static constexpr int RW_TIMEOUT_MS = 3000;
+
+private:
+    BleGattQueue* m_gattQueue = nullptr;
+    QTimer m_operationTimeoutTimer;
+};

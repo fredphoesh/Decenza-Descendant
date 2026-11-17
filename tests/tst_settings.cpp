@@ -1,0 +1,2860 @@
+#include <QtTest>
+#include <QSettings>
+#include <QSignalSpy>
+#include <QQmlEngine>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <memory>
+
+#include "core/settings.h"
+#include "core/settings_ai.h"
+#include "core/settings_app.h"
+#include "core/settings_brew.h"
+#include "core/settings_dye.h"
+#include "core/settings_mcp.h"
+#include "core/settings_network.h"
+#include "core/settings_graph.h"
+#include "core/settings_theme.h"
+#include "core/settings_visualizer.h"
+#include "core/settingsserializer.h"
+#include "core/appsettings.h"
+#include <QScopeGuard>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QRegularExpression>
+#include <QFile>
+
+// Test Settings property round-trip and signal emission.
+// Under DECENZA_TESTING, Settings and every settings_<domain>.cpp construct
+// their QSettings from Settings::testQSettingsPath() — an isolated per-process
+// temp file, NOT the real ("DecentEspresso", "DE1Qt") store the shipped app
+// reads/writes. Raw QSettings seeding in these tests must use the same
+// isolated path (never the real store) or the seeded data lands somewhere
+// nothing reads. Tests still save originals in init() and restore in
+// cleanup() (guaranteed to run even if assertions fail mid-test).
+
+// File-scope helper: the ordered list of "type" values in a getZoneItems()
+// result, for compact layout-composition assertions.
+static QStringList typesOf(const QVariantList& items) {
+    QStringList result;
+    for (const QVariant& v : items)
+        result << v.toMap().value("type").toString();
+    return result;
+}
+
+// File-scope helper (Q_OBJECT moc rejects nested structs in test classes).
+// Snapshot + clear the Known Devices store so a test owns it for the
+// duration, and restore on scope exit. Settings exposes addKnownScale /
+// removeKnownScale but no bulk reset; the snapshot path covers test
+// isolation without leaking test entries into the user's QSettings store.
+struct KnownScalesGuard {
+    explicit KnownScalesGuard(Settings* s) : m_settings(s) {
+        m_snapshot = s->knownScales();
+        m_origPrimary = s->primaryScaleAddress();
+        for (const QVariant& v : m_snapshot) {
+            s->removeKnownScale(v.toMap()["address"].toString());
+        }
+    }
+    ~KnownScalesGuard() {
+        const QVariantList current = m_settings->knownScales();
+        for (const QVariant& v : current) {
+            m_settings->removeKnownScale(v.toMap()["address"].toString());
+        }
+        for (const QVariant& v : m_snapshot) {
+            const QVariantMap s = v.toMap();
+            m_settings->addKnownScale(s["address"].toString(),
+                                      s["type"].toString(),
+                                      s["name"].toString());
+        }
+        if (!m_origPrimary.isEmpty()) {
+            m_settings->setPrimaryScale(m_origPrimary);
+        }
+    }
+    Settings* m_settings;
+    QVariantList m_snapshot;
+    QString m_origPrimary;
+};
+
+class tst_Settings : public QObject {
+    Q_OBJECT
+
+private:
+    Settings m_settings;
+
+    // Saved originals — restored in cleanup() regardless of test outcome
+    double m_origTargetWeight;
+    QVariantMap m_origCustomFontSizes;
+    double m_origDoseCupTare;
+    bool m_origDoseCaptureSound;
+    double m_origSteamTemp;
+    QString m_origScaleAddress;
+    QString m_origThemeMode;
+    bool m_origIgnoreVolume;
+    bool m_origAutoUpdate;
+    QString m_origDyeBeanBrand;
+    QString m_origAutoLoadFilename;
+    int m_origAutoLoadRevertMinutes;
+    QString m_origDyeBeanBaseId;
+    QString m_origDyeBeanBaseData;
+    double m_origWaterTemperature;
+    QString m_origTemperatureUnit;
+    QByteArray m_origVesselPresets;
+    QByteArray m_origPitcherPresets;
+    int m_origSelectedPitcher = 0;
+    int m_origStandingPitcher = SettingsBrew::NoStandingPitcher;
+    bool m_origMilkAutoCapture;
+    int m_origActiveRecipeId;
+    int m_origAutoLoadRecipeId;
+    QString m_origLayoutConfiguration;
+
+private slots:
+
+    // Remote MCP no longer needs the local MCP switch. A store holding Remote Access
+    // on with MCP off had remote MCP OFF, and must not come up with the public
+    // connector running after the upgrade; one with both on keeps it.
+    void remoteMcpThatWasOffStaysOffOnUpgrade_data()
+    {
+        QTest::addColumn<bool>("mcpOn");
+        QTest::addColumn<bool>("remoteOn");
+        QTest::addColumn<bool>("remoteAfter");
+        QTest::newRow("remote on, MCP off: was off, stays off") << false << true << false;
+        QTest::newRow("both on: keeps it") << true << true << true;
+        QTest::newRow("remote off") << true << false << false;
+    }
+
+    void remoteMcpThatWasOffStaysOffOnUpgrade()
+    {
+        QFETCH(bool, mcpOn);
+        QFETCH(bool, remoteOn);
+        QFETCH(bool, remoteAfter);
+        {
+            QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+            raw.setValue("mcp/enabled", mcpOn);
+            raw.setValue("mcp/remoteEnabled", remoteOn);
+            raw.remove("migration/remoteMcpIndependentOfLocal");
+            raw.sync();
+        }
+        Settings upgraded;
+        QCOMPARE(upgraded.mcp()->remoteMcpEnabled(), remoteAfter);
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        QVERIFY(raw.value("migration/remoteMcpIndependentOfLocal").toBool());
+        raw.setValue("mcp/enabled", false);
+        raw.setValue("mcp/remoteEnabled", false);
+    }
+
+    // Discuss pastes the shot unless the chosen app can read it: an app with no
+    // connector support must never open to an empty chat because MCP is on.
+    void discussAppReadsShotOnlyThroughAWorkingConnector_data()
+    {
+        QTest::addColumn<int>("app");
+        QTest::addColumn<bool>("localServing");
+        QTest::addColumn<bool>("remoteLive");
+        QTest::addColumn<bool>("reads");
+        QTest::newRow("Claude app, connector live") << 0 << true << true << true;
+        QTest::newRow("Claude web, MCP on but no remote connector") << 1 << true << false << false;
+        QTest::newRow("ChatGPT, connector live") << 2 << false << true << true;
+        QTest::newRow("Gemini, everything on") << 3 << true << true << false;
+        QTest::newRow("Grok, everything on") << 4 << true << true << false;
+        QTest::newRow("custom URL, everything on") << 5 << true << true << false;
+        QTest::newRow("Claude Desktop, local server") << 7 << true << false << true;
+        QTest::newRow("Claude Desktop, server off") << 7 << false << true << false;
+    }
+
+    void discussAppReadsShotOnlyThroughAWorkingConnector()
+    {
+        QFETCH(int, app);
+        QFETCH(bool, localServing);
+        QFETCH(bool, remoteLive);
+        QFETCH(bool, reads);
+        QCOMPARE(SettingsNetwork::discussAppReadsShot(app, localServing, remoteLive), reads);
+    }
+
+    // === Graph display transforms ===================================================
+    //
+    // Both resolvers are static and pure, so these need no settings store and no Settings
+    // instance.
+
+    void graphFlowMultiplier_resolvesOnlyOneTwoOrThree_data()
+    {
+        QTest::addColumn<QVariant>("stored");
+        QTest::addColumn<int>("expected");
+
+        const int dflt = SettingsGraph::kFlowMultiplierDefault;
+
+        QTest::newRow("unset") << QVariant() << dflt;
+        QTest::newRow("empty string") << QVariant(QString()) << dflt;
+        QTest::newRow("zero") << QVariant(0) << dflt;
+        QTest::newRow("negative") << QVariant(-2) << dflt;
+        QTest::newRow("above range") << QVariant(7) << dflt;
+        QTest::newRow("non-numeric") << QVariant(QStringLiteral("2x")) << dflt;
+        QTest::newRow("1") << QVariant(1) << 1;
+        QTest::newRow("2") << QVariant(2) << 2;
+        QTest::newRow("3") << QVariant(3) << 3;
+        // The INI backend used on Android/Linux/iOS hands numbers back as strings, so the
+        // resolver must accept them. Reading these as unparseable would silently pin every
+        // one of those platforms to the default.
+        QTest::newRow("string 3") << QVariant(QStringLiteral("3")) << 3;
+    }
+
+    void graphFlowMultiplier_resolvesOnlyOneTwoOrThree()
+    {
+        QFETCH(QVariant, stored);
+        QFETCH(int, expected);
+        QCOMPARE(SettingsGraph::resolveFlowMultiplier(stored), expected);
+    }
+
+    // The three-state right-axis mode supersedes the graph/showWeightAxis boolean. An
+    // upgrading user must keep the choice they made under the old setting, and resolution
+    // must never write, so the old value survives a rollback.
+    void graphRightAxisMode_migratesTheSupersededBoolean_data()
+    {
+        QTest::addColumn<QVariant>("storedMode");
+        QTest::addColumn<QVariant>("legacyBool");
+        QTest::addColumn<QString>("expected");
+
+        const QString weight = SettingsGraph::kRightAxisWeight;
+        const QString temperature = SettingsGraph::kRightAxisTemperature;
+        const QString flow = SettingsGraph::kRightAxisFlow;
+
+        QTest::newRow("fresh install") << QVariant() << QVariant() << weight;
+        QTest::newRow("legacy true -> weight") << QVariant() << QVariant(true) << weight;
+        QTest::newRow("legacy false -> temperature") << QVariant() << QVariant(false) << temperature;
+        // INI backends store booleans as these strings; toBool() handles them.
+        QTest::newRow("legacy \"false\" string") << QVariant() << QVariant(QStringLiteral("false")) << temperature;
+        // An explicit mode always wins over the superseded boolean.
+        QTest::newRow("mode wins over legacy") << QVariant(flow) << QVariant(true) << flow;
+        QTest::newRow("weight") << QVariant(weight) << QVariant() << weight;
+        QTest::newRow("temperature") << QVariant(temperature) << QVariant() << temperature;
+        QTest::newRow("flow") << QVariant(flow) << QVariant() << flow;
+        // Unrecognised falls back rather than persisting nonsense — including a case
+        // mismatch, which is the shape a hand-typed literal in QML would take.
+        QTest::newRow("wrong case") << QVariant(QStringLiteral("Flow")) << QVariant() << weight;
+        QTest::newRow("garbage") << QVariant(QStringLiteral("sideways")) << QVariant() << weight;
+        QTest::newRow("garbage falls back to legacy") << QVariant(QStringLiteral("sideways")) << QVariant(false) << temperature;
+    }
+
+    void graphRightAxisMode_migratesTheSupersededBoolean()
+    {
+        QFETCH(QVariant, storedMode);
+        QFETCH(QVariant, legacyBool);
+        QFETCH(QString, expected);
+        QCOMPARE(SettingsGraph::resolveRightAxisMode(storedMode, legacyBool), expected);
+    }
+
+    // Three graphs share the right-axis control, so the order lives in one place. A cycle
+    // that failed to return to its start would strand a mode as unreachable.
+    void graphRightAxisMode_cyclesThroughAllThreeAndWraps()
+    {
+        const QString weight = SettingsGraph::kRightAxisWeight;
+        const QString temperature = SettingsGraph::kRightAxisTemperature;
+        const QString flow = SettingsGraph::kRightAxisFlow;
+
+        QCOMPARE(SettingsGraph::nextRightAxisMode(weight), temperature);
+        QCOMPARE(SettingsGraph::nextRightAxisMode(temperature), flow);
+        QCOMPARE(SettingsGraph::nextRightAxisMode(flow), weight);
+
+        // An unrecognised current mode still advances somewhere reachable rather than
+        // sticking, so a corrupt stored value cannot freeze the control.
+        QCOMPARE(SettingsGraph::nextRightAxisMode(QStringLiteral("sideways")), weight);
+    }
+
+    void steamGraphVisibilityKeepsItsPersistedKeys()
+    {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QStringList keys{QStringLiteral("graph/showFlow"),
+                               QStringLiteral("steamGraph/showPressure"),
+                               QStringLiteral("steamGraph/showFlow"),
+                               QStringLiteral("steamGraph/showTemperature")};
+        QVariantMap originals;
+        for (const QString& key : keys) {
+            if (raw.contains(key)) originals.insert(key, raw.value(key));
+            raw.remove(key);
+        }
+        const auto restore = qScopeGuard([&raw, keys, originals] {
+            for (const QString& key : keys) {
+                if (originals.contains(key)) raw.setValue(key, originals.value(key));
+                else raw.remove(key);
+            }
+        });
+
+        SettingsGraph graph;
+        QVERIFY(graph.showSteamPressure());
+        QVERIFY(graph.showSteamFlow());
+        QVERIFY(graph.showSteamTemperature());
+        graph.setShowFlow(true);
+        QSignalSpy snapshotChanged(&graph, &SettingsGraph::snapshotChanged);
+        graph.setShowSteamFlow(false);
+        QCOMPARE(raw.value(QStringLiteral("steamGraph/showFlow")).toBool(), false);
+        QCOMPARE(snapshotChanged.count(), 1);
+        QCOMPARE(graph.snapshot().value(QStringLiteral("showSteamFlow")).toBool(), false);
+        QCOMPARE(graph.snapshot().value(QStringLiteral("showFlow")).toBool(), true);
+    }
+
+    void init() { QTest::failOnWarning();
+        // Save all originals before each test
+        m_origTargetWeight = m_settings.brew()->targetWeight();
+        m_origDoseCupTare = m_settings.brew()->doseCupTareWeight();
+        m_origDoseCaptureSound = m_settings.brew()->doseCaptureSoundEnabled();
+        m_origSteamTemp = m_settings.brew()->steamTemperature();
+        m_origScaleAddress = m_settings.scaleAddress();
+        m_origThemeMode = m_settings.theme()->themeMode();
+        // Font sizes: saved/restored like every other setting rather than relying on
+        // a trailing reset inside each test — a trailing reset does not run when an
+        // assertion fails mid-test, which is exactly when leaked state does most harm.
+        m_origCustomFontSizes = m_settings.theme()->customFontSizes();
+        m_origIgnoreVolume = m_settings.brew()->ignoreVolumeWithScale();
+        m_origAutoUpdate = m_settings.upload()->autoUpdate();
+        m_origDyeBeanBrand = m_settings.dye()->dyeBeanBrand();
+        m_origAutoLoadFilename = m_settings.app()->autoLoadProfileFilename();
+        m_origAutoLoadRevertMinutes = m_settings.app()->autoLoadRevertMinutes();
+        m_origDyeBeanBaseId = m_settings.dye()->dyeBeanBaseId();
+        m_origDyeBeanBaseData = m_settings.dye()->dyeBeanBaseData();
+        m_origWaterTemperature = m_settings.brew()->waterTemperature();
+        m_origTemperatureUnit = m_settings.app()->temperatureUnit();
+        // Mutated directly by the effectiveSteamDurationSec tests AND as a side effect of
+        // setSteamPitcherCalibration (calibrating re-enables weight-timed steaming).
+        m_origMilkAutoCapture = m_settings.brew()->milkAutoCaptureEnabled();
+        { QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+          m_origVesselPresets = raw.value("water/vesselPresets").toByteArray();
+          m_origPitcherPresets = raw.value("steam/pitcherPresets").toByteArray();
+          m_origSelectedPitcher = raw.value("steam/selectedPitcher", 0).toInt();
+          m_origStandingPitcher = raw.value("steam/standingPitcher",
+                                            SettingsBrew::NoStandingPitcher).toInt(); }
+        m_origActiveRecipeId = m_settings.dye()->activeRecipeId();
+        m_origAutoLoadRecipeId = m_settings.dye()->autoLoadRecipeId();
+        // Layout: saved/restored here for the same reason as the font sizes
+        // above. The layout tests mutate a shared store and a trailing restore
+        // inside each test is skipped when an assertion fails — leaving a
+        // half-built layout (or, after resetLayoutToDefault(), NO layout key at
+        // all) for every later layout test to trip over, which buries the first
+        // real failure under cascading ones.
+        m_origLayoutConfiguration = m_settings.network()->layoutConfiguration();
+    }
+
+    void cleanup() {
+        // Restore all originals after each test (runs even on assertion failure)
+        m_settings.network()->setLayoutConfiguration(m_origLayoutConfiguration);
+        m_settings.theme()->setCustomFontSizes(m_origCustomFontSizes);
+        m_settings.brew()->setTargetWeight(m_origTargetWeight);
+        m_settings.brew()->setDoseCupTareWeight(m_origDoseCupTare);
+        m_settings.brew()->setDoseCaptureSoundEnabled(m_origDoseCaptureSound);
+        m_settings.brew()->setSteamTemperature(m_origSteamTemp);
+        m_settings.setScaleAddress(m_origScaleAddress);
+        m_settings.theme()->setThemeMode(m_origThemeMode);
+        m_settings.brew()->setIgnoreVolumeWithScale(m_origIgnoreVolume);
+        m_settings.upload()->setAutoUpdate(m_origAutoUpdate);
+        m_settings.dye()->setDyeBeanBrand(m_origDyeBeanBrand);
+        m_settings.app()->setAutoLoadProfileFilename(m_origAutoLoadFilename);
+        m_settings.app()->setAutoLoadRevertMinutes(m_origAutoLoadRevertMinutes);
+        m_settings.dye()->setDyeBeanBaseId(m_origDyeBeanBaseId);
+        m_settings.dye()->setDyeBeanBaseData(m_origDyeBeanBaseData);
+        m_settings.brew()->setWaterTemperature(m_origWaterTemperature);
+        m_settings.app()->setTemperatureUnit(m_origTemperatureUnit);
+        m_settings.brew()->setMilkAutoCaptureEnabled(m_origMilkAutoCapture);
+        { QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+          raw.setValue("water/vesselPresets", m_origVesselPresets);
+          raw.setValue("steam/pitcherPresets", m_origPitcherPresets);
+          raw.setValue("steam/selectedPitcher", m_origSelectedPitcher);
+          // The parked recipe-override pitcher. A test that leaves this set makes
+          // the NEXT test's unwind restore a pitcher it never parked, and the
+          // failure lands somewhere unrelated.
+          raw.setValue("steam/standingPitcher", m_origStandingPitcher);
+          raw.remove("steam/heaterOffRemovedNames");
+          raw.sync(); }
+        // Recipe state (add-recipes).
+        m_settings.dye()->setActiveRecipeId(m_origActiveRecipeId);
+        // recipe-auto-load: restored last so it wins regardless of what the
+        // autoLoadProfileFilename restore above may have cross-cleared it to.
+        m_settings.dye()->setAutoLoadRecipeId(m_origAutoLoadRecipeId);
+    }
+
+    void mqttBackupCarriesDeviceIdNeverClientId() {
+        // The client ID is the broker's session key: a restored backup that copied it made
+        // two live installs disconnect each other. The device ID is the Home Assistant
+        // identity a replacement tablet must keep.
+        AppSettings raw;
+        const QStringList keys{"mqtt/clientId", "mqtt/deviceId", "mqtt/discoveryMigrated"};
+        QVariantMap original;
+        for (const auto& key : keys) original[key] = raw.value(key);
+        const auto restore = qScopeGuard([&] {
+            for (const auto& key : keys) {
+                if (original[key].isValid()) raw.setValue(key, original[key]);
+                else raw.remove(key);
+            }
+        });
+        raw.setValue("mqtt/clientId", "decenza_here_1");
+        raw.setValue("mqtt/deviceId", "decenza_ha_1");
+
+        const auto mqtt = SettingsSerializer::exportToJson(&m_settings, false)["mqtt"].toObject();
+        QVERIFY2(!mqtt.contains("clientId"), "the client ID must never leave the install");
+        QCOMPARE(mqtt.value("deviceId").toString(), QString("decenza_ha_1"));
+
+        SettingsSerializer::importFromJson(&m_settings, QJsonObject{{"mqtt", QJsonObject{{"deviceId", "decenza_ha_2"}}}});
+        QCOMPARE(raw.value("mqtt/deviceId").toString(), QString("decenza_ha_2"));
+
+        // A backup from before the device ID: its client ID built that install's unique_ids,
+        // so it becomes the device ID — and this install keeps its own client ID.
+        SettingsSerializer::importFromJson(&m_settings, QJsonObject{{"mqtt", QJsonObject{{"clientId", "decenza_old_tablet"}}}});
+        QCOMPARE(raw.value("mqtt/deviceId").toString(), QString("decenza_old_tablet"));
+        QCOMPARE(raw.value("mqtt/clientId").toString(), QString("decenza_here_1"));
+    }
+
+    void mqttRestoreWithoutPasswordCannotRedirectIt() {
+        // POST /api/backup/restore excludes the password: a crafted backup naming another
+        // host, or TLS off, would otherwise send the stored one there in CONNECT.
+        AppSettings raw;
+        const QStringList keys{"mqtt/password", "mqtt/brokerHost", "mqtt/useTls", "mqtt/baseTopic"};
+        QVariantMap original;
+        for (const auto& key : keys) original[key] = raw.value(key);
+        const auto restore = qScopeGuard([&] {
+            for (const auto& key : keys) {
+                if (original[key].isValid()) raw.setValue(key, original[key]);
+                else raw.remove(key);
+            }
+        });
+        raw.setValue("mqtt/password", "secret");
+        raw.setValue("mqtt/brokerHost", "broker.home");
+        raw.setValue("mqtt/useTls", true);
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("kept this device's"));
+        SettingsSerializer::importFromJson(&m_settings,
+            QJsonObject{{"mqtt", QJsonObject{{"brokerHost", "attacker.example"}, {"useTls", false},
+                                             {"baseTopic", "restored"}}}},
+            SettingsSerializer::sensitiveKeys());
+
+        QCOMPARE(raw.value("mqtt/brokerHost").toString(), QString("broker.home"));
+        QVERIFY(raw.value("mqtt/useTls").toBool());
+        QCOMPARE(raw.value("mqtt/baseTopic").toString(), QString("restored"));   // the rest restores
+    }
+
+    void uploadSwitchesLeaveAnUpgradedInstallUnchanged() {
+        // An install from before the switches has none stored: Visualizer must stay
+        // on (it uploaded before) and Decent off (opt-in, as in Decaid).
+        AppSettings raw;
+        const QStringList keys{"visualizer/enabled", "visualizer/username", "visualizer/password", "decent/enabled",
+                               "visualizer/autoUpload", "visualizer/minDuration"};
+        QVariantMap original;
+        for (const auto& key : keys) original[key] = raw.value(key);
+        const auto restore = qScopeGuard([&] {
+            for (const auto& key : keys) {
+                if (original[key].isValid()) raw.setValue(key, original[key]);
+                else raw.remove(key);
+            }
+        });
+        for (const auto& key : keys) raw.remove(key);
+        // A choice made on the old Visualizer tab carries over to the shared settings.
+        raw.setValue("visualizer/autoUpload", false);
+        raw.setValue("visualizer/minDuration", 10.0);
+        raw.sync();
+
+        Settings fresh;
+        QVERIFY(!fresh.upload()->autoUpload());
+        QCOMPARE(fresh.upload()->minDuration(), 10.0);
+        QVERIFY(fresh.visualizer()->visualizerEnabled());
+        QVERIFY(!fresh.decent()->enabled());
+        QVERIFY2(!fresh.visualizer()->visualizerActive(), "switched on but no account is not active");
+        fresh.visualizer()->setVisualizerUsername("barista");
+        fresh.visualizer()->setVisualizerPassword("secret");
+        QVERIFY(fresh.visualizer()->visualizerActive());
+        fresh.visualizer()->setVisualizerEnabled(false);
+        QVERIFY(!fresh.visualizer()->visualizerActive());
+    }
+
+    void decentAccountNeverTransfers() {
+        AppSettings raw;
+        const QStringList keys{"decent/email", "decent/cryptpw", "decent/enabled", "visualizer/enabled",
+                               "visualizer/autoUpload", "visualizer/minDuration"};
+        QVariantMap original;
+        for (const auto& key : keys) original[key] = raw.value(key);
+        const auto restore = qScopeGuard([&] {
+            for (const auto& key : keys) {
+                if (original[key].isValid()) raw.setValue(key, original[key]);
+                else raw.remove(key);
+            }
+        });
+        m_settings.decent()->setAccount("owner@example.com", "cryptpw-token");
+        m_settings.decent()->setEnabled(true);
+
+        // Not even a credential-complete export carries the account.
+        const auto decent = SettingsSerializer::exportToJson(&m_settings, true)["decent"].toObject();
+        QCOMPARE(QJsonDocument(decent).toJson(QJsonDocument::Compact),
+                 QByteArray(R"({"enabled":true})"));
+
+        // A hand-edited backup naming another account must neither replace this one
+        // nor wipe it; the switches and the shared settings do restore.
+        SettingsSerializer::importFromJson(&m_settings, QJsonObject{
+            {"decent", QJsonObject{{"email", "attacker@example.com"}, {"cryptpw", "stolen"},
+                                   {"encryptedPassword", "stolen"}, {"enabled", false}}},
+            {"visualizer", QJsonObject{{"enabled", false}, {"autoUpload", false}, {"minDuration", 9.0}}}});
+        QCOMPARE(m_settings.decent()->email(), QStringLiteral("owner@example.com"));
+        QCOMPARE(m_settings.decent()->encryptedPassword(), QStringLiteral("cryptpw-token"));
+        QVERIFY(!m_settings.decent()->enabled());
+        QVERIFY(!m_settings.visualizer()->visualizerEnabled());
+        QVERIFY(!m_settings.upload()->autoUpload());
+        QCOMPARE(m_settings.upload()->minDuration(), 9.0);
+    }
+
+    void portalSelectionAndDisplayPreferenceSurviveBackup() {
+        AppSettings raw;
+        const QStringList keys{"portal/address", "portal/name", "portal/syncDisplay"};
+        QVariantMap original;
+        for (const auto& key : keys) original[key] = raw.value(key);
+        const auto restore = qScopeGuard([&] {
+            for (const auto& key : keys) {
+                if (original[key].isValid()) raw.setValue(key, original[key]);
+                else raw.remove(key);
+            }
+        });
+        raw.setValue(keys[0], "AA:BB:CC:DD:EE:FF");
+        raw.setValue(keys[1], "Test PORTAL");
+        raw.setValue(keys[2], false);
+        const auto portal = SettingsSerializer::exportToJson(&m_settings, false)["portal"].toObject();
+        QCOMPARE(portal.value("address").toString(), QString("AA:BB:CC:DD:EE:FF"));
+        QCOMPARE(portal.value("name").toString(), QString("Test PORTAL"));
+        QVERIFY(portal.contains("syncDisplay"));
+        QVERIFY(!portal.value("syncDisplay").toBool());
+        for (const auto& key : keys) raw.remove(key);
+        SettingsSerializer::importFromJson(&m_settings, QJsonObject{{"portal", portal}});
+        QCOMPARE(raw.value(keys[0]).toString(), QString("AA:BB:CC:DD:EE:FF"));
+        QCOMPARE(raw.value(keys[1]).toString(), QString("Test PORTAL"));
+        QCOMPARE(raw.value(keys[2]), QVariant(false));
+        // Old backups and an explicitly excluded pairing must preserve this device.
+        SettingsSerializer::importFromJson(&m_settings, QJsonObject{});
+        SettingsSerializer::importFromJson(&m_settings, QJsonObject{{"portal", QJsonObject{}}}, {"portal"});
+        QCOMPARE(raw.value(keys[0]).toString(), QString("AA:BB:CC:DD:EE:FF"));
+        QCOMPARE(raw.value(keys[2]), QVariant(false));
+    }
+
+    void aiModelChoicesSurviveBackup() {
+        auto* ai = m_settings.ai();
+        const QJsonObject original = ai->providerModels();
+        const auto restore = qScopeGuard([&] {
+            for (const QString& id : {QStringLiteral("openai"), QStringLiteral("openrouter")})
+                ai->setProviderModel(id, original.value(id).toString());
+        });
+        ai->setProviderModel("openai", "gpt-6-luna");
+        ai->setProviderModel("openrouter", "openai/gpt-6.1-sol");
+        const QJsonObject backup = SettingsSerializer::exportToJson(&m_settings, false)["ai"].toObject();
+        ai->setProviderModel("openai", QString());
+        ai->setProviderModel("openrouter", QString());
+        SettingsSerializer::importFromJson(&m_settings, QJsonObject{{"ai", backup}});
+        QCOMPARE(ai->providerModel("openai"), QString("gpt-6-luna"));
+        QCOMPARE(ai->providerModel("openrouter"), QString("openai/gpt-6.1-sol"));
+    }
+
+    // ==========================================
+    // Property round-trip (set -> get)
+    // ==========================================
+
+    void targetWeightRoundTrip() {
+        m_settings.brew()->setTargetWeight(42.5);
+        QCOMPARE(m_settings.brew()->targetWeight(), 42.5);
+    }
+
+    void doseCupTareWeightRoundTrip() {
+        m_settings.brew()->setDoseCupTareWeight(12.5);
+        QCOMPARE(m_settings.brew()->doseCupTareWeight(), 12.5);
+    }
+
+    void doseCupTareWeightClampsNegativeToZero() {
+        // Setter clamps below 0 — a negative tare would otherwise inflate the
+        // computed net dose. 0 is the "no cup / feature off" sentinel.
+        m_settings.brew()->setDoseCupTareWeight(-5.0);
+        QCOMPARE(m_settings.brew()->doseCupTareWeight(), 0.0);
+    }
+
+    void doseCaptureSoundEnabledRoundTrip() {
+        m_settings.brew()->setDoseCaptureSoundEnabled(true);
+        QCOMPARE(m_settings.brew()->doseCaptureSoundEnabled(), true);
+        m_settings.brew()->setDoseCaptureSoundEnabled(false);
+        QCOMPARE(m_settings.brew()->doseCaptureSoundEnabled(), false);
+    }
+
+    void steamTemperatureRoundTrip() {
+        m_settings.brew()->setSteamTemperature(155.0);
+        QCOMPARE(m_settings.brew()->steamTemperature(), 155.0);
+    }
+
+    void scaleAddressRoundTrip() {
+        m_settings.setScaleAddress("AA:BB:CC:DD:EE:FF");
+        QCOMPARE(m_settings.scaleAddress(), QString("AA:BB:CC:DD:EE:FF"));
+    }
+
+    void themeModeRoundTrip() {
+        m_settings.theme()->setThemeMode("light");
+        QCOMPARE(m_settings.theme()->themeMode(), QString("light"));
+    }
+
+    void uploadAutoUpdateDefaultIsTrue() {
+        // Default value is true — auto-update is opt-out, not opt-in. It reads the
+        // pre-split visualizer/autoUpdate key, so an existing choice carries over.
+        // Strategy: write the opposite (false) so any per-instance or NSUserDefaults
+        // cache holds false, then remove the disk key and read through a fresh
+        // Settings instance. If the result is true, the hardcoded default actually
+        // ran (a stale cache would have returned false).
+        m_settings.upload()->setAutoUpdate(false);
+        QVERIFY(!m_settings.upload()->autoUpdate());
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        raw.remove("visualizer/autoUpdate");
+        raw.sync();
+        Settings fresh;
+        QVERIFY(fresh.upload()->autoUpdate());
+    }
+
+    void uploadAutoUpdateRoundTrip() {
+        m_settings.upload()->setAutoUpdate(false);
+        QCOMPARE(m_settings.upload()->autoUpdate(), false);
+        m_settings.upload()->setAutoUpdate(true);
+        QCOMPARE(m_settings.upload()->autoUpdate(), true);
+    }
+
+    void exportedSettingsRestoreChangedValues() {
+        m_settings.setScaleAddress(QStringLiteral("AA:BB:CC:DD:EE:FF"));
+        m_settings.brew()->setSteamTemperature(155.0);
+        m_settings.brew()->setDoseCaptureSoundEnabled(true);
+        const QJsonObject exported = SettingsSerializer::exportToJson(&m_settings, false);
+        m_settings.setScaleAddress(QStringLiteral("11:22:33:44:55:66"));
+        m_settings.brew()->setSteamTemperature(140.0);
+        m_settings.brew()->setDoseCaptureSoundEnabled(false);
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, QJsonObject{
+            {QStringLiteral("scale"), exported.value(QStringLiteral("scale"))},
+            {QStringLiteral("steam"), exported.value(QStringLiteral("steam"))},
+            {QStringLiteral("espresso"), exported.value(QStringLiteral("espresso"))}}));
+        QCOMPARE(m_settings.scaleAddress(), QStringLiteral("AA:BB:CC:DD:EE:FF"));
+        QCOMPARE(m_settings.brew()->steamTemperature(), 155.0);
+        QVERIFY(m_settings.brew()->doseCaptureSoundEnabled());
+    }
+
+    void ignoreVolumeWithScaleRoundTrip() {
+        bool original = m_settings.brew()->ignoreVolumeWithScale();
+        m_settings.brew()->setIgnoreVolumeWithScale(!original);
+        QCOMPARE(m_settings.brew()->ignoreVolumeWithScale(), !original);
+    }
+
+    void dyeBeanBaseLinkRoundTripAndClear() {
+        m_settings.dye()->setDyeBeanBaseId("5188");
+        m_settings.dye()->setDyeBeanBaseData("{\"id\":\"5188\",\"origin\":\"Colombia\"}");
+        QCOMPARE(m_settings.dye()->dyeBeanBaseId(), QString("5188"));
+        QVERIFY(m_settings.dye()->dyeBeanBaseData().contains("Colombia"));
+
+        m_settings.dye()->clearBeanBaseLink();
+        QCOMPARE(m_settings.dye()->dyeBeanBaseId(), QString());
+        QCOMPARE(m_settings.dye()->dyeBeanBaseData(), QString());
+    }
+
+    void dyeBagAndEquipmentIdentityExcludedFromExport() {
+        // Bean identity (incl. the Bean Base link) lives on the active bag, and
+        // the grinder on the active equipment package, in the shot history
+        // database and travel via the DB import path — the settings JSON must
+        // not carry them (importing them on another device would write
+        // through into whatever bag or grinder is active there).
+        m_settings.dye()->setDyeBeanBaseId("abc-123");
+        m_settings.dye()->setDyeBeanBaseData("{\"id\":\"abc-123\"}");
+        const QJsonObject exported = SettingsSerializer::exportToJson(&m_settings, false);
+
+        const QJsonObject dye = exported["dye"].toObject();
+        QVERIFY(!dye.contains("beanBrand"));
+        QVERIFY(!dye.contains("beanType"));
+        QVERIFY(!dye.contains("roastDate"));
+        QVERIFY(!dye.contains("roastLevel"));
+        QVERIFY(!dye.contains("beanBaseId"));
+        QVERIFY(!dye.contains("beanBaseData"));
+        QVERIFY(!dye.contains("grinderBrand"));
+        QVERIFY(!dye.contains("grinderModel"));
+        QVERIFY(!dye.contains("grinderBurrs"));
+        QVERIFY(!dye.contains("grinderSetting"));
+        QVERIFY(!exported.contains("beans"));
+
+        // Importing a legacy export's dye section must not touch the link.
+        m_settings.dye()->setDyeBeanBaseId("keep-me");
+        const QString grinderBefore = m_settings.dye()->dyeGrinderModel();
+        const QString grindBefore = m_settings.dye()->dyeGrinderSetting();
+        QJsonObject legacy = exported;
+        QJsonObject legacyDye = legacy["dye"].toObject();
+        legacyDye["beanBaseId"] = "stale-id";
+        legacyDye["beanBrand"] = "Stale Roaster";
+        legacyDye["grinderModel"] = "Stale Grinder";
+        legacyDye["grinderSetting"] = "stale-grind";
+        legacy["dye"] = legacyDye;
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        SettingsSerializer::importFromJson(&m_settings, legacy);
+        QCOMPARE(m_settings.dye()->dyeBeanBaseId(), QString("keep-me"));
+        QCOMPARE(m_settings.dye()->dyeGrinderModel(), grinderBefore);
+        QCOMPARE(m_settings.dye()->dyeGrinderSetting(), grindBefore);
+
+        m_settings.dye()->clearBeanBaseLink();
+    }
+
+    // ==========================================
+    // DYE fields (structured grinder data)
+    // ==========================================
+
+    void dyeFieldsRoundTrip() {
+        m_settings.dye()->setDyeBeanBrand("Square Mile");
+        QCOMPARE(m_settings.dye()->dyeBeanBrand(), QString("Square Mile"));
+    }
+
+    // ==========================================
+    // Signal emission
+    // ==========================================
+
+    void targetWeightSignalEmitted() {
+        QSignalSpy spy(m_settings.brew(), &SettingsBrew::targetWeightChanged);
+        m_settings.brew()->setTargetWeight(m_origTargetWeight + 1.0);
+        QVERIFY(spy.count() >= 1);
+    }
+
+    void themeModeSignalEmitted() {
+        QString newMode = (m_origThemeMode == "dark") ? "light" : "dark";
+        QSignalSpy spy(m_settings.theme(), &SettingsTheme::themeModeChanged);
+        m_settings.theme()->setThemeMode(newMode);
+        QVERIFY(spy.count() >= 1);
+    }
+
+    void uploadAutoUpdateSignalEmitted() {
+        QSignalSpy spy(m_settings.upload(), &SettingsUpload::autoUpdateChanged);
+        m_settings.upload()->setAutoUpdate(!m_origAutoUpdate);
+        QVERIFY(spy.count() >= 1);
+    }
+
+    // ==========================================
+    // Edge cases
+    // ==========================================
+
+    void targetWeightZeroIsValid() {
+        // 0 means disabled (no SAW)
+        m_settings.brew()->setTargetWeight(0.0);
+        QCOMPARE(m_settings.brew()->targetWeight(), 0.0);
+    }
+
+    void emptyScaleAddressIsValid() {
+        m_settings.setScaleAddress("");
+        QCOMPARE(m_settings.scaleAddress(), QString(""));
+    }
+
+    // ==========================================
+    // Derived: effectiveHotWaterVolume
+    // ==========================================
+
+    void effectiveHotWaterVolumeRespectsMode() {
+        QString origMode = m_settings.brew()->waterVolumeMode();
+        int origVol = m_settings.brew()->waterVolume();
+
+        m_settings.brew()->setWaterVolume(65);
+
+        m_settings.brew()->setWaterVolumeMode("weight");
+        QCOMPARE(m_settings.brew()->effectiveHotWaterVolume(), 0);
+
+        m_settings.brew()->setWaterVolumeMode("volume");
+        QCOMPARE(m_settings.brew()->effectiveHotWaterVolume(), 65);
+
+        // Anything other than "volume" is treated as weight mode.
+        m_settings.brew()->setWaterVolumeMode("something-else");
+        QCOMPARE(m_settings.brew()->effectiveHotWaterVolume(), 0);
+
+        // Lower bound: negative values from corrupted storage must clamp to 0,
+        // not wrap to 255 after uint8 cast.
+        m_settings.brew()->setWaterVolumeMode("volume");
+        m_settings.brew()->setWaterVolume(-1);
+        QCOMPARE(m_settings.brew()->effectiveHotWaterVolume(), 0);
+
+        // Upper bound: values above 255 clamp to the BLE uint8 max.
+        m_settings.brew()->setWaterVolume(500);
+        QCOMPARE(m_settings.brew()->effectiveHotWaterVolume(), 255);
+
+        m_settings.brew()->setWaterVolumeMode(origMode);
+        m_settings.brew()->setWaterVolume(origVol);
+    }
+
+    // ==========================================
+    // Auto-load profile settings
+    // ==========================================
+
+    void autoLoadFilenameRoundTrip() {
+        m_settings.app()->setAutoLoadProfileFilename("");  // baseline
+        QSignalSpy spy(m_settings.app(), &SettingsApp::autoLoadProfileFilenameChanged);
+        m_settings.app()->setAutoLoadProfileFilename("my-profile");
+        QCOMPARE(m_settings.app()->autoLoadProfileFilename(), QString("my-profile"));
+        QCOMPARE(spy.count(), 1);
+        // Setting the same value again is a no-op (no second signal).
+        m_settings.app()->setAutoLoadProfileFilename("my-profile");
+        QCOMPARE(spy.count(), 1);
+    }
+
+    void autoLoadRevertMinutesRoundTrip() {
+        m_settings.app()->setAutoLoadRevertMinutes(5);
+        QSignalSpy spy(m_settings.app(), &SettingsApp::autoLoadRevertMinutesChanged);
+        m_settings.app()->setAutoLoadRevertMinutes(12);
+        QCOMPARE(m_settings.app()->autoLoadRevertMinutes(), 12);
+        QCOMPARE(spy.count(), 1);
+    }
+
+    void autoLoadRevertMinutesClamped() {
+        // Range is 0..60 — 0 means "idle revert off" but startup + wake still fire.
+        m_settings.app()->setAutoLoadRevertMinutes(-5);
+        QCOMPARE(m_settings.app()->autoLoadRevertMinutes(), 0);
+        m_settings.app()->setAutoLoadRevertMinutes(200);
+        QCOMPARE(m_settings.app()->autoLoadRevertMinutes(), 60);
+        m_settings.app()->setAutoLoadRevertMinutes(30);
+        QCOMPARE(m_settings.app()->autoLoadRevertMinutes(), 30);
+        m_settings.app()->setAutoLoadRevertMinutes(0);
+        QCOMPARE(m_settings.app()->autoLoadRevertMinutes(), 0);
+    }
+
+    void autoLoadBundleRoundTrip() {
+        m_settings.app()->setAutoLoadProfileFilename("preferred-profile");
+        m_settings.app()->setAutoLoadRevertMinutes(17);
+
+        QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+
+        // Mutate to confirm import overwrites
+        m_settings.app()->setAutoLoadProfileFilename("other-profile");
+        m_settings.app()->setAutoLoadRevertMinutes(2);
+
+        // importFromJson emits a qWarning when it replaces the favorites array,
+        // even with 0 → 0 favorites. Suppress that one expected message so the
+        // test doesn't fall foul of the "no warnings in tests" rule.
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+        QCOMPARE(m_settings.app()->autoLoadProfileFilename(), QString("preferred-profile"));
+        QCOMPARE(m_settings.app()->autoLoadRevertMinutes(), 17);
+    }
+
+    // ==========================================
+    // Favorites order (profile-favorites-order)
+    // ==========================================
+    //
+    // Raw QSettings seeding, not addFavoriteProfile()/removeFavoriteProfile() —
+    // those have side effects (un-hide, select) on OTHER keys that would need
+    // their own cleanup. Direct writes to "profile/favorites" isolate the
+    // resolve-when-absent rule to the one key it actually reads.
+
+    void favoriteProfileOrderResolvesToCustomWhenFavoritesExist() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QByteArray origFavorites = raw.value("profile/favorites").toByteArray();
+        const QVariant origOrder = raw.value("profile/favoriteOrder");
+
+        QJsonArray arr;
+        QJsonObject f; f["name"] = "Test Fav"; f["filename"] = "test-fav.json";
+        arr.append(f);
+        raw.setValue("profile/favorites", QJsonDocument(arr).toJson());
+        raw.remove("profile/favoriteOrder");
+        raw.sync();
+
+        QCOMPARE(m_settings.app()->favoriteProfileOrder(), QString("custom"));
+        // The read must not have written the key — resolving is not switching.
+        QVERIFY(!QSettings(Settings::testQSettingsPath(), QSettings::IniFormat)
+                     .contains("profile/favoriteOrder"));
+
+        raw.setValue("profile/favorites", origFavorites);
+        if (origOrder.isValid()) raw.setValue("profile/favoriteOrder", origOrder);
+        else raw.remove("profile/favoriteOrder");
+    }
+
+    void favoriteProfileOrderResolvesToUsageWhenNoFavorites() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QByteArray origFavorites = raw.value("profile/favorites").toByteArray();
+        const QVariant origOrder = raw.value("profile/favoriteOrder");
+
+        raw.setValue("profile/favorites", QJsonDocument(QJsonArray()).toJson());
+        raw.remove("profile/favoriteOrder");
+        raw.sync();
+
+        QCOMPARE(m_settings.app()->favoriteProfileOrder(), QString("usage"));
+
+        raw.setValue("profile/favorites", origFavorites);
+        if (origOrder.isValid()) raw.setValue("profile/favoriteOrder", origOrder);
+        else raw.remove("profile/favoriteOrder");
+    }
+
+    // Stamping at startup is what keeps a NEW user in usage mode after their
+    // first star: the resolve rule alone would flip them to custom.
+    void favoriteProfileOrderStampSurvivesFirstFavorite() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QByteArray origFavorites = raw.value("profile/favorites").toByteArray();
+        const QVariant origOrder = raw.value("profile/favoriteOrder");
+
+        raw.setValue("profile/favorites", QJsonDocument(QJsonArray()).toJson());
+        raw.remove("profile/favoriteOrder");
+        raw.sync();
+
+        m_settings.app()->persistFavoriteProfileOrderIfAbsent();
+        QCOMPARE(raw.value("profile/favoriteOrder").toString(), QString("usage"));
+
+        QJsonArray arr;
+        QJsonObject f; f["name"] = "First Fav"; f["filename"] = "first-fav.json";
+        arr.append(f);
+        raw.setValue("profile/favorites", QJsonDocument(arr).toJson());
+        raw.sync();
+        QCOMPARE(m_settings.app()->favoriteProfileOrder(), QString("usage"));
+
+        // A second stamp never overwrites a value already present.
+        raw.setValue("profile/favoriteOrder", "alpha");
+        raw.sync();
+        m_settings.app()->persistFavoriteProfileOrderIfAbsent();
+        QCOMPARE(raw.value("profile/favoriteOrder").toString(), QString("alpha"));
+
+        raw.setValue("profile/favorites", origFavorites);
+        if (origOrder.isValid()) raw.setValue("profile/favoriteOrder", origOrder);
+        else raw.remove("profile/favoriteOrder");
+    }
+
+    // Removing a favorite BEFORE the selected one used to leave the positional
+    // index on the neighbour; the selection must follow the profile.
+    void removingAnEarlierFavoriteKeepsTheSelectionOnTheSameProfile() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QByteArray origFavorites = raw.value("profile/favorites").toByteArray();
+        const int origSelected = m_settings.app()->selectedFavoriteProfile();
+
+        QJsonArray arr;
+        for (const char* fn : {"fav_a", "fav_b", "fav_c", "fav_d"}) {
+            QJsonObject f; f["name"] = fn; f["filename"] = fn; arr.append(f);
+        }
+        raw.setValue("profile/favorites", QJsonDocument(arr).toJson());
+        raw.sync();
+        m_settings.app()->setSelectedFavoriteProfile(2);  // fav_c
+
+        m_settings.app()->removeFavoriteProfile(0);       // fav_a
+        QCOMPARE(m_settings.app()->selectedFavoriteProfile(), 1);
+        QCOMPARE(m_settings.app()->favoriteProfiles().at(1).toMap().value("filename").toString(), QString("fav_c"));
+
+        m_settings.app()->removeFavoriteProfile(1);       // fav_c itself
+        QCOMPARE(m_settings.app()->selectedFavoriteProfile(), -1);
+
+        raw.setValue("profile/favorites", origFavorites);
+        raw.sync();
+        m_settings.app()->setSelectedFavoriteProfile(origSelected);
+    }
+
+    // A backup restore rebuilds the favorites list by remove-then-add; the
+    // selected index must land on the rebuilt list, and the auto-load pin must
+    // survive when the payload does not carry one.
+    void importRestoresSelectedFavoriteAndKeepsAutoLoad() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QByteArray origFavorites = raw.value("profile/favorites").toByteArray();
+        const int origSelected = m_settings.app()->selectedFavoriteProfile();
+        const QString origAutoLoad = m_settings.app()->autoLoadProfileFilename();
+
+        QJsonArray existing;
+        QJsonObject e; e["name"] = "Old Fav"; e["filename"] = "old_fav"; existing.append(e);
+        raw.setValue("profile/favorites", QJsonDocument(existing).toJson());
+        raw.sync();
+        m_settings.app()->setAutoLoadProfileFilename("old_fav");
+
+        QJsonArray imported;
+        for (const char* fn : {"imp_a", "imp_b"}) {
+            QJsonObject f; f["name"] = fn; f["filename"] = fn; imported.append(f);
+        }
+        QJsonObject profile;
+        profile["favorites"] = imported;
+        profile["selectedFavorite"] = 1;
+        QJsonObject bundle; bundle["profile"] = profile;
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+        QCOMPARE(m_settings.app()->selectedFavoriteProfile(), 1);
+        QCOMPARE(m_settings.app()->autoLoadProfileFilename(), QString("old_fav"));
+
+        raw.setValue("profile/favorites", origFavorites);
+        raw.sync();
+        m_settings.app()->setSelectedFavoriteProfile(origSelected);
+        m_settings.app()->setAutoLoadProfileFilename(origAutoLoad);
+    }
+
+    void favoriteProfileOrderRoundTripsThroughSerializer() {
+        const QString orig = m_settings.app()->favoriteProfileOrder();
+        m_settings.app()->setFavoriteProfileOrder("alpha");
+
+        QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+        QCOMPARE(bundle.value("profile").toObject().value("favoriteOrder").toString(), QString("alpha"));
+
+        m_settings.app()->setFavoriteProfileOrder("usage");
+        // importFromJson always warns when it replaces the favorites array, even 0 -> 0.
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+        QCOMPARE(m_settings.app()->favoriteProfileOrder(), QString("alpha"));
+
+        m_settings.app()->setFavoriteProfileOrder(orig);
+    }
+
+    // ==========================================
+    // Auto-load recipe settings (recipe-auto-load) + mutual exclusion
+    // ==========================================
+
+    void autoLoadRecipeIdDefaultIsMinusOne() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        raw.remove("dye/autoLoadRecipeId");
+        raw.sync();
+        Settings fresh;
+        QCOMPARE(fresh.dye()->autoLoadRecipeId(), -1);
+    }
+
+    void autoLoadRecipeIdRoundTrip() {
+        m_settings.dye()->setAutoLoadRecipeId(-1);  // baseline
+        QSignalSpy spy(m_settings.dye(), &SettingsDye::autoLoadRecipeIdChanged);
+        m_settings.dye()->setAutoLoadRecipeId(42);
+        QCOMPARE(m_settings.dye()->autoLoadRecipeId(), 42);
+        QCOMPARE(spy.count(), 1);
+        // Setting the same value again is a no-op (no second signal).
+        m_settings.dye()->setAutoLoadRecipeId(42);
+        QCOMPARE(spy.count(), 1);
+    }
+
+    void autoLoadRecipeIdNotExportedAsDeviceLocalId() {
+        // Device-local DB row ids (activeBagId, activeEquipmentId,
+        // activeRecipeId) are deliberately excluded from settings export —
+        // autoLoadRecipeId is the same kind of value and follows suit. Only
+        // the shared revertMinutes (already exported under the profile
+        // side) round-trips.
+        m_settings.dye()->setAutoLoadRecipeId(7);
+        m_settings.app()->setAutoLoadRevertMinutes(23);
+
+        QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+        QVERIFY(!bundle.value("profile").toObject().contains("autoLoadRecipeId"));
+        // Not present anywhere else in the bundle either.
+        QVERIFY(!bundle.contains("autoLoadRecipeId"));
+
+        m_settings.dye()->setAutoLoadRecipeId(-1);
+        m_settings.app()->setAutoLoadRevertMinutes(5);
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+        // autoLoadRecipeId was never in the bundle, so import leaves it alone.
+        QCOMPARE(m_settings.dye()->autoLoadRecipeId(), -1);
+        // The shared timeout still round-trips.
+        QCOMPARE(m_settings.app()->autoLoadRevertMinutes(), 23);
+    }
+
+    void autoLoadMutualExclusion_recipeClearsProfile() {
+        m_settings.app()->setAutoLoadProfileFilename("some-profile");
+        m_settings.dye()->setAutoLoadRecipeId(-1);  // baseline
+
+        m_settings.dye()->setAutoLoadRecipeId(99);
+
+        QCOMPARE(m_settings.dye()->autoLoadRecipeId(), 99);
+        QCOMPARE(m_settings.app()->autoLoadProfileFilename(), QString());
+    }
+
+    void autoLoadMutualExclusion_profileClearsRecipe() {
+        m_settings.app()->setAutoLoadProfileFilename("");  // baseline
+        m_settings.dye()->setAutoLoadRecipeId(99);
+
+        m_settings.app()->setAutoLoadProfileFilename("some-profile");
+
+        QCOMPARE(m_settings.app()->autoLoadProfileFilename(), QString("some-profile"));
+        QCOMPARE(m_settings.dye()->autoLoadRecipeId(), -1);
+    }
+
+    void autoLoadMutualExclusion_clearingOneDoesNotSpuriouslyTouchOther() {
+        // Both already at their "cleared" defaults — clearing one must not
+        // emit a changed signal on, or otherwise disturb, the other.
+        m_settings.app()->setAutoLoadProfileFilename("");
+        m_settings.dye()->setAutoLoadRecipeId(-1);
+
+        QSignalSpy recipeSpy(m_settings.dye(), &SettingsDye::autoLoadRecipeIdChanged);
+        m_settings.app()->setAutoLoadProfileFilename("");
+        QCOMPARE(recipeSpy.count(), 0);
+        QCOMPARE(m_settings.dye()->autoLoadRecipeId(), -1);
+
+        QSignalSpy profileSpy(m_settings.app(), &SettingsApp::autoLoadProfileFilenameChanged);
+        m_settings.dye()->setAutoLoadRecipeId(-1);
+        QCOMPARE(profileSpy.count(), 0);
+        QCOMPARE(m_settings.app()->autoLoadProfileFilename(), QString());
+    }
+
+    void autoLoadMutualExclusion_reconciledAtConstructionIfBothPersisted() {
+        // The reactive cross-clear above only fires on a live changed signal
+        // — it can't see a conflict that was already on disk before Settings
+        // is even constructed (hand-edited config, a future migration bug).
+        // Settings' constructor must reconcile this once at load time rather
+        // than let both auto-loads silently race on the next trigger.
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        raw.setValue("profile/autoLoadFilename", "conflicting-profile");
+        raw.setValue("dye/autoLoadRecipeId", 55);
+        raw.sync();
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression(
+            "Settings.*both profile and recipe auto-load were persisted simultaneously.*"));
+        Settings fresh;
+        // Recipe wins, matching this file's own restore-order convention.
+        QCOMPARE(fresh.dye()->autoLoadRecipeId(), 55);
+        QCOMPARE(fresh.app()->autoLoadProfileFilename(), QString());
+
+        raw.remove("profile/autoLoadFilename");
+        raw.remove("dye/autoLoadRecipeId");
+        raw.sync();
+    }
+
+    void listSortRoundTrip() {
+        // The recipes- and beans-page sort preferences must survive an export ->
+        // import cycle. Export/import key strings are hand-mirrored under the
+        // "recipes" and "bags" root objects, so a typo on either side would
+        // silently drop the preference during device migration.
+        m_settings.network()->setRecipeSortField("coffee");
+        m_settings.network()->setRecipeSortDirection("ASC");
+        m_settings.network()->setBagSortField("roastDate");
+        m_settings.network()->setBagSortDirection("ASC");
+
+        QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+
+        // Mutate all four to confirm import overwrites them.
+        m_settings.network()->setRecipeSortField("name");
+        m_settings.network()->setRecipeSortDirection("DESC");
+        m_settings.network()->setBagSortField("dateUsed");
+        m_settings.network()->setBagSortDirection("DESC");
+
+        // importFromJson emits an expected favorites-replacement warning (see
+        // autoLoadBundleRoundTrip) — suppress it for the no-warnings-in-tests rule.
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+
+        QCOMPARE(m_settings.network()->recipeSortField(), QString("coffee"));
+        QCOMPARE(m_settings.network()->recipeSortDirection(), QString("ASC"));
+        QCOMPARE(m_settings.network()->bagSortField(), QString("roastDate"));
+        QCOMPARE(m_settings.network()->bagSortDirection(), QString("ASC"));
+    }
+
+    void waterVesselPresetTemperatureRoundTrip() {
+        // Per-preset hot-water temperature must survive an export -> import cycle.
+        m_settings.brew()->addWaterVesselPreset("Tea", 250, "weight", 40, 92.0);
+        const int idx = static_cast<int>(m_settings.brew()->waterVesselPresets().size()) - 1;
+
+        QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+
+        // Mutate the preset's temperature to confirm import overwrites it.
+        m_settings.brew()->updateWaterVesselPreset(idx, "Tea", 250, "weight", 40, 70.0);
+        QCOMPARE(m_settings.brew()->getWaterVesselPreset(idx)["temperature"].toDouble(), 70.0);
+
+        // importFromJson emits an expected favorites-replacement warning (see
+        // autoLoadBundleRoundTrip) — suppress it for the no-warnings-in-tests rule.
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+
+        QCOMPARE(m_settings.brew()->getWaterVesselPreset(idx)["temperature"].toDouble(), 92.0);
+    }
+
+    void duplicatePresetNamesAreRejected() {
+        // Presets are addressed BY NAME downstream (recipes snapshot the vessel or
+        // pitcher and re-select it by name on activation), so two sharing a name
+        // are indistinguishable — the setter refuses the second one.
+        const qsizetype before = m_settings.brew()->waterVesselPresets().size();
+        m_settings.brew()->addWaterVesselPreset("Duplicate Test", 250);
+        QCOMPARE(m_settings.brew()->waterVesselPresets().size(), before + 1);
+
+        // Same name, and the case-insensitive/whitespace variants of it.
+        for (const QString& clash : {QStringLiteral("Duplicate Test"),
+                                     QStringLiteral("duplicate test"),
+                                     QStringLiteral("  Duplicate Test  ")}) {
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression(QStringLiteral("refusing a duplicate water vessel named")));
+            m_settings.brew()->addWaterVesselPreset(clash, 300);
+        }
+        QCOMPARE(m_settings.brew()->waterVesselPresets().size(), before + 1);
+        QVERIFY(m_settings.brew()->waterVesselNameTaken("DUPLICATE TEST"));
+        QVERIFY(!m_settings.brew()->waterVesselNameTaken("Something Else"));
+
+        // Renaming a preset to the name it already holds is not a clash.
+        const int idx = static_cast<int>(before);
+        QVERIFY(!m_settings.brew()->waterVesselNameTaken("Duplicate Test", idx));
+        m_settings.brew()->updateWaterVesselPreset(idx, "Duplicate Test", 275);
+        QCOMPARE(m_settings.brew()->getWaterVesselPreset(idx)["volume"].toInt(), 275);
+
+        // The pitcher list carries the identical contract.
+        const qsizetype pitchersBefore = m_settings.brew()->steamPitcherPresets().size();
+        m_settings.brew()->addSteamPitcherPreset("Duplicate Pitcher", 30, 150, 150.0);
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("refusing a duplicate steam pitcher named")));
+        m_settings.brew()->addSteamPitcherPreset("duplicate pitcher", 45, 150, 150.0);
+        QCOMPARE(m_settings.brew()->steamPitcherPresets().size(), pitchersBefore + 1);
+    }
+
+    void unreadablePresetBlobIsNotOverwritten() {
+        // A corrupt preset blob used to be indistinguishable from an absent key:
+        // both parsed to an empty array, so the app reported "no presets" and the
+        // next add saved that empty array OVER the bytes it could not read. The
+        // read must warn, and every writer must refuse rather than destroy it.
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QByteArray corrupt = QByteArrayLiteral("{ this is not json");
+        raw.setValue("water/vesselPresets", corrupt);
+        raw.sync();
+
+        // Read through a FRESH Settings, as uploadAutoUpdateDefaultIsTrue does: the
+        // shared m_settings holds its own QSettings instance and need not observe
+        // another instance's write.
+        {
+            Settings fresh;
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression(QStringLiteral("SettingsBrew.*could not parse water/vesselPresets")));
+            QVERIFY(fresh.brew()->waterVesselPresets().isEmpty());
+
+            // The add is refused — it warns again on its own read — and the
+            // stored bytes survive untouched.
+            QTest::ignoreMessage(QtWarningMsg,
+                QRegularExpression(QStringLiteral("SettingsBrew.*could not parse water/vesselPresets")));
+            fresh.brew()->addWaterVesselPreset("Should not be written", 200);
+        }
+
+        raw.sync();
+        QCOMPARE(raw.value("water/vesselPresets").toByteArray(), corrupt);
+
+        // Restore a readable list; cleanupTestCase puts the original back, but
+        // the tests that follow in this class read presets through m_settings.
+        raw.setValue("water/vesselPresets", QByteArrayLiteral("[]"));
+        raw.sync();
+    }
+
+    void temperatureUnitRoundTrip() {
+        // The display temperature unit must survive an export -> import cycle. The
+        // serializer's export/import key strings are hand-mirrored, so a typo on
+        // either side would silently drop the setting during device-to-device
+        // migration — this asserts both sides agree.
+        m_settings.app()->setTemperatureUnit("fahrenheit");
+        QCOMPARE(m_settings.app()->temperatureUnit(), QString("fahrenheit"));
+
+        const QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+
+        // Mutate to confirm import actually overwrites it (not a silent no-op).
+        m_settings.app()->setTemperatureUnit("celsius");
+        QCOMPARE(m_settings.app()->temperatureUnit(), QString("celsius"));
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+
+        QCOMPARE(m_settings.app()->temperatureUnit(), QString("fahrenheit"));
+    }
+
+    void temperatureUnitSetterRejectsGarbage() {
+        // setTemperatureUnit whitelists {celsius, fahrenheit}: it normalises case and
+        // whitespace to a valid value, and coerces anything else to celsius (loudly)
+        // so imported garbage can't persist or re-export.
+        m_settings.app()->setTemperatureUnit("celsius");
+        // Case/whitespace normalise to a valid value — no warning, stored lowercased.
+        m_settings.app()->setTemperatureUnit("  Fahrenheit ");
+        QCOMPARE(m_settings.app()->temperatureUnit(), QString("fahrenheit"));
+        // An unknown unit coerces to celsius, with a warning.
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("invalid temperatureUnit")));
+        m_settings.app()->setTemperatureUnit("kelvin");
+        QCOMPARE(m_settings.app()->temperatureUnit(), QString("celsius"));
+    }
+
+    void temperatureUnitEmitsOnChangeOnly() {
+        // The setter's `if (temperatureUnit() != normalized)` guard must emit exactly
+        // once on a real change and stay silent on a no-op set.
+        m_settings.app()->setTemperatureUnit("celsius");
+        QSignalSpy spy(m_settings.app(), &SettingsApp::temperatureUnitChanged);
+        m_settings.app()->setTemperatureUnit("fahrenheit");   // change -> 1 emit
+        QCOMPARE(spy.count(), 1);
+        m_settings.app()->setTemperatureUnit("fahrenheit");   // no-op -> no further emit
+        QCOMPARE(spy.count(), 1);
+    }
+
+    void temperatureUnitDefaultIsCelsius() {
+        // On fresh state (key absent) the getter default must be "celsius". The unit is
+        // read once at construction, so a fresh SettingsApp is what sees the absent key.
+        m_settings.app()->setTemperatureUnit("fahrenheit");
+        // The setter still writes through the cache: a fresh instance reads it back.
+        QCOMPARE(SettingsApp().temperatureUnit(), QString("fahrenheit"));
+        { QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+          raw.remove("display/temperatureUnit");
+          raw.sync(); }
+        SettingsApp fresh;
+        QCOMPARE(fresh.temperatureUnit(), QString("celsius"));
+        // cleanup() restores the original via m_origTemperatureUnit.
+    }
+
+    void waterVesselPresetLegacyTemperatureFallsBackToGlobal() {
+        // A preset object that predates the per-preset temperature field (no
+        // "temperature" key) must export with the device's current global
+        // hot-water temperature, not 0 — this guards the migration fallback in
+        // SettingsSerializer::exportToJson.
+        QJsonObject legacy;
+        legacy["name"] = "Legacy";
+        legacy["volume"] = 200;
+        legacy["mode"] = "weight";
+        legacy["flowRate"] = 40;
+        QJsonArray arr; arr.append(legacy);
+        { QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+          raw.setValue("water/vesselPresets", QJsonDocument(arr).toJson());
+          raw.sync(); }
+
+        // Read through a fresh Settings instance so it picks up the raw write
+        // (avoids a stale per-instance QSettings cache).
+        Settings fresh;
+        fresh.brew()->setWaterTemperature(88.0);
+        const QJsonObject bundle = SettingsSerializer::exportToJson(&fresh, false);
+
+        const QJsonArray exported = bundle["water"].toObject()["vesselPresets"].toArray();
+        QCOMPARE(exported.size(), 1);
+        QCOMPARE(exported[0].toObject()["temperature"].toDouble(), 88.0);
+    }
+
+    void steamPitcherPresetTemperatureRoundTrip() {
+        // Per-pitcher steam temperature must survive an export -> import cycle.
+        m_settings.brew()->addSteamPitcherPreset("Latte", 45, 150, 135.0);
+        const int idx = m_settings.brew()->steamPitcherCount() - 1;
+
+        QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+
+        // Mutate the preset's temperature to confirm import overwrites it.
+        m_settings.brew()->updateSteamPitcherPreset(idx, "Latte", 45, 150, 120.0);
+        QCOMPARE(m_settings.brew()->getSteamPitcherPreset(idx)["temperature"].toDouble(), 120.0);
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+
+        QCOMPARE(m_settings.brew()->getSteamPitcherPreset(idx)["temperature"].toDouble(), 135.0);
+    }
+
+    void effectiveSteamDurationSecFallsBackToBaseDuration() {
+        // Weight-timed steaming OFF: scaledSteamTime() always yields 0, so the
+        // effective duration must be the preset's fixed duration, not 0.
+        m_settings.brew()->addSteamPitcherPreset("Latte", 45, 150, 135.0);
+        const int idx = m_settings.brew()->steamPitcherCount() - 1;
+        QVERIFY(m_settings.brew()->tryCalibrateSteamPitcher(idx, QString(), 300.0, 45.0)
+                == SettingsBrew::PresetMutationResult::Applied);
+        // Disable AFTER calibrating, which turns the toggle on. With the rate set,
+        // 600 g would scale to 90 s: only the toggle-off gate can produce 45 here.
+        m_settings.brew()->setMilkAutoCaptureEnabled(false);
+
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 600.0), 45);
+    }
+
+    void effectiveSteamDurationSecClampsScaledTime() {
+        // The scaled path is clamped to [5,120]s; a large rate × milk product
+        // must cap at 120, not program a multi-minute steam.
+        m_settings.brew()->addSteamPitcherPreset("Jug", 30, 150, 135.0);
+        const int idx = m_settings.brew()->steamPitcherCount() - 1;
+        QVERIFY(m_settings.brew()->tryCalibrateSteamPitcher(idx, QString(), 100.0, 30.0)
+                == SettingsBrew::PresetMutationResult::Applied);  // 0.30 s/g; also enables the toggle
+
+        // Unclamped: 0.30 * 600 = 180 → clamped to 120.
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 600.0), 120);
+        // Floor: 0.30 * 10 = 3 → clamped to 5, not a blink-and-miss 3s steam.
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 10.0), 5);
+    }
+
+    void effectiveSteamDurationSecWarnsOnCorruptZeroDuration() {
+        // An enabled preset with no positive duration is corrupt (hand-edited or a
+        // failed import). The helper must warn — loud and greppable — and still
+        // return 0 rather than inventing a time.
+        m_settings.brew()->addSteamPitcherPreset("Corrupt", 0, 150, 135.0);
+        const int idx = m_settings.brew()->steamPitcherCount() - 1;
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("no positive duration")));
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 0.0), 0);
+    }
+
+    void effectiveSteamDurationSecUsesScaledTimeWhenAvailable() {
+        // Weight-timed steaming ON + the pitcher's rate + positive milk: the scaled
+        // value wins over the base duration.
+        m_settings.brew()->addSteamPitcherPreset("Latte", 30, 150, 135.0);
+        const int idx = m_settings.brew()->steamPitcherCount() - 1;
+        QVERIFY(m_settings.brew()->tryCalibrateSteamPitcher(idx, QString(), 200.0, 30.0)
+                == SettingsBrew::PresetMutationResult::Applied);  // 0.15 s/g; also enables the toggle
+
+        // secPerGram * milk = 0.15 * 400 = 60 (base 30s is ignored).
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 400.0), 60);
+    }
+
+    void effectiveSteamDurationSecZeroForDisabledPreset() {
+        m_settings.brew()->setMilkAutoCaptureEnabled(true);
+        // The built-in "Heater off" entry, addressed by its sentinel. Users can
+        // no longer create heater-off presets, so this is the only one there is.
+        const int idx = SettingsBrew::HeaterOffPitcherIndex;
+
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 300.0), 0);
+    }
+
+    void effectiveSteamDurationSecZeroForMissingIndex() {
+        // A stale index (e.g. every preset deleted) must return 0 AND warn — unlike a
+        // disabled preset it's never deliberate, and QML guards can't detect it (an
+        // empty QVariantMap is a truthy {} in JS).
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("no steam pitcher preset at index")));
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(999, 300.0), 0);
+    }
+
+    void effectiveSteamDurationSecBaseWhenNoMilk() {
+        // Calibrated preset, weight-timing ON, but no milk available (no scale, nothing
+        // captured): must yield the base duration — not 0, and not the 5s clamp floor.
+        // The SteamItem popup tap relies on exactly this cell when tapped scale-less.
+        m_settings.brew()->addSteamPitcherPreset("Latte", 45, 150, 135.0);
+        const int idx = m_settings.brew()->steamPitcherCount() - 1;
+        m_settings.brew()->setSteamPitcherCalibration(idx, 300.0);  // also enables the toggle
+
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 0.0), 45);
+    }
+
+    void effectiveSteamDurationSecFallsBackWhenUncalibrated() {
+        // Weight-timing on but this pitcher has no rate: the base duration, not 0.
+        m_settings.brew()->setMilkAutoCaptureEnabled(true);
+        m_settings.brew()->addSteamPitcherPreset("Cortado", 20, 150, 135.0);
+        const int idx = m_settings.brew()->steamPitcherCount() - 1;
+
+        QCOMPARE(m_settings.brew()->effectiveSteamDurationSec(idx, 300.0), 20);
+    }
+
+    void eachPitcherScalesAtItsOwnRate() {
+        auto* brew = m_settings.brew();
+        brew->setMilkAutoCaptureEnabled(true);
+        brew->addSteamPitcherPreset("Whole milk", 30, 150, 135.0);
+        const int whole = brew->steamPitcherCount() - 1;
+        brew->addSteamPitcherPreset("Oat", 30, 150, 135.0);
+        const int oat = whole + 1;
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(whole, "Whole milk", 0.14)
+                == SettingsBrew::PresetMutationResult::Applied);
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(oat, "Oat", 0.18)
+                == SettingsBrew::PresetMutationResult::Applied);
+
+        QCOMPARE(brew->scaledSteamTime(whole, 200.0), 28);
+        QCOMPARE(brew->scaledSteamTime(oat, 200.0), 36);
+
+        // A negative rate stores 0; the other pitcher is untouched.
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(oat, "Oat", -1.0)
+                == SettingsBrew::PresetMutationResult::Applied);
+        QCOMPARE(brew->getSteamPitcherPreset(oat)["secondsPerGram"].toDouble(), 0.0);
+        QCOMPARE(brew->getSteamPitcherPreset(whole)["secondsPerGram"].toDouble(), 0.14);
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("built-in Heater off entry cannot be modified")));
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(SettingsBrew::HeaterOffPitcherIndex,
+                                                       QString(), 0.2)
+                == SettingsBrew::PresetMutationResult::Invalid);
+    }
+
+    void calibratingAPitcherSetsItsRateAndEnables() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset("Latte", 30, 150, 135.0);
+        const int idx = brew->steamPitcherCount() - 1;
+        brew->setMilkAutoCaptureEnabled(false);
+
+        // Non-positive input must neither divide by zero nor opt the user in.
+        QVERIFY(brew->tryCalibrateSteamPitcher(idx, "Latte", 0.0, 30.0)
+                == SettingsBrew::PresetMutationResult::Invalid);
+        QVERIFY(brew->tryCalibrateSteamPitcher(idx, "Latte", 200.0, 0.0)
+                == SettingsBrew::PresetMutationResult::Invalid);
+        QVERIFY(!brew->milkAutoCaptureEnabled());
+
+        // Above kMaxSecondsPerGram: a measured rate is stored as measured.
+        QVERIFY(brew->tryCalibrateSteamPitcher(idx, "Latte", 30.0, 70.0)
+                == SettingsBrew::PresetMutationResult::Applied);
+        QCOMPARE(brew->getSteamPitcherPreset(idx)["secondsPerGram"].toDouble(), 70.0 / 30.0);
+        QVERIFY(brew->milkAutoCaptureEnabled());
+
+        // The same pour again changes no rate and still opts back in.
+        brew->setMilkAutoCaptureEnabled(false);
+        QVERIFY(brew->tryCalibrateSteamPitcher(idx, "Latte", 30.0, 70.0)
+                == SettingsBrew::PresetMutationResult::NoChange);
+        QVERIFY(brew->milkAutoCaptureEnabled());
+    }
+
+    // The last pour belongs to a pitcher, not to a name: it follows a rename and
+    // dies with a delete, so it can never calibrate a pitcher that took the name.
+    void lastPourFollowsItsPitcherThroughRenameAndDelete() {
+        auto* brew = m_settings.brew();
+        const QString origName = brew->lastSteamPitcherName();
+        const auto restore = qScopeGuard([&] { brew->setLastSteamPitcherName(origName); });
+        brew->addSteamPitcherPreset("Oat", 30, 150, 135.0);
+        const int oat = brew->steamPitcherCount() - 1;
+        brew->setLastSteamPitcherName("Oat");
+
+        QVERIFY(brew->tryRenameSteamPitcherPreset(oat, "Oat", "Oat barista")
+                == SettingsBrew::PresetMutationResult::Applied);
+        QCOMPARE(brew->lastSteamPitcherName(), QString("Oat barista"));
+
+        QVERIFY(brew->tryRemoveSteamPitcherPreset(oat, "Oat barista")
+                == SettingsBrew::PresetMutationResult::Applied);
+        QCOMPARE(brew->lastSteamPitcherName(), QString());
+    }
+
+    void newPitcherRateComesFromTheSelectedPitcher() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset("Flat white", 30, 150, 135.0);
+        const int small = brew->steamPitcherCount() - 1;
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(small, "Flat white", 0.14)
+                == SettingsBrew::PresetMutationResult::Applied);
+        brew->setSelectedSteamCup(small);
+        QCOMPARE(brew->steamRateForNewPitcher(), 0.14);
+        brew->setSelectedSteamCup(SettingsBrew::HeaterOffPitcherIndex);
+        QCOMPARE(brew->steamRateForNewPitcher(), 0.0);
+    }
+
+    // The upgrade from one global steam rate: every pitcher takes it, once.
+    void globalSteamRateIsCopiedIntoEveryPitcherOnce() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QVariant origLegacy = raw.value("steam/steamSecondsPerGram");
+        const auto restore = qScopeGuard([&] {
+            if (origLegacy.isValid()) raw.setValue("steam/steamSecondsPerGram", origLegacy);
+            else raw.remove("steam/steamSecondsPerGram");
+            raw.setValue("migration/steamRatePerPitcher", true);
+            raw.sync();
+        });
+        QJsonArray presets{
+            QJsonObject{{"name", "Small"}, {"duration", 30}, {"flow", 150}},
+            QJsonObject{{"name", "Oat"}, {"duration", 30}, {"flow", 150}, {"secondsPerGram", 0.18}}};
+        raw.setValue("steam/pitcherPresets", QJsonDocument(presets).toJson());
+        raw.setValue("steam/steamSecondsPerGram", 0.14);
+        raw.remove("migration/steamRatePerPitcher");
+        raw.sync();
+
+        {
+            Settings upgraded;
+            QCOMPARE(upgraded.brew()->getSteamPitcherPreset(0)["secondsPerGram"].toDouble(), 0.14);
+            QCOMPARE(upgraded.brew()->getSteamPitcherPreset(1)["secondsPerGram"].toDouble(), 0.18);
+        }
+        raw.sync();
+        QVERIFY(raw.value("migration/steamRatePerPitcher").toBool());
+
+        // A pitcher added later without a rate is not picked up by a second launch.
+        presets.append(QJsonObject{{"name", "Later"}, {"duration", 30}, {"flow", 150}});
+        raw.setValue("steam/pitcherPresets", QJsonDocument(presets).toJson());
+        raw.sync();
+        Settings secondLaunch;
+        QVERIFY(!secondLaunch.brew()->getSteamPitcherPreset(2).contains("secondsPerGram"));
+    }
+
+    void unreadablePitchersLeaveTheRateCopyPending() {
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        const QVariant origLegacy = raw.value("steam/steamSecondsPerGram");
+        const auto restore = qScopeGuard([&] {
+            if (origLegacy.isValid()) raw.setValue("steam/steamSecondsPerGram", origLegacy);
+            else raw.remove("steam/steamSecondsPerGram");
+            raw.setValue("migration/steamRatePerPitcher", true);
+            raw.sync();
+        });
+        raw.setValue("steam/pitcherPresets", QByteArray("{not json"));
+        raw.setValue("steam/steamSecondsPerGram", 0.14);
+        raw.remove("migration/steamRatePerPitcher");
+        raw.sync();
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("could not parse steam/pitcherPresets")));
+        Settings upgraded;
+        raw.sync();
+        QVERIFY(!raw.contains("migration/steamRatePerPitcher"));
+        QCOMPARE(raw.value("steam/pitcherPresets").toByteArray(), QByteArray("{not json"));
+    }
+
+    void pitcherSteamRatesRoundTrip() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset("Whole milk", 30, 150, 135.0);
+        const int whole = brew->steamPitcherCount() - 1;
+        brew->addSteamPitcherPreset("Oat", 30, 150, 135.0);
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(whole, "Whole milk", 0.14)
+                == SettingsBrew::PresetMutationResult::Applied);
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(whole + 1, "Oat", 0.18)
+                == SettingsBrew::PresetMutationResult::Applied);
+        const QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+
+        QVERIFY(brew->trySetSteamPitcherSecondsPerGram(whole, "Whole milk", 0.99)
+                == SettingsBrew::PresetMutationResult::Applied);   // prove import overwrites
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, bundle));
+        QCOMPARE(brew->getSteamPitcherPreset(whole)["secondsPerGram"].toDouble(), 0.14);
+        QCOMPARE(brew->getSteamPitcherPreset(whole + 1)["secondsPerGram"].toDouble(), 0.18);
+
+        // A backup from before per-pitcher rates: one global rate, none on the presets.
+        QJsonObject oldBundle = bundle;
+        QJsonObject steam = oldBundle["steam"].toObject();
+        QJsonArray oldPresets;
+        for (const QJsonValue& v : steam["pitcherPresets"].toArray()) {
+            QJsonObject preset = v.toObject();
+            preset.remove("secondsPerGram");
+            oldPresets.append(preset);
+        }
+        steam["pitcherPresets"] = oldPresets;
+        steam["steamSecondsPerGram"] = 0.16;
+        oldBundle["steam"] = steam;
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QVERIFY(SettingsSerializer::importFromJson(&m_settings, oldBundle));
+        QCOMPARE(brew->getSteamPitcherPreset(whole)["secondsPerGram"].toDouble(), 0.16);
+        QCOMPARE(brew->getSteamPitcherPreset(whole + 1)["secondsPerGram"].toDouble(), 0.16);
+    }
+
+    // applySteamPitcherValues is THE definition of "apply this pitcher": which
+    // values get written, what the built-in entry skips, and what a stale index
+    // does. It lives on SettingsBrew rather than MainController so it can be
+    // asserted here, without a controller — the MCP preset test links none and
+    // would otherwise be asserting a stub.
+    void applyingAPitcherWritesItsValuesToTheLiveSteamSettings() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("ApplyMe"), 42, 120, 133.0);
+        const int idx = brew->steamPitcherCount() - 1;
+
+        QCOMPARE(brew->applySteamPitcherValues(idx, 0.0), SettingsBrew::PitcherApply::Applied);
+        QCOMPARE(brew->steamTemperature(), 133.0);
+        QCOMPARE(brew->steamTimeout(), 42);
+        QCOMPARE(brew->steamFlow(), 120);
+    }
+
+    void selectingPitcherSynchronizesTemperatureWithoutPage()
+    {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("Temp A"), 30, 120, 131.0);
+        brew->addSteamPitcherPreset(QStringLiteral("Temp B"), 40, 130, 142.0);
+        const int tempA = brew->steamPitcherCount() - 2;
+        const int tempB = tempA + 1;
+
+        brew->setSteamTemperature(159.0);
+        brew->setSelectedSteamCup(tempA);
+        QCOMPARE(brew->steamTemperature(), 131.0);
+
+        // Selecting the active row again re-applies its temperature if another
+        // host setting changed it while the page was absent.
+        brew->setSteamTemperature(158.0);
+        brew->setSelectedSteamCup(tempA);
+        QCOMPARE(brew->steamTemperature(), 131.0);
+
+        brew->setSelectedSteamCup(tempB);
+        QCOMPARE(brew->steamTemperature(), 142.0);
+
+        // Heater off intentionally retains the previous live values.
+        brew->setSteamTemperature(156.0);
+        brew->setSelectedSteamCup(SettingsBrew::HeaterOffPitcherIndex);
+        QCOMPARE(brew->steamTemperature(), 156.0);
+    }
+
+    void editingSelectedPitcherSynchronizesOnlyItsTemperature()
+    {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("Unselected"), 30, 120, 132.0);
+        const int unselected = brew->steamPitcherCount() - 1;
+        brew->addSteamPitcherPreset(QStringLiteral("Selected"), 40, 130, 143.0);
+        const int selected = brew->steamPitcherCount() - 1;
+        brew->setSelectedSteamCup(selected);
+        QCOMPARE(brew->steamTemperature(), 143.0);
+
+        brew->updateSteamPitcherPreset(selected, QStringLiteral("Selected"), 41, 131, 147.0);
+        QCOMPARE(brew->steamTemperature(), 147.0);
+
+        brew->setSteamTemperature(155.0);
+        brew->updateSteamPitcherPreset(unselected, QStringLiteral("Unselected"), 31, 121, 136.0);
+        QCOMPARE(brew->steamTemperature(), 155.0);
+        QCOMPARE(brew->selectedSteamPitcher(), selected);
+    }
+
+    // The built-in carries no values of its own, so applying it must write
+    // NOTHING — the live settings keep the last real pitcher's numbers, which is
+    // what a steam session falls back to when the heater is switched on anyway
+    // by a GHC press. Writing zeros here would silently destroy that fallback.
+    void applyingTheBuiltInHeaterOffWritesNoValues() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("Before"), 37, 110, 141.0);
+        brew->applySteamPitcherValues(brew->steamPitcherCount() - 1, 0.0);
+
+        QCOMPARE(brew->applySteamPitcherValues(SettingsBrew::HeaterOffPitcherIndex, 0.0),
+                 SettingsBrew::PitcherApply::HeaterOff);
+        QCOMPARE(brew->steamTemperature(), 141.0);
+        QCOMPARE(brew->steamTimeout(), 37);
+        QCOMPARE(brew->steamFlow(), 110);
+    }
+
+    void applyingAStaleIndexWritesNothingAndSaysSo() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("Live"), 31, 105, 139.0);
+        brew->applySteamPitcherValues(brew->steamPitcherCount() - 1, 0.0);
+
+        QCOMPARE(brew->applySteamPitcherValues(9999, 0.0), SettingsBrew::PitcherApply::Missing);
+        QCOMPARE(brew->steamTemperature(), 139.0);
+        QCOMPARE(brew->steamTimeout(), 31);
+    }
+
+    // --- the built-in is addressed by SENTINEL, never by position ------------
+    //
+    // The pill rows hand this function the built-in's DISPLAY SLOT. Storing that
+    // raw is what shipped the original bug: it stops meaning "Heater off" the
+    // moment the preset count moves.
+
+    void selectingTheBuiltInByDisplaySlotStoresTheSentinel() {
+        auto* brew = m_settings.brew();
+        brew->setSelectedSteamCup(brew->steamPitcherCount());     // what a pill tap passes
+        QCOMPARE(brew->selectedSteamPitcher(), int(SettingsBrew::HeaterOffPitcherIndex));
+
+        // Add a pitcher: the display slot moved, the stored selection did not,
+        // and it still resolves to the built-in.
+        brew->addSteamPitcherPreset(QStringLiteral("Later"), 30, 150, 150.0);
+        QCOMPARE(brew->selectedSteamPitcher(), int(SettingsBrew::HeaterOffPitcherIndex));
+        QVERIFY(brew->getSteamPitcherPreset(brew->selectedSteamPitcher())
+                    .value("disabled").toBool());
+    }
+
+    // --- removing a preset must SHIFT what points past it --------------------
+
+    void removingAPresetShiftsTheSelectionRatherThanClampingIt() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("R1"), 31, 150, 150.0);
+        brew->addSteamPitcherPreset(QStringLiteral("R2"), 32, 150, 151.0);
+        const int r2 = brew->steamPitcherCount() - 1;
+        const int r1 = r2 - 1;
+        brew->setSelectedSteamCup(r2);
+
+        brew->removeSteamPitcherPreset(r1);       // delete the one BELOW the selection
+        // Clamping (the old behaviour) left the index alone unless out of range,
+        // so the user silently ended up on a different pitcher.
+        QCOMPARE(brew->getSteamPitcherPreset(brew->selectedSteamPitcher())
+                     .value("name").toString(), QStringLiteral("R2"));
+    }
+
+    // The water side clamped instead of shifting until recipe-blocks-editor-only
+    // made the vessel selection an activation-lifetime input: deleting a vessel
+    // BELOW the selection left the index alone while the array shifted under
+    // it, so the selection silently named a different vessel AND no
+    // selectedWaterVesselChanged was emitted for anyone to notice.
+    void removingAVesselShiftsTheSelectionRatherThanClampingIt() {
+        auto* brew = m_settings.brew();
+        // THREE vessels, and the selection is the MIDDLE one. With only two,
+        // clamping lands on the right vessel by accident: the selection is then
+        // the last index, the clamp fires, and size-1 happens to be where the
+        // survivor slid to. The bug needs a vessel AFTER the selected one.
+        brew->addWaterVesselPreset(QStringLiteral("W1"), 70, QStringLiteral("weight"), 4, 85.0);
+        brew->addWaterVesselPreset(QStringLiteral("W2"), 140, QStringLiteral("weight"), 4, 85.0);
+        brew->addWaterVesselPreset(QStringLiteral("W3"), 210, QStringLiteral("weight"), 4, 85.0);
+        const int w3 = static_cast<int>(brew->waterVesselPresets().size()) - 1;
+        const int w2 = w3 - 1;
+        const int w1 = w2 - 1;
+        brew->setSelectedWaterCup(w2);
+
+        brew->removeWaterVesselPreset(w1);        // delete the one BELOW the selection
+        // Clamping only rescues a selection that ran off the END, so this one
+        // was left pointing at what is now W3.
+        QCOMPARE(brew->getWaterVesselPreset(brew->selectedWaterVessel())
+                     .value("name").toString(), QStringLiteral("W2"));
+    }
+
+    // Water has no built-in entry to fall back on, so the sentinel
+    // shiftedForRemoval answers with must resolve to a surviving vessel rather
+    // than a no-vessel state its consumers would render as a default volume.
+    void removingTheSelectedVesselLandsOnASurvivingVessel() {
+        auto* brew = m_settings.brew();
+        brew->addWaterVesselPreset(QStringLiteral("Keeper"), 70, QStringLiteral("weight"), 4, 85.0);
+        brew->addWaterVesselPreset(QStringLiteral("Doomed"), 140, QStringLiteral("weight"), 4, 85.0);
+        const int doomed = static_cast<int>(brew->waterVesselPresets().size()) - 1;
+        brew->setSelectedWaterCup(doomed);
+
+        brew->removeWaterVesselPreset(doomed);
+        QVERIFY(brew->selectedWaterVessel() >= 0);
+        QVERIFY(!brew->getWaterVesselPreset(brew->selectedWaterVessel()).isEmpty());
+    }
+
+    void movingAVesselKeepsTheSelectionOnTheSameVessel() {
+        auto* brew = m_settings.brew();
+        brew->addWaterVesselPreset(QStringLiteral("M1"), 70, QStringLiteral("weight"), 4, 85.0);
+        brew->addWaterVesselPreset(QStringLiteral("M2"), 140, QStringLiteral("weight"), 4, 85.0);
+        brew->addWaterVesselPreset(QStringLiteral("M3"), 210, QStringLiteral("weight"), 4, 85.0);
+        const int m3 = static_cast<int>(brew->waterVesselPresets().size()) - 1;
+        const int m2 = m3 - 1;
+        const int m1 = m2 - 1;
+        brew->setSelectedWaterCup(m2);
+
+        brew->moveWaterVesselPreset(m1, m3);      // drag the one below past it
+        QCOMPARE(brew->getWaterVesselPreset(brew->selectedWaterVessel())
+                     .value("name").toString(), QStringLiteral("M2"));
+    }
+
+    void removingTheSelectedPresetFallsBackToHeaterOff() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("Doomed"), 33, 150, 150.0);
+        const int doomed = brew->steamPitcherCount() - 1;
+        brew->setSelectedSteamCup(doomed);
+
+        brew->removeSteamPitcherPreset(doomed);
+        // Cold is the safe landing when the thing you selected is gone; the old
+        // clamp picked whatever pitcher happened to be last and warmed it.
+        QCOMPARE(brew->selectedSteamPitcher(), int(SettingsBrew::HeaterOffPitcherIndex));
+    }
+
+    void removingAPresetShiftsTheParkedStandingPitcherToo() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("S1"), 34, 150, 150.0);
+        brew->addSteamPitcherPreset(QStringLiteral("S2"), 35, 150, 151.0);
+        const int s2 = brew->steamPitcherCount() - 1;
+        const int s1 = s2 - 1;
+        brew->setStandingSteamPitcher(s2);        // as a recipe override would park it
+
+        brew->removeSteamPitcherPreset(s1);
+        QCOMPARE(brew->getSteamPitcherPreset(brew->standingSteamPitcher())
+                     .value("name").toString(), QStringLiteral("S2"));
+    }
+
+    void removingTheParkedStandingPitcherLandsItOnHeaterOff() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("Parked"), 36, 150, 150.0);
+        const int parked = brew->steamPitcherCount() - 1;
+        brew->setStandingSteamPitcher(parked);
+
+        brew->removeSteamPitcherPreset(parked);
+        QCOMPARE(brew->standingSteamPitcher(), int(SettingsBrew::HeaterOffPitcherIndex));
+    }
+
+    // Reordering needs the same upkeep as removal. The live selection has had it
+    // for years; the parked one had neither until the review asked why.
+    void reorderingPresetsMovesTheParkedStandingPitcherWithThem() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("M1"), 37, 150, 150.0);
+        brew->addSteamPitcherPreset(QStringLiteral("M2"), 38, 150, 151.0);
+        const int m2 = brew->steamPitcherCount() - 1;
+        const int m1 = m2 - 1;
+        brew->setStandingSteamPitcher(m2);
+
+        brew->moveSteamPitcherPreset(m2, m1);     // drag M2 above M1
+        QCOMPARE(brew->getSteamPitcherPreset(brew->standingSteamPitcher())
+                     .value("name").toString(), QStringLiteral("M2"));
+    }
+
+    void recipePitcherSelectionDoesNotRestoreAnEarlierSelection() {
+        auto* brew = m_settings.brew();
+        brew->addSteamPitcherPreset(QStringLiteral("RecipeOwn"), 45, 120, 135.0);
+        const int pitcher = brew->steamPitcherCount() - 1;
+        brew->setSelectedSteamCup(SettingsBrew::HeaterOffPitcherIndex);
+        // A parked value from an older version must not be restored either.
+        brew->setStandingSteamPitcher(SettingsBrew::HeaterOffPitcherIndex);
+        QCOMPARE(brew->resolveRecipePitcherOverride(pitcher), pitcher);
+        brew->setSelectedSteamCup(pitcher);
+        QCOMPARE(brew->resolveRecipePitcherOverride(SettingsBrew::NoStandingPitcher),
+                 int(SettingsBrew::NoStandingPitcher));
+        QCOMPARE(brew->selectedSteamPitcher(), pitcher);
+        QCOMPARE(brew->standingSteamPitcher(), int(SettingsBrew::NoStandingPitcher));
+    }
+
+    // The DISPLAY position, and the signal that keeps it live. Every pill row,
+    // the compact popup's announcement and the MCP `list` response address rows
+    // by position, while the built-in is stored positionlessly — so this is the
+    // read side of that normalisation, and leaving it out is what left "Heater
+    // off" highlighted nowhere. It rides on the preset COUNT as well as the
+    // selection, which is why adding a pitcher has to re-notify: without that
+    // the highlight stays on the row the built-in used to occupy.
+    void theBuiltInsDisplayPositionFollowsThePresetCount() {
+        SettingsBrew* brew = m_settings.brew();
+        brew->setSelectedSteamCup(brew->steamPitcherCount());   // tap "Heater off"
+        QCOMPARE(brew->selectedSteamPitcher(), int(SettingsBrew::HeaterOffPitcherIndex));
+
+        const int rowBefore = brew->selectedSteamPitcherDisplayIndex();
+        QCOMPARE(rowBefore, brew->steamPitcherCount());
+        QVERIFY(brew->steamPitcherPresets().at(rowBefore).toMap().value("builtin").toBool());
+
+        QSignalSpy spy(brew, &SettingsBrew::selectedSteamPitcherDisplayIndexChanged);
+        brew->addSteamPitcherPreset(QStringLiteral("Extra"), 30, 150, 150.0);
+        QVERIFY(spy.count() > 0);        // the count moved the row: readers must hear it
+        QCOMPARE(brew->selectedSteamPitcherDisplayIndex(), rowBefore + 1);
+        QVERIFY(brew->steamPitcherPresets()
+                    .at(brew->selectedSteamPitcherDisplayIndex()).toMap().value("builtin").toBool());
+    }
+
+    // The built-in's label is reserved even though it has no stored name to
+    // collide with — two rows reading "Heater off" would be indistinguishable.
+    void theBuiltInHeaterOffNameIsReserved() {
+        QVERIFY(m_settings.brew()->steamPitcherNameTaken(QStringLiteral("Heater off")));
+        QVERIFY(m_settings.brew()->steamPitcherNameTaken(QStringLiteral("  heater OFF ")));
+        QVERIFY(!m_settings.brew()->steamPitcherNameTaken(QStringLiteral("Heater offside")));
+    }
+
+    // The standing selection is the other half of the recipe override: parked on
+    // activation, restored on deactivation. Unset must be distinguishable from
+    // "the user has Heater off selected", which is why the sentinel is -2.
+    void theStandingPitcherStartsUnsetAndRoundTrips() {
+        QCOMPARE(m_settings.brew()->standingSteamPitcher(), SettingsBrew::NoStandingPitcher);
+        m_settings.brew()->setStandingSteamPitcher(SettingsBrew::HeaterOffPitcherIndex);
+        QCOMPARE(m_settings.brew()->standingSteamPitcher(), SettingsBrew::HeaterOffPitcherIndex);
+        QVERIFY(m_settings.brew()->standingSteamPitcher() != SettingsBrew::NoStandingPitcher);
+        m_settings.brew()->setStandingSteamPitcher(SettingsBrew::NoStandingPitcher);
+        QCOMPARE(m_settings.brew()->standingSteamPitcher(), SettingsBrew::NoStandingPitcher);
+    }
+
+    // The failure RETURN, not the remap. Every other importFromJson assertion in
+    // this file is QVERIFY(import...) — the function returned an unconditional
+    // true for its whole life, so its callers' `if (!import…)` branches were dead
+    // code and a restore that dropped the steam selection still reported success.
+    // Reached by a selection with no presets beside it: nothing to remap against,
+    // so the raw index meets the range check.
+    void importReportsFailureWhenTheSelectionCannotBePlaced() {
+        QJsonObject bundle = SettingsSerializer::exportToJson(&m_settings, false);
+        QJsonObject steam = bundle["steam"].toObject();
+        steam.remove("pitcherPresets");        // no array to renumber against
+        steam["selectedPitcher"] = 50;         // addresses no pitcher on any install
+        bundle["steam"] = steam;
+
+        const int before = m_settings.brew()->selectedSteamPitcher();
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("SettingsSerializer.* importFromJson replacing .* favorites")));
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression(QStringLiteral("imported selectedPitcher 50 out of range")));
+        QVERIFY(!SettingsSerializer::importFromJson(&m_settings, bundle));
+        // Reported, and the current selection left alone rather than clamped.
+        QCOMPARE(m_settings.brew()->selectedSteamPitcher(), before);
+    }
+
+    void steamPitcherLegacyTemperatureFallsBackToGlobal() {
+        // A pitcher preset that predates the per-pitcher temperature field (no
+        // "temperature" key) must export with the device's current global steam
+        // temperature, not 0 — guards the migration fallback in exportToJson.
+        QJsonObject legacy;
+        legacy["name"] = "Legacy";
+        legacy["duration"] = 30;
+        legacy["flow"] = 150;
+        QJsonArray arr; arr.append(legacy);
+        { QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+          raw.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+          raw.sync(); }
+
+        // Read through a fresh Settings instance so it picks up the raw write.
+        Settings fresh;
+        fresh.brew()->setSteamTemperature(142.0);
+        const QJsonObject bundle = SettingsSerializer::exportToJson(&fresh, false);
+
+        const QJsonArray exported = bundle["steam"].toObject()["pitcherPresets"].toArray();
+        QCOMPARE(exported.size(), 1);
+        QCOMPARE(exported[0].toObject()["temperature"].toDouble(), 142.0);
+    }
+
+    // ==========================================
+    // ==========================================
+    // Layout: configurable-type allowlist + per-instance "configured" gate
+    // ==========================================
+
+    // typeHasOptions is derived from the readout capability schema plus the
+    // bespoke-editor set (single source of truth for the editor's gear
+    // indicator + open routing). Pin the configurable set so dropping a type
+    // or breaking the screensaver prefix match is a visible, deliberate change.
+    void typeHasOptionsAllowlist() {
+        const QStringList configurable = {
+            "custom", "scaleWeight", "shotPlan", "sleep", "machineStatus",
+            "temperature", "steamTemperature", "waterLevel", "clock", "lastShot",
+            "batteryLevel", "scaleBattery", "doseWeight", "milkWeight", "profileName"
+        };
+        for (const QString& t : configurable)
+            QVERIFY2(SettingsNetwork::typeHasOptions(t), qPrintable("expected configurable: " + t));
+
+        // "shotPlan" is the only plan widget type; "plan"/"steamPlan" were development
+        // working names, appear in no saved layout, and must never enter the allowlist.
+        QVERIFY(!SettingsNetwork::typeHasOptions("steamPlan"));
+        QVERIFY(!SettingsNetwork::typeHasOptions("plan"));
+
+        // Any screensaver* type is configurable (prefix match).
+        QVERIFY(SettingsNetwork::typeHasOptions("screensaver"));
+        QVERIFY(SettingsNetwork::typeHasOptions("screensaverFlipClock"));
+
+        // Plain widgets and unknown/empty types are not.
+        QVERIFY(!SettingsNetwork::typeHasOptions("spacer"));
+        QVERIFY(!SettingsNetwork::typeHasOptions("separator"));
+        QVERIFY(!SettingsNetwork::typeHasOptions("pageTitle"));
+        QVERIFY(!SettingsNetwork::typeHasOptions(""));
+
+        // Built-in ACTION widgets ARE configurable now — they carry gesture
+        // overrides (layout-widget-gesture-overrides). `espresso` used to stand
+        // here as the example of a non-configurable widget; that is what the
+        // feature changed, so it moves sides rather than being deleted.
+        QVERIFY(SettingsNetwork::typeHasOptions("espresso"));
+        QVERIFY(SettingsNetwork::typeHasOptions("beans"));
+        QVERIFY(SettingsNetwork::typeHasOptions("history"));
+    }
+
+    // The capability schema drives the unified readout options editor (which
+    // sections it shows) and the web editor's injected WIDGET_CAPABILITIES.
+    // Pin the per-type keys and the schema↔typeHasOptions agreement.
+    void optionKeysForTypeSchema() {
+        QCOMPARE(SettingsNetwork::optionKeysForType("scaleWeight"),
+                 (QStringList{"dataMode", "displayMode", "showRatio", "color"}));
+        QCOMPARE(SettingsNetwork::optionKeysForType("temperature"),
+                 (QStringList{"displayMode", "color"}));
+        QCOMPARE(SettingsNetwork::optionKeysForType("batteryLevel"),
+                 (QStringList{"displayMode", "color"}));
+        // profileName has no meaningful icon form — color only.
+        QCOMPARE(SettingsNetwork::optionKeysForType("profileName"), (QStringList{"color"}));
+        // Bespoke-editor and unknown types carry no readout keys.
+        QVERIFY(SettingsNetwork::optionKeysForType("custom").isEmpty());
+        QVERIFY(SettingsNetwork::optionKeysForType("shotPlan").isEmpty());
+        QVERIFY(SettingsNetwork::optionKeysForType("").isEmpty());
+        // Action widgets carry gesture keys and nothing else.
+        QCOMPARE(SettingsNetwork::optionKeysForType("espresso"),
+                 (QStringList{"longPressAction", "doubleclickAction"}));
+        QCOMPARE(SettingsNetwork::optionKeysForType("history"),
+                 (QStringList{"longPressAction", "doubleclickAction"}));
+
+        // Every type with readout keys must be configurable.
+        const QStringList readouts = {
+            "machineStatus", "temperature", "steamTemperature", "waterLevel", "clock",
+            "scaleWeight", "batteryLevel", "scaleBattery", "doseWeight", "milkWeight",
+            "profileName"
+        };
+        for (const QString& t : readouts) {
+            QVERIFY2(!SettingsNetwork::optionKeysForType(t).isEmpty(), qPrintable("expected keys: " + t));
+            QVERIFY2(SettingsNetwork::typeHasOptions(t), qPrintable("schema/gate disagree: " + t));
+        }
+
+        QVERIFY(SettingsNetwork::optionKeysForType("screensaverFlipClock").isEmpty());
+
+    }
+
+    // The widget catalog drives the in-app palette, chip names, the library
+    // card, and the web editor's injected WIDGET_CATALOG. Pin invariants, not
+    // the full list, so adding a widget stays a one-table edit.
+    void widgetCatalogInvariants() {
+        const QVariantList catalog = SettingsNetwork::widgetCatalog();
+        const QVariantMap chips = SettingsNetwork::widgetChipNames();
+        const QVariantList cats = SettingsNetwork::widgetCategoryNames();
+        // The `cat` integers in the catalog are positional — pin the category
+        // names in order so a reorder without renumbering is caught.
+        QCOMPARE(cats.size(), 4);
+        const QStringList kCatOrder = {"Actions", "Readouts", "Utility", "Screensavers"};
+        for (int i = 0; i < cats.size(); ++i)
+            QCOMPARE(cats[i].toMap().value("fallback").toString(), kCatOrder[i]);
+        QVERIFY(catalog.size() >= 36);
+
+        QSet<QString> seen;
+        for (const QVariant& v : catalog) {
+            const QVariantMap e = v.toMap();
+            const QString type = e.value("type").toString();
+            QVERIFY2(!seen.contains(type), qPrintable("duplicate catalog type: " + type));
+            seen.insert(type);
+            const int cat = e.value("cat").toInt();
+            QVERIFY2(cat >= 0 && cat < cats.size(), qPrintable("bad category: " + type));
+            QVERIFY2(!e.value("label").toString().isEmpty(), qPrintable("empty label: " + type));
+            QVERIFY2(!e.value("labelKey").toString().isEmpty(), qPrintable("empty labelKey: " + type));
+            QVERIFY2(chips.contains(type), qPrintable("missing chip name: " + type));
+            // A typo'd flag would silently lose the web chip/menu coloring.
+            const QString flag = e.value("flag").toString();
+            QVERIFY2(flag.isEmpty() || flag == "special" || flag == "screensaver",
+                     qPrintable(type + " has unknown flag: " + flag));
+        }
+        // Every chip entry (incl. aliases) carries a usable key + fallback —
+        // an aggregate-initialized row with missing trailing fields would
+        // otherwise render blank chip labels.
+        for (auto it = chips.constBegin(); it != chips.constEnd(); ++it) {
+            const QVariantMap c = it.value().toMap();
+            QVERIFY2(!c.value("key").toString().isEmpty(), qPrintable("empty chip key: " + it.key()));
+            QVERIFY2(!c.value("fallback").toString().isEmpty(), qPrintable("empty chip fallback: " + it.key()));
+        }
+        // Legacy alias keeps a chip name without appearing in the palette.
+        QVERIFY(chips.contains("connectionStatus"));
+        QVERIFY(!seen.contains("connectionStatus"));
+
+
+    }
+
+    // An absent stored displayMode always means "today's rendering" — icon for
+    // the battery readouts, text everywhere else. Declared once; pin it.
+    void displayModeDefaultsPinned() {
+        QCOMPARE(SettingsNetwork::defaultDisplayModeForType("batteryLevel"), QStringLiteral("icon"));
+        QCOMPARE(SettingsNetwork::defaultDisplayModeForType("scaleBattery"), QStringLiteral("icon"));
+        QCOMPARE(SettingsNetwork::defaultDisplayModeForType("temperature"), QStringLiteral("text"));
+        QCOMPARE(SettingsNetwork::defaultDisplayModeForType("scaleWeight"), QStringLiteral("text"));
+        QCOMPARE(SettingsNetwork::defaultDisplayModeForType(""), QStringLiteral("text"));
+
+    }
+
+    // itemIsConfigured gates the remove-confirmation that protects a set-up
+    // widget from an accidental tap. Cover its two true-branches (configurable
+    // type; or a plain type carrying an extra property) and the false cases.
+    void itemIsConfiguredBranches() {
+        SettingsNetwork* net = m_settings.network();
+        const QString orig = net->layoutConfiguration();
+
+        net->setLayoutConfiguration(QStringLiteral(
+            "{\"version\":1,\"zones\":{\"statusBar\":["
+            "{\"type\":\"temperature\",\"id\":\"t1\"},"
+            "{\"type\":\"separator\",\"id\":\"sep1\"},"
+            "{\"type\":\"spacer\",\"id\":\"sp1\",\"width\":20}"
+            "]}}"));
+
+        // Configurable type → configured, even with only type/id stored.
+        QVERIFY(net->itemIsConfigured("t1"));
+        // Plain type, only type/id → not configured.
+        QVERIFY(!net->itemIsConfigured("sep1"));
+        // Plain type but carries an extra (non type/id) property → configured.
+        QVERIFY(net->itemIsConfigured("sp1"));
+        // Unknown id → empty props → not configured.
+        QVERIFY(!net->itemIsConfigured("does_not_exist"));
+
+        net->setLayoutConfiguration(orig);
+    }
+
+    // ensureSettingsAccessible is the shared guard (ported from the QML
+    // SettingsLayoutTab scan) that both the in-app editor and the web layout
+    // editor call after mutations that can strip Settings access from the
+    // home screen. Cover: nothing found -> repaired; a plain "settings" item
+    // already present -> left alone; a "custom" item with the navigate action
+    // -> also counts and no repair happens.
+    void ensureSettingsAccessibleRestoresAccess() {
+        SettingsNetwork* net = m_settings.network();
+        const QString orig = net->layoutConfiguration();
+
+        // No settings widget and no custom navigate:settings item anywhere.
+        net->setLayoutConfiguration(QStringLiteral(
+            "{\"version\":1,\"zones\":{\"statusBar\":["
+            "{\"type\":\"temperature\",\"id\":\"t1\"}"
+            "],\"bottomRight\":[]}}"));
+
+        QVERIFY(!net->hasItemType("settings"));
+        net->ensureSettingsAccessible();
+
+        bool found = false;
+        for (const QVariant& v : net->getZoneItems("bottomRight")) {
+            if (v.toMap().value("type").toString() == "settings") { found = true; break; }
+        }
+        QVERIFY2(found, "expected a settings widget to be added to bottomRight");
+
+        // Calling it again with a plain "settings" item present must not add
+        // a second one.
+        const qsizetype countBefore = net->getZoneItems("bottomRight").size();
+        net->ensureSettingsAccessible();
+        QCOMPARE(net->getZoneItems("bottomRight").size(), countBefore);
+
+        // A "custom" item whose action is navigate:settings also satisfies the
+        // guard — no settings widget should be added anywhere else.
+        net->setLayoutConfiguration(QStringLiteral(
+            "{\"version\":1,\"zones\":{\"topLeft\":["
+            "{\"type\":\"custom\",\"id\":\"c1\",\"action\":\"navigate:settings\"}"
+            "],\"bottomRight\":[]}}"));
+        net->ensureSettingsAccessible();
+        QVERIFY(!net->hasItemType("settings"));
+
+        net->setLayoutConfiguration(orig);
+    }
+
+    // Array-valued item properties: setItemPropertyList is the typed path QML
+    // must use (a JS array through the generic QVariant setter arrives as a
+    // wrapped QJSValue and would be stored as null). Regression for the Shot
+    // Plan chip editor saving "shotPlanItems": null, which read back as absent
+    // and silently reverted the user's edits (PR Kulitorum/Decenza#1426).
+    void itemPropertyListPersistsArrays() {
+        SettingsNetwork* net = m_settings.network();
+        const QString orig = net->layoutConfiguration();
+
+        net->setLayoutConfiguration(QStringLiteral(
+            "{\"version\":1,\"zones\":{\"centerMiddle\":["
+            "{\"type\":\"shotPlan\",\"id\":\"plan1\"}"
+            "]}}"));
+
+        // Deliberately NON-canonical order (canonical is doseYield, ..., roaster):
+        // a regression that sorts/normalizes the list on write or read would
+        // still pass with an in-order payload, and order IS the feature.
+        QVERIFY(net->setItemPropertyList("plan1", "shotPlanItems",
+                QVariantList{QStringLiteral("roaster"), QStringLiteral("doseYield"), QStringLiteral("coffee")}));
+        QVariantMap props = net->getItemProperties("plan1");
+        QCOMPARE(props.value("shotPlanItems").toStringList(),
+                 QStringList({QStringLiteral("roaster"), QStringLiteral("doseYield"), QStringLiteral("coffee")}));
+
+        // An empty array is a valid "show nothing" config: it must survive as a
+        // present, empty list — not collapse to null (which reads as absent and
+        // re-triggers legacy derivation).
+        net->setItemPropertyList("plan1", "shotPlanItems", QVariantList{});
+        props = net->getItemProperties("plan1");
+        QVERIFY(props.contains("shotPlanItems"));
+        QVERIFY(!props.value("shotPlanItems").isNull());
+        QVERIFY(props.value("shotPlanItems").toList().isEmpty());
+
+        // The generic setter still takes a plain QVariantList (the web editor's
+        // path — JSON arrays arrive as QVariantList, not QJSValue).
+        net->setItemProperty("plan1", "shotPlanItems",
+                             QVariantList{QStringLiteral("grind")});
+        props = net->getItemProperties("plan1");
+        QCOMPARE(props.value("shotPlanItems").toStringList(),
+                 QStringList{QStringLiteral("grind")});
+
+        // A write to a stale/unknown itemId must report failure (and warn), not
+        // silently no-op with the stored state unchanged.
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("no layout item with id"));
+        QVERIFY(!net->setItemProperty("gone", "shotPlanSentence", true));
+
+        // An invalid QVariant (JS undefined / missing web value) must be
+        // refused, not stored as JSON null; the previous value survives.
+        QTest::ignoreMessage(QtWarningMsg,
+                             QRegularExpression("refusing invalid or unserializable property"));
+        QVERIFY(!net->setItemProperty("plan1", "shotPlanItems", QVariant()));
+        props = net->getItemProperties("plan1");
+        QCOMPARE(props.value("shotPlanItems").toStringList(),
+                 QStringList{QStringLiteral("grind")});
+
+        net->setLayoutConfiguration(orig);
+    }
+
+    // ==========================================
+    // Recipes-first default layout
+    // ==========================================
+
+    void defaultLayoutIsRecipesFirst() {
+        SettingsNetwork* net = m_settings.network();
+        const QString orig = net->layoutConfiguration();
+
+        net->resetLayoutToDefault();
+        QCOMPARE(typesOf(net->getZoneItems("centerTop")),
+                 QStringList({"recipes", "beans", "steam", "hotwater"}));
+        QCOMPARE(typesOf(net->getZoneItems("bottomLeft")), QStringList({"sleep"}));
+        QCOMPARE(typesOf(net->getZoneItems("bottomRight")),
+                 QStringList({"flush", "history", "equipment", "espresso", "settings"}));
+        // No Auto-Favorites anywhere in the default.
+        for (const QString& zone : {QStringLiteral("centerTop"), QStringLiteral("centerMiddle"),
+                                    QStringLiteral("centerStatus"), QStringLiteral("bottomLeft"),
+                                    QStringLiteral("bottomRight"), QStringLiteral("topLeft"),
+                                    QStringLiteral("topRight"), QStringLiteral("lowerMidBar")})
+            QVERIFY(!typesOf(net->getZoneItems(zone)).contains("autofavorites"));
+
+        net->setLayoutConfiguration(orig);
+    }
+
+    // Reading the layout (getLayoutObject) must never add or duplicate the
+    // equipment/recipes buttons: those injections are now one-time, driven by the
+    // DB schema crossing from MainController (issue #1586), not by this read path.
+    // Reset, then force a fresh read from storage and confirm the composition is
+    // unchanged — the default ships both buttons exactly once and a reload keeps
+    // it that way.
+    void resetToDefaultSurvivesReloadUnchanged() {
+        SettingsNetwork* net = m_settings.network();
+        const QString orig = net->layoutConfiguration();
+
+        net->resetLayoutToDefault();
+        const QStringList centerTopBefore = typesOf(net->getZoneItems("centerTop"));
+        const QStringList bottomRightBefore = typesOf(net->getZoneItems("bottomRight"));
+
+        // A second, independent Settings instance reads the same on-disk store
+        // fresh (mirrors a fresh app start) — the read must not inject or
+        // duplicate anything.
+        Settings reloaded;
+        SettingsNetwork* reloadedNet = reloaded.network();
+        QCOMPARE(typesOf(reloadedNet->getZoneItems("centerTop")), centerTopBefore);
+        QCOMPARE(typesOf(reloadedNet->getZoneItems("bottomRight")), bottomRightBefore);
+        QCOMPARE(centerTopBefore.count("recipes"), 1);
+        QCOMPARE(bottomRightBefore.count("equipment"), 1);
+
+        net->setLayoutConfiguration(orig);
+    }
+
+    // ==========================================
+    // One-time idle-button injection (issue #1586)
+    // ==========================================
+
+    // Reading the layout no longer resurrects a removed button. A user who
+    // removed Equipment (and Recipes) must NOT get it back on a plain reload —
+    // the old presence-gated inject inside getLayoutObject did exactly that on
+    // every launch. Injection now happens only via the explicit crossing-gated
+    // methods below, which MainController calls once per schema upgrade.
+    void removedButtonsStayRemovedOnReload() {
+        SettingsNetwork* net = m_settings.network();
+
+        // A settled layout with neither Equipment nor Recipes anywhere, but with
+        // Settings still reachable so nothing else repairs it.
+        net->setLayoutConfiguration(QStringLiteral(
+            "{\"version\":1,\"zones\":{"
+            "\"bottomRight\":["
+            "{\"type\":\"history\",\"id\":\"history1\"},"
+            "{\"type\":\"beans\",\"id\":\"beans1\"},"
+            "{\"type\":\"espresso\",\"id\":\"espresso1\"},"
+            "{\"type\":\"settings\",\"id\":\"settings1\"}]"
+            "}}"));
+
+        // setLayoutConfiguration invalidates the cache, so this re-enters
+        // getLayoutObject() with a cold cache and reads from storage — which
+        // under the old code WAS the injection path. These two lines are what
+        // fail if the presence-gated inject is ever reinstated.
+        QVERIFY(!net->hasItemType("equipment"));
+        QVERIFY(!net->hasItemType("recipes"));
+
+        // Fresh read from storage (a new app start) must leave them absent.
+        Settings reloaded;
+        SettingsNetwork* reloadedNet = reloaded.network();
+        QVERIFY(!reloadedNet->hasItemType("equipment"));
+        QVERIFY(!reloadedNet->hasItemType("recipes"));
+    }
+
+    // A layout saved before lowerMidBar existed has no key for it, and no read
+    // adds one: the zone reads as empty and the first item added creates it.
+    void layoutWithoutLowerMidBarAcceptsItems() {
+        SettingsNetwork* net = m_settings.network();
+        const QString orig = net->layoutConfiguration();
+        net->setLayoutConfiguration(QStringLiteral(
+            "{\"version\":1,\"zones\":{"
+            "\"bottomRight\":[{\"type\":\"settings\",\"id\":\"settings1\"}]}}"));
+
+        QVERIFY(net->getZoneItems("lowerMidBar").isEmpty());
+        net->addItem(QStringLiteral("clock"), QStringLiteral("lowerMidBar"));
+
+        Settings reloaded;
+        SettingsNetwork* reloadedNet = reloaded.network();
+        QCOMPARE(typesOf(reloadedNet->getZoneItems("lowerMidBar")), QStringList({"clock"}));
+        QCOMPARE(typesOf(reloadedNet->getZoneItems("bottomRight")), QStringList({"settings"}));
+        net->setLayoutConfiguration(orig);
+    }
+
+    // ==========================================
+    // Known scales: invariant + heal
+    // ==========================================
+
+    // Adding the first known scale into an empty primary state must auto-
+    // promote that entry to primary. Without this, the Known Devices picker
+    // renders with currentIndex == -1 (nothing selected) even though the
+    // list has entries — the user has to tap one to make their selection
+    // "stick" as primary, which is the bug the user observed in #1281.
+    void addKnownScalePromotesToPrimaryWhenNoneSet() {
+        KnownScalesGuard guard(&m_settings);
+        // Guard cleared knownScales; also clear primary so we're in the
+        // empty-primary state.
+        m_settings.setPrimaryScale(QString());
+
+        m_settings.addKnownScale("AA:BB:CC:DD:EE:FF", "decent", "Test Scale");
+
+        QCOMPARE(m_settings.primaryScaleAddress(), QString("AA:BB:CC:DD:EE:FF"));
+        QCOMPARE(m_settings.scaleAddress(), QString("AA:BB:CC:DD:EE:FF"));
+        QCOMPARE(m_settings.scaleType(), QString("decent"));
+        QCOMPARE(m_settings.scaleName(), QString("Test Scale"));
+
+        // Adding a SECOND scale must NOT change primary (the first one's
+        // promotion is sticky; the user explicitly switches via setPrimaryScale).
+        m_settings.addKnownScale("11:22:33:44:55:66", "decent", "Second Scale");
+        QCOMPARE(m_settings.primaryScaleAddress(), QString("AA:BB:CC:DD:EE:FF"));
+    }
+
+    // Re-adding an existing known scale must repair the primary invariant
+    // if primary was cleared between the original add and the re-add. main.cpp
+    // calls addKnownScale on every scale connect, so this is the natural
+    // healing path if some other code (clearSavedScale via MCP, a future
+    // migration, a test fixture) left primary empty while the entry still
+    // existed. Without this, the early-return on existing entries would skip
+    // the invariant check and the Known Devices picker would render with
+    // nothing selected even though the list has entries.
+    void addKnownScaleRepairsPrimaryOnReAddOfExistingEntry() {
+        KnownScalesGuard guard(&m_settings);
+
+        // First add — invariant auto-promotes the new entry.
+        m_settings.addKnownScale("AA:BB:CC:DD:EE:01", "decent", "Test Scale");
+        QCOMPARE(m_settings.primaryScaleAddress(), QString("AA:BB:CC:DD:EE:01"));
+
+        // Force the "primary cleared, entry remains" state — unreachable in
+        // normal flow but reproducible at this layer.
+        m_settings.setPrimaryScale(QString());
+        QVERIFY(m_settings.primaryScaleAddress().isEmpty());
+
+        // Re-add the same address — the same call main.cpp makes on every
+        // connect. Pre-fix this hit the early-return path and left primary
+        // empty; post-fix it repairs the invariant.
+        m_settings.addKnownScale("AA:BB:CC:DD:EE:01", "decent", "Test Scale");
+        QCOMPARE(m_settings.primaryScaleAddress(), QString("AA:BB:CC:DD:EE:01"));
+        // Legacy keys are also re-synced via setPrimaryScale's normal path.
+        QCOMPARE(m_settings.scaleAddress(), QString("AA:BB:CC:DD:EE:01"));
+    }
+
+    // Settings' startup orphan-heal must repair the BOTH directions of the
+    // scale/address ↔ knownScales/primaryAddress relationship:
+    //   forward — primary empty / stale → promote first known and write legacy
+    //   reverse — primary valid but legacy empty/stale → sync legacy from primary
+    // The reverse case was the actual #1281 follow-up bug. QML's startup hook
+    // gates `tryDirectConnectToScale` on `primaryScaleAddress`, but main.cpp's
+    // BLEManager load (pre-fix) read the legacy `scale/address`. A drift
+    // between the two stranded the user with no auto-connect at startup.
+    void orphanHealRepairsLegacyAddressFromValidPrimary() {
+        KnownScalesGuard guard(&m_settings);
+
+        // Pre-seed: knownScales has an entry, primary points to it, but the
+        // legacy keys are stale/empty (simulates the divergence). Write
+        // directly to QSettings so the heal sees the pre-state on next ctor.
+        QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+        raw.remove("knownScales/scales");
+        raw.beginWriteArray("knownScales/scales");
+        raw.setArrayIndex(0);
+        raw.setValue("address", "PRIMARY:AA:11");
+        raw.setValue("type", "decent");
+        raw.setValue("name", "Healed Scale");
+        raw.endArray();
+        raw.setValue("knownScales/primaryAddress", "PRIMARY:AA:11");
+        raw.setValue("scale/address", "");
+        raw.setValue("scale/type", "");
+        raw.setValue("scale/name", "");
+        raw.sync();
+
+        // Construct a fresh Settings — the orphan-heal in its constructor
+        // sees the divergence and syncs legacy from primary.
+        Settings healed;
+
+        QCOMPARE(healed.scaleAddress(), QString("PRIMARY:AA:11"));
+        QCOMPARE(healed.scaleType(), QString("decent"));
+        QCOMPARE(healed.scaleName(), QString("Healed Scale"));
+        // primaryScaleAddress unchanged (it was already correct).
+        QCOMPARE(healed.primaryScaleAddress(), QString("PRIMARY:AA:11"));
+    }
+
+    // ==========================================
+    // Recipes (add-recipes): active recipe id (the pinned-grind write-through
+    // routing test lives in tst_coffeebags, beside the other SettingsDye
+    // async write-through tests)
+    // ==========================================
+
+    void activeRecipeIdRoundTrip() {
+        m_settings.dye()->setActiveRecipeId(-1);
+        QSignalSpy spy(m_settings.dye(), &SettingsDye::activeRecipeIdChanged);
+        m_settings.dye()->setActiveRecipeId(42);
+        QCOMPARE(m_settings.dye()->activeRecipeId(), 42);
+        QCOMPARE(spy.count(), 1);
+        m_settings.dye()->setActiveRecipeId(42);  // same value: no signal
+        QCOMPARE(spy.count(), 1);
+    }
+
+    // ==========================================
+    // Grind-quick-select catalog stepping (grind-quick-select widget):
+    // stepGrinderSetting routes numeric AND Compound "a+b" grinders through the
+    // catalog pipeline.
+    // ==========================================
+
+    void stepGrinderSetting_numeric() {
+        SettingsDye* dye = m_settings.dye();
+        // Turin DF83V — NumericWithSuffix. Default decimals = 1.
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 2.0), QString("22"));
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", -3.0), QString("17"));
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 0.5), QString("20.5"));
+        // Below zero is a VALID candidate on a plain-numeric grinder: a stepless
+        // collar's zero is a user-set calibration reference (Niche Zero) and
+        // finer-than-zero is a real dial position, so nothing is skipped
+        // (replace-grind-inputs-with-picker; previously returned "").
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "1", -5.0), QString("-4"));
+        // Zero itself, and formatting on the way down, are unchanged.
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "2", -2.0), QString("0"));
+        // Sub-0.5 step precision is honored, not truncated to a single decimal
+        // (the grind widget's history-derived step goes to 2 decimals). Trailing
+        // zeros stripped: 20.50 → "20.5".
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 0.25, 2), QString("20.25"));
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 0.05, 2), QString("20.05"));
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 0.5, 2),  QString("20.5"));
+        // decimals = 0 rounds to an integer label (20.25 → "20"); the decimals
+        // arg is qBound(0, .., 3), so out-of-range values clamp rather than
+        // producing garbage-length labels: -1 → 0 decimals, 9 → 3 decimals.
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 0.25, 0),  QString("20"));
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 0.25, -1), QString("20"));
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 0.125, 9), QString("20.125"));
+    }
+
+    void stepGrinderSetting_compound() {
+        SettingsDye* dye = m_settings.dye();
+        // Eureka Mignon Specialita — Compound, 100 positions/rev. This is the
+        // cohort the hand-rolled regex missed entirely (fell through to history).
+        QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "1+4", 1.0), QString("1+5"));
+        QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "1+4", -2.0), QString("1+2"));
+        // Rev carry UP: 1+98 (=198) + 5 = 203 → 2+3.
+        QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "1+98", 5.0), QString("2+3"));
+        // Rev borrow DOWN across a revolution: 2+3 (=203) - 5 = 198 → 1+98. The
+        // mirror of the carry case above — exercises floor() on the way down.
+        QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "2+3", -5.0), QString("1+98"));
+        // Below floor → "".
+        QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "0+2", -5.0), QString());
+        // A compound grinder whose setting is recorded as a plain number keeps
+        // the numeric form (NOT re-notated to "0+3.5") — output follows the input.
+        QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "2.5", 1.0, 2), QString("3.5"));
+    }
+
+    void stepGrinderSetting_negativeCandidates() {
+        SettingsDye* dye = m_settings.dye();
+        // Niche Zero — NumericWithSuffix, stepless collar whose zero is a
+        // user-set calibration reference: finer than zero is a real dial
+        // position, so the full ±window generates (replace-grind-inputs-with-
+        // picker). At 0.25 with a 0.25 step, 5 steps down reaches -1.
+        QCOMPARE(dye->stepGrinderSetting("Niche", "Zero", "0.25", -1.25, 2), QString("-1"));
+        QCOMPARE(dye->stepGrinderSetting("Niche", "Zero", "0.25", -0.25, 2), QString("0"));
+        // A ±5-step probe around a positive anchor stays positive (6.75..9.25
+        // at step 0.25) — the range the WEB datalist offers. The app wheel's
+        // window is ±400 steps and deliberately reaches negatives from any
+        // anchor; that is the guard-removal behaviour the assertions above
+        // cover.
+        QCOMPARE(dye->stepGrinderSetting("Niche", "Zero", "8", -1.25, 2), QString("6.75"));
+        QCOMPARE(dye->stepGrinderSetting("Niche", "Zero", "8", 1.25, 2), QString("9.25"));
+        // Click-indexed (Compound) grinders keep the skip, keyed on the
+        // grinder's REGISTRY notation, not the current value's written form:
+        // a Mignon logging plain "2.5" still refuses a negative candidate —
+        // a negative linear position is meaningless on click-indexed hardware
+        // however it is written.
+        QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "2.5", -3.0, 2), QString());
+    }
+
+    void grinderIsClickIndexed_followsRegistryNotation() {
+        SettingsDye* dye = m_settings.dye();
+        // The QML numeric fallback re-checks the click-indexed skip through this
+        // (stepGrinderSetting's "" falls through to the JS branch, which would
+        // otherwise resurrect the refused negative for numeric-logging Mignons).
+        QVERIFY(dye->grinderIsClickIndexed("Eureka", "Mignon Specialita"));
+        QVERIFY(!dye->grinderIsClickIndexed("Niche", "Zero"));
+        QVERIFY(!dye->grinderIsClickIndexed("Acme", "NotReal"));
+    }
+
+    void stepGrinderSetting_customGrinderFallsBack() {
+        // A grinder not in the registry returns "" so the widget keeps its own
+        // plain-numeric / letter / history fallback (unchanged behaviour).
+        QCOMPARE(m_settings.dye()->stepGrinderSetting("Acme", "NotReal", "20", 2.0), QString());
+    }
+
+    void stepGrinderSetting_unparseableRegistryValueFallsBack() {
+        SettingsDye* dye = m_settings.dye();
+        // A registry grinder whose current setting can't be parsed as a dial
+        // number (a word, or empty/whitespace) returns "" — the caller then uses
+        // its JS letter / history fallback rather than the catalog. Exercises the
+        // parseGrinderSetting == nullopt branch that the happy-path tests skip.
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "fine", 2.0), QString());
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "", 2.0), QString());
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "   ", 2.0), QString());
+    }
+
+    // --- Font sizes: single source of truth + override reporting (#1469) -----
+
+    void fontSizeDefaults_areTheSingleSource() {
+        // The web theme editor used to carry its own copy of this table. If a default
+        // changes, both the QML theme and the editor must move together — this asserts
+        // the canonical values so a silent edit to one surface is caught here.
+        const QMap<QString, int>& d = SettingsTheme::fontSizeDefaults();
+        QCOMPARE(d.value("headingSize"), 32);
+        QCOMPARE(d.value("titleSize"), 24);
+        QCOMPARE(d.value("subtitleSize"), 18);
+        QCOMPARE(d.value("bodySize"), 18);
+        QCOMPARE(d.value("labelSize"), 14);
+        QCOMPARE(d.value("captionSize"), 12);
+        QCOMPARE(d.value("valueSize"), 48);
+        QCOMPARE(d.value("timerSize"), 72);
+        QCOMPARE(d.value("smallSize"), 10);
+        QCOMPARE(d.size(), 9);
+    }
+
+    void effectiveFontSizes_defaultsWhenUnset() {
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        const QVariantMap eff = theme->effectiveFontSizes();
+        // Assert the KEY NAMES, not just the count. QML indexes this map by name
+        // (effectiveFontSizes.labelSize), and Theme.qml no longer carries `|| 14`
+        // fallbacks — so a renamed or missing key yields undefined, then
+        // Math.round(undefined * scale) = NaN, then Qt.font({pixelSize: NaN}) on a
+        // font role used app-wide. Silent, and a size-only check would not catch it.
+        QCOMPARE(eff.keys(), SettingsTheme::fontSizeDefaults().keys());
+        QCOMPARE(eff.value("labelSize").toInt(), 14);
+        QCOMPARE(eff.value("timerSize").toInt(), 72);
+        // No role may ever be zero/undefined — that would render invisible text.
+        for (auto it = eff.constBegin(); it != eff.constEnd(); ++it)
+            QVERIFY2(it.value().toInt() > 0, qPrintable("non-positive size for " + it.key()));
+    }
+
+    void effectiveFontSizes_mergesOverrides() {
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        theme->setFontSize("labelSize", 22);
+        const QVariantMap eff = theme->effectiveFontSizes();
+        QCOMPARE(eff.value("labelSize").toInt(), 22);   // overridden
+        QCOMPARE(eff.value("bodySize").toInt(), 18);    // untouched roles stay default
+        // Totality must survive overrides too, not just the unset case.
+        QCOMPARE(eff.keys(), SettingsTheme::fontSizeDefaults().keys());
+        theme->resetFontSizesToDefault();
+    }
+
+    void fontSizeOverrides_emptyWhenAllDefault() {
+        // The startup log must stay silent when nothing is customised — this is the
+        // overwhelmingly common case and the reason the log line is conditional.
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        QVERIFY(theme->fontSizeOverrides().isEmpty());
+    }
+
+    void fontSizeOverrides_reportsOnlyChangedRoles() {
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        theme->setFontSize("labelSize", 20);
+        theme->setFontSize("bodySize", 24);
+        const QVariantMap changed = theme->fontSizeOverrides();
+        QCOMPARE(changed.size(), 2);
+        QCOMPARE(changed.value("labelSize").toInt(), 20);
+        QCOMPARE(changed.value("bodySize").toInt(), 24);
+        QVERIFY(!changed.contains("timerSize"));
+    }
+
+    void fontSizeOverrides_storedValueEqualToDefaultIsNotAnOverride() {
+        // Dragging a slider and putting it back writes a stored entry equal to the
+        // default. That is not a customization and must not be reported, or the log
+        // would accuse a user of a change they did not make.
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        theme->setFontSize("labelSize", 14);   // == default
+        QVERIFY(theme->customFontSizes().contains("labelSize"));  // it IS stored
+        QVERIFY(theme->fontSizeOverrides().isEmpty());            // but is not an override
+    }
+
+    void fontSizeOverrides_ignoresGarbageStoredValues_data() {
+        QTest::addColumn<QVariant>("stored");
+        QTest::addColumn<int>("expectedEffective");
+        // The `stored > 0` guard in effectiveFontSizes()/fontSizeOverrides() is the only
+        // thing standing between a corrupt QSettings blob and pixelSize 0 (invisible
+        // text). Every one of these is reachable: getFontSize() returns 0 for a missing
+        // key, the web POST /api/theme/font takes a JSON body, and customFontSizes()
+        // round-trips through JSON where a string silently .toInt()s to 0.
+        QTest::newRow("zero")        << QVariant(0)      << 14;
+        QTest::newRow("negative")    << QVariant(-5)     << 14;
+        QTest::newRow("non-numeric") << QVariant("big")  << 14;
+    }
+
+    void fontSizeOverrides_ignoresGarbageStoredValues() {
+        QFETCH(QVariant, stored);
+        QFETCH(int, expectedEffective);
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        theme->setCustomFontSizes(QVariantMap{{"labelSize", stored}});
+        // Falls back to the default rather than rendering at 0...
+        QCOMPARE(theme->effectiveFontSizes().value("labelSize").toInt(), expectedEffective);
+        // ...and is not reported as a user override in the startup log.
+        QVERIFY(theme->fontSizeOverrides().isEmpty());
+    }
+
+    void fontSizeOverrides_unknownKeyIsDropped() {
+        // Both accessors iterate fontSizeDefaults(), so a key outside the canonical
+        // domain is silently ignored. Pinning that deliberate choice.
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        // The reject is now loud, not silent — assert the warning fires too, otherwise
+        // failOnWarning turns intended diagnostics into a red test.
+        // [Font][Overrides] now, via the registered helper. The quotes are gone with
+        // the stream operator: the message is one QString built with .arg(), so the
+        // role name is no longer wrapped by qDebug's QString quoting.
+        QTest::ignoreMessage(QtWarningMsg,
+                             "[Font][Overrides] Ignoring unknown font role: bogusSize");
+        theme->setFontSize("bogusSize", 99);
+        QVERIFY(!theme->effectiveFontSizes().contains("bogusSize"));
+        QVERIFY(!theme->fontSizeOverrides().contains("bogusSize"));
+        QCOMPARE(theme->effectiveFontSizes().keys(), SettingsTheme::fontSizeDefaults().keys());
+    }
+
+    void setFontSize_clampsToRoleRange() {
+        // POST /api/theme/font accepts a JSON body, so an out-of-range value is reachable
+        // without touching the editor's sliders. Unclamped, timerSize=100000 renders the
+        // app unusable. Bounds live in fontRoles() and are enforced on write.
+        SettingsTheme* theme = m_settings.theme();
+        theme->resetFontSizesToDefault();
+        const auto& role = SettingsTheme::fontRoles().value("timerSize");
+
+        QTest::ignoreMessage(QtWarningMsg, "[Font][Overrides] Clamped timerSize 100000 -> 120");
+        theme->setFontSize("timerSize", 100000);
+        QCOMPARE(theme->effectiveFontSizes().value("timerSize").toInt(), role.max);
+
+        QTest::ignoreMessage(QtWarningMsg, "[Font][Overrides] Clamped labelSize 1 -> 8");
+        theme->setFontSize("labelSize", 1);
+        QCOMPARE(theme->effectiveFontSizes().value("labelSize").toInt(), role.min > 0
+                 ? SettingsTheme::fontRoles().value("labelSize").min : 8);
+    }
+
+    void themeQmlFontRoleNamesMatchDefaults() {
+        // Guards the C++/QML seam that no compiler checks. Theme.qml indexes
+        // effectiveFontSizes by literal name; this PR removed its `|| 14` fallbacks, so
+        // a rename on either side yields NaN pixelSize app-wide with every other test
+        // still green. Reads the shipped QML rather than a copy of the list.
+        QFile f(QStringLiteral(DECENZA_SOURCE_DIR) + "/qml/Theme.qml");
+        QVERIFY2(f.open(QIODevice::ReadOnly | QIODevice::Text), "cannot open qml/Theme.qml");
+        const QString qml = QString::fromUtf8(f.readAll());
+
+        static const QRegularExpression re(QStringLiteral("effectiveFontSizes\\.(\\w+)"));
+        QStringList referenced;
+        auto it = re.globalMatch(qml);
+        while (it.hasNext())
+            referenced << it.next().captured(1);
+
+        QVERIFY2(!referenced.isEmpty(), "no effectiveFontSizes.<role> references found — "
+                                        "did Theme.qml stop using the shared defaults?");
+        for (const QString& role : std::as_const(referenced)) {
+            QVERIFY2(SettingsTheme::fontSizeDefaults().contains(role),
+                     qPrintable("Theme.qml references effectiveFontSizes." + role
+                                + " which is not a key of SettingsTheme::fontSizeDefaults()"));
+        }
+    }
+
+    void resetFontSizesToDefault_clearsOverrides() {
+        SettingsTheme* theme = m_settings.theme();
+        theme->setFontSize("headingSize", 40);
+        QVERIFY(!theme->fontSizeOverrides().isEmpty());
+        theme->resetFontSizesToDefault();
+        QVERIFY(theme->fontSizeOverrides().isEmpty());
+        QCOMPARE(theme->effectiveFontSizes().value("headingSize").toInt(), 32);
+    }
+
+    // QML must be able to chain THROUGH a domain sub-object: `Settings.theme.activeThemeName`,
+    // which is how roughly 1,300 call sites read settings.
+    //
+    // This is not a hypothetical. `settings.h` declares the domain Q_PROPERTYs with their
+    // concrete types (SettingsTheme* etc.) precisely so qmllint can resolve what is behind them.
+    // Getting there without including the domain headers was attempted via
+    // Q_DECLARE_OPAQUE_POINTER — which compiled, satisfied the linter, and then handed QML a
+    // QVariant(SettingsTheme*) rather than an object, leaving every `Settings.<domain>.<prop>`
+    // undefined at runtime. That approach was reverted; this test is what makes the revert
+    // permanent, because nothing else in the build would notice its return.
+    //
+    // The change this test belongs to exists because that failure mode shipped once already
+    // (fixed in PR Kulitorum/Decenza#1661), and during the migration an equivalent break passed the build, the linter AND the
+    // full suite while the app was unusable. So assert it against a real QQmlEngine.
+    //
+    // NOTE ON SCOPE: this publishes the instance as a context property, which is NOT how the app
+    // does it (main.cpp publishes SettingsForeign::s_singletonInstance and QML resolves the
+    // registered singleton type). The registration itself cannot be exercised here — it is
+    // emitted by qmltyperegistrar on the Decenza QML module target, which the test binaries do
+    // not link. What is checked instead is the property-chaining behaviour, which is identical
+    // once the object reaches QML by either route, and which is what the opaque-pointer attempt
+    // broke. The registration side is covered structurally by tst_qmlregistration.
+    void qmlChainsThroughDomainSubObjects() {
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("Settings", &m_settings);
+
+        m_settings.theme()->setActiveThemeName("qml-chain-probe");
+
+        QQmlComponent component(&engine);
+        component.setData(
+            "import QtQml\n"
+            "QtObject {\n"
+            // A live binding through the sub-object — the read half.
+            "    property string themeName: Settings.theme.activeThemeName\n"
+            "    property string readBeforeWrite\n"
+            "    property bool wroteThrough\n"
+            // The write half, deliberately after property init so it does not race the binding
+            // above. Reading is the weaker check: a `typeof === 'object'` probe passes even for a
+            // QVariant-wrapped opaque pointer, which is the exact thing that broke. A write that
+            // reaches the C++ setter cannot.
+            "    Component.onCompleted: {\n"
+            "        readBeforeWrite = themeName\n"
+            "        Settings.theme.activeThemeName = 'qml-chain-written'\n"
+            "        wroteThrough = (Settings.theme.activeThemeName === 'qml-chain-written')\n"
+            "    }\n"
+            "}\n",
+            QUrl("qrc:/tst_settings_domain_chain.qml"));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+
+        std::unique_ptr<QObject> obj(component.create());
+        QVERIFY2(obj, qPrintable(component.errorString()));
+
+        QCOMPARE(obj->property("readBeforeWrite").toString(), QStringLiteral("qml-chain-probe"));
+        QVERIFY2(obj->property("wroteThrough").toBool(),
+                 "QML could not WRITE through Settings.<domain>.");
+        // And the write landed on the C++ object rather than on a copy — the failure shape of a
+        // QVariant-wrapped pointer.
+        QCOMPARE(m_settings.theme()->activeThemeName(), QStringLiteral("qml-chain-written"));
+        // The binding followed the change, so the sub-object's NOTIFY reaches QML too.
+        QCOMPARE(obj->property("themeName").toString(), QStringLiteral("qml-chain-written"));
+    }
+
+    // GrinderAliases::findEntry() memoizes its last (brand, model) lookup. Its
+    // failure shape is a STALE HIT: answer the second grinder with the first
+    // one's entry. Nothing else in the suite alternates grinders within one call
+    // sequence, so nothing else can catch it.
+    //
+    // Asserted through stepGrinderSetting() because the notation reached through
+    // the memo is what the picker consumes, and the grinders below disagree
+    // about it.
+    void findEntryMemoDoesNotServeAStaleGrinder() {
+        SettingsDye* dye = m_settings.dye();
+
+        // Alternate, so every call but the first is a memo hit for the WRONG
+        // grinder if the key is ignored. Repeated to outlive a one-deep memo
+        // that happens to be refreshed by the previous line.
+        for (int i = 0; i < 3; ++i) {
+            QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 2.0), QString("22"));
+            QCOMPARE(dye->stepGrinderSetting("Eureka", "Mignon Specialita", "1+4", 1.0),
+                     QString("1+5"));
+        }
+
+        // Same brand, different model: the MODEL half of the key alone must
+        // invalidate. The pair has to DISAGREE or the assertion proves nothing —
+        // Niche Zero and Duo are both NumericWithSuffix, so "5"+1 is "6" either
+        // way and this passed with the model dropped from the key.
+        //
+        // 1Zpresso J-Max and K-Max are both Compound but carry at 30 vs 90
+        // positions/rev, so 0+29 stepped by 1 reaches 30 = a full revolution on
+        // one and 30 into the first on the other.
+        for (int i = 0; i < 3; ++i) {
+            QCOMPARE(dye->stepGrinderSetting("1Zpresso", "J-Max", "0+29", 1.0), QString("1+0"));
+            QCOMPARE(dye->stepGrinderSetting("1Zpresso", "K-Max", "0+29", 1.0), QString("0+30"));
+        }
+
+        // A negative result is cached too — the custom-grinder case, which is
+        // the WORST caller (it walks the whole table) and so the one most worth
+        // memoizing. It must stay "" on repeat, and must not poison the next
+        // real lookup.
+        for (int i = 0; i < 3; ++i)
+            QCOMPARE(dye->stepGrinderSetting("Homebuilt", "No Such Grinder", "20", 2.0), QString());
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 2.0), QString("22"));
+
+        // Case-insensitivity is the lookup's contract; the memo compares keys
+        // exactly, so a differently-cased repeat must MISS and re-resolve rather
+        // than fall through to nullptr.
+        QCOMPARE(dye->stepGrinderSetting("turin", "df83v", "20", 2.0), QString("22"));
+        QCOMPARE(dye->stepGrinderSetting("Turin", "DF83V", "20", 2.0), QString("22"));
+    }
+
+    // stepGrinderSettingRange must be indistinguishable from calling
+    // stepGrinderSetting once per row. The picker builds its wheel from the
+    // batch form and falls back per row on an empty entry, so a divergence in
+    // EITHER direction is a wrong wheel: a spurious value hides the JS fallback
+    // that should have run, and a spurious empty invents a fallback row.
+    //
+    // Both forms now share stepFromParsed(), so this is the test that keeps the
+    // extraction honest — it is the only thing that would catch the batch loop
+    // drifting from the single-row rules.
+    void stepGrinderSettingRangeMatchesTheSingleRowForm_data() {
+        QTest::addColumn<QString>("brand");
+        QTest::addColumn<QString>("model");
+        QTest::addColumn<QString>("current");
+        QTest::addColumn<double>("step");
+        QTest::addColumn<int>("decimals");
+
+        // Registry plain-numeric, including a step that reaches below zero (a
+        // stepless collar keeps negatives; the batch must not clamp them away).
+        QTest::newRow("niche-zero-0.25")   << "Niche" << "Zero" << "8"    << 0.25 << 2;
+        QTest::newRow("niche-zero-below0") << "Niche" << "Zero" << "0.5"  << 0.25 << 2;
+        // Compound, in its own notation — exercises rev carry AND the
+        // click-indexed below-floor skip, which is where empties come from.
+        QTest::newRow("mignon-compound")   << "Eureka" << "Mignon Specialita" << "1+4" << 1.0 << 1;
+        QTest::newRow("mignon-floor")      << "Eureka" << "Mignon Specialita" << "0+2" << 1.0 << 1;
+        // Compound grinder recorded as a plain number: must stay numeric, not
+        // be re-notated — a rule that lives in stepFromParsed and could be lost.
+        QTest::newRow("mignon-plain")      << "Eureka" << "Mignon Specialita" << "2.5" << 0.5 << 2;
+        // Different revolution length, so a shared-entry bug shows up.
+        QTest::newRow("jmax-compound")     << "1Zpresso" << "J-Max" << "0+29" << 1.0 << 1;
+        // Not in the registry: every row must decline, and the list must still
+        // be full length or the caller's window silently shifts.
+        QTest::newRow("custom-grinder")    << "Homebuilt" << "No Such" << "20" << 0.5 << 1;
+        // In the registry but unparseable (pure letters) — same, via the other
+        // early return.
+        QTest::newRow("unparseable")       << "Niche" << "Zero" << "AB" << 1.0 << 1;
+        QTest::newRow("empty-current")     << "Niche" << "Zero" << ""   << 1.0 << 1;
+    }
+
+    void stepGrinderSettingRangeMatchesTheSingleRowForm() {
+        QFETCH(QString, brand);
+        QFETCH(QString, model);
+        QFETCH(QString, current);
+        QFETCH(double, step);
+        QFETCH(int, decimals);
+
+        SettingsDye* dye = m_settings.dye();
+        // Narrower than the picker's ±400 so the table stays quick; the loop is
+        // uniform in n, so the window width is not what could break.
+        const int span = 12;
+        const QStringList batch =
+            dye->stepGrinderSettingRange(brand, model, current, step, -span, span, decimals);
+
+        QCOMPARE(batch.size(), 2 * span + 1);
+        for (int n = -span; n <= span; ++n) {
+            const QString one = dye->stepGrinderSetting(brand, model, current, n * step, decimals);
+            QCOMPARE(batch.at(n + span), one);
+        }
+    }
+
+    // Degenerate window: toN < fromN yields an empty list rather than a
+    // one-element one. The caller indexes by offset, so an off-by-one here
+    // shifts every row of the wheel.
+    void stepGrinderSettingRangeHandlesAnEmptyWindow() {
+        SettingsDye* dye = m_settings.dye();
+        QVERIFY(dye->stepGrinderSettingRange("Niche", "Zero", "8", 0.25, 1, 0, 2).isEmpty());
+        QCOMPARE(dye->stepGrinderSettingRange("Niche", "Zero", "8", 0.25, 0, 0, 2).size(), 1);
+    }
+
+};
+
+QTEST_GUILESS_MAIN(tst_Settings)
+#include "tst_settings.moc"

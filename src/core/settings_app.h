@@ -1,0 +1,257 @@
+#pragma once
+
+#include <QObject>
+#include "appsettings.h"
+#include <QString>
+#include <QStringList>
+#include <QVariantList>
+#include <QVariantMap>
+
+// App-level settings: auto-update channel, backup schedule, developer/platform
+// flags, water level/refill, profile management bookkeeping (favorites,
+// current profile), device identity, Pocket pairing.
+//
+// Split from Settings to keep settings.h's transitive-include footprint small.
+class SettingsApp : public QObject {
+    Q_OBJECT
+
+    // Platform capabilities (compile-time)
+    Q_PROPERTY(bool hasQuick3D READ hasQuick3D CONSTANT FINAL)
+    Q_PROPERTY(bool use12HourTime READ use12HourTime CONSTANT FINAL)
+    Q_PROPERTY(bool isDebugBuild READ isDebugBuild CONSTANT FINAL)
+
+    // Launcher mode (Android only — registers app as the home screen launcher
+    // via the LauncherAlias activity-alias)
+    Q_PROPERTY(bool launcherMode READ launcherMode WRITE setLauncherMode NOTIFY launcherModeChanged FINAL)
+
+    // Profile management
+    Q_PROPERTY(QVariantList favoriteProfiles READ favoriteProfiles NOTIFY favoriteProfilesChanged FINAL)
+    Q_PROPERTY(int selectedFavoriteProfile READ selectedFavoriteProfile WRITE setSelectedFavoriteProfile NOTIFY selectedFavoriteProfileChanged FINAL)
+    // custom|alpha|usage — see profile-favorites-order. The READ resolves an
+    // absent setting (custom if favorites exist, usage otherwise) WITHOUT
+    // writing it back; only an explicit set persists a mode. See settings_app.cpp.
+    Q_PROPERTY(QString favoriteProfileOrder READ favoriteProfileOrder WRITE setFavoriteProfileOrder NOTIFY favoriteProfileOrderChanged FINAL)
+    Q_PROPERTY(QString currentProfile READ currentProfile WRITE setCurrentProfile NOTIFY currentProfileChanged FINAL)
+    Q_PROPERTY(QString autoLoadProfileFilename READ autoLoadProfileFilename WRITE setAutoLoadProfileFilename NOTIFY autoLoadProfileFilenameChanged FINAL)
+    Q_PROPERTY(int autoLoadRevertMinutes READ autoLoadRevertMinutes WRITE setAutoLoadRevertMinutes NOTIFY autoLoadRevertMinutesChanged FINAL)
+
+    // Auto-update
+    Q_PROPERTY(bool autoCheckUpdates READ autoCheckUpdates WRITE setAutoCheckUpdates NOTIFY autoCheckUpdatesChanged FINAL)
+    Q_PROPERTY(bool betaUpdatesEnabled READ betaUpdatesEnabled WRITE setBetaUpdatesEnabled NOTIFY betaUpdatesEnabledChanged FINAL)
+    Q_PROPERTY(qint64 lastKnownApkSizeBytes READ lastKnownApkSizeBytes WRITE setLastKnownApkSizeBytes NOTIFY lastKnownApkSizeBytesChanged FINAL)
+
+    // One-time "enable Appear on top to auto-reopen after updates" prompt
+    // has been shown. Persists across app restarts; once true, the prompt
+    // is never re-shown. Matches the GPS/storage permission-prompt model:
+    // user is asked once at the teachable moment, no permanent in-app UI.
+    // READ-only on the Q_PROPERTY so QML cannot accidentally re-arm the
+    // prompt by writing false; UpdateChecker mutates via the C++ setter.
+    Q_PROPERTY(bool autoRelaunchPromptShown READ autoRelaunchPromptShown NOTIFY autoRelaunchPromptShownChanged FINAL)
+
+    // DE1 firmware update channel. false = bundled Stable firmware, true =
+    // bundled Early access firmware. The historical nightly preference is
+    // removed by Settings' one-time firmware-channel upgrade.
+    // Independent from betaUpdatesEnabled, which controls the Decenza *app*
+    // update channel.
+    Q_PROPERTY(bool firmwareEarlyAccess READ firmwareEarlyAccess WRITE setFirmwareEarlyAccess NOTIFY firmwareEarlyAccessChanged FINAL)
+
+    // Daily backup
+    Q_PROPERTY(int dailyBackupHour READ dailyBackupHour WRITE setDailyBackupHour NOTIFY dailyBackupHourChanged FINAL)
+
+    // Water level / refill
+    Q_PROPERTY(QString waterLevelDisplayUnit READ waterLevelDisplayUnit WRITE setWaterLevelDisplayUnit NOTIFY waterLevelDisplayUnitChanged FINAL)
+    Q_PROPERTY(QString temperatureUnit READ temperatureUnit WRITE setTemperatureUnit NOTIFY temperatureUnitChanged FINAL)
+
+    // Water refill level (mm threshold for refill warning, sent to machine)
+    Q_PROPERTY(int waterRefillPoint READ waterRefillPoint WRITE setWaterRefillPoint NOTIFY waterRefillPointChanged FINAL)
+
+    // Refill kit override (0=force off, 1=force on, 2=auto-detect)
+    Q_PROPERTY(int refillKitOverride READ refillKitOverride WRITE setRefillKitOverride NOTIFY refillKitOverrideChanged FINAL)
+
+    // Developer settings
+    Q_PROPERTY(bool developerTranslationUpload READ developerTranslationUpload WRITE setDeveloperTranslationUpload NOTIFY developerTranslationUploadChanged FINAL)
+    Q_PROPERTY(bool simulationMode READ simulationMode WRITE setSimulationMode NOTIFY simulationModeChanged FINAL)
+    // Whether the paired refractometer should measure by itself when it detects a
+    // sample. The device stores this too, but the R2 is only connected while the
+    // post-shot review page is open — so the setting has to live here for the user
+    // to be able to change it at any time. Applied to the device on every connect.
+    Q_PROPERTY(bool refractometerAutoTest READ refractometerAutoTest WRITE setRefractometerAutoTest NOTIFY refractometerAutoTestChanged FINAL)
+    // False on builds with no simulator compiled in (tablet release). QML gates
+    // every Simulation Mode affordance on this, so the feature is absent from
+    // the UI rather than present and dead. CONSTANT: it is a build property, so
+    // it cannot change while the app is running.
+    Q_PROPERTY(bool simulatorAvailable READ simulatorAvailable CONSTANT FINAL)
+    Q_PROPERTY(bool hideGhcSimulator READ hideGhcSimulator WRITE setHideGhcSimulator NOTIFY hideGhcSimulatorChanged FINAL)
+    Q_PROPERTY(bool simulatedScaleEnabled READ simulatedScaleEnabled WRITE setSimulatedScaleEnabled NOTIFY simulatedScaleEnabledChanged FINAL)
+    Q_PROPERTY(bool screenCaptureEnabled READ screenCaptureEnabled WRITE setScreenCaptureEnabled NOTIFY screenCaptureEnabledChanged FINAL)
+
+    // During-steam live coaching cues (LiveSteamCoach). Two independent opt-ins,
+    // both OFF by default: `steamCoachVisualEnabled` shows the on-screen banner on
+    // the steam page, `steamCoachAudioEnabled` speaks the cues. Neither implies the
+    // other, and the audio path is routed independently of the accessibility
+    // master switch (AccessibilityManager::announceCoaching).
+    Q_PROPERTY(bool steamCoachVisualEnabled READ steamCoachVisualEnabled WRITE setSteamCoachVisualEnabled NOTIFY steamCoachVisualEnabledChanged FINAL)
+    Q_PROPERTY(bool steamCoachAudioEnabled READ steamCoachAudioEnabled WRITE setSteamCoachAudioEnabled NOTIFY steamCoachAudioEnabledChanged FINAL)
+    Q_PROPERTY(QString steamViewMode READ steamViewMode WRITE setSteamViewMode NOTIFY steamViewModeChanged FINAL)
+
+public:
+    explicit SettingsApp(QObject* parent = nullptr);
+
+    // Platform capabilities
+    bool hasQuick3D() const;
+    bool use12HourTime() const { return m_use12HourTime; }
+    bool isDebugBuild() const;
+
+    // Launcher mode
+    bool launcherMode() const;
+    void setLauncherMode(bool enabled);
+
+    // Profile favorites
+    QVariantList favoriteProfiles() const;
+    int selectedFavoriteProfile() const;
+    void setSelectedFavoriteProfile(int index);
+    Q_INVOKABLE void addFavoriteProfile(const QString& name, const QString& filename);
+    Q_INVOKABLE void removeFavoriteProfile(int index);
+    Q_INVOKABLE void moveFavoriteProfile(int from, int to);
+    Q_INVOKABLE QVariantMap getFavoriteProfile(int index) const;
+    Q_INVOKABLE bool isFavoriteProfile(const QString& filename) const;
+    Q_INVOKABLE bool updateFavoriteProfile(const QString& oldFilename, const QString& newFilename, const QString& newTitle);
+    Q_INVOKABLE int findFavoriteIndexByFilename(const QString& filename) const;
+
+    // Bulk rewrite of display order, for ProfileManager::resortFavorites()
+    // (profile-favorites-order alpha/usage modes) — reordering ~50 entries one
+    // moveFavoriteProfile() at a time is both slower and, mid-sequence, would
+    // fire favoriteProfilesChanged() with a partially-reordered list. Any
+    // filename in `filenamesInOrder` not currently a favorite is ignored; any
+    // current favorite missing from it is dropped — callers always pass a
+    // permutation of the CURRENT list (favoriteProfiles() itself), never a
+    // hand-built one.
+    Q_INVOKABLE void setFavoritesOrder(const QStringList& filenamesInOrder);
+
+    // Favorites order mode: custom|alpha|usage. See profile-favorites-order.
+    QString favoriteProfileOrder() const;
+    void setFavoriteProfileOrder(const QString& mode);
+    void persistFavoriteProfileOrderIfAbsent();
+
+    // Current profile
+    QString currentProfile() const;
+    void setCurrentProfile(const QString& profile);
+
+    // Auto-load profile
+    QString autoLoadProfileFilename() const;
+    void setAutoLoadProfileFilename(const QString& filename);
+    int autoLoadRevertMinutes() const;
+    void setAutoLoadRevertMinutes(int minutes);
+
+    // Auto-update
+    bool autoCheckUpdates() const;
+    void setAutoCheckUpdates(bool enabled);
+    bool betaUpdatesEnabled() const;
+    void setBetaUpdatesEnabled(bool enabled);
+    bool firmwareEarlyAccess() const;
+    void setFirmwareEarlyAccess(bool enabled);
+    qint64 lastKnownApkSizeBytes() const;
+    void setLastKnownApkSizeBytes(qint64 size);
+
+    // Android auto-relaunch one-time prompt sentinel
+    bool autoRelaunchPromptShown() const;
+    void setAutoRelaunchPromptShown(bool shown);
+
+    // Daily backup
+    int dailyBackupHour() const;
+    void setDailyBackupHour(int hour);
+
+    // Water level / refill
+    QString waterLevelDisplayUnit() const;
+    void setWaterLevelDisplayUnit(const QString& unit);
+
+    // Temperature display unit ("celsius" or "fahrenheit"). Storage stays Celsius;
+    // this only affects display/entry.
+    QString temperatureUnit() const;
+    // Called by Settings::factoryReset() after wiping the store.
+    void invalidateCache();
+    void setTemperatureUnit(const QString& unit);
+    int waterRefillPoint() const;
+    void setWaterRefillPoint(int mm);
+    int refillKitOverride() const;
+    void setRefillKitOverride(int value);
+
+    // Developer settings
+    bool developerTranslationUpload() const;
+    void setDeveloperTranslationUpload(bool enabled);
+    bool simulationMode() const;
+
+    bool refractometerAutoTest() const;
+    void setRefractometerAutoTest(bool value);
+    void setSimulationMode(bool enabled);
+    // Plain const member, matching isDebugBuild() above. A static READ accessor
+    // also compiles, but this property is only useful if QML resolves it: a
+    // property that reads as `undefined` is falsy and silently fails CLOSED,
+    // which would remove Simulation Mode from desktop builds too, with nothing
+    // logged. Not worth deviating from the working precedent on this class.
+    bool simulatorAvailable() const;
+    bool hideGhcSimulator() const;
+    void setHideGhcSimulator(bool hide);
+    bool simulatedScaleEnabled() const;
+    void setSimulatedScaleEnabled(bool enabled);
+    bool screenCaptureEnabled() const;
+    void setScreenCaptureEnabled(bool enabled);
+
+    // During-steam live coaching cues (independent visual + audio opt-ins)
+    bool steamCoachVisualEnabled() const;
+    void setSteamCoachVisualEnabled(bool enabled);
+    bool steamCoachAudioEnabled() const;
+    void setSteamCoachAudioEnabled(bool enabled);
+    QString steamViewMode() const;
+    void setSteamViewMode(const QString& mode);
+
+    // Device identity (stable UUID for server communication)
+    Q_INVOKABLE QString deviceId() const;
+
+    // Pocket app pairing token
+    Q_INVOKABLE QString pocketPairingToken() const;
+    void setPocketPairingToken(const QString& token);
+
+signals:
+    void launcherModeChanged();
+    void favoriteProfilesChanged();
+    void selectedFavoriteProfileChanged();
+    void favoriteProfileOrderChanged();
+    void currentProfileChanged();
+    void autoLoadProfileFilenameChanged();
+    void autoLoadRevertMinutesChanged();
+    void autoCheckUpdatesChanged();
+    void betaUpdatesEnabledChanged();
+    void lastKnownApkSizeBytesChanged();
+    void autoRelaunchPromptShownChanged();
+    void firmwareEarlyAccessChanged();
+    void dailyBackupHourChanged();
+    void waterLevelDisplayUnitChanged();
+    void temperatureUnitChanged();
+    void waterRefillPointChanged();
+    void refillKitOverrideChanged();
+    void developerTranslationUploadChanged();
+    void simulationModeChanged();
+    void refractometerAutoTestChanged();
+    void hideGhcSimulatorChanged();
+    void simulatedScaleEnabledChanged();
+    void screenCaptureEnabledChanged();
+    void steamCoachVisualEnabledChanged();
+    void steamCoachAudioEnabledChanged();
+    void steamViewModeChanged();
+
+private:
+    // Stored simulation preference with this build's default applied, before
+    // simulationMode()'s "no simulator in this build" override. Shared by the
+    // getter and the setter so their notion of "unchanged" cannot drift.
+    bool storedSimulationMode() const;
+
+    mutable AppSettings m_settings;
+    bool m_use12HourTime = false;
+    // Cached: Theme's temperature helpers read it on every readout update, and
+    // QSettings::value() is a CFPreferences lookup on macOS.
+    QString m_temperatureUnit;
+
+    // Runtime-only flag — not persisted, resets to false on app restart
+    bool m_developerTranslationUpload = false;
+};

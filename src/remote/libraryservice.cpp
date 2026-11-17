@@ -1,0 +1,184 @@
+#include "libraryservice.h"
+
+#include "core/widgetlibrary.h"
+#include "servicepayload.h"
+#include "serviceoperation.h"
+#include <QRemoteObjectNode>
+#include <QFileInfo>
+#include <QQmlEngine>
+#include <QUrl>
+#include <QUrlQuery>
+
+namespace {
+QPointer<QRemoteObjectNode> s_publishedNode;
+QPointer<WidgetLibrary> s_publishedLocalLibrary;
+}
+
+LibraryService::LibraryService(QRemoteObjectNode* node, QObject* parent)
+    : RemoteService(parent)
+{
+    setNode(node);
+}
+
+LibraryService::~LibraryService()
+{
+    if (m_state) disconnect(m_state, nullptr, this, nullptr);
+}
+
+void LibraryService::setPublishedNode(QRemoteObjectNode* node) { s_publishedNode = node; }
+void LibraryService::setPublishedLocalLibrary(WidgetLibrary* library) { s_publishedLocalLibrary = library; }
+QRemoteObjectNode* LibraryService::publishedNode() { return s_publishedNode; }
+
+LibraryService* LibraryService::create(QQmlEngine* engine)
+{
+    return new LibraryService(publishedNode(), engine);
+}
+
+bool LibraryService::connected() const
+{
+    return RemoteServiceReplica::isReady(m_node, m_state, s_publishedNode);
+}
+
+QVariantList LibraryService::localEntries() const
+{
+    QVariantList entries = connected() ? m_state->localEntries() : QVariantList();
+    for (QVariant& value : entries) {
+        QVariantMap entry = value.toMap();
+        const QString id = entry.value(QStringLiteral("id")).toString();
+        if (entry.contains(QStringLiteral("thumbnailFullUrl")))
+            entry.insert(QStringLiteral("thumbnailFullUrl"), thumbnailUrl(id));
+        if (entry.contains(QStringLiteral("thumbnailCompactUrl")))
+            entry.insert(QStringLiteral("thumbnailCompactUrl"), thumbnailUrl(id, true));
+        value = entry;
+    }
+    return entries;
+}
+
+quint64 LibraryService::revision() const
+{
+    return connected() ? m_state->revision() : 0;
+}
+
+bool LibraryService::ready() const
+{
+    return connected() && m_state->ready();
+}
+
+QString LibraryService::errorMessage() const
+{
+    if (!connected()) return tr("Library service is disconnected.");
+    return m_state->errorMessage();
+}
+
+void LibraryService::setNode(QRemoteObjectNode* node)
+{
+    if (!RemoteServiceReplica::replace(this, node, m_node, m_state, m_nodeDestroyed,
+            [this] { failPending(QStringLiteral("disconnected")); }))
+        return;
+    connect(m_state, &QRemoteObjectReplica::stateChanged, this, &LibraryService::changed);
+    connect(m_state, &QRemoteObjectReplica::notified, this, &LibraryService::changed);
+    connect(m_state, &LibraryStateReplica::localEntriesChanged,
+            this, &LibraryService::changed);
+    connect(m_state, &LibraryStateReplica::revisionChanged,
+            this, &LibraryService::changed);
+    connect(m_state, &LibraryStateReplica::readyChanged,
+            this, &LibraryService::changed);
+    connect(m_state, &LibraryStateReplica::errorMessageChanged,
+            this, &LibraryService::changed);
+    connect(m_state, &LibraryStateReplica::operationCompleted, this,
+            [this, replica = m_state](const QString& id, const QString& operation, bool success,
+                   const QVariantMap& result, const QString& reason) {
+        if (m_state != replica || !m_pending.contains(id) || m_pending.value(id) != operation) return;
+        m_pending.remove(id);
+        const QPointer<LibraryService> guard(this);
+        emit busyChanged();
+        if (!guard) return;
+        emit operationCompleted(id, operation, success, result, reason);
+    }, Qt::QueuedConnection);
+    changed();
+}
+
+void LibraryService::changed()
+{
+    const QPointer<LibraryService> guard(this);
+    if (!connected()) failPending(QStringLiteral("disconnected"));
+    if (guard) emit stateChanged();
+}
+
+void LibraryService::failPending(const QString& reason)
+{
+    if (m_pending.isEmpty()) return;
+    const auto pending = m_pending;
+    m_pending.clear();
+    const QPointer<LibraryService> guard(this);
+    emit busyChanged();
+    for (auto it = pending.cbegin(); it != pending.cend(); ++it) {
+        if (!guard) return;
+        emit operationCompleted(it.key(), it.value(), false, {}, reason);
+    }
+}
+
+QString LibraryService::newRequestId() const
+{
+    return ServiceOperation::newId();
+}
+
+void LibraryService::refresh()
+{
+    if (connected()) m_state->refresh();
+}
+
+QString LibraryService::execute(const QString& operation, const QVariantMap& arguments,
+                                const QString& requestId)
+{
+    const QString id = requestId.isEmpty() ? newRequestId() : requestId;
+    if (id.isEmpty() || m_pending.contains(id)) return QString();
+    if (!connected()) {
+        QMetaObject::invokeMethod(this, [this, id, operation] {
+            emit operationCompleted(id, operation, false, {}, QStringLiteral("disconnected"));
+        }, Qt::QueuedConnection);
+        return id;
+    }
+    if (m_pending.size() >= 64) {
+        QMetaObject::invokeMethod(this, [this, id, operation] {
+            emit operationCompleted(id, operation, false, {}, QStringLiteral("tooManyRequests"));
+        }, Qt::QueuedConnection);
+        return id;
+    }
+    const bool wasBusy = busy();
+    const QPointer<LibraryStateReplica> replica = m_state;
+    m_pending.insert(id, operation);
+    const QPointer<LibraryService> guard(this);
+    if (!wasBusy) emit busyChanged();
+    if (!guard || m_state != replica || !m_pending.contains(id)
+        || m_pending.value(id) != operation) return id;
+    if (!connected()) {
+        m_pending.remove(id);
+        emit busyChanged();
+        if (guard) QMetaObject::invokeMethod(this, [this, id, operation] {
+            emit operationCompleted(id, operation, false, {}, QStringLiteral("disconnected"));
+        }, Qt::QueuedConnection);
+        return id;
+    }
+    replica->execute(id, operation, arguments);
+    return id;
+}
+
+QString LibraryService::thumbnailUrl(const QString& entryId, bool compact) const
+{
+    if (entryId.isEmpty()) return {};
+#ifdef Q_OS_WASM
+    QUrl url(QStringLiteral("/api/library/thumbnail"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("id"), entryId);
+    if (compact) query.addQueryItem(QStringLiteral("compact"), QStringLiteral("1"));
+    url.setQuery(query);
+    return resourceOrigin().resolved(url).toString(QUrl::FullyEncoded);
+#else
+    if (!s_publishedLocalLibrary) return {};
+    const QString path = compact && s_publishedLocalLibrary->hasThumbnailCompact(entryId)
+        ? s_publishedLocalLibrary->thumbnailCompactPath(entryId)
+        : s_publishedLocalLibrary->thumbnailPath(entryId);
+    return QFileInfo::exists(path) ? QUrl::fromLocalFile(path).toString() : QString();
+#endif
+}

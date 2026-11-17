@@ -1,0 +1,106 @@
+#include "setupvars.iss"
+#include "version.iss"
+
+; ============================================================
+; Pre-build: Deploy application with all Qt dependencies
+; ============================================================
+#expr Exec("cmd.exe", "/c rmdir /s /q """ + AppDeployDir + """ 2>nul & mkdir """ + AppDeployDir + """", , , SW_HIDE)
+#expr Exec("cmd.exe", "/c copy /y """ + AppBuildDir + "\" + TargetName + ".exe"" """ + AppDeployDir + "\""", , , SW_HIDE)
+; Qt 6.12 skips this plugin unless requested (qtbase/src/tools/windeployqt/main.cpp:1025-1032).
+#expr Exec(QtDir + "\bin\windeployqt.exe", """" + AppDeployDir + "\" + TargetName + ".exe"" --qmldir """ + SourceDir + "\qml"" --force-openssl --no-translations --no-system-d3d-compiler --no-opengl-sw", , , SW_SHOW)
+#expr Exec("cmd.exe", "/c copy /y """ + SourcePath + "\qt.conf"" """ + AppDeployDir + "\""", , , SW_HIDE)
+
+; Copy OpenSSL DLLs (required for TLS in Remote Access)
+#ifdef OpenSslDir
+#expr Exec("cmd.exe", "/c copy /y """ + OpenSslDir + "\libssl-3-x64.dll"" """ + AppDeployDir + "\""", , , SW_HIDE)
+#expr Exec("cmd.exe", "/c copy /y """ + OpenSslDir + "\libcrypto-3-x64.dll"" """ + AppDeployDir + "\""", , , SW_HIDE)
+#endif
+
+#if !FileExists(AppDeployDir + "\tls\qopensslbackend.dll")
+  #error Missing Qt OpenSSL TLS plugin: tls\qopensslbackend.dll
+#endif
+#if !FileExists(AppDeployDir + "\libssl-3-x64.dll")
+  #error Missing OpenSSL runtime: libssl-3-x64.dll. Set OpenSslDir in setupvars.iss.
+#endif
+#if !FileExists(AppDeployDir + "\libcrypto-3-x64.dll")
+  #error Missing OpenSSL runtime: libcrypto-3-x64.dll. Set OpenSslDir in setupvars.iss.
+#endif
+
+[Setup]
+; Application identity
+AppId={{DE986B6F-22F0-4999-94B6-6501772DFAB9}
+AppName={#TargetProduct}
+AppVersion={#VersionNumber}
+AppVerName={#TargetProduct} v{#VersionNumber}
+AppPublisher={#TargetCompany}
+AppPublisherURL=https://github.com/Kulitorum/Decenza
+AppSupportURL=https://github.com/Kulitorum/Decenza/issues
+
+; Installation settings
+; x64compatible admits Arm64 Windows 11, which runs this x64 build under emulation.
+; Plain "x64" is Inno's alias for x64os (native x64 only) and refuses Arm64 with
+; WindowsVersionNotSupported. Needs Inno Setup 6.3+.
+ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64compatible
+DefaultDirName={autopf}\{#TargetCompany}\{#TargetProduct}
+DefaultGroupName={#TargetCompany}\{#TargetProduct}
+DisableProgramGroupPage=yes
+
+; Output settings
+OutputDir=Output
+OutputBaseFilename={#TargetName}_v{#VersionNumber}_win{#TargetArch}_installer
+Compression=lzma2
+SolidCompression=yes
+LZMAUseSeparateProcess=yes
+
+; Visual settings
+WizardStyle=modern
+SetupIconFile=..\resources\icons\decenza.ico
+; Without this, Inno Setup shows a generic icon for the Start Menu "Uninstall"
+; shortcut and the Control Panel > Programs and Features entry, even though
+; the app's own exe already has the logo embedded (see CMakeLists.txt
+; QT_WIN_RC_ICONS). (#1467)
+UninstallDisplayIcon={app}\{#TargetName}.exe
+
+; Privileges
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[CustomMessages]
+english.InstallingVCRedist=Installing Visual C++ Runtime...
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[Files]
+; Main application - all files from deploy directory
+Source: "{#AppDeployDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; VC++ Redistributable
+Source: "{#VcRedistDir}\{#VcRedistFile}"; DestDir: "{tmp}"; Flags: deleteafterinstall
+
+[Icons]
+Name: "{group}\{#TargetProduct}"; Filename: "{app}\{#TargetName}.exe"; WorkingDir: "{app}"
+Name: "{group}\Uninstall {#TargetProduct}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#TargetProduct}"; Filename: "{app}\{#TargetName}.exe"; Tasks: desktopicon; WorkingDir: "{app}"
+
+[Run]
+; Install VC++ Runtime (silently, only if needed)
+Filename: "{tmp}\{#VcRedistFile}"; Parameters: "/install /quiet /norestart"; StatusMsg: "{cm:InstallingVCRedist}"; Flags: waituntilterminated skipifsilent
+
+; Windows caches exe/shortcut icons per-user (IconCache.db) — updating over an
+; older install can otherwise leave Explorer/Start Menu/Programs and Features
+; showing a stale generic icon even though the new exe has the logo embedded
+; and UninstallDisplayIcon is now set above. ie4uinit is Microsoft's own
+; built-in tool for invalidating that cache. (#1467)
+Filename: "{sys}\ie4uinit.exe"; Parameters: "-ClearIconCache"; Flags: runhidden waituntilterminated
+
+; Option to launch after install
+Filename: "{app}\{#TargetName}.exe"; Description: "{cm:LaunchProgram,{#StringChange(TargetProduct, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; Clean up any generated files
+Type: filesandordirs; Name: "{app}"

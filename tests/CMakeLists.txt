@@ -1,0 +1,3003 @@
+find_package(Qt6 REQUIRED COMPONENTS Test Core Bluetooth Sql Network WebSockets RemoteObjects Positioning)
+if(NOT IOS)
+    find_package(Qt6 REQUIRED COMPONENTS SerialPort)
+endif()
+
+# zlib exports platform feature macros such as _LARGEFILE64_SOURCE on Linux.
+# Shared PCH donors and ZIP-linked consumers must see the same definitions.
+add_compile_definitions("$<TARGET_PROPERTY:ZLIB::ZLIB,INTERFACE_COMPILE_DEFINITIONS>")
+
+# Every test links decenza_testlib directly (see add_decenza_test), and the
+# targets that also link decenza_shotlib get it a second time through that
+# library's PUBLIC interface. Without de-duplication the Apple linker emits
+# "ignoring duplicate libraries" for each such target.
+if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+endif()
+
+# Disable AUTOMOC path prefix so MOC includes use plain filenames
+# instead of relative paths that break for out-of-tree builds.
+set(CMAKE_AUTOMOC_PATH_PREFIX OFF)
+
+# Registers a Qt Test binary with CTest. CTest only knows one result per binary;
+# the junitxml logger records per-function results from the same single run.
+# Each -o adds a logger, and any explicit -o suppresses the default text-on-stdout
+# one (qtestcase.cpp:779-818, 995-1009), so `-o -,txt` keeps ctest's output as is.
+set(DECENZA_TEST_RESULTS_DIR "${CMAKE_BINARY_DIR}/test-results")
+file(MAKE_DIRECTORY "${DECENZA_TEST_RESULTS_DIR}")
+function(add_decenza_qtest name)
+    add_test(NAME ${name} COMMAND ${name}
+        -o -,txt
+        -o "${DECENZA_TEST_RESULTS_DIR}/${name}.xml,junitxml")
+    # Qt Test writes this straight to its loggers, past failOnWarning
+    # (qtestlog.cpp:322 vs 330-336), and drops every later message - so a binary
+    # that hits the cap would otherwise pass with its output silently truncated.
+    set_tests_properties(${name} PROPERTIES
+        FAIL_REGULAR_EXPRESSION "Maximum amount of warnings exceeded")
+endfunction()
+
+# A stale QML cache unit otherwise passes: Qt 6.12 drops a unit whose AOT lookup
+# signatures no longer match the live types to the interpreter, silently
+# (qv4executablecompilationunit.cpp:153-177). Makes that fatal for every test in the
+# calling directory; call it last there so no later ENVIRONMENT assignment replaces it.
+function(decenza_fail_on_invalid_aot)
+    get_property(_tests DIRECTORY PROPERTY TESTS)
+    foreach(_test IN LISTS _tests)
+        set_property(TEST ${_test} APPEND PROPERTY ENVIRONMENT "QV4_FAIL_ON_INVALID_AOT=1")
+        # GUI-linked Qt tests otherwise appear as separate apps in the macOS Dock.
+        if(APPLE AND NOT IOS)
+            set_property(TEST ${_test} APPEND PROPERTY ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        endif()
+    endforeach()
+    set_property(DIRECTORY PROPERTY DECENZA_FAIL_ON_INVALID_AOT ON)
+endfunction()
+
+# Convenience function for adding test executables.
+# Each test compiles only the source files it needs (no full app build).
+function(add_decenza_test name)
+    add_executable(${name} ${ARGN})
+    # Record every test executable so `build_tests` below can depend on the set
+    # without anyone maintaining a second list by hand.
+    #
+    # A target declared with a bare add_executable + add_test does NOT pass
+    # through here and must append to DECENZA_TEST_TARGETS itself — see
+    # tst_shotcorpus. Forgetting that shows up as "(Not Run)" in a clean build,
+    # and ONLY in a clean build.
+    set_property(GLOBAL APPEND PROPERTY DECENZA_TEST_TARGETS ${name})
+    set_target_properties(${name} PROPERTIES AUTOMOC_PATH_PREFIX OFF)
+    target_compile_definitions(${name} PRIVATE DECENZA_TESTING)
+    # Source-tree path, so a test can assert against shipped QML/assets rather than
+    # a duplicated copy of their contents (see themeQmlFontRoleNamesMatchDefaults).
+    target_compile_definitions(${name} PRIVATE
+        DECENZA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    # Link the shared decenza_testlib so the base sources (settings, BLE,
+    # profile, machine, …) are compiled once, not recompiled into every target.
+    # Per-process QSettings isolation is handled in the settings classes
+    # themselves via Settings::testQSettingsPath() (a PID-scoped IniFormat store)
+    # under DECENZA_TESTING — that is what makes `ctest -j` safe.
+    target_link_libraries(${name} PRIVATE
+        decenza_testlib
+        Qt6::Test Qt6::Core Qt6::Bluetooth Qt6::Sql Qt6::Network Qt6::Gui
+    )
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}       # For mocks/
+    )
+    # Any test that compiles mdnsresolver.cpp needs the header-only mjansson
+    # library, which the main target gets separately. SYSTEM for the same reason
+    # it is SYSTEM there: the header is -Wcast-align-dirty BSD socket code and
+    # these targets are -Werror too. Guarded because iOS never fetches it.
+    if(NOT IOS AND mdns_lib_SOURCE_DIR)
+        target_include_directories(${name} SYSTEM PRIVATE ${mdns_lib_SOURCE_DIR})
+    endif()
+    # Share the one precompiled header decenza_test_pch builds, rather than
+    # building a private ~47 MB one per target. decenza_test_pch is declared
+    # further down this file but that is fine: a function body is evaluated at
+    # CALL time, and the first add_decenza_test() call is well after it.
+    #
+    # Anything added ABOVE this line that changes compile flags — a define, an
+    # include dir, a linked Qt module — must be mirrored onto decenza_test_pch,
+    # or REUSE_FROM fails for all 106 targets at once with an error naming
+    # cmake_pch.hxx and not the flag that actually diverged.
+    if(DECENZA_ENABLE_PCH)
+        target_precompile_headers(${name} REUSE_FROM decenza_test_pch)
+    endif()
+    add_decenza_qtest(${name})
+endfunction()
+
+# Source file sets for reuse across tests
+set(MACHINE_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/machine/machinestate.cpp
+)
+
+set(BLE_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/ble/de1device.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/bletransport.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/blegattqueue.cpp
+    # The scale/refractometer transport base gained the shared queue's
+    # submit/complete plumbing, so it is no longer header-only. It belongs
+    # beside blegattqueue.cpp and bletransport.cpp, which were already here.
+    #
+    # A narrow library would be the rule for a NEW shared source, and it is not
+    # the right call for this one: the rule exists to kill duplicate COMPILES
+    # (touching profilemanager.cpp cost 77.0 s across nine of them), and this
+    # file is compiled exactly once either way. Splitting it out would trade
+    # nothing for a new target and another link edge on all 106 binaries. The
+    # duplication gate stays at zero with it here.
+    ${CMAKE_SOURCE_DIR}/src/ble/transport/scalebletransport.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/blecapability.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scaledevice.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/protocol/binarycodec.cpp
+)
+
+set(PROFILE_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/core/profilecataloglogic.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/de1apptclfields.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profileframe.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profilegenerator.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profileanalyzer.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profileeditmodel.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profileparams.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/temperaturedisplay.cpp
+)
+
+set(CORE_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/core/emojiassets.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/markdownrenderer.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/appsettings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_mqtt.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_autowake.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_hardware.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_ai.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_theme.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/backgroundpresets.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_visualizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_decent.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_upload.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_mcp.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_brew.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_dye.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/coffeebagfields.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/coffeebagstorage.cpp  # SettingsDye write-through dependency
+    ${CMAKE_SOURCE_DIR}/src/history/equipmentstorage.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_network.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/layoutcatalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/layoutsnapshot.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_app.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_calibration.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/settings_graph.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scales/scaletypeids.cpp
+)
+
+set(CONTROLLER_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/controllers/shottimingcontroller.cpp
+    # The steam-target derivation. One small TU whose only dependency is Settings,
+    # which decenza_testlib already carries — so this is the cheap shape (compiled
+    # once here) rather than the expensive one the header warns about.
+    ${CMAKE_SOURCE_DIR}/src/controllers/steamheaterpolicy.cpp
+    # Sensor calibration. It takes its profile facts through a closure rather
+    # than a ProfileManager pointer, so it needs nothing decenza_testlib does not
+    # already carry — the cheap shape, like steamheaterpolicy above.
+    ${CMAKE_SOURCE_DIR}/src/controllers/sensorcalibrationcontroller.cpp
+)
+
+# Shot analysis / projection layer. Plain Qt Core — no Quick or Graphs — so it
+# belongs in decenza_testlib and lightweight tests (tst_shotprojection,
+# tst_shotanalysis) can use it without dragging in the GUI frameworks. The
+# Quick-dependent half lives in decenza_shotlib below.
+set(ANALYSIS_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/history/shotprojection.cpp
+    # shotprojection.h is listed so AUTOMOC generates the Q_GADGET meta-object —
+    # without it ShotProjection::staticMetaObject is undefined and gadget users
+    # fail to link.
+    ${CMAKE_SOURCE_DIR}/src/history/shotprojection.h
+    ${CMAKE_SOURCE_DIR}/src/ai/conductance.cpp
+    ${CMAKE_SOURCE_DIR}/src/ai/portaltailanalyzer.cpp
+    ${CMAKE_SOURCE_DIR}/src/ai/shotanalysis.cpp
+    ${CMAKE_SOURCE_DIR}/src/ai/shotsummarizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/ai/shotsummarizer_kb.cpp
+    # Shape-based KB resolution (change: resolve-profile-kb-by-shape). It sat
+    # in its own narrow decenza_shapelib until shotsummarizer.cpp itself began
+    # calling resolveProfileKb — and shotsummarizer.cpp is compiled HERE, so
+    # the narrow library would have had to be linked by everything that links
+    # this one, which is the fan-out the narrow library existed to avoid, plus
+    # a circular dependency (shapelib linked testlib). One TU, compiled once,
+    # in the library its caller already lives in.
+    ${CMAKE_SOURCE_DIR}/src/ai/profileshapeindex.cpp
+)
+
+set(SIMULATOR_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/simulator/de1simulator.cpp
+    ${CMAKE_SOURCE_DIR}/src/simulator/simulatedscale.cpp
+)
+
+# Standalone codec source (for lightweight tests that only need BLE encoding)
+set(CODEC_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/ble/protocol/binarycodec.cpp
+)
+
+# --- tst_binarycodec: BLE codec encode/decode tests (minimal deps) ---
+
+# ---------------------------------------------------------------------------
+# decenza_testlib: the base-Qt sources that most test binaries share, compiled
+# ONCE here instead of recompiled into each of the 106 targets below (it said
+# "~30" for years after the count had tripled — recount with
+# `grep -c "^add_decenza_test(" tests/CMakeLists.txt` rather than trusting this
+# number — anchored, because this very line contains the search string and an
+# unanchored grep counts itself). Test targets link this instead of listing the
+# bundle vars.
+# Built with DECENZA_TESTING so the friend-class seams match, and AUTOMOC on so
+# Q_OBJECT sources (de1device, machinestate, de1transport.h, …) are moc'd once.
+# ---------------------------------------------------------------------------
+add_library(decenza_testlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/network/steamhealthsnapshot.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/steamuistate.cpp
+    ${MACHINE_SOURCES}
+    ${BLE_SOURCES}
+    ${PROFILE_SOURCES}
+    ${CORE_SOURCES}
+    ${CONTROLLER_SOURCES}
+    ${SIMULATOR_SOURCES}
+    ${ANALYSIS_SOURCES}
+    # TranslationManager is needed by sources that link this lib (VisualizerUploader
+    # via decenza_shotlib; LiveSteamCoach) now that they route user-visible strings
+    # through translate(). Compiling it into the lib provides the symbol once
+    # instead of each target adding translationmanager.cpp.
+    ${CMAKE_SOURCE_DIR}/src/core/translationmanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/translationcatalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/de1transport.h
+)
+set_target_properties(decenza_testlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+# DECENZA_SIMULATOR unconditionally: tests build the simulator sources (see
+# SIMULATOR_SOURCES above) and tst_simulatedscale/tst_de1simulator exercise them,
+# so the seam must exist in every test configuration. PUBLIC so it reaches every
+# test target that links this. Tests run on desktop, which ships the simulator
+# anyway; keying this off the app's build type is what let #1629 through — the
+# nightly builds RelWithDebInfo, the guard was QT_DEBUG, and every local Debug
+# run stayed green while CI could not compile the test at all.
+target_compile_definitions(decenza_testlib PUBLIC DECENZA_TESTING DECENZA_SIMULATOR)
+# Qt6::Qml is needed for QJSValue/QJSEngine: TranslationManager exposes `translate` as a
+# QJSValue property holding a callable, which is what makes translated bindings re-evaluate
+# on a language change (see translationmanager.h). PUBLIC so every test target inherits it.
+find_package(Qt6 REQUIRED COMPONENTS Qml)
+target_link_libraries(decenza_testlib PUBLIC
+    Qt6::Core Qt6::Bluetooth Qt6::Sql Qt6::Network Qt6::Gui Qt6::Qml
+)
+target_include_directories(decenza_testlib PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+# Its own PCH, not the test one below: this library does not link Qt6::Test, so
+# <QtTest> is not available to it and it cannot share that header set. It is the
+# most expensive single target in tests/ (183.9 s of the 1208 s, ~15%) because it
+# compiles 43 production sources, which is the shape that measured ~28% — the
+# same ~0.5 s per TU the app-side comment describes.
+if(DECENZA_ENABLE_PCH)
+    target_precompile_headers(decenza_testlib PRIVATE
+        <QtCore/qobject.h>
+        <QtCore/qstring.h>
+        <QtCore/qvariant.h>
+        <QtCore/qdatetime.h>
+        <QtCore/qdebug.h>
+        <QtCore/qjsonobject.h>
+        <QtCore/qjsonarray.h>
+        <QtCore/qjsondocument.h>
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# decenza_test_pch: builds the precompiled header ONCE; every test target reuses
+# it via REUSE_FROM in add_decenza_test().
+#
+# Why a donor target rather than putting the header list on each test: a plain
+# target_precompile_headers() per target builds a SEPARATE ~47 MB PCH per target.
+# At 106 test targets that is ~240 s of PCH builds to save ~285 s of parsing —
+# most of the win handed straight back. REUSE_FROM builds one and shares it.
+#
+# It cannot hang off decenza_testlib, which every test already links: that
+# library does not link Qt6::Test, so it cannot compile <QtTest> and cannot be
+# the donor for a PCH containing it. Hence a target whose flags are constructed
+# to match what add_decenza_test() gives a test, exactly.
+#
+# KEEPING THE FLAGS IN SYNC IS LOAD-BEARING. REUSE_FROM requires the consumer's
+# compile flags to match the donor's; a define added to add_decenza_test() and
+# not here makes every test fail to compile against the shared PCH. If that
+# happens the error names cmake_pch.hxx and looks unrelated to the define — add
+# it in both places.
+#
+# Measured on this machine (isolated single-TU compiles, real flags):
+#   tst_bleserviceerror  1.51s -> 0.44s   -71%
+#   tst_roastdate        1.20s -> 0.44s   -64%
+#   tst_shotanalysis     2.10s -> 1.03s   -51%
+#   tst_settings         2.30s -> 1.18s   -49%
+#   tst_coffeebags       2.56s -> 1.50s   -41%
+#   tst_aimanager        2.60s -> 1.58s   -39%
+#
+# Tests benefit more than the app because a test TU is mostly header: a whole
+# 60-line test file costs 1.45 s and `#include <QtTest>` ALONE costs 1.42 s. The
+# body is 3% of it. That is also why the suite's build cost tracks file count
+# rather than test count — 90% of test-TU compile time is fixed per file, 10%
+# scales with lines (r=0.35, ~0.83 ms/line, ~1.4 s fixed).
+#
+# No language filter here and none needed: tests/ contains no Objective-C++. If
+# a .mm ever lands in a test target, it needs SKIP_PRECOMPILE_HEADERS — see the
+# note in the top-level CMakeLists.txt for why a $<COMPILE_LANGUAGE:CXX> genex
+# is NOT the way to do that (it empties the ObjC++ PCH instead of preventing its
+# use, and clang then rejects the C++ one).
+# The WHOLE target is inside the guard, not just its target_precompile_headers()
+# call. This target exists only to build a PCH: with DECENZA_ENABLE_PCH OFF —
+# which is the default on Windows — declaring it anyway would compile and link a
+# static library against decenza_testlib and six Qt modules to produce an
+# artefact nothing reuses. Every other PCH site in this change guards only the
+# target_precompile_headers() call, correctly, because those targets exist for
+# their own sake and would still be built with the PCH off; this one does not.
+if(DECENZA_ENABLE_PCH)
+    add_library(decenza_test_pch STATIC ${CMAKE_CURRENT_SOURCE_DIR}/pch_donor.cpp)
+    set_target_properties(decenza_test_pch PROPERTIES AUTOMOC OFF AUTOMOC_PATH_PREFIX OFF)
+    target_compile_definitions(decenza_test_pch PRIVATE
+        DECENZA_TESTING
+        DECENZA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_link_libraries(decenza_test_pch PRIVATE
+        decenza_testlib
+        Qt6::Test Qt6::Core Qt6::Bluetooth Qt6::Sql Qt6::Network Qt6::Gui
+    )
+    target_include_directories(decenza_test_pch PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_precompile_headers(decenza_test_pch PRIVATE
+        <QtTest>
+        <QtCore/qjsonobject.h>
+        <QtCore/qjsonarray.h>
+        <QtCore/qjsondocument.h>
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# decenza_shotlib: the shot-history / live-model / upload layer, compiled ONCE
+# instead of into every target that needs it. Split from decenza_testlib because
+# it drags in Qt Quick, which the small tests (tst_binarycodec, tst_shotprojection)
+# have no reason to link. The Quick edge is fastlinerenderer.h (QQuickItem,
+# QSGGeometryNode), included by shotdatamodel.cpp and fastlinerenderer.cpp —
+# NOT shotdatamodel.h, which is Qt Core only and forward-declares the renderer.
+# Link this instead of listing the sources; the plain-Core analysis/projection
+# half is in decenza_testlib via ANALYSIS_SOURCES.
+#
+# Tests that link this still need version_code.cpp and, if they touch the KB
+# loaders, the ai.qrc resource — neither belongs in a shared static lib.
+# ---------------------------------------------------------------------------
+find_package(Qt6 REQUIRED COMPONENTS Quick)
+# Shot and steam graph tests share the renderer without sharing their models.
+add_library(decenza_fastlinetestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/rendering/fastlinerenderer.h
+    ${CMAKE_SOURCE_DIR}/src/rendering/fastlinerenderer.cpp)
+set_target_properties(decenza_fastlinetestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_include_directories(decenza_fastlinetestlib PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(decenza_fastlinetestlib PUBLIC Qt6::Quick)
+
+add_library(decenza_shotlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/history/shothistorystorage.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/shothistorystorage_internal.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/shothistorystorage_serialize.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/shotfileexport.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/shothistorystorage_queries.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/recipestorage.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/shotdatamodel.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/visualizeruploader.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/shotuploads.cpp
+    # Header-only Q_NAMESPACE: listed so AUTOMOC emits its staticMetaObject.
+    ${CMAKE_SOURCE_DIR}/src/network/accountlink.h
+)
+set_target_properties(decenza_shotlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_compile_definitions(decenza_shotlib PUBLIC DECENZA_TESTING)
+target_link_libraries(decenza_shotlib PUBLIC
+    decenza_fastlinetestlib decenza_testlib
+    decenza_shotcomparisonlib   # ShotHistoryStorage::shotOutcomeStatic
+    Qt6::Quick
+)
+# ${CMAKE_BINARY_DIR} for the generated version.h, which visualizeruploader.cpp
+# includes. PUBLIC so linking targets inherit it and don't each repeat it.
+target_include_directories(decenza_shotlib PUBLIC ${CMAKE_BINARY_DIR})
+
+# The production resources.qrc, compiled ONCE for the three targets that need
+# :/icons/* and :/backgrounds/* to resolve (tst_backgroundpresets,
+# tst_mcpserver_protocol, tst_remoteaccess). Each used to AUTORCC it into
+# itself: 34.9 s across the three, 22.4 s of it duplicate, and two of those
+# were among the slowest edges under tests/.
+#
+# OBJECT rather than STATIC, deliberately. A generated qrc .cpp is reached only
+# through its static initialiser — nothing references a symbol in it — so from a
+# static archive the linker has no reason to pull it in and the resource
+# silently fails to register. An OBJECT library's objects are always linked.
+# (This is the same archive-pull rule that made an over-merged static library
+# fail earlier in this file, seen from the other side.)
+add_library(decenza_testresources OBJECT ${CMAKE_SOURCE_DIR}/resources/resources.qrc)
+set_target_properties(decenza_testresources PROPERTIES AUTORCC ON)
+target_link_libraries(decenza_testresources PUBLIC Qt6::Core)
+
+# resources/ai.qrc (profile knowledge, dial-in reference), compiled ONCE for the
+# targets whose shot loading reaches ShotSummarizer's KB loaders. OBJECT for the
+# same static-initialiser reason as decenza_testresources above.
+add_library(decenza_testairesources OBJECT ${CMAKE_SOURCE_DIR}/resources/ai.qrc)
+set_target_properties(decenza_testairesources PROPERTIES AUTORCC ON)
+target_link_libraries(decenza_testairesources PUBLIC Qt6::Core)
+
+# FirmwareAssetCache is exercised by exactly these two targets. Keep its
+# Q_OBJECT implementation in one narrow library so it is compiled once.
+add_library(decenza_firmwareassetcachelib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/firmwareassetcache.cpp
+)
+set_target_properties(decenza_firmwareassetcachelib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_firmwareassetcachelib PUBLIC decenza_testlib)
+
+# GitHub release requests and HDS manifest parsing are each exercised by two
+# focused targets. Keep them narrow: adding either to decenza_testlib would
+# relink all test executables for two sources that only these targets need.
+add_library(decenza_githubreleaseclientlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/githubreleaseclient.cpp
+)
+target_link_libraries(decenza_githubreleaseclientlib PUBLIC decenza_testlib)
+
+add_library(decenza_hdsfirmwarecataloglib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/hdsfirmwarecatalog.cpp
+)
+target_link_libraries(decenza_hdsfirmwarecataloglib PUBLIC decenza_testlib)
+
+add_decenza_test(tst_binarycodec
+    tst_binarycodec.cpp
+)
+
+# --- tst_wifiscaleresult: pure WiFi-scale discovery result logic (TXT parsing,
+# address dedupe, row labelling). Deliberately separate from the mDNS transport,
+# which needs real packets on a real LAN and so cannot be covered here. ---
+add_decenza_test(tst_wifiscaleresult
+    tst_wifiscaleresult.cpp
+)
+target_link_libraries(tst_wifiscaleresult PRIVATE decenza_wifiscaleresultlib)
+
+# --- tst_aborted_shot_classifier: header-only "did the shot start?" classifier (issue #899) ---
+add_decenza_test(tst_aborted_shot_classifier
+    tst_aborted_shot_classifier.cpp
+)
+
+# --- tst_tastecvamap: header-only taste-tap → Visualizer CVA mapping (add-ai-taste-intake) ---
+add_decenza_test(tst_tastecvamap
+    tst_tastecvamap.cpp
+)
+
+# --- tst_visualizershotlist: header-only shared paginator decision logic
+# (window filter / newest-first early-stop / page-ceiling guard) ---
+add_decenza_test(tst_visualizershotlist
+    tst_visualizershotlist.cpp
+)
+
+# --- tst_dialing_helpers: pure session-grouping algorithm (issue #1009) ---
+add_decenza_test(tst_dialing_helpers
+    tst_dialing_helpers.cpp
+)
+
+# --- tst_basketaliases: basket registry data-integrity + lookup/summary
+# helpers (header-only target; mirrors the untested GrinderAliases sibling) ---
+add_decenza_test(tst_basketaliases
+    tst_basketaliases.cpp
+)
+
+# --- tst_drinktypes: recipe-wizard tea profile type-matching, temp proximity,
+# and per-type default temps (header-only target; add-recipe-wizard-tea) ---
+add_decenza_test(tst_drinktypes
+    tst_drinktypes.cpp
+)
+
+# --- tst_recipeselectionmodel: pure selection + deferred-start state machine
+# behind MainController::selectedRecipeId (header-only target; PR #1470) ---
+add_decenza_test(tst_recipeselectionmodel
+    tst_recipeselectionmodel.cpp
+)
+
+# --- tst_recipewiringcontroller: the active-recipe write-through wiring
+# extracted from MainController (extract-recipe-wiring-controller). Drives the
+# controller through its four ports with synchronous fakes — no RecipeStorage,
+# SettingsDye, ProfileManager, event loop or DB. Compiles only the controller
+# .cpp; its only non-fake dependencies are the inline Recipe::profileDiverged
+# (recipestorage.h) and DrinkTypes::hasGrind (drinktypes.h), both header-only. ---
+add_decenza_test(tst_recipewiringcontroller
+    tst_recipewiringcontroller.cpp
+    ${CMAKE_SOURCE_DIR}/src/controllers/recipewiringcontroller.cpp
+)
+
+# --- tst_mcptools_shots_helpers: detectorResults envelope reshape (issue #1012) ---
+add_decenza_test(tst_mcptools_shots_helpers
+    tst_mcptools_shots_helpers.cpp
+)
+
+# --- tst_firmwarepackets: FWMapRequest + firmware chunk byte layout tests
+# (header-only target; no cpp dependency beyond the test itself) ---
+add_decenza_test(tst_firmwarepackets
+    tst_firmwarepackets.cpp
+)
+
+# --- tst_firmwareheader: bootfwupdate.dat header parser + validator tests
+# (header-only target; uses QFile / QTemporaryDir for on-disk cases) ---
+add_decenza_test(tst_firmwareheader
+    tst_firmwareheader.cpp
+)
+
+# --- tst_firmwareassetcachehelpers: pure helpers (MetaJson JSON round-trip,
+# Range-header computation). Network-driven FirmwareAssetCache class is
+# covered by the integration test in tst_firmwareflow. ---
+add_decenza_test(tst_firmwareassetcachehelpers
+    tst_firmwareassetcachehelpers.cpp
+)
+target_link_libraries(tst_firmwareassetcachehelpers PRIVATE
+    decenza_firmwareassetcachelib
+    decenza_testresources
+)
+
+# --- tst_migrationinterfaceselect: pure interface-selection ordering for
+# multi-homing-robust device-migration connects. orderedSubnetCandidates() is
+# inline in datamigrationclient.h, so this needs no client/storage sources. ---
+add_decenza_test(tst_migrationinterfaceselect
+    tst_migrationinterfaceselect.cpp
+)
+
+# --- tst_profile: Profile JSON/TCL parsing, frame generation, BLE encoding ---
+add_decenza_test(tst_profile
+    tst_profile.cpp
+)
+
+# --- tst_builtinprofileformat: every shipped built-in must satisfy Decaid's
+# Profile.fromJson contract (required keys, non-empty steps, enum vocabulary), so
+# a profile makes the same coffee in every DE1 app. See OpenSpec
+# align-profile-json-with-reaprime.
+add_decenza_test(tst_builtinprofileformat
+    tst_builtinprofileformat.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+# decenza_shotlib: the upload-payload test asserts VisualizerUploader emits the
+# same canonical serialization as the on-disk format.
+target_link_libraries(tst_builtinprofileformat PRIVATE decenza_shotlib)
+target_include_directories(tst_builtinprofileformat PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_visualizershotparse: JSON->ShotRecord recovery parser (string-encoded
+# DYE scalars must not zero; hollow-shot guard; phantom-frame guard). ---
+# shotanalysis.cpp is NOT listed here: it is in ANALYSIS_SOURCES, hence in
+# decenza_testlib, which add_decenza_test links. Listing it compiled the same
+# 3.3 s translation unit a second time for no reason, and nothing detected that
+# until the duplication audit — which is why check_test_source_duplication.py
+# now fails on exactly this shape.
+add_library(decenza_shotparserlib STATIC ${CMAKE_SOURCE_DIR}/src/history/shotfileparser.cpp)
+target_link_libraries(decenza_shotparserlib PUBLIC decenza_testlib)
+
+add_decenza_test(tst_visualizershotparse
+    tst_visualizershotparse.cpp
+)
+target_link_libraries(tst_visualizershotparse PRIVATE decenza_shotparserlib)
+target_compile_definitions(tst_visualizershotparse PRIVATE
+    TST_VIS_PARSE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+# --- tst_temperaturedisplay: adaptive temp-override display formatter ---
+add_decenza_test(tst_temperaturedisplay
+    tst_temperaturedisplay.cpp
+)
+
+# --- tst_profileframe: ProfileFrame JSON/TCL/flags tests (minimal deps) ---
+add_decenza_test(tst_profileframe
+    tst_profileframe.cpp
+)
+
+# --- tst_autoflowcal: window-level flow cal classification (#739 regression) ---
+add_decenza_test(tst_autoflowcal
+    tst_autoflowcal.cpp
+    ${CMAKE_SOURCE_DIR}/src/controllers/autoflowcalclassifier.cpp
+)
+
+# --- tst_machinestate: Phase transitions, volume reset, signals ---
+add_decenza_test(tst_machinestate
+    tst_machinestate.cpp
+    mocks/MockScaleDevice.h
+    mocks/MockTransport.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/drinksequencecontroller.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/drinksequencecontroller.cpp
+)
+
+# Shared request tracking for the facade tests, with one QObject/moc owner.
+add_library(decenza_serviceoperationtestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/remote/serviceoperation.h
+    ${CMAKE_SOURCE_DIR}/src/remote/serviceoperation.cpp)
+set_target_properties(decenza_serviceoperationtestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_serviceoperationtestlib PUBLIC Qt6::Core)
+
+# --- tst_stableweightcapture: deterministic virtual-zero and dose capture engine ---
+add_library(decenza_preparationtestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/stableweightcapture.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/preparationstate.h
+    ${CMAKE_SOURCE_DIR}/src/core/preparationstate.cpp
+    ${CMAKE_SOURCE_DIR}/src/controllers/preparationcontroller.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/preparationcontroller.cpp
+    ${CMAKE_SOURCE_DIR}/src/controllers/steamautoflushcontroller.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/steamautoflushcontroller.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scaledeviceproxy.cpp
+)
+set_target_properties(decenza_preparationtestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_compile_definitions(decenza_preparationtestlib PUBLIC DECENZA_TESTING)
+target_include_directories(decenza_preparationtestlib PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(decenza_preparationtestlib PUBLIC decenza_testlib Qt6::Qml)
+add_decenza_test(tst_stableweightcapture tst_stableweightcapture.cpp)
+target_link_libraries(tst_stableweightcapture PRIVATE decenza_preparationtestlib)
+add_decenza_test(tst_preparationcontroller tst_preparationcontroller.cpp mocks/MockScaleDevice.h)
+target_link_libraries(tst_preparationcontroller PRIVATE decenza_preparationtestlib)
+add_decenza_test(tst_steamautoflushcontroller tst_steamautoflushcontroller.cpp)
+target_link_libraries(tst_steamautoflushcontroller PRIVATE decenza_preparationtestlib)
+add_decenza_test(tst_steamstopstate tst_steamstopstate.cpp)
+
+# --- tst_simulatedscale: simulator weight -> SimulatedScale -> MachineState ---
+add_decenza_test(tst_simulatedscale
+    tst_simulatedscale.cpp
+)
+
+# --- tst_de1simulator: simulator frame stepping ---
+# The simulator drives every shot pulled without a machine, so a fault here reads
+# as a fault in the profile — which is exactly how the zero-length-frame bug was
+# found (an A-Flow shot that never reached its extraction frame).
+add_decenza_test(tst_de1simulator
+    tst_de1simulator.cpp
+)
+
+# --- tst_livesteamcoach: during-steam coaching milestones, gating, completion ---
+add_decenza_test(tst_livesteamcoach
+    tst_livesteamcoach.cpp
+    ${CMAKE_SOURCE_DIR}/src/ai/livesteamcoach.cpp
+)
+
+# --- tst_machinestatussnapshot: widget snapshot schema + temp coalescing ---
+add_decenza_test(tst_machinestatussnapshot
+    tst_machinestatussnapshot.cpp
+    mocks/MockScaleDevice.h
+    ${CMAKE_SOURCE_DIR}/src/widget/machinestatussnapshot.cpp
+)
+
+# --- tst_profileparams: ProfileParams serialization, validation, clamping ---
+add_decenza_test(tst_profileparams
+    tst_profileparams.cpp
+)
+
+# --- tst_shotprojection: ShotProjection::coerce() (QVariant → gadget) ---
+add_decenza_test(tst_shotprojection
+    tst_shotprojection.cpp
+)
+
+# --- tst_roastdate: RoastDate::toIso() roast-date normalizer (header-only) ---
+add_decenza_test(tst_roastdate
+    tst_roastdate.cpp
+)
+
+# --- tst_steamheaterpolicy: THE steam-target derivation, and that it stays the only one ---
+add_decenza_test(tst_steamheaterpolicy
+    tst_steamheaterpolicy.cpp
+)
+
+# --- tst_sensorcalibration: the capture controller behind the calibration wizards ---
+add_decenza_test(tst_sensorcalibration
+    tst_sensorcalibration.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/sensorcalibrationservicesource.cpp
+)
+qt6_add_repc_sources(tst_sensorcalibration
+    ${CMAKE_SOURCE_DIR}/src/remote/sensorcalibrationservice.rep)
+target_include_directories(tst_sensorcalibration PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(tst_sensorcalibration PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects)
+
+# --- tst_settings: Settings persistence and defaults ---
+add_decenza_test(tst_settings
+    tst_settings.cpp
+)
+target_link_libraries(tst_settings PRIVATE decenza_settingsserializerlib)
+
+# --- tst_appsettings: the single canonical settings store ---
+# Asserts the store-identity assumption the whole consolidation rests on (that the
+# explicit organization/application pair and a default-constructed QSettings address
+# the same file), and scans src/ for handles constructed outside the accessor.
+# Deliberately links nothing: it tests Qt's own store naming plus the source tree.
+add_decenza_test(tst_appsettings
+    tst_appsettings.cpp
+)
+
+# --- tst_backgroundpresets: background preset catalogue + Glass theme ---
+# Includes the WCAG contrast floors for every colour — against the page, the page under
+# the densest pattern, the card and the action tile — computable here in a way it never
+# was for a photo background, and measured against the shipped derivation in C++.
+add_decenza_test(tst_backgroundpresets
+    tst_backgroundpresets.cpp
+    # For the backup/migration round-trip: the colour and pattern must survive a
+    # settings export/import, which backs every persistence surface in the app.
+)
+# Compile the production qrc so :/backgrounds/*.svg resolve — the catalogue test asserts
+# every pattern asset actually ships, which is the check that catches a catalogue entry
+# pointing at a file nobody added to resources.qrc.
+target_link_libraries(tst_backgroundpresets PRIVATE decenza_testresources)
+# Qt6::Svg so the test can RENDER each pattern tile and measure its ink coverage, rather
+# than trusting the hand-entered figure the contrast maths depends on. Two of the six were
+# wrong before this check existed, both understating the shift.
+target_link_libraries(tst_backgroundpresets PRIVATE decenza_settingsserializerlib Qt6::Svg)
+
+# --- tst_saw_settings: per-(profile, scale) SAW learning + batch + bootstrap ---
+add_decenza_test(tst_saw_settings
+    tst_saw_settings.cpp
+)
+
+# --- tst_qmlregistration: the C++ types QML is supposed to know about actually reach it ---
+# Reads two artifacts rather than executing the registration: the qmltypes generated by
+# qmltyperegistrar on the Decenza QML module target (which the test binaries do not link, so
+# there is no way to exercise it directly), and main.cpp's explicit qml_register_types_Decenza()
+# call. Guards the failure mode where a type is missing from the registry and every tool in the
+# build stays green — see the file header for the three times that has now happened.
+add_decenza_test(tst_qmlregistration
+    tst_qmlregistration.cpp
+)
+target_compile_definitions(tst_qmlregistration PRIVATE
+    DECENZA_QMLTYPES_PATH="${CMAKE_BINARY_DIR}/Decenza/Decenza.qmltypes")
+if(DECENZA_WEB_BUNDLE_DIR)
+    # The Wasm build's generated module metadata is retained beside its deployment bundle.
+    # Checking it keeps web-only compile-time singleton adapters from being mistaken for
+    # omissions in the native Decenza module.
+    get_filename_component(_decenza_web_build_dir "${DECENZA_WEB_BUNDLE_DIR}" DIRECTORY)
+    set(_decenza_web_qmltypes_path "${_decenza_web_build_dir}/Decenza/decenza-web.qmltypes")
+else()
+    set(_decenza_web_qmltypes_path "")
+endif()
+target_compile_definitions(tst_qmlregistration PRIVATE
+    DECENZA_WEB_QMLTYPES_PATH="${_decenza_web_qmltypes_path}")
+# Generate the real registry, including fresh removals, without compiling the
+# app executable merely to read metadata. Missing metadata fails this test.
+add_dependencies(tst_qmlregistration decenza_qml_metadata)
+
+# --- tst_translationreactivity: QML binding dependency on translate/emoji lookups ---
+# Needs a real QQmlEngine to assert that bindings re-evaluate, so it links Qt6::Qml
+# on top of what add_decenza_test provides. Guards the mechanism that keeps 3,248
+# translated strings from silently freezing after a language change. TranslationManager
+# itself comes from decenza_testlib, so realTranslateIsANotifyingProperty() checks the
+# SHIPPING meta-object rather than the spike's stand-in.
+find_package(Qt6 REQUIRED COMPONENTS Qml)
+add_decenza_test(tst_translationreactivity
+    tst_translationreactivity.cpp
+)
+target_link_libraries(tst_translationreactivity PRIVATE Qt6::Qml)
+
+add_decenza_test(tst_translationcatalog
+    tst_translationcatalog.cpp
+)
+
+# --- tst_translationsourcedrift: what happens when a key's English is rewritten ---
+# Pins the contract that the registry follows the source text while the existing translation is
+# KEPT and merely reported, not dropped. This comment used to say the opposite — that a
+# translation of the previous wording stops being served — which was the first implementation,
+# reverted after it ate 11 German strings on a real run. The old
+# `if (!contains(key))` guard meant a key's English was captured once and never revisited,
+# which a full rescan could not repair either.
+add_decenza_test(tst_translationsourcedrift
+    tst_translationsourcedrift.cpp
+)
+target_link_libraries(tst_translationsourcedrift PRIVATE Qt6::Qml)
+
+# --- tst_translationscan: the QML string scan, and that it stays off the calling stack ---
+# The scan is what feeds AI translation and community upload, so its three patterns are pinned
+# here. The asynchrony is pinned for a different reason: as a synchronous scan it pumped
+# processEvents() per file, and that nested pump crashed shipped iOS 2.0.0 (#1692) — an event
+# delivered inside it destroyed the settings page while its TabBar handler was still running.
+#
+# The fixture resource is mounted at the SAME prefix the scanner hardcodes
+# (":/qt/qml/Decenza/qml", src/core/translationmanager.cpp). Without it the app's QML module —
+# which belongs to the Decenza target, not to this binary — is absent, the scan finds zero files,
+# and the worker loop, the file reads, the progress posts and the registry-writing tail all go
+# unexecuted while the tests still pass. This is resource DATA, not a QML harness: nothing here is
+# loaded or instantiated, the scanner reads it as text.
+add_decenza_test(tst_translationscan
+    tst_translationscan.cpp
+)
+qt_add_resources(tst_translationscan "translationscan_fixtures"
+    PREFIX "/qt/qml/Decenza/qml"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/data/qmlscan"
+    FILES
+        data/qmlscan/AlphaPage.qml
+        data/qmlscan/BetaPage.qml
+)
+target_link_libraries(tst_translationscan PRIVATE Qt6::Qml)
+
+# --- tst_markdownrenderer: markdown -> HTML, incl. the raw-HTML security claim ---
+add_decenza_test(tst_markdownrenderer
+    tst_markdownrenderer.cpp
+)
+target_link_libraries(tst_markdownrenderer PRIVATE Qt6::Qml)
+
+# --- tst_emojiassets: the SHIPPED :/emoji resource set ---
+# Compiles emoji.qrc in so this asserts what actually ships, not the source directory —
+# without it a missing/stale qrc would silently strip every emoji in the app while
+# tst_textescaping (which reads disk) stayed green.
+add_decenza_test(tst_emojiassets
+    tst_emojiassets.cpp
+    ${CMAKE_SOURCE_DIR}/resources/emoji.qrc
+)
+include("${CMAKE_SOURCE_DIR}/cmake/image_sets.cmake")
+decenza_add_image_sets(tst_emojiassets)
+
+# --- tst_textescaping: Theme.escapeHtml / replaceEmojiWithImg escaping contract ---
+# Runs the real JS out of qml/Theme.qml in a QJSEngine, so it guards shipping source
+# rather than a copy. Needs Qt6::Qml for QJSEngine.
+add_decenza_test(tst_textescaping
+    tst_textescaping.cpp
+)
+target_link_libraries(tst_textescaping PRIVATE Qt6::Qml)
+
+# --- tst_customwidgethtml: shared widget behavior and DocumentFormatter ---
+add_decenza_test(tst_customwidgethtml
+    tst_customwidgethtml.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/uiworkprobe.h
+    ${CMAKE_SOURCE_DIR}/src/core/documentformatter.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/browserdisplay.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/browserdisplay.h
+)
+# Qt6::Quick, not just Qml: documentformatter.h includes <QQuickTextDocument>, which is a
+# Quick header even though nothing in this test constructs one.
+target_link_libraries(tst_customwidgethtml PRIVATE Qt6::Qml Qt6::Quick)
+# Focus, keyboard and wheel checks need exposed windows, but not desktop windows.
+set_tests_properties(tst_customwidgethtml PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_decenza_test(tst_libraryservice
+    tst_libraryservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/widgetlibrary.cpp
+)
+target_sources(tst_libraryservice PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/remote/libraryservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/libraryservicesource.cpp
+)
+qt6_add_repc_sources(tst_libraryservice ${CMAKE_SOURCE_DIR}/src/remote/libraryservice.rep)
+target_include_directories(tst_libraryservice PRIVATE ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(tst_libraryservice PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects)
+
+# --- tst_recipesearch: Recipes-page tokenized search matcher ---
+# Runs the real JS out of qml/components/RecipeSearch.js in a QJSEngine, so it guards
+# shipping source rather than a copy. Needs Qt6::Qml for QJSEngine.
+add_decenza_test(tst_recipesearch
+    tst_recipesearch.cpp
+)
+target_link_libraries(tst_recipesearch PRIVATE Qt6::Qml)
+
+# --- tst_beanbaseclient: Bean Base API client (debounce, rate limit, cache, parse) ---
+add_decenza_test(tst_beanbaseclient
+    tst_beanbaseclient.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptools_beansearch.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptoolregistry.h
+)
+target_link_libraries(tst_beanbaseclient PRIVATE decenza_beanbaselib decenza_communitysettingslib)
+
+# --- tst_autowakewindow: scheduled stay-awake window predicate (#1203) ---
+add_decenza_test(tst_autowakewindow
+    tst_autowakewindow.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/autowakemanager.cpp
+)
+
+# --- tst_dbtxn: DbWriteTxn lock discipline shared by the storages ---
+# Header-only (dbutils.h), so no extra sources. Covers the outcomes the storage
+# suites never reach: they all run uncontended and single-connection, so they
+# only ever exercise the successful DbWriteTxn::begin() path.
+add_decenza_test(tst_dbtxn
+    tst_dbtxn.cpp
+)
+
+# --- tst_updatechecker: shared GitHub releases request + connection policy ---
+# Guards ConnectionCacheExpiryTimeoutSecondsAttribute, whose absence is invisible
+# except as an hourly Qt warning in shipped logs. Friend-class access is via
+# `friend class tst_UpdateChecker` under DECENZA_TESTING in updatechecker.h.
+add_library(decenza_updatecheckertestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/updatechecker.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_include_directories(decenza_updatecheckertestlib PUBLIC ${CMAKE_BINARY_DIR})
+target_link_libraries(decenza_updatecheckertestlib PUBLIC decenza_testlib decenza_githubreleaseclientlib)
+add_decenza_test(tst_updatechecker tst_updatechecker.cpp)
+target_link_libraries(tst_updatechecker PRIVATE decenza_updatecheckertestlib)
+
+# --- tst_hdsfirmwarecatalog: OpenScale manifest parsing and HDS eligibility ---
+add_decenza_test(tst_hdsfirmwarecatalog
+    tst_hdsfirmwarecatalog.cpp
+)
+target_link_libraries(tst_hdsfirmwarecatalog PRIVATE decenza_hdsfirmwarecataloglib)
+
+# --- tst_hdsfirmwareupdatecontroller: manifest lifecycle, active-scale gate, and stale replies ---
+add_decenza_test(tst_hdsfirmwareupdatecontroller
+    tst_hdsfirmwareupdatecontroller.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/hdsfirmwareupdatecontroller.cpp
+)
+target_link_libraries(tst_hdsfirmwareupdatecontroller PRIVATE
+    decenza_githubreleaseclientlib
+    decenza_hdsfirmwarecataloglib
+)
+
+# --- tst_tclimport: TCL profile import round-trip against de1app profiles ---
+add_decenza_test(tst_tclimport
+    tst_tclimport.cpp
+)
+target_compile_definitions(tst_tclimport PRIVATE
+    MALFORMED_TCL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/malformed_tcl"
+    DE1APP_PROFILES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/de1app_profiles"
+)
+
+# --- tst_profilegenerator: Frame generation vs de1app stock profiles ---
+add_decenza_test(tst_profilegenerator
+    tst_profilegenerator.cpp
+)
+
+# --- tst_profileeditorparity: D-Flow / A-Flow against their upstream plugins ---
+# The plugins are the oracle (Damian-AU/D_Flow_Espresso_Profile @ 7f3c9726,
+# Jan3kJ/A_Flow @ e1a4d871). A-Flow fixtures come from the de1app corpus, which
+# holds the plugin's own 9-frame profiles; D-Flow ships no .tcl, so its three are
+# extracted by tools/extract_dflow_profiles.py into their own fixture dir.
+add_decenza_test(tst_profileeditorparity
+    tst_profileeditorparity.cpp
+)
+target_compile_definitions(tst_profileeditorparity PRIVATE
+    DE1APP_PROFILES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/de1app_profiles"
+    DFLOW_PLUGIN_PROFILES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/dflow_plugin_profiles"
+    DE1APP_PACKED_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/de1app_packed"
+    PACK_PROPERTY_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/pack_property"
+    AFLOW_LEGACY_PROFILES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/aflow_legacy_profiles"
+)
+
+# --- tst_shotanalysis: ShotAnalysis quality heuristics ---
+add_decenza_test(tst_shotanalysis
+    tst_shotanalysis.cpp
+)
+
+# --- tst_shotsummarizer: AI-prompt suppression cascade (issue #921) ---
+# Pins the contract that ShotSummarizer's prompt path delegates detector
+# orchestration to ShotAnalysis::generateSummary, so puck-failure shots
+# can't leak misleading channeling/temp observations to the AI advisor.
+# Qt::Quick + fastlinerenderer come in transitively via shotdatamodel.h —
+# summarizeFromHistory() doesn't touch ShotDataModel itself, but the
+# shotsummarizer.cpp translation unit links its symbols.
+find_package(Qt6 REQUIRED COMPONENTS Quick Graphs)
+# Compile the AI resource files (profile knowledge, dial-in reference,
+# claude agent) into the test binary so ShotSummarizer's lazy loaders
+# find them silently. Without this, calls to shotAnalysisSystemPrompt()
+# emit qWarning lines that violate the "no warnings during test runs"
+# policy in docs/CLAUDE_MD/TESTING.md §Test warnings.
+add_decenza_test(tst_shotsummarizer
+    tst_shotsummarizer.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+    $<TARGET_OBJECTS:decenza_testairesources>
+)
+target_link_libraries(tst_shotsummarizer PRIVATE decenza_shotlib)
+target_include_directories(tst_shotsummarizer PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_aimanager: canonical-source separation end-to-end (task 10.5) ---
+# Pins the contract that AIManager::emitRecentShotContext hoists profile
+# intent + recipe + setup identity to a single header at the top of the
+# "Previous Shots" section, and that legacy empty-string identity fields
+# read as "inherit" rather than "different." Friend-class access is via
+# `friend class tst_AIManager` under DECENZA_TESTING in aimanager.h.
+add_library(decenza_aimanagertestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/ai/aimanager.h
+    ${CMAKE_SOURCE_DIR}/src/ai/aimanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/ai/aiconversation.h
+    ${CMAKE_SOURCE_DIR}/src/ai/aiconversation.cpp)
+set_target_properties(decenza_aimanagertestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_aimanagertestlib PUBLIC
+    decenza_dialingblockslib decenza_aiproviderlib decenza_shotlib)
+
+add_library(decenza_conversationsessioncontracttestlib STATIC)
+set_target_properties(decenza_conversationsessioncontracttestlib PROPERTIES AUTOMOC ON)
+qt6_add_repc_sources(decenza_conversationsessioncontracttestlib
+    ${CMAKE_SOURCE_DIR}/src/remote/conversationsession.rep)
+target_include_directories(decenza_conversationsessioncontracttestlib PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(decenza_conversationsessioncontracttestlib PUBLIC Qt6::RemoteObjects)
+
+add_library(decenza_beanuicontracttestlib STATIC)
+set_target_properties(decenza_beanuicontracttestlib PROPERTIES AUTOMOC ON)
+qt6_add_repc_sources(decenza_beanuicontracttestlib
+    ${CMAKE_SOURCE_DIR}/src/remote/beanuiservice.rep)
+target_include_directories(decenza_beanuicontracttestlib PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(decenza_beanuicontracttestlib PUBLIC Qt6::RemoteObjects)
+
+add_decenza_test(tst_aimanager
+    tst_aimanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/beanuiservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/beanuiservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/conversationsessionsource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/conversationsessionsource.h
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptools_ai_conversations.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptoolregistry.h
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+    $<TARGET_OBJECTS:decenza_testairesources>
+)
+target_link_libraries(tst_aimanager PRIVATE decenza_aimanagertestlib decenza_serviceoperationtestlib
+    decenza_filebundletestlib
+    decenza_conversationsessioncontracttestlib decenza_beanbaselib
+    decenza_communitysettingslib decenza_baglinktestlib decenza_beanuicontracttestlib Qt6::RemoteObjects)
+target_include_directories(tst_aimanager PRIVATE ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+
+# --- tst_aiproviders: per-provider model catalog + setModel guard contract ---
+# Pins availableModels()/setModel()/shortModelName()/modelName() for the
+# user-selectable providers (OpenAI, Anthropic, Gemini, OpenRouter): catalog order,
+# constructor default = first entry, and the empty/unknown/valid setModel
+# branches that AIManager drives from Settings.ai.providerModel(). Also pins the
+# request shape and the stop/finish-reason handling for all five providers,
+# which needs a canned-response server (FakeProviderServer) on loopback —
+# Qt6::Network comes in via add_decenza_test.
+add_decenza_test(tst_aiproviders
+    tst_aiproviders.cpp
+)
+target_link_libraries(tst_aiproviders PRIVATE decenza_aiproviderlib)
+
+# --- tst_shotcorpus: Qt Test wrapper around shot_eval --validate.
+# Runs the curated corpus under tests/data/shots/ as part of the regular
+# Qt Test suite so Qt Creator's Tests panel picks it up alongside the
+# other tst_* binaries. Without this wrapper, a bare add_test(NAME ...
+# COMMAND ...) entry only surfaces in CTest, not in Qt Creator's Tests
+# UI (which auto-discovers Q_OBJECT-derived test binaries). Mac
+# developers running "Run all tests" in Qt Creator would otherwise miss
+# this corpus check.
+#
+# The shot_eval target lives in the root CMakeLists.txt developer-tools
+# block, which runs AFTER add_subdirectory(tests) — so TARGET shot_eval
+# is not defined here yet. Use the same desktop-only gate that declares
+# it, and pull the path through generator expressions at link time.
+if(NOT ANDROID AND NOT IOS)
+    add_executable(tst_shotcorpus tst_shotcorpus.cpp)
+    target_link_libraries(tst_shotcorpus PRIVATE Qt6::Test Qt6::Core)
+    target_compile_definitions(tst_shotcorpus PRIVATE
+        TST_SHOTCORPUS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        TST_SHOTCORPUS_SHOT_EVAL="$<TARGET_FILE:shot_eval>"
+    )
+    add_dependencies(tst_shotcorpus shot_eval)
+    add_decenza_qtest(tst_shotcorpus)
+    # Registered by hand because this target is declared with add_executable
+    # rather than add_decenza_test, so the function that records test targets
+    # never sees it. Omitting it made `ninja build_tests` skip this binary and
+    # ctest report "40 - tst_shotcorpus (Not Run)" — caught only by building in
+    # a CLEAN tree, since an incremental build still had the binary lying around
+    # from a previous `ninja all`.
+    #
+    # This also pulls in shot_eval via add_dependencies above, which is correct:
+    # the test shells out to `shot_eval --validate`, so that tool IS needed even
+    # though the other three (saw_replay, saw_parity, profile_sync) are not.
+    set_property(GLOBAL APPEND PROPERTY DECENZA_TEST_TARGETS tst_shotcorpus)
+endif()
+
+# --- tst_shotsettings: ShotSettings BLE wire format ---
+add_decenza_test(tst_shotsettings
+    tst_shotsettings.cpp
+    mocks/MockTransport.h
+)
+
+# --- tst_mmrwrite: DE1Device::writeMMR per-register dedup (issue #783) ---
+add_decenza_test(tst_mmrwrite
+    tst_mmrwrite.cpp
+    mocks/MockTransport.h
+)
+
+# --- tst_de1device_headless: GHC "headless" gate default + disconnect reset (#1470) ---
+add_decenza_test(tst_de1device_headless
+    tst_de1device_headless.cpp
+    mocks/MockTransport.h
+)
+
+# --- tst_de1device_mmrreads: one-shot MMR read retry + profile-upload settle window ---
+add_decenza_test(tst_de1device_mmrreads
+    tst_de1device_mmrreads.cpp
+    mocks/MockTransport.h
+)
+
+# --- tst_shotsampledecode: SetMixTemp/SetHeadTemp offsets in both BLE specs ---
+add_decenza_test(tst_shotsampledecode
+    tst_shotsampledecode.cpp
+)
+
+# --- tst_de1device_firmware: firmware-update BLE extensions on DE1Device ---
+add_decenza_test(tst_de1device_firmware
+    tst_de1device_firmware.cpp
+    mocks/MockTransport.h
+)
+
+# --- tst_firmwareupdater: FirmwareUpdater state-machine tests ---
+add_decenza_test(tst_firmwareupdater
+    tst_firmwareupdater.cpp
+    mocks/MockTransport.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/firmwareupdater.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/updateservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/updateservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/updateservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/updateservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/updateservicesource.h
+)
+qt6_add_repc_sources(tst_firmwareupdater ${CMAKE_SOURCE_DIR}/src/remote/updateservice.rep)
+qt6_add_repc_replicas(tst_firmwareupdater ${CMAKE_SOURCE_DIR}/src/remote/updateservice.rep)
+target_include_directories(tst_firmwareupdater PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_firmwareupdater PRIVATE
+    decenza_firmwareassetcachelib
+    decenza_testresources
+    decenza_updatecheckertestlib decenza_importservicetestlib Qt6::RemoteObjects Qt6::Qml
+)
+
+# --- tst_profileupload: Profile upload frame-ACK verification ---
+add_decenza_test(tst_profileupload
+    tst_profileupload.cpp
+    mocks/MockTransport.h
+)
+
+# --- tst_bleserviceerror: QLowEnergyService::ServiceError name mapping (#1586) ---
+add_decenza_test(tst_bleserviceerror
+    tst_bleserviceerror.cpp
+)
+
+# --- tst_blecontrollererror: QLowEnergyController::Error naming + which errors
+#     may interrupt the user vs. belong to the reconnect ladder (#1658) ---
+add_decenza_test(tst_blecontrollererror
+    tst_blecontrollererror.cpp
+)
+
+# --- tst_serialstall: the USB serial stall decision. Header-only predicate, so
+#     no QSerialPort link and no platform guard — which is why it was split out
+#     of SerialTransport in the first place (that class needs a real port). ---
+add_decenza_test(tst_serialstall
+    tst_serialstall.cpp
+)
+
+# --- tst_bletransporterror: the #1658 contract itself — a controller error
+#     raises no modal, and the teardown family still feeds de1LinkFault ---
+add_decenza_test(tst_bletransporterror
+    tst_bletransporterror.cpp
+)
+
+# --- tst_blegattqueue: the shared cross-device GATT queue (#1819) — one
+#     operation outstanding across all peripherals, event-driven dispatch with
+#     no queue-owned clock, per-operation retry policy, and teardown discard. ---
+add_decenza_test(tst_blegattqueue
+    tst_blegattqueue.cpp
+)
+
+# --- tst_blecommandqueue: the DE1 command queue's observable behaviour —
+#     FIFO order, urgent placement, UUID-scoped discard,
+#     clearQueue()'s in-flight accounting, depth reporting, and the retry
+#     constants. Recorded as a baseline BEFORE that queue moves onto the shared
+#     cross-device queue (#1819), so the move is verified against measurements
+#     rather than against a reading of the new code. ---
+add_decenza_test(tst_blecommandqueue
+    tst_blecommandqueue.cpp
+)
+
+# --- tst_blefidelity: BLE encode round-trip for all built-in profiles ---
+add_decenza_test(tst_blefidelity
+    tst_blefidelity.cpp
+)
+target_compile_definitions(tst_blefidelity PRIVATE
+    SRCDIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    PROFILES_DIR="${CMAKE_SOURCE_DIR}/resources/profiles"
+)
+
+# ---------------------------------------------------------------------------
+# decenza_profilelib: ProfileManager and the two storage/save sources that
+# travel with it, compiled ONCE for the nine targets that need them (the MCP
+# tests, tst_profilemanager, tst_profileeditorapppath).
+#
+# This was a `set(PROFILEMANAGER_SOURCES ...)` pasted into nine targets, which
+# meant nine compiles of the same three translation units. Measured on a clean
+# rebuild: 128 s of the 215 s of duplicate compilation in this file, and two of
+# the five slowest edges in the WHOLE build were the same profilemanager.cpp
+# object built for different targets.
+#
+# NARROW on purpose — linked by exactly the nine, not folded into
+# decenza_testlib. Measured, by touching profilemanager.cpp and diffing
+# .ninja_log (tests/-attributable cpu):
+#
+#     today, 9 duplicate compiles ......... 77.0 s   (measured)
+#     folded into decenza_testlib ......... 67.0 s   (1 compile + 106 relinks)
+#     here, in a narrow library ........... 23.0 s   (1 compile + 9 relinks)
+#
+# decenza_testlib is linked by every test target, so putting a source there
+# trades a compile fan-out of 9 for a relink fan-out of 106. That still beats
+# the duplication — link is cheap, 0.53 s mean — but it recovers a seventh of
+# what this does, and its fan-out grows with every test target added while this
+# one's does not. Do not "simplify" this into decenza_testlib.
+#
+# Links decenza_testlib (for DECENZA_TESTING/DECENZA_SIMULATOR and the include
+# dirs) but deliberately NOT decenza_shotlib: two of the nine consumers
+# (tst_profileeditorapppath, tst_mcptools_profiles) do not link it, and a static
+# library leaves its undefined references to the final executable link, where
+# each target already supplies what it needs.
+# ---------------------------------------------------------------------------
+add_library(decenza_profilelib STATIC
+    ${CMAKE_SOURCE_DIR}/src/controllers/profilemanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/controllers/profilemanager_editors.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/profilestorage.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profilesavehelper.cpp
+)
+set_target_properties(decenza_profilelib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+# ProfileManager's catalog scan resolves each profile by shape when its title
+# misses; profileshapeindex.cpp is compiled into decenza_testlib, so that
+# comes with the testlib link.
+target_link_libraries(decenza_profilelib PUBLIC decenza_testlib)
+
+# --- The rest of the narrow libraries, same rule: consumer set no wider than
+# the targets that need the sources. Each replaced a source list pasted into
+# three or four targets. Costs are the duplicate cpu they removed, from the
+# clean-rebuild audit in
+# openspec/changes/archive/2026-07-31-cut-test-build-cost/baseline.md.
+
+# weightprocessor + stepexitarbiter: tst_saw, tst_scalefeedliveness,
+# tst_weightprocessor (11.1 s). Plain Qt Core, no extra link requirements.
+add_library(decenza_weightlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/machine/weightprocessor.cpp
+    ${CMAKE_SOURCE_DIR}/src/machine/stepexitarbiter.cpp
+)
+set_target_properties(decenza_weightlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_weightlib PUBLIC decenza_testlib)
+
+# accessibilitymanager (4 consumers, 12.7 s) and screensavervideomanager +
+# batterymanager (3 consumers, a subset of the same targets, 15.2 s).
+#
+# TWO libraries, not one, even though the consumer sets differ by a single
+# target. The first attempt merged them on the reasoning that a static library
+# contributes only the objects an executable actually references, so the odd
+# target out would pay a link edge rather than a compile. That reasoning is
+# WRONG here and the link proved it: AUTOMOC emits ONE mocs_compilation.cpp per
+# target, holding the meta-objects of every Q_OBJECT class in it. Pulling that
+# single object in for AccessibilityManager drags references to
+# ScreensaverVideoManager with it, and tst_accessibility_announcements — which
+# links neither ProfileStorage nor decenza_profilelib — failed with undefined
+# ProfileStorage::staticMetaObject. Merging libraries whose consumer sets differ
+# is therefore not free whenever the sources carry Q_OBJECT.
+find_package(Qt6 REQUIRED COMPONENTS TextToSpeech Multimedia Quick)
+# The screen-reader probe travels with AccessibilityManager: isScreenReaderActive()
+# calls it, so a target that compiles the manager must supply it or fail to link.
+# Same APPLE/else split as the app target in the top-level CMakeLists.
+if(APPLE)
+    set(DECENZA_SCREENREADER_PROBE ${CMAKE_SOURCE_DIR}/src/core/screenreaderprobe.mm)
+else()
+    set(DECENZA_SCREENREADER_PROBE ${CMAKE_SOURCE_DIR}/src/core/screenreaderprobe.cpp)
+endif()
+
+add_library(decenza_a11ylib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/accessibilitymanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/accessibilitytext.h
+    ${DECENZA_SCREENREADER_PROBE}
+)
+set_target_properties(decenza_a11ylib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+# The .mm must opt OUT of the PCH: decenza_testlib's is C++-only, and CMake still
+# passes -include-pch to Objective-C++ compile lines, which clang refuses with
+# "Objective-C was disabled in precompiled file ... but is currently enabled".
+# Same property, same reason as the top-level CMakeLists uses for its .mm files.
+if(APPLE)
+    set_source_files_properties(${DECENZA_SCREENREADER_PROBE}
+                                PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endif()
+target_link_libraries(decenza_a11ylib PUBLIC
+    decenza_testlib Qt6::TextToSpeech Qt6::Multimedia Qt6::Quick
+)
+
+add_library(decenza_appserviceslib STATIC
+    ${CMAKE_SOURCE_DIR}/src/screensaver/screensavervideomanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/personalmediapreparation.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/batterymanager.cpp
+)
+set_target_properties(decenza_appserviceslib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+# decenza_profilelib for ProfileStorage, which ScreensaverVideoManager connects to.
+target_link_libraries(decenza_appserviceslib PUBLIC
+    decenza_profilelib Qt6::TextToSpeech Qt6::Multimedia Qt6::Quick
+)
+
+# beanbaseclient: tst_beanbaseclient, tst_coffeebags, tst_mcptools_write (7.8 s).
+add_library(decenza_beanbaselib STATIC
+    ${CMAKE_SOURCE_DIR}/src/history/unifiedbeansearchmodel.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/beanbaseclient.cpp
+)
+set_target_properties(decenza_beanbaselib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_beanbaselib PUBLIC decenza_testlib)
+
+add_library(decenza_baglinktestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/network/baglinkcontroller.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/visualizershotsync.cpp)
+set_target_properties(decenza_baglinktestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_baglinktestlib PUBLIC decenza_beanbaselib decenza_shotlib)
+
+# --- The two-consumer cases. Each saves only 2-6 s, which is NOT why they are
+# here: they are here so check_test_source_duplication.py can be an absolute
+# gate with no exception list. An exception list is a place for the next
+# duplicate to be argued into, and then the one after that; a rule with no
+# knobs cannot drift. Judge these on that, not on the seconds.
+#
+# One library each, never merged, because no two share a consumer set — and
+# merging libraries whose consumer sets differ breaks the link whenever the
+# sources carry Q_OBJECT (see the a11y/appservices note above).
+# Spelled out one by one rather than generated in a foreach() — deliberately.
+# check_test_source_duplication.py reads THIS FILE as text (it runs in the
+# build-free PR job, so it cannot query the build graph), and a library whose
+# name is assembled at configure time is invisible to it. Keep every
+# add_library() and its sources literal and greppable.
+add_library(decenza_aiproviderlib STATIC ${CMAKE_SOURCE_DIR}/src/ai/aiprovider.cpp)
+set_target_properties(decenza_aiproviderlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_aiproviderlib PUBLIC decenza_testlib)
+
+# Shot-to-shot comparison: the advisor's change detection (dialing_blocks.cpp),
+# MCP shots_compare, the shot page's outcome (via decenza_shotlib) and the
+# comparison tests. Not in decenza_testlib, which every target links.
+add_library(decenza_shotcomparisonlib STATIC ${CMAKE_SOURCE_DIR}/src/history/shotcomparison.cpp)
+set_target_properties(decenza_shotcomparisonlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_shotcomparisonlib PUBLIC decenza_testlib)
+
+add_library(decenza_dialingblockslib STATIC ${CMAKE_SOURCE_DIR}/src/ai/dialing_blocks.cpp)
+set_target_properties(decenza_dialingblockslib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_dialingblockslib PUBLIC decenza_shotlib decenza_shotcomparisonlib)
+
+# --- tst_shotcomparison: shot-to-shot input diff, comparison metrics, profile version ---
+add_decenza_test(tst_shotcomparison tst_shotcomparison.cpp)
+target_link_libraries(tst_shotcomparison PRIVATE decenza_shotcomparisonlib)
+
+# Bean Search Phase 2: pure, networkless community-shot summariser (grinderaliases.h
+# is header-only, so testlib's Qt core is the only link dependency).
+add_library(decenza_communitylib STATIC ${CMAKE_SOURCE_DIR}/src/core/communityaggregator.cpp)
+set_target_properties(decenza_communitylib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_communitylib PUBLIC decenza_testlib)
+
+# --- tst_communityaggregator: cleaning, profile-family grouping, credible-bound ranking,
+#     12-month window, grinder matching, min-sample gates ---
+add_decenza_test(tst_communityaggregator tst_communityaggregator.cpp)
+target_link_libraries(tst_communityaggregator PRIVATE decenza_communitylib)
+
+# Bean Search Phase 4: the community-shots network client (over the aggregator).
+add_library(decenza_communitysettingslib STATIC ${CMAKE_SOURCE_DIR}/src/network/communitysettingsclient.cpp)
+set_target_properties(decenza_communitysettingslib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_communitysettingslib PUBLIC decenza_communitylib)
+
+# --- tst_communitysettingsclient: fake-QTcpServer client (happy path, 404 latch, 429/parse,
+#     latest-wins supersede, canonical merge, degrade, auth header, cache) ---
+add_decenza_test(tst_communitysettingsclient tst_communitysettingsclient.cpp)
+target_link_libraries(tst_communitysettingsclient PRIVATE decenza_communitysettingslib)
+
+add_library(decenza_settingsserializerlib STATIC ${CMAKE_SOURCE_DIR}/src/core/settingsserializer.cpp)
+set_target_properties(decenza_settingsserializerlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_settingsserializerlib PUBLIC decenza_testlib)
+
+add_library(decenza_webdebugloggerlib STATIC ${CMAKE_SOURCE_DIR}/src/network/webdebuglogger.cpp)
+set_target_properties(decenza_webdebugloggerlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_webdebugloggerlib PUBLIC decenza_testlib)
+
+add_library(decenza_webrequestguardlib STATIC ${CMAKE_SOURCE_DIR}/src/network/webrequestguard.cpp)
+target_link_libraries(decenza_webrequestguardlib PUBLIC decenza_testlib)
+
+add_library(decenza_wifiscaleresultlib STATIC ${CMAKE_SOURCE_DIR}/src/network/wifiscaleresult.cpp)
+set_target_properties(decenza_wifiscaleresultlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_wifiscaleresultlib PUBLIC decenza_testlib)
+
+add_library(decenza_refractometerlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/ble/refractometers/refractometerdevice.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/refractometers/refractometerproxy.h
+    ${CMAKE_SOURCE_DIR}/src/ble/refractometers/refractometerproxy.cpp)
+set_target_properties(decenza_refractometerlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_refractometerlib PUBLIC decenza_testlib)
+
+
+# --- tst_coffeebags: coffee bag storage, preset->bag migration, transfer
+# survival, and the unified bean search merge logic (bean-bag-inventory) ---
+find_package(Qt6 REQUIRED COMPONENTS Quick)
+add_decenza_test(tst_coffeebags
+    tst_coffeebags.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_coffeebags PRIVATE decenza_beanbaselib decenza_shotlib)
+target_include_directories(tst_coffeebags PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_dbmigration: DB schema baseline, upgrade floor, and migrations above it ---
+find_package(Qt6 REQUIRED COMPONENTS Quick)
+add_decenza_test(tst_dbmigration
+    tst_dbmigration.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_dbmigration PRIVATE decenza_shotlib)
+target_include_directories(tst_dbmigration PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_equipment: equipment package storage statics — grind/rpm split,
+# rpmCapable derivation, package CRUD + identity dedup
+# (add-equipment-packages). Static helpers only, so a minimal source set. ---
+add_decenza_test(tst_equipment
+    tst_equipment.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_include_directories(tst_equipment PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_recipestorage: recipe storage statics + lifecycle (add-recipes) —
+# variant-map round-trip, CRUD, inventory MRU/shot-count aggregate,
+# delete-vs-archive guard, clone provenance, bean-link open-bag resolution.
+# CoffeeBagStorage rides along for the bag-resolution cases. ---
+add_decenza_test(tst_recipestorage
+    tst_recipestorage.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_recipestorage PRIVATE decenza_shotlib)
+target_include_directories(tst_recipestorage PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_recipepromotion: RecipePromotion::fieldsFromShotRecord — the shared
+# promotion field-builder behind recipe_create_from_shot (MCP) and the web
+# promote endpoint. Header-only dependency
+# (beanbase_blob.h's canonicalId is inline), no DB needed. ---
+add_decenza_test(tst_recipepromotion
+    tst_recipepromotion.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/recipepromotion.cpp
+)
+
+# --- tst_dialing_blocks: DB-backed coverage for the four shared
+# block builders that drive both `dialing_get_context` (MCP) and the
+# in-app advisor's user-prompt enrichment (issue #1044). Stands up a
+# real ShotHistoryStorage schema, inserts curated fixtures, and asserts
+# byte-equivalence between the two surfaces. Renamed from
+# tst_mcptools_dialing_blocks alongside the src/mcp -> src/ai relocation
+# in #1040.
+# Compile the AI resource files (profile knowledge, dial-in reference,
+# claude agent) into the test binary so ShotSummarizer's KB loaders
+# find them silently during buildGrinderCalibrationBlock tests.
+add_decenza_test(tst_dialing_blocks
+    tst_dialing_blocks.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+    $<TARGET_OBJECTS:decenza_testairesources>
+)
+# The ShotRow fixtures use designated initializers; MSVC requires C++20 for them.
+# The shared PCH is built at the project's C++17, and clang refuses to reuse a PCH
+# across that boundary -- "C++20 was disabled in precompiled file ... but is
+# currently enabled" -- so this one target builds without it. That costs this
+# target's PCH saving only; every other test target still reuses decenza_test_pch.
+set_property(TARGET tst_dialing_blocks PROPERTY CXX_STANDARD 20)
+set_property(TARGET tst_dialing_blocks PROPERTY DISABLE_PRECOMPILE_HEADERS ON)
+target_link_libraries(tst_dialing_blocks PRIVATE decenza_dialingblockslib decenza_shotlib)
+target_include_directories(tst_dialing_blocks PRIVATE ${CMAKE_BINARY_DIR})
+# Built-in profile corpus, for the KB-coverage gate (every shipped profile
+# must resolve to a KB entry — restructure-kb-as-validated-json, task 5.2/6.6).
+# SHOTS_CORPUS_DIR: the tests/data/shots/ regression corpus, for the
+# companion KB-coverage gate over every shot fixture's profile_title
+# (task 5.2 supplement).
+target_compile_definitions(tst_dialing_blocks PRIVATE
+    PROFILES_DIR="${CMAKE_SOURCE_DIR}/resources/profiles"
+    SHOTS_CORPUS_DIR="${CMAKE_SOURCE_DIR}/tests/data/shots")
+
+# --- tst_shotrecord_cache: ShotRecord::cachedAnalysis dedup + fallback ---
+add_decenza_test(tst_shotrecord_cache
+    tst_shotrecord_cache.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_shotrecord_cache PRIVATE decenza_shotlib)
+target_include_directories(tst_shotrecord_cache PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_shotimportdedupe: importShotRecord dedupe by visualizer_id (the
+# Visualizer-recovery sync-gap case) ---
+add_decenza_test(tst_shotimportdedupe
+    tst_shotimportdedupe.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_shotimportdedupe PRIVATE decenza_shotlib)
+target_include_directories(tst_shotimportdedupe PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_decentshotupload: Decent account link, ShotRecord payload, upload classes ---
+add_decenza_test(tst_decentshotupload
+    tst_decentshotupload.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/decentaccount.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/decentshotrecord.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/decentshotuploader.cpp
+    $<TARGET_OBJECTS:decenza_testairesources>
+)
+target_link_libraries(tst_decentshotupload PRIVATE decenza_shotlib ZLIB::ZLIB)
+target_include_directories(tst_decentshotupload PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_scaleprotocol: Scale BLE packet parsing (Decent, Bookoo, DiFluid, Acaia) ---
+add_decenza_test(tst_scaleprotocol
+    tst_scaleprotocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scales/decentscale.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scales/bookooscale.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scales/difluidscale.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scales/acaiascale.cpp
+)
+
+if(NOT IOS)
+    # --- tst_usbdecentscale: HDS USB version and OTA trigger packet ---
+add_decenza_test(tst_usbdecentscale
+    tst_usbdecentscale.cpp
+    ${CMAKE_SOURCE_DIR}/src/usb/usbdecentscale.cpp
+)
+target_link_libraries(tst_usbdecentscale PRIVATE Qt6::SerialPort)
+endif()
+
+# --- tst_decentscalewifi: WiFi scale driver (WebSocket protocol) ---
+add_decenza_test(tst_decentscalewifi
+    tst_decentscalewifi.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/scales/decentscalewifi.cpp
+)
+target_link_libraries(tst_decentscalewifi PRIVATE
+    Qt6::WebSockets
+    # name() formats its label through WifiScaleResultUtil so the WiFi scale is
+    # spelled identically everywhere it is shown.
+    decenza_wifiscaleresultlib
+)
+
+# --- tst_wifiscalediscovery: mDNS probe service ---
+add_decenza_test(tst_wifiscalediscovery
+    tst_wifiscalediscovery.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/wifiscalediscovery.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/mdnsresolver.cpp
+    # Two files, one TU each, both tiny — not worth a library. multicastlock.cpp
+    # is a no-op off Android and exists here only because mdnsresolver.cpp calls
+    # into it; see the duplication rules in TESTING.md before widening this.
+    ${CMAKE_SOURCE_DIR}/src/network/multicastlock.cpp
+)
+target_link_libraries(tst_wifiscalediscovery PRIVATE decenza_wifiscaleresultlib)
+
+# --- tst_difluidr2: DiFluid R2 refractometer packet parsing and name matching ---
+add_decenza_test(tst_difluidr2
+    tst_difluidr2.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/refractometers/difluidr2.cpp
+)
+target_link_libraries(tst_difluidr2 PRIVATE decenza_refractometerlib)
+
+# PORTAL transport lifecycle: subscription confirmation is not a measurement,
+# malformed/stale/disconnected samples must not appear live; graph writes bracket capture.
+add_decenza_test(tst_belkaportal
+    tst_belkaportal.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/belkaportaldevice.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/belkaportaldevice.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/portalcontroller.cpp
+    ${CMAKE_SOURCE_DIR}/src/controllers/portalcontroller.h
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_belkaportal PRIVATE decenza_shotlib decenza_settingsserializerlib Qt6::Qml)
+target_include_directories(tst_belkaportal PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_difluidr1: DiFluid R1 key derivation, AES decrypt, plaintext parsing (#1307) ---
+add_decenza_test(tst_difluidr1
+    tst_difluidr1.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/refractometers/difluidr1.cpp
+    ${CMAKE_SOURCE_DIR}/src/ble/refractometers/aes128.cpp
+)
+# RefractometerDevice is needed on EVERY platform — keep this outside the IOS
+# branch below. It briefly lived on the OpenSSL line inside else(), which links
+# fine on desktop and would have failed only on an iOS build.
+target_link_libraries(tst_difluidr1 PRIVATE decenza_refractometerlib)
+# Crypto backend: OpenSSL on Windows/Linux/Android, CommonCrypto (in libSystem) on
+# macOS and iOS. Match the Q_OS_DARWIN branch in aes128.cpp exactly.
+if(APPLE)
+    # CommonCrypto is part of libSystem — no extra linkage needed.
+else()
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(tst_difluidr1 PRIVATE OpenSSL::Crypto)
+endif()
+
+# --- tst_logcollapse: the shared repeat-collapsing log gate (header-only, so no extra sources) ---
+add_decenza_test(tst_logcollapse
+    tst_logcollapse.cpp
+)
+
+# --- tst_weightprocessor: WeightProcessor edge cases (LSLR, oscillation, per-frame) ---
+add_decenza_test(tst_weightprocessor
+    tst_weightprocessor.cpp
+)
+target_link_libraries(tst_weightprocessor PRIVATE decenza_weightlib)
+
+# --- tst_scalefeedliveness: stall detector driven by sample arrival, not value
+# change — a constant weight must not trip a false stall (#1176/#1185) ---
+add_decenza_test(tst_scalefeedliveness
+    tst_scalefeedliveness.cpp
+    mocks/MockScaleDevice.h
+)
+target_link_libraries(tst_scalefeedliveness PRIVATE decenza_weightlib)
+
+# --- tst_scaleblepriority: connection-priority backoff decision logic (#1093/#1176) ---
+# BlePriorityDetector is header-only and Qt-free — no extra sources to link.
+add_decenza_test(tst_scaleblepriority
+    tst_scaleblepriority.cpp
+)
+
+# --- tst_scaleskiphighlatch: BLEManager::ScaleSkipHighLatch value-type
+# invariant (#1093/#1176, D7) + D9 SettingsHardware persisted store. The
+# struct is header-inline; settings_hardware.cpp is QtCore-only (QSettings). ---
+add_decenza_test(tst_scaleskiphighlatch
+    tst_scaleskiphighlatch.cpp
+)
+
+# --- tst_sawprediction: shared SAW expected-drip kernel (σ + Gaussian math) ---
+add_decenza_test(tst_sawprediction
+    tst_sawprediction.cpp
+)
+
+# --- tst_saw: WeightProcessor SAW tests (minimal deps) ---
+add_decenza_test(tst_saw
+    tst_saw.cpp
+)
+target_link_libraries(tst_saw PRIVATE decenza_weightlib)
+
+# --- tst_visualizermixgoal: temperature.mix_goal / mix present-vs-absent in upload JSON ---
+add_decenza_test(tst_visualizermixgoal
+    tst_visualizermixgoal.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_visualizermixgoal PRIVATE decenza_shotlib)
+target_include_directories(tst_visualizermixgoal PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_sampleblobseries: mix goal series round-trip + legacy blob without the key ---
+add_decenza_test(tst_sampleblobseries
+    tst_sampleblobseries.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_sampleblobseries PRIVATE decenza_shotlib decenza_shotparserlib)
+target_include_directories(tst_sampleblobseries PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_mqttclient: reconnect state machine (backoff cadence, reachability, user-disconnect) ---
+# mqttclient.cpp was in no test target at all until a latched m_userRequestedDisconnect
+# shipped in the change meant to STOP reconnection dying permanently. Drives the private
+# slots via the DECENZA_TESTING friend and asserts on timer state — no broker, no waiting.
+add_library(decenza_localnetworktestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/network/localnetworkaccess.h
+    ${CMAKE_SOURCE_DIR}/src/network/localnetworkaccess.cpp)
+set_target_properties(decenza_localnetworktestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_include_directories(decenza_localnetworktestlib PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(decenza_localnetworktestlib PUBLIC Qt6::Core Qt6::Network)
+add_decenza_test(tst_mqttclient
+    tst_mqttclient.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/mqttclient.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_mqttclient PRIVATE decenza_qtmqtt decenza_localnetworktestlib)
+# mqttclient.cpp includes the generated version.h (sw_version in the HA discovery payload).
+target_include_directories(tst_mqttclient PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_settling: SAW settling trimSettlingData(), m_sawSettling flag, shot save ordering ---
+find_package(Qt6 REQUIRED COMPONENTS Graphs Quick)
+add_decenza_test(tst_settling
+    tst_settling.cpp
+    mocks/MockScaleDevice.h
+)
+target_link_libraries(tst_settling PRIVATE decenza_shotlib)
+
+# --- tst_sav: MachineState SAV tests ---
+add_decenza_test(tst_sav
+    tst_sav.cpp
+    mocks/MockScaleDevice.h
+)
+
+# --- Shared Q_OBJECT headers for tests using MockTransport (listed as sources for AUTOMOC) ---
+set(MCP_MOC_HEADERS
+    mocks/MockTransport.h
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptoolregistry.h
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcpresourceregistry.h
+)
+
+# mcpserver.cpp: tst_remoteaccess, tst_mcpserver_protocol, tst_mcpserver_session
+# (11.6 s). Its own two headers are listed so AUTOMOC emits their meta-objects
+# here rather than in each consumer.
+#
+# ${MCP_MOC_HEADERS} is deliberately NOT listed. Those headers are moc'd by
+# every target that uses them — including several that do not link this library
+# — so adding them here produced 24 duplicate symbols (McpToolRegistry,
+# McpResourceRegistry, MockTransport meta-objects defined in both this archive
+# and the consumer's own mocs_compilation.cpp). A moc'd header belongs to
+# exactly one compilation unit in any given link; hoist a header into a library
+# only when every user of it links that library.
+add_library(decenza_mcpserverlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcpserver.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcpserver.h
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcpsession.h
+)
+set_target_properties(decenza_mcpserverlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_mcpserverlib PUBLIC decenza_profilelib decenza_shotlib)
+
+# ---------------------------------------------------------------------------
+# Every narrow library reuses decenza_testlib's precompiled header.
+#
+# REUSE_FROM rather than a PCH each, because reuse costs NOTHING: the header is
+# already built for decenza_testlib, so even a 2.7 s target comes out ahead. A
+# private PCH per library would not — building one costs ~2 s, so the small
+# libraries would spend more making a PCH than they save using it. That is the
+# whole reason this is a reuse list and not a loop calling
+# target_precompile_headers() on each.
+#
+# On flag compatibility, which REUSE_FROM does require: an earlier version of
+# this comment claimed these libraries "define nothing of their own", which was
+# simply false — decenza_shotlib carries its own
+# target_compile_definitions(decenza_shotlib PUBLIC DECENZA_TESTING) just above,
+# and every Qt module a consumer links contributes its own QT_<MODULE>_LIB
+# through INTERFACE_COMPILE_DEFINITIONS.
+#
+# The real rule is narrower and was MEASURED off the generated build.ninja rather
+# than reasoned about, because reasoning about it produced the wrong answer
+# twice. Of the 107 test targets in the graph: 74 compile with a define set
+# identical to the donor's, and 32 compile with EXTRA defines (QT_QUICK_LIB,
+# QT_OPENGL_LIB, SRCDIR and friends). ALL 106 that go through add_decenza_test()
+# carry -include-pch; the only one that does not is tst_shotcorpus, which is
+# excluded on purpose. So extra defines on a consumer do NOT cost it the PCH.
+#
+# That is clang's actual contract: it rejects a PCH on CONFLICTING macro
+# definitions, not on the consumer having additional macros the precompiled
+# content never read. This PCH is QtTest plus three QJson headers — nothing in it
+# is conditioned on QT_QUICK_LIB — so a Quick-linking test reuses it safely.
+#
+# What WOULD break it is redefining a macro the donor already has to a different
+# value, or a language/standard difference. If you add one of those to a library
+# below, it moves off this list.
+#
+# Re-derive this by diffing DEFINES between a consumer's compile line and the
+# donor's cmake_pch.hxx.pch line in build.ninja; do not restore a claim about
+# what the targets define without doing so.
+#
+# So the rule for adding a library below is not "it must define nothing", it is
+# "it must define nothing the donor does not already define". A NEW macro on any
+# of these moves it off this list or onto decenza_testlib.
+#
+# Listed literally, not derived from a glob or a directory scan: a new library
+# that silently fails to appear here just quietly costs a few seconds forever,
+# which is exactly the kind of regression nothing reports.
+set(DECENZA_TESTLIB_PCH_REUSERS
+    decenza_shotlib
+    decenza_profilelib
+    decenza_weightlib
+    decenza_a11ylib
+    decenza_appserviceslib
+    decenza_beanbaselib
+    decenza_baglinktestlib
+    decenza_aiproviderlib
+    decenza_dialingblockslib
+    decenza_shotcomparisonlib
+    decenza_settingsserializerlib
+    decenza_webdebugloggerlib
+    decenza_wifiscaleresultlib
+    decenza_refractometerlib
+    decenza_mcpserverlib
+    decenza_aimanagertestlib
+)
+if(DECENZA_ENABLE_PCH)
+    foreach(_lib IN LISTS DECENZA_TESTLIB_PCH_REUSERS)
+        target_precompile_headers(${_lib} REUSE_FROM decenza_testlib)
+    endforeach()
+    unset(_lib)
+endif()
+
+# Both focused consumers need RSS diagnostics; compile it once without adding
+# another relink dependency to unrelated test executables.
+add_library(decenza_memorymonitortestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/memorymonitor.h
+    ${CMAKE_SOURCE_DIR}/src/core/memorymonitor.cpp)
+set_target_properties(decenza_memorymonitortestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_memorymonitortestlib PUBLIC decenza_testlib Qt6::Quick Qt6::Qml)
+
+# --- tst_profilemanager: ProfileManager lifecycle, signals, BLE, MCP resources, QML bindings ---
+find_package(Qt6 REQUIRED COMPONENTS Graphs Quick Qml)
+add_decenza_test(tst_profilemanager
+    tst_profilemanager.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcpresources.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/fddiagnostics.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_profilemanager PRIVATE decenza_memorymonitortestlib decenza_webdebugloggerlib decenza_profilelib decenza_shotlib Qt6::Qml)
+
+# --- tst_profileeditorapppath: D-Flow/A-Flow profile editing through the path a USER takes ---
+# Companion to tst_profileeditorparity, which exercises ProfileGenerator and
+# ProfileAnalyzer directly — one layer below the app. This drives the two
+# Q_INVOKABLEs QML binds (getOrConvertProfileParams / uploadProfileFromParams), which
+# is the only place ProfileManager's editorType repair and regenerateFromParams's
+# #331 passthrough restore are both in the path.
+add_decenza_test(tst_profileeditorapppath
+    tst_profileeditorapppath.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_profileeditorapppath PRIVATE decenza_profilelib Qt6::Graphs Qt6::Quick)
+target_include_directories(tst_profileeditorapppath PRIVATE ${CMAKE_BINARY_DIR})
+target_compile_definitions(tst_profileeditorapppath PRIVATE
+    DE1APP_PROFILES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/de1app_profiles"
+    DFLOW_PLUGIN_PROFILES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/dflow_plugin_profiles"
+    EDIT_MATRIX_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/edit_matrix"
+)
+
+target_include_directories(tst_profilemanager PRIVATE ${CMAKE_BINARY_DIR})
+target_compile_definitions(tst_profilemanager PRIVATE SRCDIR="${CMAKE_SOURCE_DIR}/tests")
+# Add built-in profiles QRC so isBuiltInFilename() works in tests. The .qrc is
+# generated from resources/profiles/ by the top-level CMakeLists.txt ("Bundled
+# profiles"), the same file the app links.
+qt_add_resources(PROFILES_QRC "${DECENZA_PROFILES_QRC}")
+target_sources(tst_profilemanager PRIVATE ${PROFILES_QRC})
+# Also needed for compareWithBuiltin test (QFile::exists(":/profiles/..."))
+target_sources(tst_tclimport PRIVATE ${PROFILES_QRC})
+# ProfileManager falls back to :/profiles/default.json on construction; without
+# the built-in resource it warns, and QTest::failOnWarning turns that into a
+# failure unrelated to anything under test.
+target_sources(tst_profileeditorapppath PRIVATE ${PROFILES_QRC})
+# ProfileShapeIndex builds its shape index from :/profiles/*.json, so the shape
+# resolution tests need the built-ins present. Attached here rather than at the
+# target's own definition because PROFILES_QRC is declared further down this
+# file than tst_shotsummarizer is defined.
+target_sources(tst_shotsummarizer PRIVATE ${PROFILES_QRC})
+# ProfileManager's catalog scan resolves each profile against the KB, so the
+# knowledge resource has to be present or every lookup silently returns empty
+# and a KB-dependent assertion fails for a reason that looks like a logic bug.
+# That has now cost two debugging rounds in this change; the binary carrying
+# ProfileManager should simply have the data ProfileManager reads.
+target_sources(tst_profilemanager PRIVATE $<TARGET_OBJECTS:decenza_testairesources>)
+
+# --- MCP tool tests (ProfileManager + MockTransport) ---
+
+# --- tst_mcptools_profiles: Profile MCP tools, PR #561 BLE upload regression ---
+find_package(Qt6 REQUIRED COMPONENTS Graphs Quick)
+add_decenza_test(tst_mcptools_profiles
+    tst_mcptools_profiles.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptools_profiles.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_mcptools_profiles PRIVATE decenza_profilelib Qt6::Graphs Qt6::Quick)
+target_include_directories(tst_mcptools_profiles PRIVATE ${CMAKE_BINARY_DIR})
+# Built-in profiles QRC, as tst_profilemanager and tst_tclimport already do.
+# Without it ProfileManager cannot open ":/profiles/default.json" and falls
+# back to whatever a PREVIOUS test left on disk — so this passed on a developer
+# machine and on CI retry, and failed on the first attempt of every clean run.
+# See the note on the ctest retry in release.yml.
+target_sources(tst_mcptools_profiles PRIVATE ${PROFILES_QRC})
+
+# --- tst_mcptools_write: Write MCP tools (settings_set temp/weight BLE upload) ---
+# mcptools_write.cpp includes all write tools, pulling in Accessibility/Screensaver/Translation/Battery,
+# and BeanBaseClient since bag_update re-resolves the bag photo when the product URL changes.
+find_package(Qt6 REQUIRED COMPONENTS TextToSpeech Multimedia)
+add_decenza_test(tst_mcptools_write
+    tst_mcptools_write.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptools_write.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_mcptools_write PRIVATE decenza_beanbaselib decenza_a11ylib decenza_appserviceslib decenza_profilelib decenza_shotlib Qt6::TextToSpeech Qt6::Multimedia)
+target_include_directories(tst_mcptools_write PRIVATE ${CMAKE_BINARY_DIR})
+# Same missing built-in profiles QRC as tst_mcptools_profiles above.
+target_sources(tst_mcptools_write PRIVATE ${PROFILES_QRC})
+
+# --- tst_mcptools_presets: steam-pitcher / water-vessel preset MCP tools ---
+# (unit conversions, partial-update merge, apply-on-select). MainController is
+# passed null; CONTROLLER_SOURCES is linked only to satisfy its referenced symbols.
+find_package(Qt6 REQUIRED COMPONENTS TextToSpeech Multimedia)
+add_decenza_test(tst_mcptools_presets
+    tst_mcptools_presets.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptools_presets.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_mcptools_presets PRIVATE decenza_a11ylib decenza_appserviceslib decenza_profilelib decenza_shotlib Qt6::TextToSpeech Qt6::Multimedia)
+target_include_directories(tst_mcptools_presets PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_webdebuglogger: WebDebugLogger session-index cache (improve-mcp-debug-log-search),
+# plus CrashHandler::getDebugLogTail()/selectCrashNarrative(), which read the debug.log
+# WebDebugLogger writes and produce the crash report's debug_log_tail. crashhandler.cpp
+# is compiled into this target alone — no other test needs it, so no intermediate
+# library. It includes version.h and calls versionCode(), hence version_code.cpp. ---
+add_decenza_test(tst_webdebuglogger
+    tst_webdebuglogger.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/btlogfilter.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/crashhandler.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/systemlogservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/systemlogservicesource.cpp
+)
+add_library(decenza_systemlogwiretestlib STATIC)
+qt6_add_repc_sources(decenza_systemlogwiretestlib ${CMAKE_SOURCE_DIR}/src/remote/systemlogservice.rep)
+target_link_libraries(decenza_systemlogwiretestlib PUBLIC Qt6::RemoteObjects)
+target_include_directories(decenza_systemlogwiretestlib PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(tst_webdebuglogger PRIVATE decenza_webdebugloggerlib
+    decenza_serviceoperationtestlib decenza_filebundletestlib decenza_systemlogwiretestlib Qt6::RemoteObjects decenza_zip)
+target_include_directories(tst_webdebuglogger PRIVATE ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+
+add_decenza_test(tst_systemlogservice
+    tst_systemlogservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/systemlogservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/systemlogservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/systemlogservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_replicas(tst_systemlogservice ${CMAKE_SOURCE_DIR}/src/remote/systemlogservice.rep)
+target_include_directories(tst_systemlogservice PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_systemlogservice PRIVATE decenza_serviceoperationtestlib decenza_systemlogwiretestlib Qt6::RemoteObjects Qt6::Qml)
+
+# --- tst_webrequestguard: the shot server's cross-site refusal. Its own file because
+# a cross-site write let through, or a same-origin or non-browser one refused, fails
+# nowhere else in the suite. ---
+add_decenza_test(tst_webrequestguard tst_webrequestguard.cpp)
+target_link_libraries(tst_webrequestguard PRIVATE decenza_webrequestguardlib)
+
+# --- tst_mcplogfilter: shared filter/tail helpers for debug_get_log / shots_get_debug_log ---
+# (mcplogfilter.h is header-only — nothing to link beyond decenza_testlib's Qt Core.)
+add_decenza_test(tst_mcplogfilter
+    tst_mcplogfilter.cpp
+)
+
+# --- tst_mcptools_shots_debuglog: shots_get_debug_log filter/regex/tail (improve-mcp-debug-log-search) ---
+add_decenza_test(tst_mcptools_shots_debuglog
+    tst_mcptools_shots_debuglog.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptools_shots.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_mcptools_shots_debuglog PRIVATE decenza_a11ylib decenza_appserviceslib decenza_profilelib decenza_shotlib decenza_shotcomparisonlib Qt6::TextToSpeech Qt6::Multimedia)
+target_include_directories(tst_mcptools_shots_debuglog PRIVATE ${CMAKE_BINARY_DIR})
+# Same missing built-in profiles QRC as tst_mcptools_profiles above — McpTestFixture's
+# ProfileManager falls back to "default" at construction and warns without it.
+target_sources(tst_mcptools_shots_debuglog PRIVATE ${PROFILES_QRC})
+
+# --- tst_mcpserver_session: Session management, ping, subscribe/unsubscribe ---
+# Uses real mcpserver.cpp but stubs out tool/resource registration functions
+# to avoid linking mcptools_*.cpp and their heavy transitive deps.
+find_package(Qt6 REQUIRED COMPONENTS Graphs Quick)
+add_decenza_test(tst_mcpserver_session
+    tst_mcpserver_session.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_mcpserver_session PRIVATE decenza_mcpserverlib decenza_profilelib decenza_shotlib)
+target_include_directories(tst_mcpserver_session PRIVATE ${CMAKE_BINARY_DIR})
+
+# --- tst_mcpserver_protocol: 2025-11-25 spec compliance (version negotiation,
+# MCP-Protocol-Version header validation, Origin allowlist, structuredContent,
+# resource_link extraction, title/icons/$schema). Stubs out tool/resource
+# registration like tst_mcpserver_session — same dependency footprint.
+find_package(Qt6 REQUIRED COMPONENTS Graphs Quick)
+add_decenza_test(tst_mcpserver_protocol
+    tst_mcpserver_protocol.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_mcpserver_protocol PRIVATE decenza_mcpserverlib decenza_profilelib decenza_shotlib)
+target_include_directories(tst_mcpserver_protocol PRIVATE ${CMAKE_BINARY_DIR})
+
+# Compile the production qrc so :/icons/* paths resolve at runtime — the
+# RESOURCE listing still carries icons (five records, five distinct icons) and
+# resourcesListAt2025_11_25EmitsTitleAndIcons reads the SVGs out of the bundle.
+# Tools no longer carry icons at all, so the tool-side round-trip test this
+# comment used to name is gone; the link is still load-bearing for resources.
+target_link_libraries(tst_mcpserver_protocol PRIVATE decenza_testresources)
+
+# --- tst_remoteaccess: the remote-access coordinator — capability-token
+# lifecycle for the MCP connector and Remote Web Access, dedicated-listener route
+# gating, failed-token rate limiting, end-to-end MCP dispatch through the loopback
+# listener, and web admission/hand-off against a fake RemoteWebHost. Same
+# McpServer dependency footprint as tst_mcpserver_protocol, plus the coordinator. ---
+add_decenza_test(tst_remoteaccess
+    tst_remoteaccess.cpp
+    ${MCP_MOC_HEADERS}
+    ${CMAKE_SOURCE_DIR}/src/network/remoteaccess.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/remoteaccess.h
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptunnel_tsnet.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/mcptunnel_tsnet.h
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+)
+target_link_libraries(tst_remoteaccess PRIVATE decenza_mcpserverlib decenza_profilelib decenza_shotlib
+    decenza_webrequestguardlib)
+target_include_directories(tst_remoteaccess PRIVATE ${CMAKE_BINARY_DIR})
+target_link_libraries(tst_remoteaccess PRIVATE decenza_testresources)
+
+# --- tst_accessibility_announcements: announce() routing rule (platform vs TTS) ---
+# AccessibilityManager pulls TextToSpeech (m_tts construction in initTts) and
+# QQuickWindow (root-window lookup in dispatchPlatformAnnouncement). The test
+# itself never builds a window — the FakeAccessibilityManager subclass overrides
+# the dispatch virtuals so no real Qt accessibility / TTS state is touched.
+find_package(Qt6 REQUIRED COMPONENTS TextToSpeech Multimedia Quick Network)
+add_decenza_test(tst_accessibility_announcements
+    tst_accessibility_announcements.cpp
+)
+target_link_libraries(tst_accessibility_announcements PRIVATE
+    decenza_a11ylib Qt6::TextToSpeech Qt6::Multimedia Qt6::Quick Qt6::Network
+)
+
+# --- tst_steamhealth: SteamDataModel summaries and SteamHealthTracker trend detection ---
+add_decenza_test(tst_steamhealth
+    tst_steamhealth.cpp
+    ${CMAKE_SOURCE_DIR}/src/machine/steamhealthtracker.cpp
+)
+target_link_libraries(tst_steamhealth PRIVATE decenza_steammodeltestlib decenza_shotlib)
+
+# --- tst_exifdate: EXIF date scanning from JPEG bytes.
+# Header-only and dependency-free, which is the point: the same logic inside
+# ShotServer::extractImageDate was untestable without linking a web server, a
+# storage backend, a DE1 device and an AI manager — so it was never tested, and
+# a rename silently made the whole path dead code. Nothing to link here.
+add_decenza_test(tst_exifdate
+    tst_exifdate.cpp
+)
+
+# --- tst_kb_schema: build-time KB validator (tools/validate_kb.py) coverage
+# (change: restructure-kb-as-validated-json, task 5.1). Shells out to the
+# same Python interpreter the root CMakeLists.txt's `validate_kb` build gate
+# uses (find_package(Python3) there defines Python3_EXECUTABLE in this
+# subdirectory's scope since add_subdirectory(tests) runs after that block),
+# so this test exercises the exact command CI/local builds run — not a
+# reimplementation. Asserts the real shipped profile_knowledge.json passes,
+# and that a representative set of deliberately-corrupted fixtures (written
+# to a QTemporaryDir at runtime) fail with an error naming the offending
+# entry/key, per the profile-knowledge-base spec's five validator scenarios.
+# No Decenza sources needed — pure QProcess + QJsonDocument plumbing.
+if(NOT Python3_Interpreter_FOUND)
+    message(FATAL_ERROR
+        "Python3 not found — tst_kb_schema requires the same interpreter "
+        "the validate_kb build gate uses. Install Python 3.")
+endif()
+add_decenza_test(tst_kb_schema
+    tst_kb_schema.cpp
+)
+target_compile_definitions(tst_kb_schema PRIVATE
+    VALIDATE_KB_PYTHON3="${Python3_EXECUTABLE}"
+    VALIDATE_KB_SCRIPT="${CMAKE_SOURCE_DIR}/tools/validate_kb.py"
+    VALIDATE_KB_REAL_JSON="${CMAKE_SOURCE_DIR}/resources/ai/profile_knowledge.json"
+)
+
+# Run the same build-free source ownership audit as the per-PR CI job.
+add_test(NAME test_source_duplication
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/check_test_source_duplication.py")
+
+# --- failonwarning_lint: guard that every QTEST_*MAIN test file arms
+# QTest::failOnWarning() (see tests/lint_failonwarning.cmake and the Handling
+# Warnings section of docs/CLAUDE_MD/TESTING.md). A pure cmake -P check — no
+# build, no extra dependency — that re-globs on each run, so a newly-added
+# test file that forgets the guard fails `ctest` without a reconfigure.
+add_test(NAME failonwarning_lint
+    COMMAND ${CMAKE_COMMAND}
+        -DLINT_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/lint_failonwarning.cmake)
+
+# --- Sanitizer canaries: proof that each sanitizer is armed, not merely asked
+# for. A silently-unapplied sanitizer yields the same green suite as a clean
+# codebase, so each canary commits a deliberate defect of its sanitizer's kind
+# and run_sanitizer_canary.cmake fails the test unless it was reported.
+# Registered only under the matching option, so ordinary builds never compile
+# or run them. See the header comments in the two canary sources.
+#
+# The UBSan canary runs in BOTH modes, which it previously did not. It used to
+# be skipped whenever UBSan was in its auto-enabled Debug (recovering) mode, on
+# the reasoning that a recovering sanitizer lets the process exit 0 and the
+# canary would "fail" while everything worked. True as far as it goes — but
+# recovering mode is every developer's local Debug build, i.e. exactly the gate
+# that runs most often, and it was the one configuration with no armed-ness
+# proof at all. The fix is to check the right evidence for the mode: an abort
+# where the build halts, and the diagnostic text alone where it recovers.
+if(ENABLE_UBSAN)
+    add_executable(sanitizer_canary sanitizer_canary.cpp)
+    set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF)
+    if(_ubsan_recover)
+        set(_ubsan_expect_abort OFF)
+    else()
+        set(_ubsan_expect_abort ON)
+    endif()
+    add_test(NAME sanitizer_canary
+        COMMAND ${CMAKE_COMMAND}
+            -DCANARY=$<TARGET_FILE:sanitizer_canary>
+            -DSANITIZER=ubsan
+            -DEXPECT_ABORT=${_ubsan_expect_abort}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/run_sanitizer_canary.cmake)
+endif()
+
+# ASan has no recovering mode for this defect class, so it always aborts.
+if(ENABLE_ASAN)
+    add_executable(asan_canary asan_canary.cpp)
+    set_target_properties(asan_canary PROPERTIES AUTOMOC OFF)
+    add_test(NAME asan_canary
+        COMMAND ${CMAKE_COMMAND}
+            -DCANARY=$<TARGET_FILE:asan_canary>
+            -DSANITIZER=asan
+            -DEXPECT_ABORT=ON
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/run_sanitizer_canary.cmake)
+endif()
+
+# Exercise the production shared text/suggestion components as a compiled QML
+# module. The QML files below are the same source files consumed by the native
+# and Wasm targets; aliases keep them together in this isolated test URI.
+find_package(Qt6 REQUIRED COMPONENTS Quick QuickTest QuickEffects QuickControls2)
+set(_shared_form_control_sources
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedMarkdownSource.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/ColorEditor.qml
+    ${CMAKE_SOURCE_DIR}/qml/AppShell.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedSectionHeader.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentInventoryView.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentInventoryStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentCardView.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentCardStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentSummaryRenderer.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentSummaryView.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentSummaryFormat.js
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedBackgroundSurface.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedBeanThumbnail.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedShotPlanView.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedShotPlanStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedShotPlanFormat.js
+    ${CMAKE_SOURCE_DIR}/qml/components/RecipeDrinkCardView.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/RecipeDrinkCardStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/RecipeCardText.js
+    ${CMAKE_SOURCE_DIR}/qml/components/DrinkTypeCatalog.js
+    ${CMAKE_SOURCE_DIR}/qml/components/RecipeNameEditor.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/FormControlStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedTextField.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedSuggestionField.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedSuggestionFieldChrome.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedAccessibleButton.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedAccessibleTapArea.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedButtonInteraction.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedButtonStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedCardTapArea.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedFocusIndicator.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedIconButton.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedDialogStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedDecenzaDialog.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedSelectionDialog.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedKeyboardInteraction.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedKeyboardAwareContainer.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentDialogStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentDialogText.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentUiBackend.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EquipmentInfoDialogView.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedEquipmentDialogButton.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedEquipmentSuggestionField.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedEquipmentDialog.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedSwitchStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedStyledSwitch.qml
+)
+foreach(_card_source IN ITEMS SharedMarkdownSource.qml ColorEditor.qml SharedSectionHeader.qml EquipmentInventoryView.qml EquipmentInventoryStyle.qml EquipmentCardView.qml EquipmentCardStyle.qml EquipmentSummaryRenderer.qml EquipmentSummaryView.qml EquipmentSummaryFormat.js SharedBackgroundSurface.qml SharedBeanThumbnail.qml SharedShotPlanView.qml SharedShotPlanStyle.qml SharedShotPlanFormat.js RecipeDrinkCardView.qml RecipeDrinkCardStyle.qml RecipeCardText.js DrinkTypeCatalog.js SharedSuggestionFieldChrome.qml SharedAccessibleButton.qml SharedAccessibleTapArea.qml SharedButtonInteraction.qml SharedButtonStyle.qml SharedCardTapArea.qml SharedFocusIndicator.qml SharedIconButton.qml SharedDialogStyle.qml SharedDecenzaDialog.qml SharedSelectionDialog.qml SharedKeyboardInteraction.qml SharedKeyboardAwareContainer.qml EquipmentDialogStyle.qml EquipmentDialogText.qml EquipmentUiBackend.qml EquipmentInfoDialogView.qml SharedEquipmentDialogButton.qml SharedEquipmentSuggestionField.qml SharedEquipmentDialog.qml SharedSwitchStyle.qml SharedStyledSwitch.qml)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/qml/components/${_card_source}
+        PROPERTIES QT_RESOURCE_ALIAS ${_card_source})
+endforeach()
+set_source_files_properties(
+    ${CMAKE_SOURCE_DIR}/qml/components/RecipeNameEditor.qml
+    PROPERTIES QT_RESOURCE_ALIAS RecipeNameEditor.qml
+)
+set_source_files_properties(
+    ${CMAKE_SOURCE_DIR}/qml/components/FormControlStyle.qml
+    PROPERTIES QT_RESOURCE_ALIAS FormControlStyle.qml
+)
+set_source_files_properties(
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedTextField.qml
+    PROPERTIES QT_RESOURCE_ALIAS SharedTextField.qml
+)
+set_source_files_properties(
+    ${CMAKE_SOURCE_DIR}/qml/components/SharedSuggestionField.qml
+    PROPERTIES QT_RESOURCE_ALIAS SharedSuggestionField.qml
+)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_wateramountmodeselector.qml
+    PROPERTIES QT_RESOURCE_ALIAS tst_wateramountmodeselector.qml)
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_sharedformcontrols.qml
+    PROPERTIES QT_RESOURCE_ALIAS tst_sharedformcontrols.qml
+)
+set_source_files_properties(
+    ${CMAKE_SOURCE_DIR}/qml/AppShell.qml
+    PROPERTIES QT_QML_SINGLETON_TYPE TRUE QT_RESOURCE_ALIAS AppShell.qml
+               QT_QML_SOURCE_TYPENAME AppShell
+)
+# Exercise the shipping confirmation dialog and its native control adapters.
+# Only presentation/service dependencies are supplied by the isolated fixture;
+# host event validation remains covered by the GlobalSupport service tests.
+set(_mcp_confirmation_control_sources
+    ${CMAKE_SOURCE_DIR}/qml/components/WaterAmountModeSelector.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/McpConfirmDialog.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/CrashReportDialog.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/HideKeyboardButton.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/AccessibleMouseArea.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/DecenzaDialog.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/AccessibleButton.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/NativeDialogStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/NativeButtonStyle.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/NativeButtonInteraction.qml
+)
+foreach(_file IN LISTS _mcp_confirmation_control_sources)
+    get_filename_component(_name "${_file}" NAME)
+    set_source_files_properties("${_file}" PROPERTIES QT_RESOURCE_ALIAS "${_name}")
+endforeach()
+set(_mcp_confirmation_fixture_sources)
+foreach(_type IN ITEMS Theme TranslationManager AccessibilityManager WebDebugLogger GlobalSupportService Keyboard)
+    set(_file "${CMAKE_CURRENT_SOURCE_DIR}/qml/McpConfirmation${_type}.qml")
+    set_source_files_properties("${_file}" PROPERTIES
+        QT_QML_SINGLETON_TYPE TRUE QT_RESOURCE_ALIAS "${_type}.qml"
+        QT_QML_SOURCE_TYPENAME "${_type}")
+    list(APPEND _mcp_confirmation_fixture_sources "${_file}")
+endforeach()
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_mcpconfirmdialog.qml
+    PROPERTIES QT_RESOURCE_ALIAS tst_mcpconfirmdialog.qml)
+add_executable(tst_sharedformcontrols tst_sharedformcontrols.cpp)
+decenza_use_stable_qmlcachegen(tst_sharedformcontrols)
+qt_add_qml_module(tst_sharedformcontrols
+    URI Decenza
+    VERSION 1.0
+    RESOURCE_PREFIX /qt/qml
+    SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/sharedformcontrolsinputmethodprobe.h
+        ${CMAKE_SOURCE_DIR}/src/core/accessiblevaluechange.h
+        ${CMAKE_SOURCE_DIR}/src/core/accessiblevaluechange.cpp
+    QML_FILES
+        ${_shared_form_control_sources}
+        ${_mcp_confirmation_control_sources}
+        ${_mcp_confirmation_fixture_sources}
+        ${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_sharedformcontrols.qml
+        ${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_mcpconfirmdialog.qml
+        ${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_wateramountmodeselector.qml
+)
+decenza_wire_qml_cache_deps(tst_sharedformcontrols _tst_sharedformcontrols_units_wired)
+target_link_libraries(tst_sharedformcontrols PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickTest Qt6::QuickEffects Qt6::QuickControls2 decenza_testresources
+)
+target_include_directories(tst_sharedformcontrols PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
+set_property(GLOBAL APPEND PROPERTY DECENZA_TEST_TARGETS tst_sharedformcontrols)
+add_test(NAME tst_sharedformcontrols COMMAND tst_sharedformcontrols
+    -input :/qt/qml/Decenza
+    -o -,txt
+    -o "${DECENZA_TEST_RESULTS_DIR}/tst_sharedformcontrols.xml,junitxml"
+)
+set_tests_properties(tst_sharedformcontrols PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_CONTROLS_STYLE=Basic"
+    FAIL_REGULAR_EXPRESSION "Maximum amount of warnings exceeded"
+)
+
+# Instantiate the production GrindRowSource from source with only its host
+# singleton supplied by the fixture. The isolated QML form-control module does
+# not ship the application-wide Decenza module.
+add_decenza_test(tst_lastshotchartsourceqml tst_lastshotchartsourceqml.cpp)
+target_compile_definitions(tst_lastshotchartsourceqml PRIVATE
+    LAST_SHOT_CHART_SOURCE_QML_FILE="${CMAKE_SOURCE_DIR}/qml/components/LastShotChartSource.qml"
+)
+target_link_libraries(tst_lastshotchartsourceqml PRIVATE Qt6::Qml Qt6::Quick)
+
+add_decenza_test(tst_grindrowsourceqml tst_grindrowsourceqml.cpp)
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/qml/GrindRowSourceRecipeContext.qml
+    PROPERTIES QT_QML_SINGLETON_TYPE TRUE QT_RESOURCE_ALIAS RecipeContext.qml
+               QT_QML_SOURCE_TYPENAME RecipeContext
+)
+decenza_use_stable_qmlcachegen(tst_grindrowsourceqml)
+qt_add_qml_module(tst_grindrowsourceqml
+    URI DecenzaGrindRowSourceTests
+    VERSION 1.0
+    RESOURCE_PREFIX /qt/qml
+    QML_FILES ${CMAKE_CURRENT_SOURCE_DIR}/qml/GrindRowSourceRecipeContext.qml
+)
+decenza_wire_qml_cache_deps(tst_grindrowsourceqml _tst_grindrowsourceqml_units_wired)
+target_compile_definitions(tst_grindrowsourceqml PRIVATE
+    GRIND_ROW_SOURCE_QML_FILE="${CMAKE_SOURCE_DIR}/qml/components/GrindRowSource.qml"
+)
+target_link_libraries(tst_grindrowsourceqml PRIVATE Qt6::Qml Qt6::Quick)
+
+# Shared completion policy used by both native and Wasm operation pages.
+set_source_files_properties(
+    ${CMAKE_SOURCE_DIR}/qml/AppShell.qml
+    PROPERTIES QT_QML_SINGLETON_TYPE TRUE QT_RESOURCE_ALIAS AppShell.qml
+               QT_QML_SOURCE_TYPENAME AppShell
+)
+set(_completion_qml
+    ${CMAKE_SOURCE_DIR}/qml/AppShell.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/EspressoCompletionPolicy.js
+    ${CMAKE_SOURCE_DIR}/qml/components/OperationCompletionState.qml
+    ${CMAKE_SOURCE_DIR}/qml/components/OperationNavigationPolicy.js
+    ${CMAKE_SOURCE_DIR}/qml/components/BrowserRouteHistory.js
+    ${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_operationcompletionoverlay.qml)
+foreach(_file IN LISTS _completion_qml)
+    get_filename_component(_name "${_file}" NAME)
+    set_source_files_properties("${_file}" PROPERTIES QT_RESOURCE_ALIAS "${_name}")
+endforeach()
+add_executable(tst_operationcompletionoverlay tst_operationcompletionoverlay.cpp)
+decenza_use_stable_qmlcachegen(tst_operationcompletionoverlay)
+qt_add_qml_module(tst_operationcompletionoverlay
+    URI DecenzaOperationCompletionTests VERSION 1.0 RESOURCE_PREFIX /qt/qml
+    QML_FILES ${_completion_qml})
+decenza_wire_qml_cache_deps(tst_operationcompletionoverlay _tst_operationcompletionoverlay_units_wired)
+target_link_libraries(tst_operationcompletionoverlay PRIVATE Qt6::QuickTest Qt6::Quick Qt6::Qml)
+set_property(GLOBAL APPEND PROPERTY DECENZA_TEST_TARGETS tst_operationcompletionoverlay)
+add_test(NAME tst_operationcompletionoverlay COMMAND tst_operationcompletionoverlay
+    -input :/qt/qml/DecenzaOperationCompletionTests
+    -o -,txt -o "${DECENZA_TEST_RESULTS_DIR}/tst_operationcompletionoverlay.xml,junitxml")
+set_tests_properties(tst_operationcompletionoverlay PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_CONTROLS_STYLE=Basic"
+    FAIL_REGULAR_EXPRESSION "Maximum amount of warnings exceeded")
+
+# These test modules intentionally use the same Decenza URI as the production
+# components they exercise. Keep each target in a separate CMake binary
+# directory: Qt's generated qmake_Decenza.qrc is URI-based and otherwise the
+# later target overwrites the qmldir resource used by the earlier executable.
+add_subdirectory(subsystemlogview)
+add_subdirectory(localfiletransfer)
+
+# These adapters are exercised by several fixtures; compile each production
+# source once so adding a facade test does not duplicate transport builds.
+add_library(decenza_remoteservicebasetestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h)
+qt_extract_metatypes(decenza_remoteservicebasetestlib)
+target_link_libraries(decenza_remoteservicebasetestlib PUBLIC Qt6::Qml Qt6::RemoteObjects)
+
+add_library(decenza_languageservicefacadelib STATIC
+    ${CMAKE_SOURCE_DIR}/src/remote/languageservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/languageservice.cpp
+)
+set_target_properties(decenza_languageservicefacadelib PROPERTIES AUTOMOC ON)
+target_include_directories(decenza_languageservicefacadelib PUBLIC
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/remote ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(decenza_languageservicefacadelib PUBLIC decenza_remoteservicebasetestlib)
+qt6_add_repc_replicas(decenza_languageservicefacadelib
+    ${CMAKE_SOURCE_DIR}/src/remote/languageservice.rep)
+
+add_library(decenza_comparisonreadouttestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/history/shotcomparisonreadout.cpp)
+target_link_libraries(decenza_comparisonreadouttestlib PUBLIC Qt6::Core)
+
+add_library(decenza_webclienttestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/remote/hostsessionservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/hostsessionservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/bagservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/bagservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/profileservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/profileservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/recipecontextservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/recipecontextservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/beanuiservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/beanuiservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/comparisonservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/comparisonservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/conversationsession.h
+    ${CMAKE_SOURCE_DIR}/src/remote/conversationsession.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/historyservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/historyservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/shotreviewactions.h
+    ${CMAKE_SOURCE_DIR}/src/remote/shotreviewactions.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/beansearchservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/beansearchservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/equipmentservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/equipmentservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/recipeservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/recipeservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/machineuisnapshot.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/steampitchersnapshot.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotemachineuisource.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotemachineuisource.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotede1device.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotede1device.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteprofilemanager.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteprofilemanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotebelkaportal.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotebelkaportal.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotescaledevice.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotescaledevice.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteblemanager.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteblemanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteusbscalemanager.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteusbscalemanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotemachinestate.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotemachinestate.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotemaincontroller.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotemaincontroller.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/steameditrequest.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotesessionbackend.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotesessionbackend.cpp
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotesettings.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotesettings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/steamcalculations.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteaccessibilitymanager.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteaccessibilitymanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/accessibilitytext.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotetranslationmanager.h
+    ${CMAKE_SOURCE_DIR}/src/webclient/remotetranslationmanager.cpp
+)
+set_target_properties(decenza_webclienttestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+qt_extract_metatypes(decenza_webclienttestlib)
+target_compile_definitions(decenza_webclienttestlib PUBLIC DECENZA_TESTING)
+target_include_directories(decenza_webclienttestlib PUBLIC
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/generated
+    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(decenza_webclienttestlib PUBLIC decenza_package_identity decenza_comparisonreadouttestlib decenza_serviceoperationtestlib decenza_preparationtestlib decenza_languageservicefacadelib Qt6::Qml Qt6::WebSockets Qt6::Quick Qt6::RemoteObjects)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/equipmentservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/hostsessionservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/recipeservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/bagservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/profileservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/recipecontextservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/beanuiservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/comparisonservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/conversationsession.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/historyservice.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/shotreviewactions.rep)
+qt6_add_repc_replicas(decenza_webclienttestlib ${CMAKE_SOURCE_DIR}/src/remote/beansearchservice.rep)
+
+
+add_decenza_test(tst_steamuistate tst_steamuistate.cpp)
+target_link_libraries(tst_steamuistate PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_preparationstate tst_preparationstate.cpp)
+target_link_libraries(tst_preparationstate PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_machineuisnapshot tst_machineuisnapshot.cpp)
+target_link_libraries(tst_machineuisnapshot PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_steampitchersnapshot tst_steampitchersnapshot.cpp)
+target_link_libraries(tst_steampitchersnapshot PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_remotesessionbackend tst_remotesessionbackend.cpp)
+target_link_libraries(tst_remotesessionbackend PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_remotesettings tst_remotesettings.cpp)
+target_link_libraries(tst_remotesettings PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_remotetranslationmanager tst_remotetranslationmanager.cpp)
+target_link_libraries(tst_remotetranslationmanager PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_remoteaccessibilitymanager tst_remoteaccessibilitymanager.cpp)
+target_link_libraries(tst_remoteaccessibilitymanager PRIVATE decenza_webclienttestlib)
+add_library(decenza_remotecontracttestlib STATIC)
+qt6_add_repc_sources(decenza_remotecontracttestlib
+    ${CMAKE_SOURCE_DIR}/src/remote/hostsessionservice.rep
+    ${CMAKE_SOURCE_DIR}/src/remote/languageservice.rep)
+target_include_directories(decenza_remotecontracttestlib PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(decenza_remotecontracttestlib PUBLIC Qt6::RemoteObjects)
+target_link_libraries(tst_remotetranslationmanager PRIVATE decenza_remotecontracttestlib)
+target_link_libraries(tst_remotesessionbackend PRIVATE decenza_remotecontracttestlib)
+target_link_libraries(tst_remotesettings PRIVATE decenza_remotecontracttestlib)
+add_library(decenza_qtrowebsockettestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/remote/qtrowebsocketdevice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/qtrowebsocketdevice.cpp)
+set_target_properties(decenza_qtrowebsockettestlib PROPERTIES AUTOMOC ON)
+target_include_directories(decenza_qtrowebsockettestlib PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(decenza_qtrowebsockettestlib PUBLIC Qt6::WebSockets)
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/qml/RemoteObjectConnectionServicesFixture.qml
+    PROPERTIES QT_RESOURCE_ALIAS RemoteObjectConnectionServicesFixture.qml)
+decenza_use_stable_qmlcachegen(tst_remotesessionbackend)
+qt_add_qml_module(tst_remotesessionbackend
+    URI DecenzaConnectionTests VERSION 1.0 RESOURCE_PREFIX /qt/qml
+    SOURCES
+        ${CMAKE_SOURCE_DIR}/src/remote/hostsessionservice_qml.h
+        ${CMAKE_SOURCE_DIR}/src/webclient/remoteobjectconnection.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/remotesessionprobe.h
+    QML_FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/qml/RemoteObjectConnectionServicesFixture.qml)
+decenza_wire_qml_cache_deps(tst_remotesessionbackend _tst_remotesessionbackend_units_wired)
+target_include_directories(tst_remotesessionbackend PRIVATE ${CMAKE_SOURCE_DIR}/src/webclient)
+target_sources(tst_remotesessionbackend PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/webclient/remoteobjectconnection.cpp)
+target_link_libraries(tst_remotesessionbackend PRIVATE decenza_qtrowebsockettestlib)
+
+add_decenza_test(tst_equipmentservice
+    tst_equipmentservice.cpp
+    ${CMAKE_BINARY_DIR}/version_code.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/equipmentservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/equipmentservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/recipeservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/recipeservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/equipmentuisnapshot.h
+    ${CMAKE_SOURCE_DIR}/src/core/equipmentuisnapshot.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/equipmentuioperations.h
+    ${CMAKE_SOURCE_DIR}/src/core/equipmentuioperations.cpp
+)
+qt6_add_repc_sources(tst_equipmentservice ${CMAKE_SOURCE_DIR}/src/remote/equipmentservice.rep)
+qt6_add_repc_sources(tst_equipmentservice ${CMAKE_SOURCE_DIR}/src/remote/recipeservice.rep)
+target_include_directories(tst_equipmentservice PRIVATE ${CMAKE_SOURCE_DIR}/src/remote ${CMAKE_SOURCE_DIR}/src/core)
+target_link_libraries(tst_equipmentservice PRIVATE decenza_dialingblockslib decenza_shotlib decenza_webclienttestlib Qt6::Qml Qt6::RemoteObjects)
+
+add_decenza_test(tst_steameditrequest tst_steameditrequest.cpp)
+target_link_libraries(tst_steameditrequest PRIVATE decenza_webclienttestlib)
+add_decenza_test(tst_steampageeditor
+    tst_steampageeditor.cpp
+    mocks/MockScaleDevice.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/steampageeditor.h
+    ${CMAKE_SOURCE_DIR}/src/controllers/steampageeditor.cpp
+)
+target_link_libraries(tst_steampageeditor PRIVATE decenza_webclienttestlib)
+
+add_library(decenza_steammodeltestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/models/steamdatamodel.h
+    ${CMAKE_SOURCE_DIR}/src/models/steamdatamodel.cpp)
+set_target_properties(decenza_steammodeltestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_link_libraries(decenza_steammodeltestlib PUBLIC decenza_fastlinetestlib)
+
+add_library(decenza_steamgraphtestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/network/remotesteamgraphsnapshot.cpp
+)
+set_target_properties(decenza_steamgraphtestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_include_directories(decenza_steamgraphtestlib PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(decenza_steamgraphtestlib PUBLIC decenza_steammodeltestlib Qt6::Quick Qt6::Network)
+add_decenza_test(tst_remotesteamgraphsnapshot tst_remotesteamgraphsnapshot.cpp)
+target_link_libraries(tst_remotesteamgraphsnapshot PRIVATE decenza_steamgraphtestlib)
+set_tests_properties(tst_remotesteamgraphsnapshot PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+add_decenza_test(tst_steamdatamodelsnapshot tst_steamdatamodelsnapshot.cpp)
+target_link_libraries(tst_steamdatamodelsnapshot PRIVATE decenza_steamgraphtestlib)
+set_tests_properties(tst_steamdatamodelsnapshot PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_decenza_test(tst_screensavermediarange tst_screensavermediarange.cpp)
+add_decenza_test(tst_screensavermediatickets
+    tst_screensavermediatickets.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/screensaverservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/screensaverservicesource.cpp
+)
+qt6_add_repc_sources(tst_screensavermediatickets ${CMAKE_SOURCE_DIR}/src/remote/screensaverservice.rep)
+target_include_directories(tst_screensavermediatickets PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(tst_screensavermediatickets PRIVATE
+    decenza_serviceoperationtestlib decenza_appserviceslib decenza_importservicetestlib Qt6::Network Qt6::RemoteObjects
+)
+
+add_decenza_test(tst_layoutservice
+    tst_layoutservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/layoutservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/layoutservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/layoutservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/layoutservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_sources(tst_layoutservice ${CMAKE_SOURCE_DIR}/src/remote/layoutservice.rep)
+qt6_add_repc_replicas(tst_layoutservice ${CMAKE_SOURCE_DIR}/src/remote/layoutservice.rep)
+target_include_directories(tst_layoutservice PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/src/remote")
+target_link_libraries(tst_layoutservice PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects Qt6::Qml)
+
+add_decenza_test(tst_themeservice
+    tst_themeservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/thememanagementservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/thememanagementservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/thememanagementservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/thememanagementservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_sources(tst_themeservice ${CMAKE_SOURCE_DIR}/src/remote/thememanagementservice.rep)
+qt6_add_repc_replicas(tst_themeservice ${CMAKE_SOURCE_DIR}/src/remote/thememanagementservice.rep)
+target_include_directories(tst_themeservice PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/src/remote")
+target_link_libraries(tst_themeservice PRIVATE decenza_serviceoperationtestlib decenza_appserviceslib Qt6::RemoteObjects Qt6::Qml)
+
+add_decenza_test(tst_settingspreferencesservice
+    tst_settingspreferencesservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/settingspreferencesservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/settingspreferencesservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/settingspreferencesservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/settingspreferencesservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/shotreporter.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/locationprovider.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/permissionrequests.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_sources(tst_settingspreferencesservice ${CMAKE_SOURCE_DIR}/src/remote/settingspreferencesservice.rep)
+qt6_add_repc_replicas(tst_settingspreferencesservice ${CMAKE_SOURCE_DIR}/src/remote/settingspreferencesservice.rep)
+target_include_directories(tst_settingspreferencesservice PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/src/remote")
+target_link_libraries(tst_settingspreferencesservice PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects Qt6::Qml Qt6::Positioning decenza_appserviceslib decenza_a11ylib)
+target_sources(tst_settingspreferencesservice PRIVATE
+    ${CMAKE_BINARY_DIR}/version_code.cpp)
+target_link_libraries(tst_settingspreferencesservice PRIVATE decenza_aimanagertestlib)
+
+
+# Staged test integration; add adjacent to the translation manager tests.
+add_decenza_test(tst_languageservicesource
+    tst_languageservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/languageservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/languageservicesource.cpp
+)
+target_link_libraries(tst_languageservicesource PRIVATE decenza_remotecontracttestlib
+    decenza_importservicetestlib decenza_filebundletestlib)
+target_include_directories(tst_languageservicesource PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_languageservicesource PRIVATE decenza_languageservicefacadelib Qt6::RemoteObjects Qt6::Qml)
+
+add_decenza_test(tst_preparationservice
+    tst_preparationservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/preparationservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/preparationservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/preparationservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/preparationservicesource.cpp
+)
+qt6_add_repc_sources(tst_preparationservice ${CMAKE_SOURCE_DIR}/src/remote/preparationservice.rep)
+qt6_add_repc_replicas(tst_preparationservice ${CMAKE_SOURCE_DIR}/src/remote/preparationservice.rep)
+target_include_directories(tst_preparationservice PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_preparationservice PRIVATE decenza_serviceoperationtestlib decenza_preparationtestlib Qt6::Qml Qt6::RemoteObjects)
+
+add_decenza_test(tst_maintenanceoperationpolicy tst_maintenanceoperationpolicy.cpp)
+add_decenza_test(tst_shotuploadcommandpolicy tst_shotuploadcommandpolicy.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/shotuploadcommandpolicy.cpp)
+target_include_directories(tst_shotuploadcommandpolicy PRIVATE ${CMAKE_SOURCE_DIR}/src/remote)
+
+add_decenza_test(tst_maintenanceservice
+    tst_maintenanceservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/maintenanceservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/maintenanceservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/maintenanceservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_sources(tst_maintenanceservice ${CMAKE_SOURCE_DIR}/src/remote/maintenanceservice.rep)
+qt6_add_repc_replicas(tst_maintenanceservice ${CMAKE_SOURCE_DIR}/src/remote/maintenanceservice.rep)
+target_include_directories(tst_maintenanceservice PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_maintenanceservice PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects Qt6::Qml)
+
+add_decenza_test(tst_shotuploadservice
+    tst_shotuploadservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/shotuploadservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/shotuploadservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/shotuploadservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_sources(tst_shotuploadservice ${CMAKE_SOURCE_DIR}/src/remote/shotuploadservice.rep)
+qt6_add_repc_replicas(tst_shotuploadservice ${CMAKE_SOURCE_DIR}/src/remote/shotuploadservice.rep)
+target_include_directories(tst_shotuploadservice PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_shotuploadservice PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects Qt6::Qml)
+
+add_decenza_test(tst_machinecontrolpresets tst_machinecontrolpresets.cpp)
+
+add_decenza_test(tst_externalurlopener
+    tst_externalurlopener.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/externalurlopener.h
+    ${CMAKE_SOURCE_DIR}/src/remote/externalurlopener.cpp)
+target_link_libraries(tst_externalurlopener PRIVATE Qt6::Gui Qt6::Qml)
+
+add_decenza_test(tst_machinecontrolservice
+    tst_machinecontrolservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/machinecontrolservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/machinecontrolservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_sources(tst_machinecontrolservice ${CMAKE_SOURCE_DIR}/src/remote/machinecontrolservice.rep)
+qt6_add_repc_replicas(tst_machinecontrolservice ${CMAKE_SOURCE_DIR}/src/remote/machinecontrolservice.rep)
+target_include_directories(tst_machinecontrolservice PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/src/remote")
+target_link_libraries(tst_machinecontrolservice PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects Qt6::Qml)
+
+
+# One live-graph facade and source path for both application targets.
+add_decenza_test(tst_liveshotgraphservice
+    tst_liveshotgraphservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/liveshotgraphservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/liveshotgraphservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/liveshotgraphservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/liveshotgraphservicesource.cpp)
+qt6_add_repc_sources(tst_liveshotgraphservice ${CMAKE_SOURCE_DIR}/src/remote/liveshotgraphservice.rep)
+qt6_add_repc_replicas(tst_liveshotgraphservice ${CMAKE_SOURCE_DIR}/src/remote/liveshotgraphservice.rep)
+target_include_directories(tst_liveshotgraphservice PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/src/remote")
+target_link_libraries(tst_liveshotgraphservice PRIVATE Qt6::RemoteObjects Qt6::Qml decenza_shotlib decenza_profilelib)
+set_tests_properties(tst_liveshotgraphservice PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=30000")
+
+add_decenza_test(tst_steamservice
+    tst_steamservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/steamservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/steamservice.cpp
+)
+qt6_add_repc_sources(tst_steamservice ${CMAKE_SOURCE_DIR}/src/remote/steamservice.rep)
+qt6_add_repc_replicas(tst_steamservice ${CMAKE_SOURCE_DIR}/src/remote/steamservice.rep)
+target_include_directories(tst_steamservice PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/src/remote")
+target_link_libraries(tst_steamservice PRIVATE Qt6::RemoteObjects Qt6::Qml decenza_steamgraphtestlib)
+set_tests_properties(tst_steamservice PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+
+add_decenza_test(tst_remotesessionserver
+    tst_remotesessionserver.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/remotesessionserver.h
+    ${CMAKE_SOURCE_DIR}/src/network/remotesessionserver.cpp
+)
+target_link_libraries(tst_remotesessionserver PRIVATE decenza_webrequestguardlib decenza_qtrowebsockettestlib Qt6::WebSockets)
+if(NOT ANDROID AND NOT APPLE)
+    target_link_libraries(tst_remotesessionserver PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(tst_remotesessionserver PRIVATE DECENZA_TEST_OPENSSL_PEM)
+endif()
+
+add_decenza_test(tst_sessionbackgroundimage
+    tst_sessionbackgroundimage.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/sessionbackgroundimage.cpp
+)
+add_decenza_test(tst_webclientassets
+    tst_webclientassets.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/webclientassets.cpp
+)
+decenza_add_image_sets(tst_webclientassets)
+# A few real images are enough to exercise the image route; the whole emoji set is
+# tst_emojiassets' job.
+qt_add_resources(tst_webclientassets emoji_route_fixture
+    PREFIX "/emoji" BASE "${CMAKE_SOURCE_DIR}/resources/emoji"
+    FILES "${CMAKE_SOURCE_DIR}/resources/emoji/2615.svg" "${CMAKE_SOURCE_DIR}/resources/emoji/31-20e3.svg")
+qt_add_resources(tst_webclientassets map_route_fixture
+    PREFIX "/maps" BASE "${CMAKE_SOURCE_DIR}/resources/maps"
+    FILES "${CMAKE_SOURCE_DIR}/resources/maps/earth_day.jpg")
+qt_add_resources(tst_webclientassets embedded_webclient_fixture
+    PREFIX "/webclient" BASE "${CMAKE_CURRENT_SOURCE_DIR}/data/webclient"
+    FILES
+        data/webclient/package.json
+        data/webclient/index.html
+        data/webclient/decenza-web.js
+        data/webclient/decenza-web.wasm
+        data/webclient/qtloader.js
+        data/webclient/qt-dialog-accessibility.js)
+add_test(NAME tst_webclientpackage
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/webclient/test_package.py"
+)
+set(_qml_inventory_manifest_args
+    --manifest "native=${CMAKE_BINARY_DIR}/.qt/rcc/Decenza_raw_qml_0.qrc")
+if(DECENZA_WEB_BUNDLE_DIR)
+    get_filename_component(_decenza_web_build_dir "${DECENZA_WEB_BUNDLE_DIR}" DIRECTORY)
+    set(_decenza_web_qml_manifest "${_decenza_web_build_dir}/.qt/rcc/decenza-web_raw_qml_0.qrc")
+    if(EXISTS "${_decenza_web_qml_manifest}")
+        list(APPEND _qml_inventory_manifest_args
+            --manifest "wasm=${_decenza_web_qml_manifest}")
+    endif()
+endif()
+add_test(NAME tst_qmlinventory
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/webclient/check_qml_inventory.py"
+        ${_qml_inventory_manifest_args}
+)
+add_test(NAME tst_qmlinventory_selftest
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/webclient/check_qml_inventory.py" --self-test
+)
+add_test(NAME tst_webclientresourceclosure
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/webclient/test_check_webclient_resource_closure.py"
+)
+
+# --- build_tests: everything ctest needs, and nothing it does not.
+#
+# `ninja` with no target builds `all`, which for this project is dominated by
+# things the test suite never executes. Measured on a nightly sanitizer build:
+# 385 C++ objects for the Decenza app and 36 for the tools (shot_eval,
+# saw_replay, saw_parity, profile_sync), against 318 for the tests themselves —
+# so roughly 56% of the compilation, plus the app's link, is work the job
+# throws away.
+#
+# No test target LINKS the app — they link decenza_testlib / decenza_shotlib, which compile the
+# src/ sources they need independently. Sanitizer coverage is unaffected: ASan and UBSan report on
+# code that RUNS, and this job runs only the suite.
+#
+# The registration test depends on decenza_qml_metadata, not the executable.
+# Its registry/copy targets are also sufficient for the nightly QML lint gate;
+# missing registry output fails the test instead of skipping its entire class.
+#
+# What this gives up, stated plainly: the nightly no longer compiles
+# app-exclusive code (main.cpp, QML glue) under sanitizer flags. That is not a
+# real loss — those files are already compiled several times a day by the
+# platform builds, and nothing here executed them.
+#
+# Use: `ninja build_tests` instead of `ninja`.
+# Shared recipe dependency facades: real QtRO transport, isolated fixture state.
+add_decenza_test(tst_beanuiservice tst_beanuiservice.cpp)
+target_link_libraries(tst_beanuiservice PRIVATE decenza_webclienttestlib decenza_beanuicontracttestlib)
+
+add_decenza_test(tst_beansearchservice tst_beansearchservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/beansearchservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/beansearchservicesource.cpp)
+qt6_add_repc_sources(tst_beansearchservice ${CMAKE_SOURCE_DIR}/src/remote/beansearchservice.rep)
+target_link_libraries(tst_beansearchservice PRIVATE decenza_webclienttestlib decenza_beanbaselib decenza_shotlib)
+
+add_decenza_test(tst_bagservice tst_bagservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/bagservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/bagservicesource.cpp)
+qt6_add_repc_sources(tst_bagservice ${CMAKE_SOURCE_DIR}/src/remote/bagservice.rep)
+target_link_libraries(tst_bagservice PRIVATE decenza_webclienttestlib decenza_shotlib)
+
+add_decenza_test(tst_baglinkcontroller tst_baglinkcontroller.cpp)
+target_link_libraries(tst_baglinkcontroller PRIVATE decenza_baglinktestlib)
+
+add_decenza_test(tst_recipecontextservice tst_recipecontextservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/recipecontextservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/recipecontextservicesource.cpp)
+qt6_add_repc_sources(tst_recipecontextservice ${CMAKE_SOURCE_DIR}/src/remote/recipecontextservice.rep)
+target_link_libraries(tst_recipecontextservice PRIVATE decenza_webclienttestlib decenza_shotlib)
+
+add_decenza_test(tst_profileservice tst_profileservice.cpp
+    ${MCP_MOC_HEADERS}
+    ${PROFILES_QRC}
+    ${CMAKE_SOURCE_DIR}/src/remote/profileservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/profileservicesource.cpp)
+qt6_add_repc_sources(tst_profileservice ${CMAKE_SOURCE_DIR}/src/remote/profileservice.rep)
+target_link_libraries(tst_profileservice PRIVATE
+    decenza_webclienttestlib decenza_profilelib decenza_shotlib Qt6::Graphs Qt6::Quick)
+
+add_decenza_test(tst_historyservice tst_historyservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/historyservicesource.cpp)
+qt6_add_repc_sources(tst_historyservice ${CMAKE_SOURCE_DIR}/src/remote/historyservice.rep)
+target_link_libraries(tst_historyservice PRIVATE decenza_webclienttestlib decenza_shotlib)
+
+add_decenza_test(tst_profileeditmodel tst_profileeditmodel.cpp
+    ${CMAKE_SOURCE_DIR}/src/profile/profileeditordraft.h
+    ${CMAKE_SOURCE_DIR}/src/profile/profileeditordraft.cpp)
+
+add_decenza_test(tst_shotreviewactions tst_shotreviewactions.cpp)
+qt6_add_repc_sources(tst_shotreviewactions ${CMAKE_SOURCE_DIR}/src/remote/shotreviewactions.rep)
+target_link_libraries(tst_shotreviewactions PRIVATE decenza_webclienttestlib)
+
+add_decenza_test(tst_shotcomparisonreadout tst_shotcomparisonreadout.cpp)
+target_link_libraries(tst_shotcomparisonreadout PRIVATE decenza_comparisonreadouttestlib)
+
+add_decenza_test(tst_calibrationoperationpolicy tst_calibrationoperationpolicy.cpp)
+add_decenza_test(tst_flowcalibrationmath tst_flowcalibrationmath.cpp)
+
+add_decenza_test(tst_flowcalibrationservice
+    tst_flowcalibrationservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/flowcalibrationmodel.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/flowcalibrationservicesource.cpp)
+qt6_add_repc_sources(tst_flowcalibrationservice
+    ${CMAKE_SOURCE_DIR}/src/remote/flowcalibrationservice.rep)
+target_link_libraries(tst_flowcalibrationservice PRIVATE
+    decenza_webclienttestlib decenza_shotlib)
+
+add_decenza_test(tst_comparisonservice tst_comparisonservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/comparisonservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/comparisonservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/models/shotcomparisonmodel.cpp)
+qt6_add_repc_sources(tst_comparisonservice ${CMAKE_SOURCE_DIR}/src/remote/comparisonservice.rep)
+target_link_libraries(tst_comparisonservice PRIVATE decenza_webclienttestlib decenza_shotlib decenza_shotcomparisonlib)
+
+add_decenza_test(tst_conversationsession tst_conversationsession.cpp)
+target_link_libraries(tst_conversationsession PRIVATE decenza_webclienttestlib decenza_conversationsessioncontracttestlib)
+
+add_decenza_test(tst_servicepayload tst_servicepayload.cpp)
+
+add_decenza_test(tst_settingsconnectionsservice
+    tst_settingsconnectionsservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/settingsconnectionsservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/settingsconnectionsservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/settingsconnectionsservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h
+)
+qt6_add_repc_sources(tst_settingsconnectionsservice
+    ${CMAKE_SOURCE_DIR}/src/remote/settingsconnectionsservice.rep)
+qt6_add_repc_replicas(tst_settingsconnectionsservice
+    ${CMAKE_SOURCE_DIR}/src/remote/settingsconnectionsservice.rep)
+target_include_directories(tst_settingsconnectionsservice PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_SOURCE_DIR}/src/remote")
+target_link_libraries(tst_settingsconnectionsservice PRIVATE decenza_serviceoperationtestlib Qt6::RemoteObjects Qt6::Qml)
+
+
+add_decenza_test(tst_mqttservicepolicy tst_mqttservicepolicy.cpp)
+add_decenza_test(tst_updateoperationpolicy tst_updateoperationpolicy.cpp)
+
+add_decenza_test(tst_aisettingsservicesource
+    tst_aisettingsservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/aisettingsservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/aisettingsservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/aisettingsservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h)
+qt6_add_repc_sources(tst_aisettingsservicesource ${CMAKE_SOURCE_DIR}/src/remote/aisettingsservice.rep)
+qt6_add_repc_replicas(tst_aisettingsservicesource ${CMAKE_SOURCE_DIR}/src/remote/aisettingsservice.rep)
+target_include_directories(tst_aisettingsservicesource PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_aisettingsservicesource PRIVATE Qt6::RemoteObjects Qt6::Qml)
+
+add_library(decenza_fullbackuprestoretestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/core/fullbackuprestore.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/fullbackuprestore.h)
+set_target_properties(decenza_fullbackuprestoretestlib PROPERTIES AUTOMOC ON AUTOMOC_PATH_PREFIX OFF)
+target_compile_definitions(decenza_fullbackuprestoretestlib PRIVATE DECENZA_TESTING)
+target_link_libraries(decenza_fullbackuprestoretestlib PUBLIC decenza_testlib)
+
+add_decenza_test(tst_backupoperationpolicy tst_backupoperationpolicy.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/backupservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/backupservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/core/databasebackupmanager.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/databasebackupmanager.h)
+qt6_add_repc_sources(tst_backupoperationpolicy ${CMAKE_SOURCE_DIR}/src/remote/backupservice.rep)
+target_include_directories(tst_backupoperationpolicy PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_backupoperationpolicy PRIVATE
+    decenza_serviceoperationtestlib decenza_aimanagertestlib decenza_appserviceslib
+    decenza_settingsserializerlib decenza_profilelib decenza_shotlib decenza_filebundletestlib
+    decenza_importservicetestlib decenza_fullbackuprestoretestlib
+    Qt6::RemoteObjects decenza_zip)
+add_decenza_test(tst_debugconversionpolicy tst_debugconversionpolicy.cpp)
+add_library(decenza_filebundletestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/remote/opaquefilebundlestore.h
+    ${CMAKE_SOURCE_DIR}/src/remote/opaquefilebundlestore.cpp)
+target_include_directories(decenza_filebundletestlib PUBLIC ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(decenza_filebundletestlib PUBLIC Qt6::Core)
+add_decenza_test(tst_datamigrationcommandpolicy tst_datamigrationcommandpolicy.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/datamigrationcommandpolicy.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/datamigrationclient.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/datamigrationservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/datamigrationservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/datamigrationservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/datamigrationservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/datamigrationservice_qml.h)
+qt6_add_repc_sources(tst_datamigrationcommandpolicy ${CMAKE_SOURCE_DIR}/src/remote/datamigrationservice.rep)
+qt6_add_repc_replicas(tst_datamigrationcommandpolicy ${CMAKE_SOURCE_DIR}/src/remote/datamigrationservice.rep)
+target_include_directories(tst_datamigrationcommandpolicy PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_datamigrationcommandpolicy PRIVATE
+    decenza_aimanagertestlib decenza_appserviceslib decenza_settingsserializerlib decenza_fullbackuprestoretestlib
+    decenza_profilelib decenza_shotlib decenza_serviceoperationtestlib decenza_remoteservicebasetestlib decenza_localnetworktestlib Qt6::RemoteObjects Qt6::Qml)
+
+add_decenza_test(tst_shotserversettingspolicy tst_shotserversettingspolicy.cpp)
+
+# Import adapters exercise the canonical importers; compile their shared support once.
+add_library(decenza_importservicetestlib STATIC
+    ${CMAKE_SOURCE_DIR}/src/profile/profileimporter.cpp
+    ${CMAKE_SOURCE_DIR}/src/history/shotimporter.cpp
+    ${CMAKE_SOURCE_DIR}/src/network/visualizerimporter.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/importservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/importservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/profileimportservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/profileimportservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/profileimportservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/profileimportservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/profileimportservicesource.h
+    ${CMAKE_SOURCE_DIR}/src/remote/visualizerprofileimportservicesource.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/visualizerprofileimportservicesource.h)
+qt6_add_repc_sources(decenza_importservicetestlib
+    ${CMAKE_SOURCE_DIR}/src/remote/importservice.rep
+    ${CMAKE_SOURCE_DIR}/src/remote/profileimportservice.rep
+    ${CMAKE_SOURCE_DIR}/src/remote/visualizerprofileimportservice.rep)
+qt6_add_repc_replicas(decenza_importservicetestlib
+    ${CMAKE_SOURCE_DIR}/src/remote/profileimportservice.rep)
+target_include_directories(decenza_importservicetestlib PUBLIC
+    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(decenza_importservicetestlib PUBLIC
+    decenza_serviceoperationtestlib decenza_testlib decenza_profilelib decenza_shotlib decenza_shotparserlib
+    decenza_remoteservicebasetestlib decenza_zip)
+add_decenza_test(tst_profileimportservicesource tst_profileimportservicesource.cpp)
+target_link_libraries(tst_profileimportservicesource PRIVATE decenza_importservicetestlib)
+add_decenza_test(tst_visualizerprofileimportservicesource tst_visualizerprofileimportservicesource.cpp)
+target_link_libraries(tst_visualizerprofileimportservicesource PRIVATE decenza_importservicetestlib)
+
+add_decenza_test(tst_localfilesave tst_localfilesave.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/localfileselection.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/localfileselection.h)
+target_link_libraries(tst_localfilesave PRIVATE Qt6::Widgets Qt6::Qml decenza_filebundletestlib)
+# Qt Widgets defines QT_WIDGETS_LIB, which is absent from the shared QtTest PCH.
+set_property(TARGET tst_localfilesave PROPERTY DISABLE_PRECOMPILE_HEADERS ON)
+set_tests_properties(tst_localfilesave PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_decenza_test(tst_globalsupportconfirmationstate
+    tst_globalsupportconfirmationstate.cpp)
+target_include_directories(tst_globalsupportconfirmationstate PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/remote)
+
+add_decenza_test(tst_globalsupportprivatereply
+    tst_globalsupportprivatereply.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/globalsupportservice.cpp
+    ${CMAKE_SOURCE_DIR}/src/remote/globalsupportservice.h
+    ${CMAKE_SOURCE_DIR}/src/remote/globalsupportservice_qml.h
+    ${CMAKE_SOURCE_DIR}/src/remote/remoteservice.h)
+qt6_add_repc_sources(tst_globalsupportprivatereply
+    ${CMAKE_SOURCE_DIR}/src/remote/globalsupportservice.rep)
+qt6_add_repc_replicas(tst_globalsupportprivatereply
+    ${CMAKE_SOURCE_DIR}/src/remote/globalsupportservice.rep)
+target_include_directories(tst_globalsupportprivatereply PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/remote)
+target_link_libraries(tst_globalsupportprivatereply PRIVATE
+    Qt6::RemoteObjects Qt6::Qml)
+
+add_decenza_test(tst_ghcsimulatoroperationpolicy tst_ghcsimulatoroperationpolicy.cpp)
+
+# Exercise facade admission and reconnect behavior through the existing domain suites.
+foreach(_service_test IN ITEMS
+        "tst_flowcalibrationservice|flowcalibrationservice"
+        "tst_sensorcalibration|sensorcalibrationservice"
+        "tst_libraryservice|libraryservice"
+        "tst_ghcsimulatoroperationpolicy|ghcsimulatorservice"
+        "tst_shotserversettingspolicy|shotserversettingsservice"
+        "tst_screensavermediatickets|screensaverservice")
+    string(REPLACE "|" ";" _service_pair "${_service_test}")
+    list(GET _service_pair 0 _test_target)
+    list(GET _service_pair 1 _service_name)
+    target_sources(${_test_target} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/remote/${_service_name}.h
+        ${CMAKE_SOURCE_DIR}/src/remote/${_service_name}.cpp)
+    qt6_add_repc_replicas(${_test_target} ${CMAKE_SOURCE_DIR}/src/remote/${_service_name}.rep)
+    target_include_directories(${_test_target} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(${_test_target} PRIVATE
+        decenza_serviceoperationtestlib decenza_remoteservicebasetestlib Qt6::RemoteObjects Qt6::Qml)
+endforeach()
+unset(_service_test)
+unset(_service_pair)
+unset(_test_target)
+unset(_service_name)
+qt6_add_repc_sources(tst_ghcsimulatoroperationpolicy ${CMAKE_SOURCE_DIR}/src/remote/ghcsimulatorservice.rep)
+qt6_add_repc_sources(tst_shotserversettingspolicy ${CMAKE_SOURCE_DIR}/src/remote/shotserversettingsservice.rep)
+target_link_libraries(tst_screensavermediatickets PRIVATE decenza_memorymonitortestlib)
+
+# Collect after every test declaration, including the shared-service suites.
+get_property(_decenza_test_targets GLOBAL PROPERTY DECENZA_TEST_TARGETS)
+if(ENABLE_UBSAN)
+    list(APPEND _decenza_test_targets sanitizer_canary)
+endif()
+if(ENABLE_ASAN)
+    list(APPEND _decenza_test_targets asan_canary)
+endif()
+add_custom_target(build_tests DEPENDS ${_decenza_test_targets})
+list(LENGTH _decenza_test_targets _decenza_test_count)
+message(STATUS "build_tests target covers ${_decenza_test_count} test executables")
+
+decenza_fail_on_invalid_aot()
+# A subdirectory's tests are out of reach from here before CMake 3.28, so each
+# subdirectory calls the helper itself; refuse one that registers tests and does not.
+function(_decenza_require_aot_tripwire dir)
+    get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(_subdir IN LISTS _subdirs)
+        get_property(_tests DIRECTORY "${_subdir}" PROPERTY TESTS)
+        get_property(_armed DIRECTORY "${_subdir}" PROPERTY DECENZA_FAIL_ON_INVALID_AOT)
+        if(_tests AND NOT _armed)
+            message(FATAL_ERROR "${_subdir}/CMakeLists.txt registers tests but does not end with "
+                "decenza_fail_on_invalid_aot()")
+        endif()
+        _decenza_require_aot_tripwire("${_subdir}")
+    endforeach()
+endfunction()
+_decenza_require_aot_tripwire("${CMAKE_CURRENT_SOURCE_DIR}")

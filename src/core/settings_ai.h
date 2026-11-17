@@ -1,0 +1,87 @@
+#pragma once
+
+#include <QObject>
+#include <QJsonObject>
+#include "appsettings.h"
+#include <QString>
+
+// AI Dialing Assistant settings: provider selection, API keys, endpoints.
+class SettingsAI : public QObject {
+    Q_OBJECT
+
+    Q_PROPERTY(QString aiProvider READ aiProvider WRITE setAiProvider NOTIFY aiProviderChanged FINAL)
+    Q_PROPERTY(QString openaiApiKey READ openaiApiKey WRITE setOpenaiApiKey NOTIFY openaiApiKeyChanged FINAL)
+    Q_PROPERTY(QString anthropicApiKey READ anthropicApiKey WRITE setAnthropicApiKey NOTIFY anthropicApiKeyChanged FINAL)
+    Q_PROPERTY(QString geminiApiKey READ geminiApiKey WRITE setGeminiApiKey NOTIFY geminiApiKeyChanged FINAL)
+    Q_PROPERTY(QString ollamaEndpoint READ ollamaEndpoint WRITE setOllamaEndpoint NOTIFY ollamaEndpointChanged FINAL)
+    Q_PROPERTY(QString ollamaModel READ ollamaModel WRITE setOllamaModel NOTIFY ollamaModelChanged FINAL)
+    Q_PROPERTY(QString openaiEndpoint READ openaiEndpoint WRITE setOpenaiEndpoint NOTIFY openaiEndpointChanged FINAL)
+    Q_PROPERTY(QString anthropicEndpoint READ anthropicEndpoint WRITE setAnthropicEndpoint NOTIFY anthropicEndpointChanged FINAL)
+    Q_PROPERTY(QString openrouterApiKey READ openrouterApiKey WRITE setOpenrouterApiKey NOTIFY openrouterApiKeyChanged FINAL)
+    // When true (default), tapping AI Advice opens the tap-only taste intake
+    // picker before the conversation; when false, it opens the conversation
+    // directly (pre-existing behavior). See add-ai-taste-intake.
+    Q_PROPERTY(bool tasteIntakeOnAsk READ tasteIntakeOnAsk WRITE setTasteIntakeOnAsk NOTIFY tasteIntakeOnAskChanged FINAL)
+
+public:
+    explicit SettingsAI(QObject* parent = nullptr);
+
+    QString aiProvider() const;
+    void setAiProvider(const QString& provider);
+
+    QString openaiApiKey() const;
+    void setOpenaiApiKey(const QString& key);
+
+    QString anthropicApiKey() const;
+    void setAnthropicApiKey(const QString& key);
+
+    QString geminiApiKey() const;
+    void setGeminiApiKey(const QString& key);
+
+    QString ollamaEndpoint() const;
+    void setOllamaEndpoint(const QString& endpoint);
+
+    QString ollamaModel() const;
+    void setOllamaModel(const QString& model);
+
+    QString openaiEndpoint() const;
+    void setOpenaiEndpoint(const QString& endpoint);
+
+    QString anthropicEndpoint() const;
+    void setAnthropicEndpoint(const QString& endpoint);
+
+    QString openrouterApiKey() const;
+    void setOpenrouterApiKey(const QString& key);
+
+    bool tasteIntakeOnAsk() const;
+    void setTasteIntakeOnAsk(bool enabled);
+
+    // Per-provider selected model, stored under ai/model/<providerId>, for every
+    // provider with a catalog (AIProvider::availableModels). Empty = unset → the
+    // provider's default. Ollama keeps its own ollamaModel field.
+    Q_INVOKABLE QString providerModel(const QString& providerId) const;
+    Q_INVOKABLE void setProviderModel(const QString& providerId, const QString& modelId);
+    // Every stored selection, {providerId: modelId}, for backup and restore.
+    QJsonObject providerModels() const;
+    void setProviderModels(const QJsonObject& models);
+
+signals:
+    void aiProviderChanged();
+    void openaiApiKeyChanged();
+    void anthropicApiKeyChanged();
+    void geminiApiKeyChanged();
+    void ollamaEndpointChanged();
+    void ollamaModelChanged();
+    void openaiEndpointChanged();
+    void anthropicEndpointChanged();
+    void openrouterApiKeyChanged();
+    void tasteIntakeOnAskChanged();
+    void providerModelChanged();
+
+    // Aggregate signal — emitted whenever any AI setting changes. Lets consumers
+    // (e.g. AIManager) refresh all providers without subscribing to each signal.
+    void configurationChanged();
+
+private:
+    mutable AppSettings m_settings;
+};

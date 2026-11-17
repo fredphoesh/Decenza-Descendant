@@ -1,0 +1,4056 @@
+// Several Repeater delegates and `Component`/`sourceComponent` blocks here read
+// this file's ids (`wizardPage`, `bagGridFlick`, `wizardBeansDialog`,
+// `wizardKnowledgeDialog`); Bound makes them statically resolvable. Every one of those
+// delegates declares its injected role, `modelData`, required in the same edit --
+// without that, Bound stops role injection and every tile in the wizard (drink type,
+// bag, equipment, pitcher, vessel) renders blank at RUNTIME, silently. The profile
+// step's own tiles moved into the shared ProfilePicker component, which carries the
+// same discipline for its own delegates.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import QtQuick.Layouts
+import Decenza
+
+// Recipe wizard (add-recipe-wizard-tea): ONE page for all recipe creation and
+// editing, replacing RecipeComposerPage. Three entry points land here — blank
+// (RecipesPage "Add"), prefilled from a shot (promote buttons, via
+// `promoteShotId`), and clone (RecipesPage clone action, via `prefill`).
+//
+// Creation walks steps: drink type → bean → profile → details → summary.
+// Picker steps auto-advance on tap (no Next); breadcrumb chips navigate back.
+// The SUMMARY IS THE EDIT PAGE: edit/clone/promote land directly on it with
+// everything loaded, and tapping a row reopens just that step. Templates (the
+// `templates` table below) set defaults per drink type but never restrict —
+// the summary offers add/remove for the milk and hot-water blocks, so any
+// block combination the recipe model allows stays expressible.
+//
+// Prefill priority on the details step (never over a user edit): most recent
+// shot with the chosen bean+profile pair → (tea) the bag's structured brewing
+// data → the profile's own recommended numbers. Tea default temps and the
+// profile type-match table live in C++ (src/core/drinktypes.h, exposed via
+// ProfileService) — the single source shared with the ranking helpers.
+T.Page {
+    id: wizardPage
+    NativeFormControlStyle { id: recipeNameControlStyle }
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: mode === "edit" ? TranslationManager.translate("recipes.wizard.editTitle", "Edit Recipe") : TranslationManager.translate("recipes.wizard.createTitle", "New Recipe")
+
+    objectName: "recipeWizardPage"
+    background: ThemedPageBackground {}
+
+    // "create" | "edit". Edit loads the row; create starts from `prefill`
+    // (possibly empty) or `promoteShotId`. Same contract as the old composer.
+    property string mode: "create"
+    property int editRecipeId: -1
+    property var prefill: ({})
+    property real promoteShotId: 0
+
+    // Intercept the Android system back button / Escape key (Main.qml pops
+    // the page directly otherwise): step back like the bottom-bar arrow, so
+    // leaving the wizard always funnels through the unsaved-changes guard.
+    focus: true
+    Keys.onReleased: function(event) {
+        if (event.key === Qt.Key_Back || event.key === Qt.Key_Escape) {
+            event.accepted = true
+            goBackOneStep()
+        }
+    }
+
+    // --- step machine ----------------------------------------------------
+    // "drink" | "bean" | "profile" | "details" | "summary". Creation walks
+    // them in order; edit/clone/promote start at "summary". A step opened
+    // FROM the summary returns to it on selection instead of advancing.
+    property string currentStep: "drink"
+
+    // Step order, as an explicit switch rather than `[...].indexOf(currentStep)`.
+    // qmlcachegen compiles QJSList::indexOf() and assigns its qsizetype result
+    // straight into the int this feeds (StackLayout.currentIndex), which is a
+    // -Wshorten-64-to-32 error under -Werror. The binding only started compiling
+    // when this page moved to a T.Page root, so the Qt defect was invisible before.
+    // -1 for an unknown step, matching indexOf and leaving the StackLayout blank.
+    function _stepIndex(step: string): int {
+        switch (step) {
+        case "drink":   return 0
+        case "bean":    return 1
+        case "profile": return 2
+        case "details": return 3
+        case "summary": return 4
+        }
+        return -1
+    }
+    property bool _fromSummary: false
+    // True when the wizard OPENED on the summary (edit / promote / clone):
+    // back from the summary then exits; in a creation walk it steps back
+    // to details instead.
+    property bool _enteredAtSummary: false
+    // The details step is walked as a sequence of one-facet WINDOWS, the same
+    // screens whether creating (walk forward) or editing (a summary card jumps
+    // straight to its window). `_detailsPage` names the current window:
+    // "equipment" → "numbers" (dose/yield/temp/grind) → "steam"/"water" (only
+    // the blocks the drink has). Equipment comes first because the grinder's
+    // rpm capability gates the rpm field on the numbers window.
+    property string _detailsPage: "equipment"
+
+    // The ordered details windows for the current drink — equipment and the
+    // numbers always; steam/water only when the recipe carries that block.
+    function detailsPages() {
+        var pages = ["equipment", "numbers"]
+        if (fHasMilk) pages.push("steam")
+        if (fHasWater) pages.push("water")
+        return pages
+    }
+    readonly property bool isLastDetailsPage: {
+        var pages = detailsPages()
+        return pages.indexOf(_detailsPage) >= pages.length - 1
+    }
+    // Forward through the details windows (creation walk); past the last one
+    // lands on the summary.
+    function detailsAdvance() {
+        var pages = detailsPages()
+        var i = pages.indexOf(_detailsPage)
+        if (i < 0 || i >= pages.length - 1) {
+            _fromSummary = false
+            currentStep = "summary"
+        } else {
+            _detailsPage = pages[i + 1]
+        }
+    }
+    // "Move on" from a details window: a window opened FROM the summary returns
+    // there; in the creation walk it steps to the next window. Backs both the
+    // Continue button and the equipment tiles' auto-advance on selection.
+    function detailsContinue() {
+        if (_fromSummary) {
+            _fromSummary = false
+            currentStep = "summary"
+        } else {
+            detailsAdvance()
+        }
+    }
+
+    function openStep(step) {
+        _fromSummary = (currentStep === "summary")
+        _enterStep(step)
+    }
+    function stepDone(nextStep) {
+        if (_fromSummary) {
+            _fromSummary = false
+            _enterStep("summary")
+        } else {
+            _enterStep(nextStep)
+        }
+    }
+    function _enterStep(step) {
+        currentStep = step
+        if (step === "bean")
+            BagService.requestInventory()
+        // The "profile" step's ranking request now lives in ProfilePicker
+        // itself, reactive to its beanBrand/beanType/roastLevel/teaType
+        // properties — those already change when the bean step sets fRoaster
+        // etc., regardless of which step is visible when it happens.
+    }
+
+    // The bottom-bar back arrow steps BACK through the wizard; it exits only
+    // from the first step (or from the summary when the wizard opened there —
+    // edit/promote/clone). A step opened from the summary returns to it.
+    function goBackOneStep() {
+        if (_fromSummary) {
+            _fromSummary = false
+            _enterStep("summary")
+            return
+        }
+        switch (currentStep) {
+        case "drink":
+            requestExit()
+            break
+        case "bean":
+            _enterStep("drink")
+            break
+        case "profile":
+            _enterStep("bean")
+            break
+        case "details": {
+            // Step back through the details windows; from the first one, back
+            // out to the profile step (bean, for hot-water tea with no profile).
+            let pages = detailsPages()
+            let i = pages.indexOf(_detailsPage)
+            if (i > 0) {
+                _detailsPage = pages[i - 1]
+            } else if (isHotWaterTea) {
+                // "Just hot water" was picked ON the profile step — return
+                // there with the tea profile list restored (and undo the
+                // row's hot-water pre-seed; picking it again re-applies).
+                fDrinkType = "tea"
+                setWaterIncluded(false)
+                _enterStep("profile")
+            } else {
+                _enterStep("profile")
+            }
+            break
+        }
+        case "summary":
+            if (_enteredAtSummary)
+                requestExit()
+            else {
+                // Back into the creation walk: re-enter at the last details
+                // window so Continue-ing returns straight to the summary.
+                _detailsPage = detailsPages().slice(-1)[0]
+                _enterStep("details")
+            }
+            break
+        default:
+            requestExit()
+        }
+    }
+
+    // --- drink-type templates ---------------------------------------------
+    // Per-type wizard configuration. Filter sets follow the profile JSON
+    // beverage_type vocabulary (empty/missing = espresso — see
+    // ProfileService's current-profile beverage type. Blocks listed under
+    // `preseed` are switched on when the type is picked; `fields` gates the
+    // details step. Tea default temps come from ProfileService.defaultTeaTempC.
+    readonly property var templates: ({
+        espresso:     { beverages: ["espresso", ""], bagKind: "coffee",
+                        milk: false, water: false, grind: true, isTea: false },
+        filter:       { beverages: ["filter", "pourover"], bagKind: "coffee",
+                        milk: false, water: false, grind: true, isTea: false },
+        americano:    { beverages: ["espresso", ""], bagKind: "coffee",
+                        milk: false, water: true, waterOrder: "after", grind: true, isTea: false },
+        long_black:   { beverages: ["espresso", ""], bagKind: "coffee",
+                        milk: false, water: true, waterOrder: "before", grind: true, isTea: false },
+        latte:        { beverages: ["espresso", ""], bagKind: "coffee",
+                        milk: true, water: false, grind: true, isTea: false },
+        latte_hotwater: { beverages: ["espresso", ""], bagKind: "coffee",
+                        milk: true, water: true, waterOrder: "before", grind: true, isTea: false },
+        tea:          { beverages: ["tea_portafilter"], bagKind: "tea",
+                        milk: false, water: false, grind: false, isTea: true },
+        tea_hotwater: { beverages: [], bagKind: "tea",
+                        milk: false, water: true, waterOrder: "after", grind: false, isTea: true }
+    })
+    readonly property var activeTemplate: templates[fDrinkType] || templates.espresso
+    readonly property bool isTeaDrink: activeTemplate.isTea === true
+    readonly property bool isHotWaterTea: fDrinkType === "tea_hotwater"
+
+    // Labels/icons live in the DrinkType singleton (shared with the cards,
+    // pills, and auto-naming). The wizard's own picker keeps the LONG forms
+    // ("Latte / Cappuccino"); everything downstream uses the short ones.
+    function drinkTypeLabel(t) { return DrinkType.longLabel(t) }
+    function drinkTypeIcon(t) { return DrinkType.icon(t) }
+    function drinkTypeIcons(t) { return DrinkType.icons(t) }
+
+    // --- form state (same vocabulary as the old composer) ------------------
+    property string fDrinkType: ""
+    property string fProfileTitle: ""
+    property string fProfileJson: ""
+    property real fProfileTempC: 0
+    property real fTempDeltaC: 0
+    // The stored offset as loaded, preserved verbatim when the profile's own
+    // temperature can't be resolved (uninstalled profile): the tea save path
+    // needs the profile temp to convert its absolute UI back to an offset,
+    // and without it the loaded offset must ride through untouched.
+    property real fLoadedTempOffsetC: 0
+    property bool _submitting: false
+    // The hard bag link (recipes-bag-links-ui-polish): the SPECIFIC bag this
+    // recipe is made with — selection on the bag step links exactly that
+    // bag; two open bags of one bean are distinct choices. 0 = no bag.
+    property real fBagId: 0
+    property string fBeanBaseId: ""
+    property string fRoaster: ""
+    property string fCoffee: ""
+    property string fBagBlob: ""          // selected bag's beanBaseData (tea brewing seeds)
+    property real fEquipmentId: 0
+    property bool _equipmentChoiceMade: false
+    property string fEquipmentName: ""
+    // Grinder identity of the recipe's selected package — the grind control's
+    // context (grind-value-entry: the recipe's grinder, never the active one).
+    property string fEquipmentGrinderBrand: ""
+    property string fEquipmentGrinderModel: ""
+    // RPM capability: one function, the RECIPE's package as arguments — not the
+    // argument-less active-grinder resolution (which would ignore the package
+    // the equipment window just made the user choose).
+    readonly property bool fEquipmentRpmCapable:
+        Boolean(_selectedPackage && _selectedPackage.rpmCapable)
+    readonly property real minimumRatio: Number(RecipeContext.preferences.minRatio) || 0.5
+    readonly property real maximumRatio: Number(RecipeContext.preferences.maxRatio) || 100.0
+    // The recipe's own dial-in (grind always lives on the recipe —
+    // fix-recipe-grind-integrity). 0 rpm = unset, uniform across surfaces.
+    property string fGrind: ""
+    property int fRpmPinned: 0
+    property bool fHasMilk: false
+    property real fMilkWeightG: 0
+    property string fPitcherName: ""
+    // The built-in "Heater off" entry, chosen deliberately. Distinct from
+    // naming no pitcher: that is silence, this is a decision, and the app
+    // resolves them differently.
+    property bool fHeaterOff: false
+    property int fPitcherDurationSec: 0
+    property int fPitcherFlow: 0
+    property real fPitcherTemperatureC: 0
+    property real fPitcherWeightG: 0
+    property real fPitcherSecondsPerGram: 0
+    property string _loadedSteamJson: ""
+    property bool _steamChoiceEdited: false
+    property bool _loadedSteamHasDetails: false
+    property bool _steamRemoved: false
+    // A clone is an editable copy of a saved recipe, not a shot prefill.
+    readonly property bool _fromSavedRecipe: mode === "edit" || (prefill && prefill.clonedFromRecipeId > 0)
+    readonly property bool legacySteamSettings: _fromSavedRecipe && !fHasMilk && !_steamRemoved
+        && (fPitcherName !== "" || fHeaterOff || fMilkWeightG > 0
+            || (!_steamChoiceEdited && _loadedSteamHasDetails))
+    property bool fHasWater: false
+    property string fVesselName: ""
+    property int fVesselVolume: 0
+    property string fWaterAmountMode: "fixed"
+    property real fWaterRatio: 2.5
+    readonly property real waterEspressoTargetG: {
+        let bag = {}
+        for (let i = 0; i < _bags.length; ++i)
+            if (_bags[i].id === fBagId) bag = _bags[i]
+        return RecipeContext.recipeYieldPreview({yieldMode: fYieldMode,
+            yieldValue: fYieldMode === "ratio" ? (parseFloat(ratioField.text) || 0) : (parseFloat(yieldField.text) || 0),
+            doseG: parseFloat(doseField.text) || 0}, bag, fProfileYieldG, resolveProfileObj() || {})
+    }
+    property string fVesselMode: "weight"
+    property int fVesselFlowRate: 40
+    property real fVesselTemperatureC: 0
+    property string fWaterOrder: "after"
+    property string _loadedWaterJson: ""
+    property bool _waterChoiceEdited: false
+    property bool _loadedWaterHasDetails: false
+    property bool _waterRemoved: false
+    readonly property bool legacyWaterSettings: _fromSavedRecipe && !fHasWater && !_waterRemoved
+        && (fVesselName !== "" || (!_waterChoiceEdited && _loadedWaterHasDetails))
+    readonly property bool showSavedGrind: activeTemplate.grind
+        || (_fromSavedRecipe && (fGrind.trim() !== "" || fRpmPinned > 0))
+    property string errorMessage: ""
+    property string _autoName: ""
+
+    // Lowercased names of existing non-archived recipes (excluding the one being
+    // edited). TWO consumers: suggestName() uses it to disambiguate an auto-name
+    // collision, and `nameInUse` below uses it to GATE SAVE
+    // (block-duplicate-active-names) — so this is no longer cosmetic-only. Filled
+    // asynchronously by requestInventory() → onInventoryReady; empty until it
+    // lands, in which case the collision qualifier degrades to nothing (the plain
+    // descriptive name ships, never worse than before) and the save gate reads as
+    // "no collision", leaving the storage guard to refuse a genuine duplicate.
+    property var _existingRecipeNames: []
+    property string _promoteShotRequestId: ""
+    property bool _promoteShotWaitingForHistory: false
+    property string _latestShotRequestId: ""
+    property var _latestShotQuery: ({})
+    property bool _latestShotWaitingForHistory: false
+    property string _latestGrindRequestId: ""
+    property var _latestGrindQuery: ({})
+    property bool _latestGrindWaitingForHistory: false
+    property string _grindDefaultRequestId: ""
+    property bool _grindDefaultWaiting: false
+    property bool _grindUserEdited: false
+    property string _grindDefaultContext: ""
+
+    function requestPromotedShotWhenReady() {
+        if (!_promoteShotWaitingForHistory || promoteShotId <= 0
+            || !visible || !RecipeContext.historyReady)
+            return
+        _promoteShotWaitingForHistory = false
+        _promoteShotRequestId = RecipeContext.newRequestId()
+        RecipeContext.requestHistory(_promoteShotRequestId, "shot", { shotId: promoteShotId })
+    }
+
+    function retryDeferredHistoryReads() {
+        if (!visible || !RecipeContext.historyReady)
+            return
+        requestPromotedShotWhenReady()
+        if (_latestShotWaitingForHistory)
+            requestLatestShotForSelection()
+        if (_latestGrindWaitingForHistory)
+            requestLatestGrindForSelection()
+        if (_grindDefaultWaiting)
+            requestRecipeGrindDefault()
+    }
+
+    readonly property bool _equipmentServiceReady: EquipmentService.ready
+    on_EquipmentServiceReadyChanged: {
+        if (_equipmentServiceReady && visible) requestGrindHint()
+    }
+
+    onVisibleChanged: {
+        if (visible) {
+            retryDeferredHistoryReads()
+            requestGrindHint()
+        }
+    }
+
+    // Yield anchor (add-yield-ratio-anchor): which of {yield, ratio} was last
+    // written — "none" | "absolute" | "ratio". The non-anchored field shows
+    // the derived value, dimmed, never blank; only the anchor is stored.
+    property string fYieldMode: "none"
+
+    // Re-derive the non-anchored yield field through the dose. Called on any
+    // dose/yield/ratio edit and after seeding.
+    function syncDerivedYieldFields() {
+        var d = parseFloat(doseField.text) || 0
+        if (fYieldMode === "ratio") {
+            let r = parseFloat(ratioField.text) || 0
+            yieldField.text = (d > 0 && r > 0) ? (d * r).toFixed(1) : ""
+        } else if (fYieldMode === "absolute") {
+            let y = parseFloat(yieldField.text) || 0
+            ratioField.text = (d > 0 && y > 0) ? (y / d).toFixed(1) : ""
+        } else {
+            // Unanchored: both empty unless one gets typed into.
+        }
+    }
+
+    readonly property bool hasBean: fBeanBaseId !== "" || fRoaster !== "" || fCoffee !== ""
+    // The name this recipe arrived with (edit mode only; empty when creating).
+    property string _originalName: ""
+    // Cause of the last refused save, from recipeUpdateFailed.
+    property string _saveFailReason: ""
+    // Snapshot the persisted editable fields before they seed the form. The
+    // storage service compares this with the row inside the update transaction.
+    property var _originalEditableSnapshot: ({})
+    property bool _saveConflict: false
+
+    // Active-name uniqueness (block-duplicate-active-names): the entered name may
+    // not match another non-archived recipe. Relies on `_existingRecipeNames`,
+    // which onInventoryReady fills with the lowercased non-archived names minus
+    // the recipe being edited; it is empty until that request lands, so this reads
+    // as "no collision" until then and the storage guard is the real backstop.
+    //
+    // Re-saving the name a recipe already has is never a collision — otherwise a
+    // recipe that already shared a name with another could not be edited at all.
+    readonly property bool nameInUse: {
+        var n = recipeNameEditor.text.trim().toLowerCase()
+        if (n.length === 0) return false
+        if (n === _originalName.trim().toLowerCase()) return false
+        return _existingRecipeNames.indexOf(n) >= 0
+    }
+    readonly property bool canSave: RecipeService.ready && !RecipeService.busy
+        && (!fHasWater || fWaterAmountMode !== "ratio" || RecipeContext.waterAmountPreview(
+            Object.assign({hasWater: true, vesselName: fVesselName}, recipeVesselSnapshot()), waterEspressoTargetG).valid)
+        && !_saveConflict
+        && RecipeService.isSaveValid(recipeNameEditor.text, fProfileTitle, buildHotWaterJson())
+        && !nameInUse
+
+    // What the summary hero renders: the wizard state shaped exactly like a
+    // stored recipe map, so the shared RecipeDrinkCard shows the card the
+    // management page will show after save (WYSIWYG). An object-literal
+    // binding — re-evaluates as the fields change.
+    readonly property var previewMap: ({
+        name: recipeNameEditor.text,
+        drinkType: fDrinkType,
+        profileTitle: fProfileTitle,
+        bagId: fBagId,
+        beanBaseId: fBeanBaseId,
+        roasterName: fRoaster,
+        coffeeName: fCoffee,
+        doseG: parseFloat(doseField.text) || 0,
+        yieldValue: fYieldMode === "ratio"
+            ? ((parseFloat(ratioField.text) || 0) > 0
+               ? Math.max(minimumRatio, Math.min(maximumRatio, parseFloat(ratioField.text))) : 0)
+            : (parseFloat(yieldField.text) || 0),
+        yieldMode: (fYieldMode === "ratio" && (parseFloat(ratioField.text) || 0) > 0) ? "ratio"
+                 : (fYieldMode === "absolute" && (parseFloat(yieldField.text) || 0) > 0) ? "absolute"
+                 : "none",
+        tempOffsetC: isTeaDrink
+            ? (fProfileTempC > 0
+                ? (fTeaTempC > 0 && Math.abs(fTeaTempC - fProfileTempC) > 0.05
+                    ? fTeaTempC - fProfileTempC : 0)
+                : fLoadedTempOffsetC)
+            : (Math.abs(fTempDeltaC) > 0.05 ? fTempDeltaC : 0),
+        grindPinned: showSavedGrind ? fGrind.trim() : "",
+        steamJson: buildSteamJson(),
+        hotWaterJson: buildHotWaterJson()
+    })
+
+    // Auto-suggested name ("<Bean> <DrinkType> · <Profile>"): applied while the
+    // field is empty or still holds the previous suggestion — never over a
+    // user edit. SHORT type labels only ("Gran Bar Latte", never "… Latte /
+    // Cappuccino"), and the type word is skipped when the bean name already
+    // ends with it ("Milk Blend Espresso", not "Milk Blend Espresso Espresso").
+    // The profile is included from the first recipe (issue #1548: one bean made
+    // many ways needs the profile to be distinguishable AND searchable — users
+    // hunt by profile, e.g. "Crem Yir" = Cremina Yirgacheffe). The profile is
+    // cleaned first (editor prefix stripped, type-word stutter removed).
+    function suggestName() {
+        var bean = (fCoffee !== "" ? fCoffee : fRoaster).trim()
+        var typeWord = fDrinkType !== "" ? DrinkType.shortLabel(fDrinkType) : ""
+        var parts = []
+        if (bean !== "") parts.push(bean)
+        if (typeWord !== "") {
+            let stutter = bean !== ""
+                && bean.toLowerCase().endsWith(" " + typeWord.toLowerCase())
+            if (bean.toLowerCase() === typeWord.toLowerCase())
+                stutter = true
+            if (!stutter) parts.push(typeWord)
+        }
+        var base = parts.join(" ")
+        // Append the cleaned profile (a hot-water tea recipe carries none).
+        var profile = cleanProfileForName(fProfileTitle, typeWord)
+        if (profile !== "")
+            base = base === "" ? profile : (base + " · " + profile)
+
+        if (base === "")
+            return
+
+        // When the composed name matches an existing recipe's display name
+        // (a plain name-string match — we cache names, not their identity),
+        // disambiguate by appending the DRAFT's own dial-in value: yield tried
+        // first, else dose. Never a bare counter. Best-effort: with the
+        // inventory not yet loaded (or no usable value) the plain `base` ships.
+        var suggestion = base
+        if (nameCollides(base)) {
+            let yq = yieldQualifierText()
+            let dq = doseQualifierText()
+            if (yq !== "" && !nameCollides(base + " " + yq))
+                suggestion = base + " " + yq
+            else if (dq !== "" && !nameCollides(base + " " + dq))
+                suggestion = base + " " + dq
+            else if (yq !== "")
+                suggestion = base + " " + yq       // best effort — still shown
+            else if (dq !== "")
+                suggestion = base + " " + dq
+        }
+
+        if (suggestion === "" || (recipeNameEditor.text !== "" && recipeNameEditor.text !== _autoName))
+            return
+        recipeNameEditor.text = suggestion
+        _autoName = suggestion
+    }
+
+    // Turn a profile title into the token used in a suggested recipe name:
+    // strip the D-Flow/ or A-Flow/ editor-membership prefix (see the project
+    // note "editor membership = title prefix"), then drop a trailing word that
+    // just repeats the drink-type word (the bean stutter rule, for the
+    // profile). Returns "" when no profile or nothing survives.
+    function cleanProfileForName(title, typeWord) {
+        var p = (title || "").trim()
+        if (p === "")
+            return ""
+        var lower = p.toLowerCase()
+        if (lower.indexOf("d-flow/") === 0 || lower.indexOf("a-flow/") === 0)
+            p = p.substring(p.indexOf("/") + 1).trim()
+        if (typeWord && typeWord !== "") {
+            let lp = p.toLowerCase(), lt = typeWord.toLowerCase()
+            if (lp === lt)
+                return ""
+            if (lp.endsWith(" " + lt))
+                p = p.substring(0, p.length - lt.length - 1).trim()
+        }
+        return p
+    }
+
+    // True when an existing non-archived recipe already carries this exact name
+    // (case-insensitive). The set excludes the recipe being edited.
+    function nameCollides(candidate) {
+        var c = (candidate || "").trim().toLowerCase()
+        if (c === "")
+            return false
+        for (let i = 0; i < _existingRecipeNames.length; ++i)
+            if (_existingRecipeNames[i] === c)
+                return true
+        return false
+    }
+
+    // Collision qualifiers from the current dial-in state. Ratio → "1:2.5",
+    // absolute yield / dose → "40g" (trailing ".0" trimmed).
+    function yieldQualifierText() {
+        if (fYieldMode === "ratio") {
+            let r = parseFloat(ratioField.text) || 0
+            return r > 0 ? "1:" + trimNumForName(r) : ""
+        }
+        if (fYieldMode === "absolute") {
+            let y = parseFloat(yieldField.text) || 0
+            return y > 0 ? trimNumForName(y) + "g" : ""
+        }
+        return ""
+    }
+    function doseQualifierText() {
+        var d = parseFloat(doseField.text) || 0
+        return d > 0 ? trimNumForName(d) + "g" : ""
+    }
+    function trimNumForName(v) {
+        return Number(v).toFixed(1).replace(/\.0$/, "")
+    }
+
+
+    Component.onCompleted: {
+        if (mode === "edit" && editRecipeId > 0) {
+            currentStep = "summary"
+            _enteredAtSummary = true
+            RecipeService.requestRecipe(editRecipeId)
+        } else if (promoteShotId > 0) {
+            currentStep = "summary"
+            _enteredAtSummary = true
+            _promoteShotWaitingForHistory = true
+            requestPromotedShotWhenReady()
+        } else if (prefill && Object.keys(prefill).length > 0) {
+            currentStep = "summary"
+            _enteredAtSummary = true
+            applyRecipeMap(prefill)
+            recipeNameEditor.focusInput()
+            recipeNameEditor.selectAll()
+            captureBaseline()
+        } else {
+            currentStep = "drink"
+            captureBaseline()
+        }
+        // EVERY entry path needs the existing-name set, not just the blank-create
+        // walk: besides feeding suggestName()'s auto-name disambiguation, it now
+        // backs the duplicate-name gate on Save (block-duplicate-active-names).
+        // Requesting it only for the blank walk left `nameInUse` permanently false
+        // in edit/promote/clone — i.e. inert in edit mode, which is exactly where a
+        // rename collision happens.
+        //
+        // Issued LAST, after each path's own load above, deliberately: runAsync
+        // dispatches to a single FIFO SerialDbWorker, so putting this heavy
+        // full-table scan first would delay the recipe/shot the user is waiting to
+        // see. The gate reads as "no collision" until the scan lands, and the
+        // storage guard is the real backstop either way.
+        RecipeService.requestInventory()
+    }
+
+    // --- ported state <-> JSON helpers (verbatim composer semantics) -------
+
+    function applyRecipeMap(r) {
+        recipeNameEditor.text = r.name || ""
+        // Only in EDIT mode does the recipe have a name it already owns. Recording
+        // it lets the duplicate gate fire on an actual rename only, so a recipe
+        // that already shares a name with another stays editable
+        // (block-duplicate-active-names). A clone/promote is a new recipe, so any
+        // collision there IS new and must block.
+        if (mode === "edit" && editRecipeId > 0)
+            _originalName = recipeNameEditor.text
+        fProfileTitle = r.profileTitle || ""
+        fProfileJson = r.profileJson || ""
+        fBagId = r.bagId || 0
+        fBeanBaseId = r.beanBaseId || ""
+        fRoaster = r.roasterName || ""
+        fCoffee = r.coffeeName || ""
+        fEquipmentId = r.equipmentId || 0
+        doseField.text = r.doseG > 0 ? Number(r.doseG).toFixed(1) : ""
+        // Yield spec: the anchored field gets the stored value; the other
+        // derives through the dose (dimmed, never blank). A legacy prefill
+        // map still carrying yieldG seeds an absolute.
+        fYieldMode = ((r.yieldMode === "ratio" || r.yieldMode === "absolute")
+                      && (r.yieldValue || 0) > 0) ? r.yieldMode
+                   : ((r.yieldG || 0) > 0 ? "absolute" : "none")
+        if (fYieldMode === "ratio") {
+            ratioField.text = Number(r.yieldValue).toFixed(1)
+            yieldField.text = ""
+        } else if (fYieldMode === "absolute") {
+            yieldField.text = Number((r.yieldValue || 0) > 0 ? r.yieldValue : r.yieldG).toFixed(1)
+            ratioField.text = ""
+        } else {
+            yieldField.text = ""
+            ratioField.text = ""
+        }
+        syncDerivedYieldFields()
+        fLoadedTempOffsetC = r.tempOffsetC || 0
+        refreshProfileTemp()
+        // The stored offset loads verbatim — no open-time subtraction against
+        // the profile temp, so a profile temperature edit can never manufacture
+        // a phantom offset here (recipe-relative-temp-offset).
+        fTempDeltaC = r.tempOffsetC || 0
+        // Tea EDITS its brew temperature ABSOLUTE (fTeaTempC) but stores the
+        // same offset — seed the absolute as profileTemp + offset here or an
+        // edit/clone/promote (which all load through this function and open on
+        // the summary, never through applyDetailsPrefill) would save 0 and
+        // silently discard the stored temperature. Unresolvable profile → 0;
+        // the save path then preserves fLoadedTempOffsetC instead.
+        fTeaTempC = (r.drinkType && String(r.drinkType).indexOf("tea") === 0
+                     && fProfileTempC > 0) ? fProfileTempC + (r.tempOffsetC || 0) : 0
+        fGrind = r.grindPinned || ""
+        fRpmPinned = r.rpmPinned || 0
+        _grindUserEdited = true
+        applySteamJson(r.steamJson || "")
+        applyHotWaterJson(r.hotWaterJson || "")
+        // Drink type: stored value, else derive from the loaded blocks — a
+        // legacy (pre-migration-28) recipe opens under the right template.
+        fDrinkType = r.drinkType || deriveDrinkType()
+        // Loading an existing recipe counts as "already filled" — a later async
+        // history reply must not overwrite the saved numbers.
+        _detailsUserEdited = true
+        _numbersSource = "saved"
+        if (fEquipmentId > 0)
+            EquipmentService.requestInventory()
+        refreshBagDetails()
+    }
+
+    // QML-side mirror of Recipe::deriveDrinkType (blocks + the selected
+    // profile's beverage_type, resolvable here because ProfileService is).
+    function deriveDrinkType() {
+        var bev = ""
+        if (fProfileTitle !== "") {
+            const info = ProfileService.profileCatalogInfoForTitle(fProfileTitle)
+            bev = String(info.beverageType || "").toLowerCase()
+        }
+        if (fProfileTitle === "" && fHasWater) return "tea_hotwater"
+        if (bev === "tea_portafilter") return "tea"
+        if (fHasMilk && fHasWater) return "latte_hotwater"
+        if (fHasMilk) return "latte"
+        if (fHasWater) return fWaterOrder === "before" ? "long_black" : "americano"
+        if (bev === "filter" || bev === "pourover") return "filter"
+        return "espresso"
+    }
+
+    function applySteamJson(json) {
+        _loadedSteamJson = json || ""
+        _steamChoiceEdited = false; _loadedSteamHasDetails = false; _steamRemoved = false
+        fHasMilk = false; fMilkWeightG = 0; fHeaterOff = false
+        fPitcherName = ""; fPitcherDurationSec = 0; fPitcherFlow = 0; fPitcherTemperatureC = 0
+        fPitcherWeightG = 0
+        if (!json || json === "")
+            return
+        try {
+            let s = JSON.parse(json)
+            _loadedSteamHasDetails = Object.keys(s).some(function(k) { return k !== "hasMilk" })
+            fHasMilk = !!s.hasMilk
+            fMilkWeightG = s.milkWeightG || 0
+            fHeaterOff = !!s.heaterOff
+            fPitcherName = s.pitcherName || ""
+            fPitcherDurationSec = s.durationSec || 0
+            fPitcherFlow = s.flow || 0
+            fPitcherTemperatureC = s.temperatureC || 0
+            fPitcherWeightG = s.pitcherWeightG || 0
+            fPitcherSecondsPerGram = s.secondsPerGram || 0
+        } catch (e) {
+            WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: bad steam JSON:", e].map(String).join(" "))
+        }
+    }
+
+    function buildSteamJson() {
+        // A new recipe must not inherit a shot's ambient pitcher when milk was
+        // not included. Existing recipes lack provenance, so preserve their
+        // saved settings on edit rather than guessing whether they were chosen.
+        if (!fHasMilk && _steamRemoved)
+            return ""
+        if (_fromSavedRecipe && !fHasMilk && !_steamChoiceEdited)
+            return _loadedSteamJson
+        if (!fHasMilk && !legacySteamSettings)
+            return ""
+        if (!fHasMilk && fMilkWeightG <= 0 && fPitcherName === "" && !fHeaterOff)
+            return ""
+        var s = { hasMilk: fHasMilk }
+        if (fMilkWeightG > 0) s.milkWeightG = fMilkWeightG
+        // Mutually exclusive: the built-in entry carries no values, so writing
+        // both would leave activation resolving two contradictory answers.
+        if (fHeaterOff) {
+            s.heaterOff = true
+        } else if (fPitcherName !== "") {
+            s.pitcherName = fPitcherName
+            s.durationSec = fPitcherDurationSec
+            s.flow = fPitcherFlow
+            s.temperatureC = fPitcherTemperatureC
+            // Lets activation restore a deleted pitcher's empty weight, which milk capture needs.
+            if (fPitcherWeightG > 0) s.pitcherWeightG = fPitcherWeightG
+            if (fPitcherSecondsPerGram > 0) s.secondsPerGram = fPitcherSecondsPerGram
+        }
+        return JSON.stringify(s)
+    }
+
+    function applyHotWaterJson(json) {
+        _loadedWaterJson = json || ""
+        _waterChoiceEdited = false; _loadedWaterHasDetails = false; _waterRemoved = false
+        fHasWater = false; fVesselName = ""; fVesselVolume = 0
+        fVesselMode = "weight"; fVesselFlowRate = 40; fVesselTemperatureC = 0
+        fWaterOrder = "after"
+        fWaterAmountMode = "fixed"; fWaterRatio = 2.5
+        if (!json || json === "")
+            return
+        try {
+            let w = JSON.parse(json)
+            _loadedWaterHasDetails = Object.keys(w).some(function(k) { return k !== "hasWater" })
+            fHasWater = !!w.hasWater
+            fVesselName = w.vesselName || ""
+            fVesselVolume = w.volume || 0
+            fWaterAmountMode = w.amountMode ?? ""
+            fWaterRatio = Number(w.waterToEspressoRatio ?? 2.5)
+            fVesselMode = w.mode || "weight"
+            fVesselFlowRate = w.flowRate || 40
+            fVesselTemperatureC = w.temperatureC || 0
+            fWaterOrder = w.order === "before" ? "before" : "after"
+        } catch (e) {
+            WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: bad hot water JSON:", e].map(String).join(" "))
+        }
+    }
+
+    function buildHotWaterJson() {
+        if (!fHasWater && _waterRemoved)
+            return ""
+        if (_fromSavedRecipe && !fHasWater && !_waterChoiceEdited)
+            return _loadedWaterJson
+        if (!fHasWater && !legacyWaterSettings)
+            return ""
+        var w = { hasWater: fHasWater, order: fWaterOrder }
+        if (fVesselName !== "") {
+            const vessel = recipeVesselSnapshot()
+            w.vesselName = fVesselName
+            w.amountMode = vessel.amountMode
+            if (vessel.amountMode === "ratio") w.waterToEspressoRatio = vessel.waterToEspressoRatio
+            else w.volume = vessel.volume
+            w.mode = vessel.mode
+            w.flowRate = vessel.flowRate
+            w.temperatureC = vessel.temperatureC
+        }
+        return JSON.stringify(w)
+    }
+
+    // Build the current steam settings as a snapshot (promote fallback when
+    // the shot predates steam snapshots). Mirrors currentSteamSpecJson().
+    function currentSteamSnapshot() {
+        var s = {}
+        // "Heater off" is a PITCHER, so snapshotting the current state has to
+        // record it like any other. Testing only for a real preset dropped it,
+        // and a drink promoted while it was selected reopened as one that had
+        // never been asked the question. Resolved through getSteamPitcherPreset
+        // so the sentinel and the display slot both answer.
+        var current = SteamService.getSteamPitcherPreset(SteamService.state.selectedSteamPitcher)
+        if (current && current.disabled === true) {
+            s.heaterOff = true
+        } else if (current && (current.name || "") !== "") {
+            s.pitcherName = current.name
+            s.durationSec = current.duration || 0
+            s.flow = current.flow || 0
+            s.temperatureC = current.temperature || 0
+            if ((current.pitcherWeightG || 0) > 0)
+                s.pitcherWeightG = current.pitcherWeightG
+            if ((current.secondsPerGram || 0) > 0)
+                s.secondsPerGram = current.secondsPerGram
+        }
+        if (SteamService.state.lastSteamMilkG > 0)
+            s.milkWeightG = SteamService.state.lastSteamMilkG
+        return Object.keys(s).length > 0 ? JSON.stringify(s) : ""
+    }
+
+    function prefillFromShot(shot) {
+        var beanBaseId = ""
+        if (shot.beanBaseJson) {
+            try {
+                beanBaseId = JSON.parse(shot.beanBaseJson).id || ""
+            } catch (e) {
+                WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: bad beanBaseJson on promoted shot:", e].map(String).join(" "))
+            }
+        }
+        // Route through `prefill` so save() picks up the provenance fields.
+        prefill = ({
+            name: "",
+            profileTitle: shot.profileName || "",
+            profileJson: shot.profileJson || "",
+            // The shot's own bag becomes the recipe's hard bag link (a
+            // pre-bag shot carries no link; the bean identity still does).
+            bagId: shot.bagId > 0 ? shot.bagId : 0,
+            beanBaseId: beanBaseId,
+            roasterName: shot.beanBrand || "",
+            coffeeName: shot.beanType || "",
+            equipmentId: shot.equipmentId || 0,
+            doseG: shot.doseWeightG || 0,
+            // Promotion copies the shot's recorded ANCHOR (add-yield-ratio-
+            // anchor): a 1:2 shot promotes to a 1:2 recipe; a legacy shot
+            // (no anchor emitted) promotes its recorded target as absolute —
+            // never a ratio reconstructed from target ÷ dose (the dose is
+            // post-shot editable). Mirrors RecipePromotion::fieldsFromShotRecord.
+            yieldValue: (shot.yieldMode === "ratio" || shot.yieldMode === "absolute")
+                ? (shot.yieldAnchorValue || 0) : (shot.targetWeightG || 0),
+            yieldMode: (shot.yieldMode === "ratio" || shot.yieldMode === "absolute")
+                ? shot.yieldMode : ((shot.targetWeightG || 0) > 0 ? "absolute" : "none"),
+            // The shot's temperature override is a frozen ABSOLUTE; converted
+            // to the recipe's offset below, once applyRecipeMap has resolved
+            // the shot's profile temperature.
+            tempOffsetC: 0,
+            // The shot's own recorded dial — the exact grind that produced the
+            // shot being promoted — is the recipe's default (grind lives on
+            // the recipe; there is no inherit-from-bag encoding to fall back
+            // to). Editable on the summary before saving.
+            grindPinned: shot.grinderSetting || "",
+            rpmPinned: shot.rpm || 0,
+            steamJson: shot.steamJson && shot.steamJson !== "" ? shot.steamJson
+                                                               : currentSteamSnapshot(),
+            hotWaterJson: shot.hotWaterJson || "",
+            createdFromShotId: promoteShotId
+        })
+        applyRecipeMap(prefill)
+        // Promote-from-shot conversion (recipe-relative-temp-offset): offset =
+        // the shot's absolute override − the SHOT's profile snapshot
+        // temperature — the profile as it was when the shot was pulled, which
+        // is what the override was relative to. Same anchor as the C++
+        // promote path (RecipePromotion::fieldsFromShotRecord), so the two
+        // surfaces cannot disagree; the installed profile's current
+        // temperature is only the fallback for a snapshot-less shot.
+        // Unresolvable both ways → no pin.
+        if ((shot.temperatureOverrideC || 0) > 0) {
+            let promoteAnchor = 0
+            if (shot.profileJson && String(shot.profileJson).length > 0) {
+                try {
+                    promoteAnchor = Number(JSON.parse(shot.profileJson).espresso_temperature) || 0
+                } catch (e) {
+                    WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: shot profile snapshot JSON unparsable:", e].map(String).join(" "))
+                }
+            }
+            if (promoteAnchor <= 0)
+                promoteAnchor = fProfileTempC
+            if (promoteAnchor > 0) {
+                let promoteOffset = shot.temperatureOverrideC - promoteAnchor
+                if (Math.abs(promoteOffset) < 0.05)
+                    promoteOffset = 0
+                if (isTeaDrink)
+                    fTeaTempC = shot.temperatureOverrideC
+                else
+                    fTempDeltaC = promoteOffset
+            }
+        }
+        var bean = ((shot.beanBrand || "") + " " + (shot.beanType || "")).trim()
+        recipeNameEditor.text = bean !== "" ? bean : (shot.profileName || "")
+        recipeNameEditor.selectAll()
+        captureBaseline()
+    }
+
+    // Resolve the selected profile's base temperature (for the offset
+    // control) and target yield (for the summary hero's plan line).
+    property real fProfileYieldG: 0
+    // The selected profile's frame temperatures, for the summary hero's plan
+    // line — the card renders ITS profile's temps, never the loaded one
+    // (recipe-relative-temp-offset).
+    property var fProfileStepTemps: []
+    function refreshProfileTemp() {
+        fProfileTempC = 0
+        fProfileYieldG = 0
+        fProfileStepTemps = []
+        if (fProfileTitle === "")
+            return
+        var d = ProfileService.profileSummaryForTitle(fProfileTitle)
+        if ((!d || Object.keys(d).length === 0) && fProfileJson !== "") {
+            // Embedded fallback for a renamed/uninstalled profile — the same
+            // ladder the recipe cards use.
+            try { d = JSON.parse(fProfileJson) } catch (e) {
+                WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: embedded profile JSON unparsable:", e].map(String).join(" "))
+                d = null
+            }
+        }
+        if (!d)
+            return
+        fProfileTempC = Number(d.baseTempC !== undefined ? d.baseTempC : d.espresso_temperature) || 0
+        fProfileYieldG = Number(d.yieldG !== undefined ? d.yieldG : d.target_weight) || 0
+        var temps = []
+        if (d.stepTempsC && d.stepTempsC.length > 0)
+            temps = d.stepTempsC.slice()
+        else {
+            let steps = d.steps || []
+            for (let i = 0; i < steps.length; ++i) {
+                let stTemp = steps[i] ? Number(steps[i].temperature) : 0
+                if (stTemp > 0)
+                    temps.push(stTemp)
+            }
+        }
+        // See RecipesPage.refreshProfileNumbers: a resolved profile whose
+        // steps carry no explicit per-step temperature must still yield a
+        // non-empty array, or the summary hero falls through to rendering
+        // the loaded profile instead of its own.
+        fProfileStepTemps = temps.length > 0 ? temps : (fProfileTempC > 0 ? [fProfileTempC] : [])
+    }
+
+    // Re-resolve the linked bag's roast level and tea blob from inventory —
+    // used when a recipe is loaded for edit/clone, where the bag map isn't in
+    // hand.
+    function refreshBagDetails() {
+        if (hasBean)
+            BagService.requestInventory()
+    }
+
+    // The exact map save() persists (plus a create-only requestToken) — also
+    // the dirty check's comparison basis, so "unsaved changes" means
+    // precisely "save() would store something different from what was
+    // loaded".
+    function buildSaveMap() {
+        var map = {
+            name: recipeNameEditor.text.trim(),
+            drinkType: fDrinkType !== "" ? fDrinkType : deriveDrinkType(),
+            profileTitle: fProfileTitle,
+            profileJson: fProfileJson,
+            bagId: fBagId,
+            beanBaseId: fBeanBaseId,
+            roasterName: fRoaster,
+            coffeeName: fCoffee,
+            equipmentId: fEquipmentId,
+            doseG: parseFloat(doseField.text) || 0,
+            // Yield spec: only the ANCHOR is stored (one value + a mode);
+            // the derived field is display-only and never persisted.
+            // Ratio clamps to the host's canonical minimum and maximum.
+            // so the stored spec can never disagree with what activation arms.
+            yieldValue: fYieldMode === "ratio"
+                ? ((parseFloat(ratioField.text) || 0) > 0
+                   ? Math.max(minimumRatio, Math.min(maximumRatio, parseFloat(ratioField.text))) : 0)
+                : (parseFloat(yieldField.text) || 0),
+            yieldMode: (fYieldMode === "ratio" && (parseFloat(ratioField.text) || 0) > 0) ? "ratio"
+                     : (fYieldMode === "absolute" && (parseFloat(yieldField.text) || 0) > 0) ? "absolute"
+                     : "none",
+            // The offset IS the stored value (recipe-relative-temp-offset):
+            // the stepper edits it verbatim, 0 = brew at the profile's own
+            // temperature. Tea details edit the ABSOLUTE temp instead
+            // (fTeaTempC) and convert here at the boundary; an unresolvable
+            // profile preserves the loaded offset verbatim (the absolute UI
+            // could never display it, so it must not be able to destroy it).
+            tempOffsetC: isTeaDrink
+                ? (fProfileTempC > 0
+                    ? (fTeaTempC > 0 && Math.abs(fTeaTempC - fProfileTempC) > 0.05
+                        ? fTeaTempC - fProfileTempC : 0)
+                    : fLoadedTempOffsetC)
+                : (Math.abs(fTempDeltaC) > 0.05 ? fTempDeltaC : 0),
+            // Grind always lives on the recipe (fix-recipe-grind-integrity):
+            // whatever is on the field saves as the recipe's own value. Tea
+            // Tea does not acquire a grind by default; an existing saved
+            // value stays visible until the user clears it.
+            grindPinned: showSavedGrind ? fGrind.trim() : "",
+            rpmPinned: showSavedGrind ? fRpmPinned : 0,
+            steamJson: buildSteamJson(),
+            hotWaterJson: buildHotWaterJson()
+        }
+        if (prefill && prefill.createdFromShotId)
+            map.createdFromShotId = prefill.createdFromShotId
+        if (prefill && prefill.clonedFromRecipeId)
+            map.clonedFromRecipeId = prefill.clonedFromRecipeId
+        return map
+    }
+
+    function save() {
+        // Re-entry guard: a second tap while the async create/update is in
+        // flight would submit twice (create mode would duplicate the recipe —
+        // the token guard silently discards the first reply).
+        if (_submitting || !RecipeService.ready || RecipeService.busy || _saveConflict)
+            return
+        Keyboard.commit()  // IME: flush the in-progress word first
+        errorMessage = ""
+        var name = recipeNameEditor.text.trim()
+        if (name === "") {
+            errorMessage = TranslationManager.translate("recipes.wizard.errorNoName", "A recipe needs a name")
+            return
+        }
+        if (!RecipeService.isSaveValid(name, fProfileTitle, buildHotWaterJson())) {
+            errorMessage = TranslationManager.translate("recipes.wizard.errorNoProfile",
+                "A recipe needs a profile (unless it is a hot-water drink)")
+            return
+        }
+        var map = buildSaveMap()
+        _submitting = true
+        _saveFailReason = ""   // never inherit a previous attempt's cause
+        if (mode === "edit" && editRecipeId > 0) {
+            RecipeService.requestUpdateRecipe(editRecipeId, map, _originalEditableSnapshot)
+        } else {
+            // Correlation token: recipeCreated is a broadcast (MCP/web
+            // creates race this one) — the handler below must only pop on
+            // OUR create's result.
+            _createToken = "wizard-" + Date.now() + "-" + Math.floor(Math.random() * 1e9)
+            map.requestToken = _createToken
+            RecipeService.requestCreateRecipe(map)
+        }
+    }
+    property string _createToken: ""
+
+    // --- unsaved-changes guard ----------------------------------------------
+    // Snapshot of buildSaveMap() at load time; "dirty" is a comparison
+    // against it, so every field, block toggle, and picker choice is covered
+    // without per-control bookkeeping. Captured once the entry state is fully
+    // in hand (after applyRecipeMap / prefillFromShot / a blank start).
+    property string _baselineJson: ""
+    function captureBaseline() {
+        _baselineJson = JSON.stringify(buildSaveMap())
+    }
+    function hasUnsavedChanges() {
+        // No baseline yet (an edit/promote load still in flight): anything
+        // typed this early would be overwritten by applyRecipeMap when the
+        // reply lands anyway — never block the exit.
+        if (_baselineJson === "")
+            return false
+        Keyboard.commit()  // IME: flush the in-progress word first
+        return JSON.stringify(buildSaveMap()) !== _baselineJson
+    }
+    // Browser beforeunload must observe the same draft comparison without
+    // committing an IME composition as the interactive leave guard does.
+    readonly property bool browserHasUnsavedChanges: _baselineJson !== ""
+        && JSON.stringify(buildSaveMap()) !== _baselineJson
+
+    // Every cancel/back path out of the wizard funnels through here (the
+    // save-success pops and the deleted-recipe bail are deliberately not
+    // intercepted): with unsaved changes the exit dialog intercepts
+    // (Discard / Save); otherwise leave directly. The early creation-walk
+    // steps exit silently when nothing saveable exists yet (abandoning a
+    // couple of taps must not nag); from the details/summary steps — where
+    // typed content lives — any unsaved change prompts, even an unsaveable
+    // one (e.g. the name cleared for a retype): Discard plus a disabled
+    // Save beats a silent discard.
+    function requestExit() {
+        var earlyWalk = !_enteredAtSummary
+            && currentStep !== "summary" && currentStep !== "details"
+        if (hasUnsavedChanges() && (canSave || !earlyWalk))
+            exitDialog.open()
+        else
+            AppShell.backRequested()
+    }
+
+    // A failed save must be SEEN: the pinned error label exists only on the
+    // summary and details steps, but the exit dialog's Save can fire from a
+    // walk step (backing out of a create). Land on the summary, where the
+    // error, the name field, and Save sit together.
+    function showSaveError() {
+        if (currentStep !== "summary" && currentStep !== "details") {
+            _fromSummary = false
+            _enterStep("summary")
+        }
+    }
+
+    // --- wizard step actions -----------------------------------------------
+
+    // Inclusion controls serialization, not the draft: toggling a block back
+    // on restores the user's pitcher, milk amount, vessel and water settings.
+    function setMilkIncluded(included) {
+        _steamChoiceEdited = true
+        _steamRemoved = !included
+        fHasMilk = included
+    }
+
+    function setWaterIncluded(included) {
+        _waterChoiceEdited = true
+        _waterRemoved = !included
+        fHasWater = included
+    }
+
+    function selectDrinkType(type) {
+        var was = fDrinkType
+        if (type === "tea_hotwater" && fWaterAmountMode === "ratio") {
+            const preview = RecipeContext.waterAmountPreview(
+                Object.assign({hasWater: true}, recipeVesselSnapshot()), waterEspressoTargetG)
+            fVesselVolume = preview.valid ? preview.amountG : 100
+            fWaterAmountMode = "fixed"
+            fVesselMode = "weight"
+        }
+        fDrinkType = type
+        var t = templates[type]
+        // Block pre-seeds. Only when the type actually changed — re-visiting
+        // the step from the summary must not clobber tuned blocks.
+        if (was !== type) {
+            if (fHasMilk !== (t.milk === true)) {
+                setMilkIncluded(t.milk === true)
+            }
+            if (fHasWater !== (t.water === true)) {
+                setWaterIncluded(t.water === true)
+            }
+            if (t.water === true) {
+                fWaterOrder = t.waterOrder || "after"
+            }
+            // Crossing the coffee/tea boundary invalidates the bag choice.
+            if (was !== "" && (templates[was] || {}).bagKind !== t.bagKind) {
+                fBagId = 0; fBeanBaseId = ""; fRoaster = ""; fCoffee = ""; fBagBlob = ""
+                _grindDefaultRequestId = ""
+                _grindDefaultWaiting = false
+                _grindDefaultContext = ""
+                if (!_grindUserEdited) { fGrind = ""; fRpmPinned = 0 }
+            }
+            // Tea → hot-water tea keeps no profile; other switches keep it
+            // only when it still fits the new filter set (checked lazily by
+            // the profile step; clearing here keeps the walk honest).
+            if (type === "tea_hotwater")
+                { fProfileTitle = ""; fProfileJson = ""; fProfileTempC = 0; fProfileYieldG = 0; fProfileStepTemps = [] }
+            // Per-drink-type equipment default (last recipe of this type).
+            RecipeService.requestLastEquipmentForDrinkType(type)
+        }
+        suggestName()
+        // Hot-water tea has no profile step — details follows the bean.
+        stepDone("bean")
+    }
+
+    function selectBean(bag) {
+        _grindDefaultRequestId = ""
+        _grindDefaultWaiting = false
+        _grindDefaultContext = ""
+        if (!_grindUserEdited) {
+            fGrind = ""
+            fRpmPinned = 0
+        }
+        if (!bag) {
+            fBagId = 0
+            fBeanBaseId = ""; fRoaster = ""; fCoffee = ""; fBagBlob = ""
+            _selectedBagRoastLevel = ""; _selectedBagRoastDate = ""
+        } else {
+            // The tile IS the bag: link exactly this one (two open bags of
+            // the same bean are distinct choices — no identity resolution).
+            fBagId = bag.id || 0
+            fBeanBaseId = bag.beanBaseId || ""
+            fRoaster = bag.roasterName || ""
+            fCoffee = bag.coffeeName || ""
+            fBagBlob = bag.beanBaseData || ""
+            _selectedBagRoastLevel = bag.roastLevel || ""
+            _selectedBagRoastDate = bag.roastDate || ""
+            suggestName()
+        }
+        requestRecipeGrindDefault()
+        stepDone(isHotWaterTea ? "details" : "profile")
+        if (currentStep === "details")
+            applyDetailsPrefill()
+    }
+
+    function selectProfile(entry) {
+        fProfileTitle = entry.title
+        fProfileJson = ""  // installed profile: resolve by title
+        // If a tea profile was picked while the type said hot-water (or vice
+        // versa), keep the drink type honest.
+        if (fDrinkType === "tea_hotwater")
+            fDrinkType = "tea"
+        var detail = ProfileService.profileSummaryForTitle(entry.title)
+        const recommendedDose = Number(detail.recommendedDose) || 0
+        const targetWeight = Number(detail.yieldG) || 0
+        if ((recommendedDose > 0 && doseField.text === "")
+            || (targetWeight > 0 && yieldField.text === ""))
+            _numbersSource = "profile"
+        if (recommendedDose > 0 && doseField.text === "") {
+            doseField.text = recommendedDose.toFixed(1)
+            syncDerivedYieldFields()
+        }
+        if (targetWeight > 0 && yieldField.text === "" && fYieldMode === "none") {
+            yieldField.text = targetWeight.toFixed(1)
+            fYieldMode = "absolute"
+            syncDerivedYieldFields()
+        }
+        fProfileTempC = Number(detail.baseTempC) || 0
+        fProfileYieldG = targetWeight
+        var pickedTemps = []
+        if (detail.stepTempsC && detail.stepTempsC.length > 0)
+            pickedTemps = detail.stepTempsC.slice()
+        else {
+            let pickedSteps = detail.steps || []
+            for (let psi = 0; psi < pickedSteps.length; ++psi) {
+                let psTemp = pickedSteps[psi] ? Number(pickedSteps[psi].temperature) : 0
+                if (psTemp > 0)
+                    pickedTemps.push(psTemp)
+            }
+        }
+        // See RecipesPage.refreshProfileNumbers: don't leave this empty
+        // when the profile resolved but its steps carry no per-step temp.
+        fProfileStepTemps = pickedTemps.length > 0 ? pickedTemps : (fProfileTempC > 0 ? [fProfileTempC] : [])
+        // Tea temp is resolved entirely by applyDetailsPrefill (bag vendor
+        // temp with the type-match correction, then profile default, then
+        // history overwrite) — pre-seeding it here would make that whole
+        // chain dead code (its `fTeaTempC <= 0` gate would never open).
+        suggestName()
+        stepDone("details")
+        applyDetailsPrefill()
+    }
+
+    function selectJustHotWater() {
+        fDrinkType = "tea_hotwater"
+        fProfileTitle = ""; fProfileJson = ""; fProfileTempC = 0; fProfileYieldG = 0
+        setWaterIncluded(true)
+        fWaterOrder = "after"
+        suggestName()
+        stepDone("details")
+        applyDetailsPrefill()
+    }
+
+    // Link (or clear) the recipe's equipment package, from the equipment
+    // window's inline tiles. `pkg` is a flattened package map, or a
+    // { isNone: true } sentinel / null to clear.
+    function selectEquipment(pkg) {
+        _equipmentChoiceMade = true
+        if (!pkg || pkg.isNone) {
+            fEquipmentId = 0
+            fEquipmentName = ""
+            fEquipmentGrinderBrand = ""; fEquipmentGrinderModel = ""
+            _selectedPackage = ({})
+            // Package cleared — re-request the hint unscoped (id 0).
+            requestGrindHint()
+            return
+        }
+        fEquipmentId = pkg.id
+        fEquipmentName = pkg.name
+            || ((pkg.grinderBrand || "") + " " + (pkg.grinderModel || "")).trim()
+            || ((pkg.basketBrand || "") + " " + (pkg.basketModel || "")).trim()
+        fEquipmentGrinderBrand = pkg.grinderBrand || ""
+        fEquipmentGrinderModel = pkg.grinderModel || ""
+        _selectedPackage = pkg
+        // Equipment changed — re-scope the grind hint to the new package.
+        requestGrindHint()
+    }
+
+    // Request the under-grind-field hint, scoped to the selected equipment
+    // package (0 = unscoped), and the package's calibrated suggestion. Both are
+    // cleared first so a stale one never lingers while the async reply is in
+    // flight; each reply guard drops an answer for a since-changed selection.
+    function requestGrindHint() {
+        grindHint = ""
+        grindSuggestion = ({})
+        requestLatestGrindForSelection()
+        if (visible && EquipmentService.ready && activeTemplate.grind && hasBean
+            && fProfileTitle !== "" && fEquipmentId > 0)
+            EquipmentService.requestGrindSuggestion(fEquipmentId, fRoaster, fCoffee,
+                                                    _selectedBagRoastDate, fProfileTitle)
+    }
+
+    // The equipment window's tile model: a "None" tile followed by the
+    // in-inventory packages (the currently-linked one is always kept, even if
+    // it has since been retired, so the selection stays visible).
+    function equipmentTileModel() {
+        var arr = [{ isNone: true }]
+        for (let i = 0; i < _packages.length; ++i) {
+            let p = _packages[i]
+            if (p.inInventory !== false || p.id === fEquipmentId)
+                arr.push(p)
+        }
+        return arr
+    }
+
+    // Snapshot the chosen steam pitcher preset onto the recipe BY VALUE (never
+    // a preset index). Shared by the steam window's tiles.
+    function selectPitcher(preset) {
+        _steamChoiceEdited = true
+        if (preset.disabled === true) {
+            fHeaterOff = true
+            fPitcherName = ""; fPitcherDurationSec = 0
+            fPitcherFlow = 0; fPitcherTemperatureC = 0; fPitcherWeightG = 0
+            fPitcherSecondsPerGram = 0
+            return
+        }
+        fHeaterOff = false
+        fPitcherName = preset.name || ""
+        fPitcherDurationSec = preset.duration || 0
+        fPitcherFlow = preset.flow || 0
+        fPitcherTemperatureC = preset.temperature || 0
+        fPitcherWeightG = preset.pitcherWeightG || 0
+        fPitcherSecondsPerGram = preset.secondsPerGram || 0
+    }
+
+    // The label for a tile: the built-in entry carries no stored name, so the
+    // view translates it — the same rule the Steam page follows, which is why
+    // neither surface can drift into showing an untranslated "Heater off".
+    function pitcherTileTitle(preset) {
+        return SteamLabels.pitcherName(preset)
+    }
+
+    // The steam window's tile model: the enabled pitcher presets, plus the
+    // recipe's OWN pitcher when its preset has since been disabled, renamed or
+    // deleted — same rule as vesselTileModel() and equipmentTileModel(). The
+    // recipe carries a by-value snapshot, so the pitcher it names still exists
+    // as far as the recipe is concerned; only the preset list forgot it.
+    function pitcherTileModel() {
+        var arr = []
+        var presets = SteamService.state.steamPitcherPresets
+        var found = false
+        // Every entry, INCLUDING the built-in "Heater off" appended last. It
+        // used to be filtered out here, which left the wizard unable to express
+        // a drink the machine is perfectly capable of: one that steams nothing.
+        for (let i = 0; i < presets.length; ++i) {
+            arr.push(presets[i])
+            if ((presets[i].name || "") === fPitcherName)
+                found = true
+        }
+        if (!found && fPitcherName !== "") {
+            arr.push({ name: fPitcherName, duration: fPitcherDurationSec,
+                       flow: fPitcherFlow, temperature: fPitcherTemperatureC,
+                       pitcherWeightG: fPitcherWeightG,
+                       secondsPerGram: fPitcherSecondsPerGram })
+        }
+        return arr
+    }
+
+    // Compact "45s · 62°C" metadata line for a pitcher preset tile.
+    function pitcherTileMeta(preset) {
+        var parts = []
+        if ((preset.duration || 0) > 0)
+            parts.push(preset.duration + "s")
+        if ((preset.temperature || 0) > 0)
+            parts.push(Theme.formatTemperature(preset.temperature, 0))
+        return parts.join(" · ")
+    }
+
+    // Snapshot the chosen water vessel preset onto the recipe BY VALUE (never a
+    // preset index): presets can be renamed, reordered or deleted after the
+    // recipe is saved, and an index would then silently point at someone else's
+    // vessel. Called by the hot-water window's tiles.
+    function recipeVesselSnapshot() {
+        const vessel = {name: fVesselName, vesselName: fVesselName, mode: fVesselMode,
+            flowRate: fVesselFlowRate, temperatureC: fVesselTemperatureC}
+        if (fWaterAmountMode !== "") vessel.amountMode = fWaterAmountMode
+        if (fWaterAmountMode === "ratio") vessel.waterToEspressoRatio = fWaterRatio
+        else vessel.volume = fVesselVolume
+        const presets = RecipeContext.preferences.waterVesselPresets || []
+        let preset = {}
+        for (let i = 0; i < presets.length; ++i)
+            if (String(presets[i].name).toLowerCase() === fVesselName.toLowerCase()) preset = presets[i]
+        const result = RecipeContext.waterVesselSnapshot(vessel, preset)
+        if (result.amountMode === undefined && result.volume > 0) result.amountMode = "fixed"
+        result.temperature = result.temperatureC
+        return result
+    }
+
+    function editRecipeVessel(addNew) {
+        const presets = RecipeContext.preferences.waterVesselPresets || []
+        let index = -1
+        if (!addNew) {
+            for (let i = 0; i < presets.length; ++i)
+                if (String(presets[i].name).toLowerCase() === fVesselName.toLowerCase()) index = i
+        }
+        const vessel = addNew ? {} : recipeVesselSnapshot()
+        if (!addNew && vessel.amountMode === undefined) vessel.amountMode = "fixed"
+        recipeVesselEditor.openFor(vessel, index)
+    }
+
+    function selectVessel(preset) {
+        _waterChoiceEdited = true
+        fVesselName = preset.name || ""
+        fVesselVolume = preset.volume || 0
+        fWaterAmountMode = preset.amountMode || "fixed"
+        fWaterRatio = Number(preset.waterToEspressoRatio ?? 2.5)
+        fVesselMode = preset.mode || "weight"
+        // `!== undefined`, not `|| 40`: a preset really set to 0 must survive
+        // rather than being silently rewritten to the default (the same idiom
+        // HotWaterPage uses when reading these presets).
+        fVesselFlowRate = preset.flowRate !== undefined ? preset.flowRate : 40
+        fVesselTemperatureC = preset.temperatureC ?? preset.temperature ?? 0
+    }
+
+    // Set the water order, keeping the drink TYPE honest with it. Americano and
+    // long black are the same drink with the water on the other side of the
+    // shot, and the order tiles say so in their own labels — so flipping the
+    // order has to flip the type, or the recipe saves as "Americano" while
+    // DrinkType.fromRecipe() reads its blocks and calls it a long black. Any
+    // other type (a tea, a milk drink that also takes water) keeps its type.
+    function setWaterOrder(order) {
+        _waterChoiceEdited = true
+        fWaterOrder = order
+        if (fDrinkType === "americano" || fDrinkType === "long_black")
+            fDrinkType = order === "before" ? "long_black" : "americano"
+    }
+
+    // The hot-water window's tile model: the saved vessel presets, plus the
+    // recipe's OWN vessel when its preset has since been renamed or deleted.
+    // Without that last tile the window shows nothing selected and no trace of
+    // what the recipe actually holds — the same reason equipmentTileModel()
+    // keeps a retired package. The snapshot on the recipe stays authoritative
+    // either way; this only decides what the window can show.
+    function vesselTileModel() {
+        var presets = RecipeContext.preferences.waterVesselPresets || []
+        var arr = []
+        var found = false
+        for (let i = 0; i < presets.length; ++i) {
+            arr.push((presets[i].name || "") === fVesselName ? recipeVesselSnapshot() : presets[i])
+            if ((presets[i].name || "") === fVesselName)
+                found = true
+        }
+        if (!found && fVesselName !== "") {
+            arr.push(recipeVesselSnapshot())
+        }
+        return arr
+    }
+
+    // Tile artwork for a water vessel, banded by how much it holds. The bands
+    // are set around the presets the app SEEDS — "Cup" at 200 and "Mug" at 350
+    // (settings_brew.cpp) — so the artwork agrees with the name on a fresh
+    // install; an earlier split at 120/320 gave the shipped Cup a mug and the
+    // shipped Mug a glass, which is worse than no icon at all.
+    //
+    // Volume and weight presets are compared with one set of numbers because
+    // water is ~1 g/ml. A preset with no usable volume gets NO icon rather than
+    // the middle one: absent artwork reads as "unknown", whereas a mug on a
+    // 0-volume preset reads as a normal vessel and hides the problem.
+    function vesselTileIcon(preset) {
+        var v = preset.amountMode === "ratio"
+            ? RecipeContext.waterAmountPreview(Object.assign({hasWater: true, vesselName: preset.name}, preset), waterEspressoTargetG).amountG
+            : (preset.volume || 0)
+        if (v <= 0) return ""
+        if (v <= 250) return "qrc:/icons/cup.svg"
+        if (v <= 400) return "qrc:/icons/mug.svg"
+        return "qrc:/icons/glass-full.svg"
+    }
+
+    // The tile's metadata line: the amount in the preset's OWN mode (ml or g)
+    // and the temperature, e.g. "200g · 96°C" — never name-only, because two
+    // vessels can share a name and the numbers are what tell them apart.
+    // Temperature renders in the user's unit via Theme.formatTemperature.
+    function vesselTileMeta(preset) {
+        var parts = []
+        if (preset.amountMode === "ratio") {
+            const preview = RecipeContext.waterAmountPreview(Object.assign({hasWater: true, vesselName: preset.name}, preset), waterEspressoTargetG)
+            parts.push(Number(preset.waterToEspressoRatio).toFixed(1) + "×")
+            if (preview.valid) parts.push(preview.amountG + "g")
+        }
+        if ((preset.volume || 0) > 0)
+            parts.push(preset.volume + (preset.mode === "volume" ? "ml" : "g"))
+        if ((preset.temperature || 0) > 0)
+            parts.push(Theme.formatTemperature(preset.temperature, 0))
+        return parts.join(" · ")
+    }
+
+    // --- details prefill (history → tea bag data → profile defaults) -------
+
+    // Absolute tea temperature (vendor numbers are steeping temps; the tea
+    // details step edits the absolute rather than an offset).
+    property real fTeaTempC: 0
+    property var _teaBrewing: ({})
+    // Grind hint under the grind field: the latest grind dialed for this
+    // bean (or similar-roast beans), plus a UGS DIRECTION when it was dialed
+    // for a different profile. A number appears only through grindSuggestion,
+    // i.e. when the grinder calibration's own gates publish one.
+    property string grindHint: ""
+    // When the grinder calibration publishes a number for the picked profile on
+    // this bag (add-grinder-ugs-calibration), it replaces the direction-only hint.
+    property var grindSuggestion: ({})
+    readonly property bool _hasGrindSuggestion: (grindSuggestion.setting || "") !== ""
+    readonly property string grindSuggestionText: {
+        if (!_hasGrindSuggestion) return ""
+        return grindSuggestion.source === "history"
+            ? TranslationManager.translate("recipes.wizard.grindSuggestion.history",
+                  "Your shots of this bean on %1 ground at %2.")
+                  .arg(fProfileTitle).arg(grindSuggestion.setting)
+            : TranslationManager.translate("recipes.wizard.grindSuggestion.estimate",
+                  "Suggested starting grind for %1: %2 (estimate from your grinder calibration, based on your %3 shot of this bean at %4).")
+                  .arg(fProfileTitle).arg(grindSuggestion.setting)
+                  .arg(grindSuggestion.anchorProfileName || "").arg(grindSuggestion.anchorSetting || "")
+    }
+    // True once the user has typed in a details field (or an existing recipe
+    // was loaded). The profile/bag seeds fill the fields synchronously so the
+    // details step is never blank; the async shot-history reply then OVERWRITES
+    // them (design D6: history that actually worked wins) — but only while this
+    // is false, so a value the user has since typed is never clobbered.
+    property bool _detailsUserEdited: false
+
+    // Where the prefilled numbers came from — the wizard TELLS the user, so
+    // the details step isn't a wall of unexplained values: "history" (last
+    // shot with this bean+profile), "profile" (its recommended numbers),
+    // "teabag" (the bag's brewing instructions), "saved" (editing an
+    // existing recipe), "" (nothing seeded).
+    property string _numbersSource: ""
+    readonly property string numbersHint: {
+        var origin = ""
+        switch (_numbersSource) {
+        case "history":
+            origin = TranslationManager.translate("recipes.wizard.numbers.fromHistory",
+                "Prefilled from your last shot with these beans and this profile — the numbers that worked.")
+            break
+        case "profile":
+            origin = TranslationManager.translate("recipes.wizard.numbers.fromProfile",
+                "Prefilled with the profile's own recommended numbers.")
+            break
+        case "teabag":
+            origin = TranslationManager.translate("recipes.wizard.numbers.fromTeaBag",
+                "Prefilled from the tea's brewing instructions.")
+            break
+        case "saved":
+            origin = TranslationManager.translate("recipes.wizard.numbers.saved",
+                "The recipe's saved numbers.")
+            break
+        }
+        var why = isTeaDrink
+            ? TranslationManager.translate("recipes.wizard.numbers.whyTea",
+                "Adjust the leaf amount and steeping temperature to taste.")
+            : TranslationManager.translate("recipes.wizard.numbers.why",
+                "Change them to make this drink your own — the temp offset shifts the "
+                + "profile's brew temperature (0° = as the profile was designed).")
+        return origin === "" ? why : origin + " " + why
+    }
+
+    // --- summary-card value builders (enrich-recipe-editor-cards) -----------
+    // Each card reads out the recipe values that EDITING THAT CARD changes,
+    // and no value repeats across cards: recipe-overridden numbers (dose,
+    // yield/ratio, effective temperature, grind, rpm) live on Details; profile
+    // shape on Profile; bag identity on Bean; package identity (minus the
+    // recipe-owned grind/rpm) on Equipment. A read establishes a binding
+    // dependency, so these re-evaluate as the f* fields change.
+
+    // The recipe's EFFECTIVE (resulting) brew temperature, unit-aware — the same
+    // number the hero's plan line shows. NO signed offset tag: the summary shows
+    // the temperature the machine will brew, not a delta the reader has to add up.
+    // A single resulting value (not the per-frame "84 · 94°C" form) is right here
+    // because the details card joins its parts with " · ", which a per-frame temp
+    // would collide with. "" when nothing is set or the profile temp can't be
+    // resolved. Tea edits an absolute; espresso a profile offset folded into the
+    // resulting value.
+    function summaryEffectiveTempStr() {
+        if (isHotWaterTea)
+            return fVesselTemperatureC > 0 ? Theme.formatTemperature(fVesselTemperatureC, 0) : ""
+        if (isTeaDrink)
+            return fTeaTempC > 0 ? Theme.formatTemperature(fTeaTempC, 0) : ""
+        if (fProfileTempC > 0)
+            return Theme.formatTemperature(fProfileTempC + fTempDeltaC, 0)
+        // Profile temp unresolvable → no resulting value to show (never a bare offset).
+        return ""
+    }
+
+    // Details card: every value the details step pins, drink-type-scoped —
+    // dose→yield (ratio shown as such), effective temperature, grind (+ rpm
+    // only for an RPM-capable grinder). Tea omits grind; hot-water tea shows
+    // volume + temperature instead of dose→yield.
+    function summaryDetailsValue() {
+        var parts = []
+        var dose = parseFloat(doseField.text) || 0
+        var yieldG = parseFloat(yieldField.text) || 0
+        var ratioV = parseFloat(ratioField.text) || 0
+        if (isHotWaterTea) {
+            if (fWaterAmountMode === "ratio") parts.push(vesselTileMeta(recipeVesselSnapshot()))
+            else if (fVesselVolume > 0)
+                parts.push(fVesselVolume + (fVesselMode === "volume" ? "ml" : "g"))
+        } else if (fYieldMode === "ratio" && ratioV > 0) {
+            parts.push(dose > 0
+                ? dose.toFixed(1) + "g → " + (dose * ratioV).toFixed(1) + "g (1:" + ratioV.toFixed(1) + ")"
+                : "1:" + ratioV.toFixed(1))
+        } else if (dose > 0 && yieldG > 0) {
+            parts.push(dose.toFixed(1) + "g → " + yieldG.toFixed(1) + "g")
+        } else if (dose > 0) {
+            parts.push(dose.toFixed(1) + "g")
+        } else if (yieldG > 0) {
+            parts.push(TranslationManager.translate("recipes.wizard.summary.yield", "yield %1g").arg(yieldG.toFixed(1)))
+        }
+        var tempStr = summaryEffectiveTempStr()
+        if (tempStr !== "")
+            parts.push(tempStr)
+        if (showSavedGrind) {
+            let g = fGrind.trim()
+            if (g !== "")
+                parts.push(TranslationManager.translate("recipes.wizard.summary.grind", "grind %1").arg(g))
+            if (fRpmPinned > 0)
+                parts.push(TranslationManager.translate("equipment.card.lastRpm", "%1 rpm").arg(fRpmPinned))
+        }
+        return parts.length > 0 ? parts.join(" · ") : "—"
+    }
+
+    // Bean card: coffee name, then roaster · roast level · roast age. The photo
+    // is rendered separately by the card's BeanThumbnail.
+    function summaryBeanValue() {
+        var name = (fCoffee !== "" ? fCoffee : fRoaster)
+        var detail = []
+        if (fCoffee !== "" && fRoaster !== "")
+            detail.push(fRoaster)
+        if (_selectedBagRoastLevel !== "")
+            detail.push(_selectedBagRoastLevel)
+        var age = bagRoastAgeLine()
+        if (age !== "")
+            detail.push(age)
+        return detail.length > 0 ? name + "\n" + detail.join(" · ") : name
+    }
+
+    // "<roast date> · <age>d" for the linked bag — mirrors the bean step's
+    // per-tile roastAgeLine, but reads the page-level selected-bag state.
+    function bagRoastAgeLine() {
+        var date = String(_selectedBagRoastDate || "")
+        if (date === "")
+            return ""
+        var parsed = Date.fromLocaleString(Qt.locale("C"), date, "yyyy-MM-dd")
+        if (isNaN(parsed.getTime()))
+            return date
+        var days = Math.floor((Date.now() - parsed.getTime()) / 86400000)
+        return days >= 0 ? date + " · " + days + "d" : date
+    }
+
+    // The bag's product-page link (bean-image cache key follows the bag), for
+    // the summary Bean card's BeanThumbnail.
+    function bagImageLink() {
+        if (fBagBlob === "")
+            return ""
+        try { return JSON.parse(fBagBlob).link || "" }
+        catch (e) { WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: bad bag blob JSON:", e].map(String).join(" ")); return "" }
+    }
+
+    // Profile card: a RICH read-out of what PICKING A PROFILE brings to the
+    // recipe — name, editor/type classification, notable beverage type, and a
+    // pressure/flow shape summary — EXCLUDING the temp/dose/yield/grind the
+    // recipe overrides (those are Details-owned). The (i)/KB buttons live in
+    // the card header. "" profile → em dash handled by the caller.
+    function summaryProfileValue() {
+        if (fProfileTitle === "")
+            return "—"
+        var info = ProfileService.profileCatalogInfoForTitle(fProfileTitle)
+        var parts = [fProfileTitle]
+        var meta = []
+        var et = profileEditorLabel(info ? (info.editorType || "") : "")
+        if (et !== "")
+            meta.push(et)
+        var bev = profileBeverageLabel(info ? (info.beverageType || "") : "")
+        if (bev !== "")
+            meta.push(bev)
+        if (meta.length > 0)
+            parts.push(meta.join(" · "))
+        var shape = summaryProfileShape()
+        if (shape !== "")
+            parts.push(shape)
+        return parts.join("\n")
+    }
+
+    // Editor/type classification label. D-Flow/A-Flow are proper nouns (the
+    // same names the wizard header shows); the rest are localized.
+    function profileEditorLabel(code) {
+        switch (code) {
+        case "dflow": return "D-Flow"
+        case "aflow": return "A-Flow"
+        case "pressure": return TranslationManager.translate("recipes.wizard.profileType.pressure", "Pressure profile")
+        case "flow": return TranslationManager.translate("recipes.wizard.profileType.flow", "Flow profile")
+        case "advanced": return TranslationManager.translate("recipes.wizard.profileType.advanced", "Advanced profile")
+        }
+        return ""
+    }
+
+    // Only NOTABLE beverage types earn a line — espresso is the default and is
+    // already conveyed by the drink card, so it (and empty) render nothing.
+    function profileBeverageLabel(bev) {
+        switch (String(bev).toLowerCase()) {
+        case "filter": return TranslationManager.translate("recipes.wizard.profileBeverage.filter", "Filter")
+        case "pourover": return TranslationManager.translate("recipes.wizard.profileBeverage.pourover", "Pour-over")
+        case "tea_portafilter": return TranslationManager.translate("recipes.wizard.profileBeverage.tea", "Tea")
+        }
+        return ""
+    }
+
+    // Resolve the picked profile's object (installed by title, else the
+    // embedded JSON fallback) — the same ladder refreshProfileTemp uses.
+    function resolveProfileObj() {
+        if (fProfileTitle === "")
+            return null
+        var summary = ProfileService.profileSummaryForTitle(fProfileTitle)
+        if (summary && Object.keys(summary).length > 0)
+            return summary
+        if (fProfileJson !== "") {
+            try { return JSON.parse(fProfileJson) }
+            catch (e) { WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: embedded profile JSON unparsable:", e].map(String).join(" ")); return null }
+        }
+        return null
+    }
+
+    // A concise pressure/flow SHAPE summary from the profile's frames — frame
+    // count plus peak pressure / max flow across steps. Profile-owned detail
+    // the recipe never overrides.
+    function summaryProfileShape() {
+        var d = resolveProfileObj()
+        if (!d)
+            return ""
+        const frameCount = Number(d.stepCount) || (d.steps ? d.steps.length : 0)
+        if (frameCount === 0)
+            return ""
+        const maxP = Number(d.maximumPressure) || 0
+        const maxF = Number(d.maximumFlow) || 0
+        var bits = [TranslationManager.translate("recipes.wizard.profileShape.frames", "%1 frames").arg(frameCount)]
+        if (maxP > 0)
+            bits.push(TranslationManager.translate("recipes.wizard.profileShape.peakPressure", "peak %1 bar").arg(maxP.toFixed(1)))
+        if (maxF > 0)
+            bits.push(TranslationManager.translate("recipes.wizard.profileShape.maxFlow", "max %1 ml/s").arg(maxF.toFixed(1)))
+        return bits.join(" · ")
+    }
+
+    // Revert the numbers to the profile's own values (the card's "Reset to
+    // profile" action): recommended dose, target yield, no temp offset —
+    // tea falls back to the per-type default temperature when the profile
+    // states none. Marks the fields user-edited so the async history reply
+    // cannot overwrite a deliberate reset.
+    function resetNumbersToProfile() {
+        var dose = 0
+        if (fProfileTitle !== "") {
+            let d = ProfileService.profileSummaryForTitle(fProfileTitle)
+            if (d && Object.keys(d).length > 0) {
+                dose = d.recommendedDose || 0
+                fProfileTempC = d.baseTempC || 0
+                fProfileYieldG = d.yieldG || 0
+            }
+        }
+        doseField.text = dose > 0 ? Number(dose).toFixed(1) : ""
+        yieldField.text = fProfileYieldG > 0 ? Number(fProfileYieldG).toFixed(1) : ""
+        fYieldMode = fProfileYieldG > 0 ? "absolute" : "none"
+        ratioField.text = ""
+        syncDerivedYieldFields()
+        fTempDeltaC = 0
+        if (isTeaDrink)
+            fTeaTempC = fProfileTempC > 0 ? fProfileTempC
+                : ProfileService.defaultTeaTempC(String(_teaBrewing.teaType || ""))
+        _detailsUserEdited = true
+        _numbersSource = "profile"
+    }
+
+    function requestLatestShotForSelection() {
+        _latestShotRequestId = ""
+        _latestShotWaitingForHistory = false
+        if (!hasBean || fProfileTitle === "")
+            return
+        _latestShotQuery = ({ beanBrand: fRoaster, beanType: fCoffee,
+                              profileName: fProfileTitle })
+        if (!visible || !RecipeContext.historyReady) {
+            _latestShotWaitingForHistory = true
+            return
+        }
+        _latestShotRequestId = RecipeContext.newRequestId()
+        RecipeContext.requestHistory(_latestShotRequestId, "latestShotForBeanProfile",
+                                     _latestShotQuery)
+    }
+
+    function requestRecipeGrindDefault() {
+        _grindDefaultRequestId = ""
+        _grindDefaultWaiting = false
+        if (mode !== "create" || promoteShotId > 0 || _grindUserEdited
+                || !hasBean || !activeTemplate.grind)
+            return
+        if (!visible || !RecipeContext.historyReady) {
+            _grindDefaultWaiting = true
+            return
+        }
+        _grindDefaultRequestId = RecipeContext.newRequestId()
+        RecipeContext.requestHistory(_grindDefaultRequestId, "recipeGrindDefault",
+            { beanBaseId: fBeanBaseId, beanBrand: fRoaster, beanType: fCoffee })
+    }
+
+    function requestLatestGrindForSelection() {
+        _latestGrindRequestId = ""
+        _latestGrindWaitingForHistory = false
+        if (!activeTemplate.grind || (!hasBean && _selectedBagRoastLevel === ""))
+            return
+        _latestGrindQuery = ({ beanBrand: fRoaster, beanType: fCoffee,
+                               roastLevel: _selectedBagRoastLevel, equipmentId: fEquipmentId })
+        if (!visible || !RecipeContext.historyReady) {
+            _latestGrindWaitingForHistory = true
+            return
+        }
+        _latestGrindRequestId = RecipeContext.newRequestId()
+        RecipeContext.requestHistory(_latestGrindRequestId, "latestGrindForBean",
+                                     _latestGrindQuery)
+    }
+
+    function applyLatestShot(shot) {
+        if (!shot || Object.keys(shot).length === 0
+            || String(shot.profileName || "") !== fProfileTitle
+            || String(shot.beanBrand || "") !== fRoaster
+            || String(shot.beanType || "") !== fCoffee || _detailsUserEdited)
+            return
+        _numbersSource = "history"
+        if (shot.doseWeightG > 0)
+            doseField.text = Number(shot.doseWeightG).toFixed(1)
+        if (shot.yieldMode === "ratio" && (shot.yieldAnchorValue || 0) > 0) {
+            fYieldMode = "ratio"
+            ratioField.text = Number(shot.yieldAnchorValue).toFixed(1)
+        } else if (shot.targetWeightG > 0) {
+            fYieldMode = "absolute"
+            yieldField.text = Number(shot.targetWeightG).toFixed(1)
+        }
+        syncDerivedYieldFields()
+        if (shot.temperatureOverrideC > 0) {
+            if (isTeaDrink)
+                fTeaTempC = shot.temperatureOverrideC
+            else if (fProfileTempC > 0)
+                fTempDeltaC = shot.temperatureOverrideC - fProfileTempC
+        }
+        suggestName()
+    }
+
+    function applyLatestGrind(grind) {
+        if (!activeTemplate.grind || !grind
+            || String(grind.queryBrand || "") !== String(_latestGrindQuery.beanBrand || "")
+            || String(grind.queryType || "") !== String(_latestGrindQuery.beanType || "")
+            || String(grind.queryRoast || "") !== String(_latestGrindQuery.roastLevel || "")
+            || String(grind.queryEquipmentId || 0) !== String(_latestGrindQuery.equipmentId || 0)
+            || String(grind.queryEquipmentId || 0) !== String(fEquipmentId)
+            || String(grind.queryBrand || "") !== fRoaster
+            || String(grind.queryType || "") !== fCoffee
+            || String(grind.queryRoast || "") !== _selectedBagRoastLevel)
+            return
+        if (!grind.grinderSetting) {
+            grindHint = ""
+            return
+        }
+        var g = String(grind.grinderSetting || "")
+        var src = String(grind.profileName || "")
+        if (g === "") { grindHint = ""; return }
+        var parts = []
+        if (grind.matchLevel === "bean")
+            parts.push(TranslationManager.translate("recipes.wizard.grindHint.bean",
+                "Last grind for this bean: %1 (with %2).").arg(g).arg(src))
+        else
+            parts.push(TranslationManager.translate("recipes.wizard.grindHint.similar",
+                "Similar beans (%1) last ground at %2 (with %3).")
+                .arg(_selectedBagRoastLevel).arg(g).arg(src))
+        if (src !== "" && fProfileTitle !== "" && src !== fProfileTitle) {
+            const dir = ProfileService.grindDirectionBetween(src, fProfileTitle)
+            if (dir === "finer")
+                parts.push(TranslationManager.translate("recipes.wizard.grindHint.finer",
+                    "%1 typically grinds finer — start finer than that.").arg(fProfileTitle))
+            else if (dir === "coarser")
+                parts.push(TranslationManager.translate("recipes.wizard.grindHint.coarser",
+                    "%1 typically grinds coarser — start coarser than that.").arg(fProfileTitle))
+        }
+        grindHint = parts.join(" ")
+    }
+
+    function applyDetailsPrefill() {
+        // The creation walk reaches details here — start at the first window
+        // (equipment), then Continue walks numbers → steam/water → summary.
+        _detailsPage = "equipment"
+        EquipmentService.requestInventory()
+        // Each window shows its fields expanded and ready (one facet per
+        // window now — no collapse-to-summary).
+        // Profile/bag seeds run synchronously so the details step is never
+        // blank; the shot-history tier lands async via
+        // latestShotForBeanProfileReady and OVERWRITES them (history that
+        // actually worked is the top priority — design D6), guarded by
+        // _detailsUserEdited so a typed value is never clobbered.
+        if (isTeaDrink) {
+            _teaBrewing = ({})
+            if (fBagBlob !== "") {
+                try { _teaBrewing = JSON.parse(fBagBlob) } catch (e) { _teaBrewing = ({}); WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: bad bag blob JSON:", e].map(String).join(" ")) }
+            }
+            let stated = parseFloat(_teaBrewing.brewTempC) || 0
+            let typeMatched = fProfileTitle !== ""
+                && ProfileService.teaProfileMatchesType(fProfileTitle, String(_teaBrewing.teaType || ""))
+            if (fTeaTempC <= 0 && (stated > 0 || parseFloat(_teaBrewing.leafGramsPer100Ml) > 0))
+                _numbersSource = "teabag"
+            if (fTeaTempC <= 0) {
+                // Vendor temp applies verbatim for hot-water tea; for
+                // portafilter tea only when the profile is NOT type-matched
+                // (a matched profile's temp already encodes the portafilter
+                // adaptation). Fallback: profile temp, then per-type default.
+                if (isHotWaterTea && stated > 0)
+                    fTeaTempC = stated
+                else if (!typeMatched && stated > 0)
+                    fTeaTempC = stated
+                else if (fProfileTempC > 0)
+                    fTeaTempC = fProfileTempC
+                else
+                    fTeaTempC = ProfileService.defaultTeaTempC(String(_teaBrewing.teaType || ""))
+            }
+            // Leaf dose from the bag's ratio × the target volume.
+            let ratio = parseFloat(_teaBrewing.leafGramsPer100Ml) || 0
+            if (doseField.text === "" && ratio > 0) {
+                let volumeMl = isHotWaterTea ? fVesselVolume : (parseFloat(yieldField.text) || 0)
+                if (volumeMl > 0)
+                    doseField.text = (ratio * volumeMl / 100).toFixed(1)
+            }
+        }
+        requestLatestShotForSelection()
+        requestGrindHint()
+        // Dose/yield are now seeded — re-run so a collision qualifier (the rare
+        // same-bean+type+profile case) reflects real numbers. Guarded by
+        // _autoName, so a user-typed name is never touched.
+        suggestName()
+    }
+
+    // --- profile step (ProfilePicker host properties) -----------------------
+    //
+    // The ranking/model-building that used to live here (profileModel,
+    // _ranked, rebuildProfileModel, requestProfileRanking) is now inside
+    // ProfilePicker itself (design D3 centralization; the wizard's KB-affinity
+    // reasons and 5-cap are reused there verbatim, not reimplemented). This
+    // host only supplies the bean identity and the beverage constraint.
+
+    property string _selectedBagRoastLevel: ""
+    // The linked bag's roast date, kept alongside the roast level so the
+    // summary Bean card can render "<date> · <age>d" (the same line the bean
+    // step's tiles show). Resolved from inventory / direct selection.
+    property string _selectedBagRoastDate: ""
+
+    // Tea type extracted from the bag blob, for ProfilePicker's teaType prop
+    // (drives its tier-② tea-type-match reason). "" outside a tea drink.
+    readonly property string _wizardTeaType: {
+        if (!isTeaDrink || fBagBlob === "") return ""
+        try { return String(JSON.parse(fBagBlob).teaType || "") }
+        catch (e) { WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: bad bag blob JSON:", e].map(String).join(" ")); return "" }
+    }
+
+    // activeTemplate.beverages minus the "" placeholder (empty/unknown already
+    // normalizes to espresso inside ProfileService::filterProfiles).
+    readonly property var _wizardAllowedBeverages: {
+        var out = []
+        var bevs = activeTemplate.beverages || []
+        for (let i = 0; i < bevs.length; ++i) {
+            if (bevs[i] !== "") out.push(bevs[i])
+        }
+        return out
+    }
+
+    // --- connections --------------------------------------------------------
+
+    Connections {
+        target: EquipmentService
+        function onGrindSuggestionReady(suggestion) {
+            if (suggestion.packageId !== wizardPage.fEquipmentId
+                || suggestion.beanBrand !== wizardPage.fRoaster
+                || suggestion.beanType !== wizardPage.fCoffee
+                || suggestion.profileTitle !== wizardPage.fProfileTitle
+                || suggestion.roastDate !== wizardPage._selectedBagRoastDate)
+                return
+            wizardPage.grindSuggestion = suggestion
+        }
+    }
+
+    Connections {
+        target: RecipeContext
+        function onStateChanged() {
+            wizardPage.retryDeferredHistoryReads()
+        }
+        function onHistoryCompleted(requestId, operation, success, result, reason) {
+            if (operation === "recipeGrindDefault" && requestId === wizardPage._grindDefaultRequestId) {
+                wizardPage._grindDefaultRequestId = ""
+                if (success && !wizardPage._grindUserEdited && result && result.grinderSetting) {
+                    wizardPage.fGrind = String(result.grinderSetting)
+                    wizardPage.fRpmPinned = Number(result.rpm) || 0
+                    wizardPage._grindDefaultContext = [result.profileName, result.equipmentName]
+                        .filter(function(value) { return value && String(value).length > 0 }).join(" · ")
+                } else if (!success && !RecipeContext.historyReady) {
+                    wizardPage._grindDefaultWaiting = true
+                }
+                return
+            }
+            if (operation === "shot" && requestId === wizardPage._promoteShotRequestId) {
+                wizardPage._promoteShotRequestId = ""
+                if (success && result && Object.keys(result).length > 0)
+                    wizardPage.prefillFromShot(result)
+                else if (!success && !RecipeContext.historyReady)
+                    wizardPage._promoteShotWaitingForHistory = true
+                return
+            }
+            if (operation === "latestShotForBeanProfile"
+                    && requestId === wizardPage._latestShotRequestId) {
+                wizardPage._latestShotRequestId = ""
+                if (success)
+                    wizardPage.applyLatestShot(result)
+                else if (!RecipeContext.historyReady)
+                    wizardPage._latestShotWaitingForHistory = true
+                return
+            }
+            if (operation === "latestGrindForBean"
+                    && requestId === wizardPage._latestGrindRequestId) {
+                wizardPage._latestGrindRequestId = ""
+                if (success)
+                    wizardPage.applyLatestGrind(result)
+                else if (!RecipeContext.historyReady)
+                    wizardPage._latestGrindWaitingForHistory = true
+            }
+        }
+    }
+
+    Connections {
+        target: RecipeService
+        function onRecipeReady(recipeId, recipe) {
+            if (wizardPage.mode !== "edit" || recipeId !== wizardPage.editRecipeId)
+                return
+            if (Object.keys(recipe).length > 0) {
+                wizardPage._originalEditableSnapshot = RecipeService.editableSnapshot(recipe)
+                wizardPage._saveConflict = false
+                wizardPage.applyRecipeMap(recipe)
+                wizardPage.captureBaseline()
+            } else {
+                // The recipe was deleted between opening the list and the load
+                // landing — don't leave a blank "edit" form the user fills in
+                // and only fails to save. Leave the page instead.
+                WebDebugLogger.warn("Recipes", "RecipeWizardPage", ["RecipeWizard: recipe", wizardPage.editRecipeId,
+                             "no longer exists — leaving edit"].map(String).join(" "))
+                AppShell.backRequested()
+            }
+        }
+        function onRecipeCheckFailed(recipeId) {
+            if (wizardPage.mode !== "edit" || recipeId !== wizardPage.editRecipeId)
+                return
+            wizardPage.errorMessage = TranslationManager.translate(
+                "recipes.wizard.errorLoad", "Could not load this recipe")
+            wizardPage.showSaveError()
+        }
+        function onRecipeCreated(recipeId, recipe) {
+            // Only OUR create: a concurrent MCP/web create must neither pop
+            // this page nor show a phantom save error.
+            if (wizardPage._createToken === ""
+                || (recipe.requestToken || "") !== wizardPage._createToken)
+                return
+            if (wizardPage.mode !== "edit" && wizardPage._submitting) {
+                wizardPage._submitting = false
+                wizardPage._createToken = ""
+                if (recipeId > 0) {
+                    AppShell.backRequested()
+                } else {
+                    // Name the cause when storage gave one — the generic wording
+                    // leaves the user with nothing to act on, and this is the
+                    // surface where an actionable message matters most.
+                    wizardPage.errorMessage = (recipe && recipe.error === "nameInUse")
+                        ? TranslationManager.translate("recipes.dialog.nameInUse",
+                              "That name is already in use — choose a different name.")
+                        : TranslationManager.translate("recipes.wizard.errorSave", "Could not save the recipe")
+                    wizardPage.showSaveError()
+                }
+            }
+        }
+        function onRecipeUpdateFailed(recipeId, reason) {
+            // Lands just before recipeUpdated(false) and names the cause. Gated on
+            // _submitting like the terminal handler below: without it, another
+            // surface (MCP/web) failing a rename of THIS recipe while the wizard
+            // merely sits open would latch a reason, and a later save of ours that
+            // failed for an unrelated cause would report it.
+            if (wizardPage.mode === "edit" && wizardPage._submitting
+                && recipeId === wizardPage.editRecipeId) {
+                wizardPage._saveFailReason = reason
+                if (reason === "conflict")
+                    wizardPage._saveConflict = true
+            }
+        }
+        function onRecipeUpdated(recipeId, success) {
+            if (wizardPage.mode === "edit" && recipeId === wizardPage.editRecipeId
+                && wizardPage._submitting) {
+                wizardPage._submitting = false
+                if (success) {
+                    wizardPage._saveFailReason = ""
+                    AppShell.backRequested()
+                } else {
+                    // "busy" means the database was locked by another write — the
+                    // one cause here where trying again actually works, so say so
+                    // rather than showing the generic failure.
+                    wizardPage.errorMessage = wizardPage._saveFailReason === "nameInUse"
+                        ? TranslationManager.translate("recipes.dialog.nameInUse",
+                              "That name is already in use — choose a different name.")
+                        : wizardPage._saveFailReason === "conflict"
+                        ? TranslationManager.translate("recipes.wizard.errorConflict",
+                              "This recipe changed after you opened it. Your draft is still here; reopen it to review the saved version.")
+                        : wizardPage._saveFailReason === "busy"
+                        ? TranslationManager.translate("recipes.wizard.errorSaveBusy",
+                              "The database was busy — tap Save again.")
+                        : TranslationManager.translate("recipes.wizard.errorSave", "Could not save the recipe")
+                    wizardPage._saveFailReason = ""
+                    wizardPage.showSaveError()
+                }
+            }
+        }
+        function onInventoryReady(list) {
+            // Cache existing recipe names (excluding the one being edited) so
+            // suggestName() can disambiguate a collision synchronously.
+            var names = []
+            for (let i = 0; i < list.length; ++i) {
+                let r = list[i]
+                if (wizardPage.mode === "edit" && (r.id || 0) === wizardPage.editRecipeId)
+                    continue
+                let n = ((r && r.name) || "").trim().toLowerCase()
+                if (n !== "")
+                    names.push(n)
+            }
+            wizardPage._existingRecipeNames = names
+        }
+        function onLastEquipmentForDrinkTypeFailed(drinkType) {
+            if (drinkType !== wizardPage.fDrinkType || wizardPage.fEquipmentId > 0 || wizardPage._equipmentChoiceMade)
+                return
+            var message = TranslationManager.translate("recipes.wizard.equipmentDefaultFailed",
+                "Could not load the usual equipment for this drink. Please choose equipment manually.")
+            equipmentDefaultError.show(message)
+            AccessibilityManager.announce(message, true)
+        }
+        function onLastEquipmentForDrinkTypeReady(drinkType, equipmentId) {
+            // Per-drink-type default: only fills an EMPTY equipment choice.
+            // No recipe of this type yet → fall back to the currently active
+            // package (design D10), so the row prefills instead of "None".
+            if (drinkType !== wizardPage.fDrinkType || wizardPage.fEquipmentId > 0 || wizardPage._equipmentChoiceMade)
+                return
+            var id = equipmentId > 0 ? equipmentId : EquipmentService.activePackageId
+            if (id > 0) {
+                wizardPage.fEquipmentId = id
+                EquipmentService.requestInventory()
+                wizardPage.requestGrindHint()
+            }
+        }
+    }
+
+    StatusToast { id: equipmentDefaultError; error: true; durationMs: 5000 }
+
+    property var _bags: []
+    property var _packages: []
+    // The full flattened map of the recipe's linked equipment package (from
+    // EquipmentPackageView.toVariantMap) — feeds the summary Equipment card's
+    // EquipmentSummary. Empty until inventory resolves / a package is picked.
+    property var _selectedPackage: ({})
+    Connections {
+        target: BagService
+        function onInventoryReady(bags) {
+            wizardPage._bags = bags
+            if (wizardPage.hasBean) {
+                for (let i = 0; i < bags.length; ++i) {
+                    let b = bags[i]
+                    // The hard bag link first; bean identity only as a
+                    // fallback for link-less recipes (e.g. stale imports).
+                    let match = wizardPage.fBagId > 0
+                        ? b.id === wizardPage.fBagId
+                        : (wizardPage.fBeanBaseId !== ""
+                            ? b.beanBaseId === wizardPage.fBeanBaseId
+                            : (String(b.roasterName).toLowerCase() === wizardPage.fRoaster.toLowerCase()
+                               && String(b.coffeeName).toLowerCase() === wizardPage.fCoffee.toLowerCase()))
+                    if (match) {
+                        wizardPage._selectedBagRoastLevel = b.roastLevel || ""
+                        wizardPage._selectedBagRoastDate = b.roastDate || ""
+                        if (wizardPage.fBagBlob === "")
+                            wizardPage.fBagBlob = b.beanBaseData || ""
+                        return
+                    }
+                }
+            }
+        }
+    }
+    Connections {
+        target: EquipmentService
+        function onInventoryReady(packages) {
+            wizardPage._packages = packages
+            if (wizardPage.fEquipmentId > 0) {
+                for (let i = 0; i < packages.length; ++i) {
+                    if (packages[i].id === wizardPage.fEquipmentId) {
+                        wizardPage.fEquipmentName = packages[i].name
+                            || ((packages[i].grinderBrand || "") + " " + (packages[i].grinderModel || "")).trim()
+                            || ((packages[i].basketBrand || "") + " " + (packages[i].basketModel || "")).trim()
+                        wizardPage.fEquipmentGrinderBrand = packages[i].grinderBrand || ""
+                        wizardPage.fEquipmentGrinderModel = packages[i].grinderModel || ""
+                        wizardPage._selectedPackage = packages[i]
+                        return
+                    }
+                }
+                wizardPage.fEquipmentGrinderBrand = ""
+                wizardPage.fEquipmentGrinderModel = ""
+                wizardPage._selectedPackage = ({})
+            }
+            // Never start the equipment window empty (creation walk only —
+            // edit/clone carry the recipe's own package and a summary-card
+            // jump must always show the window): default to the ACTIVE
+            // package, and when the inventory holds exactly ONE in-inventory
+            // package fill it in and SKIP the window entirely — there is
+            // nothing to ask. Back from the numbers window still reaches it.
+            if (wizardPage.fEquipmentId <= 0 && !wizardPage._equipmentChoiceMade && !wizardPage._fromSummary
+                    && wizardPage.currentStep === "details"
+                    && wizardPage._detailsPage === "equipment") {
+                let inInv = packages.filter(function(p) { return p.inInventory !== false })
+                if (inInv.length === 1) {
+                    wizardPage.selectEquipment(inInv[0])
+                    wizardPage._detailsPage = "numbers"
+                } else if (inInv.length > 1) {
+                    let activeId = EquipmentService.activePackageId
+                    for (let j = 0; j < inInv.length; j++)
+                        if (inInv[j].id === activeId) {
+                            wizardPage.selectEquipment(inInv[j])
+                            break
+                        }
+                }
+            }
+        }
+    }
+
+    // Hidden Tr instances for property-bound strings.
+    Tr { id: trNone; key: "recipes.composer.none"; fallback: "None"; visible: false }
+    Tr { id: trNoBean; key: "recipes.wizard.noBean"; fallback: "No bean"; visible: false }
+    Tr { id: trNoTea; key: "recipes.wizard.noTea"; fallback: "No tea"; visible: false }
+    Tr { id: trJustHotWater; key: "recipes.wizard.justHotWater"; fallback: "Just hot water — no profile"; visible: false }
+
+    // --- Reusable pieces (composer idiom) -----------------------------------
+
+    component NumberField: ColumnLayout {
+        id: numberField
+        property string label: ""
+        property alias text: numberInput.text
+        property alias input: numberInput
+        // Dimmed = a DERIVED value (the non-anchored half of the yield/ratio
+        // pair): shown as a consequence, still editable — editing it anchors
+        // it (add-yield-ratio-anchor).
+        property bool dim: false
+        signal edited(string newText)
+        spacing: Theme.scaled(4)
+        Label {
+            text: numberField.label
+            font: Theme.captionFont
+            color: Theme.textSecondaryColor
+            Accessible.ignored: true
+        }
+        StyledTextField {
+            id: numberInput
+            Layout.fillWidth: true
+            opacity: numberField.dim ? 0.55 : 1.0
+            inputMethodHints: Qt.ImhFormattedNumbersOnly
+            Accessible.name: numberField.label
+            onTextEdited: numberField.edited(text)
+        }
+    }
+
+    component SectionCard: Rectangle {
+        id: sectionCard
+        property string title: ""
+        // Collapse-to-summary (the "prefilled and optional" treatment): a
+        // collapsible card shows only its title + a one-line summary of the
+        // current values until tapped — the prefills are ready to save, so
+        // the fields stay out of the way unless the user wants them.
+        property bool collapsible: false
+        property bool expanded: true
+        property string summary: ""
+        default property alias content: contentColumn.data
+        Layout.fillWidth: true
+        Layout.alignment: Qt.AlignTop
+        implicitHeight: cardColumn.implicitHeight + 2 * Theme.spacingMedium
+        radius: Theme.cardRadius
+        color: Theme.cardBackgroundColor
+        border.color: Theme.borderColor
+        border.width: 1
+        ColumnLayout {
+            id: cardColumn
+            anchors.fill: parent
+            anchors.margins: Theme.spacingMedium
+            spacing: Theme.spacingSmall
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+                Label {
+                    visible: sectionCard.title !== ""
+                    Layout.fillWidth: true
+                    text: sectionCard.title
+                    font: Theme.subtitleFont
+                    color: Theme.textColor
+                    Accessible.role: Accessible.Heading
+                    Accessible.name: text
+                }
+                // The single edit glyph, only while collapsed (matching the
+                // summary rows) — expanded cards edit in place.
+                ColoredIcon {
+                    visible: sectionCard.collapsible && !sectionCard.expanded
+                    source: "qrc:/icons/edit.svg"
+                    iconWidth: Theme.scaled(16)
+                    iconHeight: Theme.scaled(16)
+                    iconColor: Theme.textSecondaryColor
+                    Accessible.ignored: true
+                }
+            }
+            Label {
+                visible: sectionCard.collapsible && !sectionCard.expanded
+                Layout.fillWidth: true
+                text: sectionCard.summary
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.WordWrap
+                Accessible.ignored: true
+            }
+            ColumnLayout {
+                id: contentColumn
+                visible: !sectionCard.collapsible || sectionCard.expanded
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+            }
+        }
+        // Collapsed card: the whole card is the "open it" tap target.
+        AccessibleMouseArea {
+            anchors.fill: parent
+            enabled: sectionCard.collapsible && !sectionCard.expanded
+            visible: enabled
+            accessibleName: sectionCard.title + ", " + sectionCard.summary + ", "
+                + TranslationManager.translate("recipes.wizard.accessible.tapToAdjust", "tap to adjust")
+            accessibleItem: sectionCard
+            onAccessibleClicked: sectionCard.expanded = true
+        }
+    }
+
+    // The wizard's tap-to-select tile, used by every picker window: optional
+    // leading icon + title + optional metadata line, highlighted when selected,
+    // emits chosen() on tap. Deliberately not enumerating the call sites here —
+    // that list has been wrong once already.
+    component ChoiceTile: Rectangle {
+        id: choiceTile
+        property string title: ""
+        property string meta: ""
+        property bool selected: false
+        // Optional leading artwork (a qrc:/icons/… SVG). Purely a visual aid:
+        // the title carries the meaning, and the accessible name below is built
+        // from the text alone, so a tile with no icon loses nothing.
+        property string iconSource: ""
+        signal chosen()
+        width: Math.min(Theme.scaled(240),
+            (parent && parent.width > 0) ? parent.width : Theme.scaled(240))
+        implicitHeight: Math.max(choiceTileRow.implicitHeight, Theme.scaled(30))
+            + 2 * Theme.spacingMedium
+        radius: Theme.cardRadius
+        color: selected ? Qt.alpha(Theme.primaryColor, 0.12) : Theme.cardBackgroundColor
+        border.color: selected ? Theme.primaryColor : Theme.borderColor
+        border.width: selected ? 2 : 1
+        RowLayout {
+            id: choiceTileRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Theme.spacingMedium
+            anchors.rightMargin: Theme.spacingMedium
+            spacing: Theme.spacingSmall
+            ThemedIcon {
+                visible: choiceTile.iconSource !== ""
+                Layout.alignment: Qt.AlignVCenter
+                // A bare Item publishes no implicit minimum, so without these
+                // the layout is free to shrink the icon to nothing when a long
+                // title over-constrains the row — and since the Image inside
+                // draws at a fixed sourceSize and the tile does not clip, the
+                // artwork would keep drawing at full size over the title.
+                Layout.preferredWidth: iconSize
+                Layout.minimumWidth: iconSize
+                source: choiceTile.iconSource
+                iconSize: Theme.scaled(26)
+                // Takes the selection colour when chosen; otherwise the same
+                // Theme.iconColor every other icon uses, which on its own gives
+                // no hint of the tile's state.
+                color: choiceTile.selected ? Theme.primaryColor : Theme.iconColor
+                Accessible.ignored: true
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Theme.scaled(2)
+                Label {
+                    Layout.fillWidth: true
+                    text: choiceTile.title
+                    font: Theme.bodyFont
+                    color: Theme.textColor
+                    wrapMode: Text.WordWrap
+                    maximumLineCount: 2
+                    elide: Text.ElideRight
+                    Accessible.ignored: true
+                }
+                Label {
+                    visible: choiceTile.meta !== ""
+                    Layout.fillWidth: true
+                    text: choiceTile.meta
+                    font: Theme.captionFont
+                    color: Theme.textSecondaryColor
+                    elide: Text.ElideRight
+                    Accessible.ignored: true
+                }
+            }
+        }
+        AccessibleMouseArea {
+            anchors.fill: parent
+            accessibleName: choiceTile.title
+                + (choiceTile.meta !== "" ? ", " + choiceTile.meta : "")
+                + (choiceTile.selected
+                    ? ", " + TranslationManager.translate("common.selected", "selected") : "")
+            accessibleItem: choiceTile
+            onAccessibleClicked: choiceTile.chosen()
+        }
+    }
+
+    // A tappable summary CARD: the same look as a collapsed SectionCard on
+    // the details step (title + value summary + ONE pencil glyph), so the
+    // summary and details steps share one visual language. Tap anywhere to
+    // reopen the owning step.
+    component SummaryRow: Rectangle {
+        id: summaryRow
+        property string label: ""
+        property string value: ""
+        property string step: ""
+        // Which details window this card edits ("equipment"/"numbers"/
+        // "steam"/"water"); tapping the card jumps straight to that window.
+        property string detailsPage: ""
+        // Optional leading photo (Bean card): a shared BeanThumbnail keyed the
+        // same way the hero / bean-step tiles are.
+        property bool showThumbnail: false
+        property string thumbnailKey: ""
+        property string thumbnailLink: ""
+        property string thumbnailIcon: "qrc:/icons/coffeebeans.svg"
+        property string thumbnailFallback: ""
+        // Optional extra controls in the header, left of the edit glyph (the
+        // Profile card's (i)/KB buttons). They keep their own tap areas, which
+        // win over the card-wide select target below (z:-1 — the profile-tile
+        // pattern).
+        property Component headerActions: null
+        // Optional body content that REPLACES the value Label (the Equipment
+        // card's EquipmentSummary). When null, `value` renders as text.
+        property Component contentComponent: null
+        // Announced value for accessibility when contentComponent is used.
+        property string accessibleValue: value
+        Layout.fillWidth: true
+        Layout.alignment: Qt.AlignTop
+        implicitHeight: summaryRowBody.implicitHeight + 2 * Theme.spacingMedium
+        radius: Theme.cardRadius
+        color: Theme.cardBackgroundColor
+        border.color: Theme.borderColor
+        border.width: 1
+        RowLayout {
+            id: summaryRowBody
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Theme.spacingMedium
+            spacing: Theme.spacingMedium
+            BeanThumbnail {
+                visible: summaryRow.showThumbnail
+                Layout.preferredWidth: Theme.scaled(56)
+                Layout.preferredHeight: Theme.scaled(56)
+                Layout.alignment: Qt.AlignTop
+                imageKey: summaryRow.thumbnailKey
+                link: summaryRow.thumbnailLink
+                fallbackName: summaryRow.thumbnailFallback
+                iconSource: summaryRow.thumbnailIcon
+                iconSize: Theme.scaled(24)
+                imageSourceSize: Theme.scaled(120)
+            }
+            ColumnLayout {
+                id: summaryRowColumn
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spacingSmall
+                    Label {
+                        text: summaryRow.label
+                        font: Theme.subtitleFont
+                        color: Theme.textColor
+                        Accessible.ignored: true
+                    }
+                    Item { Layout.fillWidth: true }
+                    Loader {
+                        active: summaryRow.headerActions !== null
+                        visible: active
+                        Layout.alignment: Qt.AlignVCenter
+                        sourceComponent: summaryRow.headerActions
+                    }
+                    // Decorative edit glyph. Must be mouse-transparent: the
+                    // card's tap target sits at z:-1 (so header-action buttons
+                    // win), so a click-absorbing ColoredIcon here would swallow
+                    // taps that land on the pencil and never open the step —
+                    // the whole card was tappable EXCEPT the pencil (#1606).
+                    // ThemedIcon draws the tinted SVG without grabbing clicks,
+                    // so a tap on the pencil falls through to the card handler.
+                    ThemedIcon {
+                        source: "qrc:/icons/edit.svg"
+                        iconSize: Theme.scaled(16)
+                        color: Theme.textSecondaryColor
+                        Accessible.ignored: true
+                    }
+                }
+                Loader {
+                    Layout.fillWidth: true
+                    active: summaryRow.contentComponent !== null
+                    visible: active
+                    sourceComponent: summaryRow.contentComponent
+                }
+                Label {
+                    visible: summaryRow.contentComponent === null
+                    Layout.fillWidth: true
+                    text: summaryRow.value
+                    font: Theme.bodyFont
+                    color: Theme.textColor
+                    wrapMode: Text.WordWrap
+                    Accessible.ignored: true
+                }
+            }
+        }
+        // Card-wide select target: sits under the header-action buttons so
+        // their taps win, while a tap anywhere else opens the step.
+        CardTapArea {
+            accessibleName: summaryRow.label + ", " + summaryRow.accessibleValue
+            accessibleItem: parent
+            onAccessibleClicked: {
+                if (summaryRow.step === "details" && summaryRow.detailsPage !== "")
+                    wizardPage._detailsPage = summaryRow.detailsPage
+                wizardPage.openStep(summaryRow.step)
+            }
+        }
+    }
+
+    // --- Page body -----------------------------------------------------------
+
+    KeyboardAwareContainer {
+        anchors.fill: parent
+        anchors.topMargin: Theme.pageTopMargin
+        anchors.bottomMargin: Theme.bottomBarHeight
+        // profileSearchField used to be listed here; it now lives inside
+        // ProfilePicker, which is not a text-field host itself.
+        textFields: [recipeNameEditor.inputField, doseField.input, yieldField.input, wizardProfilePicker.searchInput]
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Theme.standardMargin
+            anchors.rightMargin: Theme.standardMargin
+            spacing: Theme.spacingMedium
+
+            // Breadcrumb chips during the creation walk: selections so far,
+            // tappable to reopen the step. Hidden on the summary (which has
+            // its own rows).
+            Flow {
+                Layout.fillWidth: true
+                Layout.topMargin: Theme.spacingSmall
+                visible: wizardPage.currentStep !== "summary"
+                spacing: Theme.spacingSmall
+
+                Repeater {
+                    model: [
+                        { step: "drink", value: wizardPage.fDrinkType !== ""
+                            ? wizardPage.drinkTypeLabel(wizardPage.fDrinkType) : "" },
+                        { step: "bean", value: wizardPage.hasBean
+                            ? (wizardPage.fCoffee !== "" ? wizardPage.fCoffee : wizardPage.fRoaster) : "" },
+                        { step: "profile", value: wizardPage.fProfileTitle }
+                    ]
+                    delegate: Rectangle {
+                        id: stepChip
+                        required property var modelData
+
+                        visible: stepChip.modelData.value !== "" && wizardPage.currentStep !== stepChip.modelData.step
+                        radius: height / 2
+                        color: Theme.cardBackgroundColor
+                        border.color: Theme.borderColor
+                        border.width: 1
+                        implicitHeight: Theme.scaled(34)
+                        implicitWidth: chipLabel.implicitWidth + 2 * Theme.spacingMedium
+                        Label {
+                            id: chipLabel
+                            anchors.centerIn: parent
+                            text: stepChip.modelData.value
+                            font: Theme.captionFont
+                            color: Theme.textColor
+                            Accessible.ignored: true
+                        }
+                        AccessibleMouseArea {
+                            anchors.fill: parent
+                            accessibleName: TranslationManager.translate(
+                                "recipes.wizard.accessible.chip", "Change %1").arg(stepChip.modelData.value)
+                            accessibleItem: parent
+                            onAccessibleClicked: wizardPage.openStep(stepChip.modelData.step)
+                        }
+                    }
+                }
+            }
+
+            StackLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                currentIndex: wizardPage._stepIndex(wizardPage.currentStep)
+
+                // ===== Step 1: drink type =====
+                ColumnLayout {
+                    spacing: Theme.spacingMedium
+                    Label {
+                        Layout.topMargin: Theme.spacingMedium
+                        text: TranslationManager.translate("recipes.wizard.chooseDrink", "What are you making?")
+                        font: Theme.subtitleFont
+                        color: Theme.textColor
+                        Accessible.role: Accessible.Heading
+                        Accessible.name: text
+                    }
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: Theme.spacingMedium
+                        Repeater {
+                            model: ["espresso", "latte", "latte_hotwater", "filter", "americano", "long_black", "tea"]
+                            delegate: Rectangle {
+                                id: drinkTile
+                                required property var modelData
+
+                                radius: Theme.cardRadius
+                                color: Theme.cardBackgroundColor
+                                border.color: wizardPage.fDrinkType === drinkTile.modelData
+                                    ? Theme.primaryColor : Theme.borderColor
+                                border.width: wizardPage.fDrinkType === drinkTile.modelData ? 2 : 1
+                                implicitWidth: Theme.scaled(170)
+                                implicitHeight: Theme.scaled(120)
+                                ColumnLayout {
+                                    anchors.centerIn: parent
+                                    spacing: Theme.spacingSmall
+                                    // A row so a combination drink (Latte + Water)
+                                    // can show both its glyphs; single-icon types
+                                    // render one centered.
+                                    RowLayout {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        spacing: Theme.spacingSmall
+                                        Repeater {
+                                            model: wizardPage.drinkTypeIcons(drinkTile.modelData)
+                                            delegate: ThemedIcon {
+                                                required property string modelData
+                                                source: modelData
+                                                iconSize: Theme.scaled(44)
+                                                color: Theme.textColor
+                                                Accessible.ignored: true
+                                            }
+                                        }
+                                    }
+                                    Label {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        text: wizardPage.drinkTypeLabel(drinkTile.modelData)
+                                        font: Theme.bodyFont
+                                        color: Theme.textColor
+                                        Accessible.ignored: true
+                                    }
+                                }
+                                AccessibleMouseArea {
+                                    anchors.fill: parent
+                                    accessibleName: wizardPage.drinkTypeLabel(drinkTile.modelData)
+                                    accessibleItem: parent
+                                    onAccessibleClicked: wizardPage.selectDrinkType(drinkTile.modelData)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ===== Step 2: bean (kind-filtered) =====
+                ColumnLayout {
+                    spacing: Theme.spacingSmall
+                    // Kind-filtered open bags (tea drinks list tea bags only).
+                    readonly property var kindBags: {
+                        var kind = wizardPage.activeTemplate.bagKind
+                        var out = []
+                        for (let i = 0; i < wizardPage._bags.length; ++i) {
+                            let b = wizardPage._bags[i]
+                            let bKind = String(b.kind || "") === "tea" ? "tea" : "coffee"
+                            if (bKind === kind)
+                                out.push(b)
+                        }
+                        return out
+                    }
+                    Label {
+                        Layout.topMargin: Theme.spacingMedium
+                        text: wizardPage.isTeaDrink
+                            ? TranslationManager.translate("recipes.wizard.chooseTea", "Which tea?")
+                            : TranslationManager.translate("recipes.wizard.chooseBean", "Which beans?")
+                        font: Theme.subtitleFont
+                        color: Theme.textColor
+                        Accessible.role: Accessible.Heading
+                        Accessible.name: text
+                    }
+                    // Empty-inventory hint: the skip row alone reads like the
+                    // inventory vanished — say WHY the list is empty and where
+                    // bags of tea (or coffee) come from.
+                    Label {
+                        visible: parent.kindBags.length === 0
+                        Layout.fillWidth: true
+                        text: wizardPage.isTeaDrink
+                            ? TranslationManager.translate("recipes.wizard.noTeaBags",
+                                  "No bags of tea in your inventory yet — add one below, or continue without one.")
+                            : TranslationManager.translate("recipes.wizard.noCoffeeBags",
+                                  "No open bags in your inventory yet — add one below, or continue without one.")
+                        font: Theme.bodyFont
+                        color: Theme.textSecondaryColor
+                        wrapMode: Text.WordWrap
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+                    // Bag TILE grid (recipes-bag-links-ui-polish): one tile per
+                    // open bag — photo, roaster caption, coffee name, roast
+                    // date/age — so two bags of the same bean are visibly
+                    // distinct choices (no dedup; the tile IS the bag). "Add a
+                    // new coffee…" and "No bean" render as ghost tiles at the
+                    // end of the grid.
+                    Flickable {
+                        id: bagGridFlick
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        contentHeight: bagGrid.implicitHeight + Theme.scaled(16)
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        readonly property var gridModel:
+                            parent.kindBags.concat([{ isAddNew: true }, { isNone: true }])
+
+                        // Roast date plus age ("2026-06-12 · 28d"); empty when
+                        // the bag states no roast date.
+                        function roastAgeLine(bag) {
+                            var date = String(bag.roastDate || "")
+                            if (date === "") return ""
+                            var parsed = Date.fromLocaleString(Qt.locale("C"), date, "yyyy-MM-dd")
+                            if (isNaN(parsed.getTime())) return date
+                            var days = Math.floor((Date.now() - parsed.getTime()) / 86400000)
+                            return days >= 0 ? date + " · " + days + "d" : date
+                        }
+
+                        Flow {
+                            id: bagGrid
+                            width: bagGridFlick.width
+                            spacing: Theme.spacingMedium
+
+                            Repeater {
+                                model: bagGridFlick.gridModel
+                                delegate: Rectangle {
+                                    id: bagTile
+                                    required property var modelData
+
+                                    readonly property bool isGhost: bagTile.modelData.isAddNew === true || bagTile.modelData.isNone === true
+                                    readonly property bool isSelected: !isGhost && wizardPage.fBagId > 0
+                                        && bagTile.modelData.id === wizardPage.fBagId
+                                    readonly property string tileTitle: bagTile.modelData.isAddNew
+                                        ? (wizardPage.isTeaDrink
+                                            ? TranslationManager.translate("recipes.wizard.addNewTea", "Add a new tea…")
+                                            : TranslationManager.translate("recipes.wizard.addNewCoffee", "Add a new coffee…"))
+                                        : bagTile.modelData.isNone
+                                            ? (wizardPage.isTeaDrink ? trNoTea.text : trNoBean.text)
+                                            : (bagTile.modelData.coffeeName || bagTile.modelData.roasterName || "")
+                                    width: Theme.scaled(170)
+                                    height: Theme.scaled(190)
+                                    radius: Theme.cardRadius
+                                    color: isGhost ? "transparent" : Theme.cardBackgroundColor
+                                    border.color: isSelected ? Theme.primaryColor : "transparent"
+                                    border.width: isSelected ? 2 : 0
+
+                                    // Ghost tiles: dashed border, same size.
+                                    Canvas {
+                                        anchors.fill: parent
+                                        visible: bagTile.isGhost
+                                        onPaint: {
+                                            var ctx = getContext("2d")
+                                            ctx.reset()
+                                            ctx.strokeStyle = Theme.borderColor
+                                            ctx.lineWidth = 1
+                                            ctx.setLineDash([6, 5])
+                                            var r = Theme.cardRadius
+                                            ctx.beginPath()
+                                            ctx.roundedRect(0.5, 0.5, width - 1, height - 1, r, r)
+                                            ctx.stroke()
+                                        }
+                                        Accessible.ignored: true
+                                    }
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        visible: !bagTile.isGhost && !bagTile.isSelected
+                                        color: "transparent"
+                                        radius: parent.radius
+                                        border.color: Theme.borderColor
+                                        border.width: 1
+                                    }
+
+                                    ColumnLayout {
+                                        anchors.fill: parent
+                                        anchors.margins: Theme.spacingSmall
+                                        spacing: Theme.scaled(4)
+
+                                        // Bag photo — the shared BeanThumbnail
+                                        // cache widget (canonical id key, else
+                                        // the bag's own "bag-<id>" key).
+                                        BeanThumbnail {
+                                            visible: !bagTile.isGhost
+                                            Layout.fillWidth: true
+                                            Layout.preferredHeight: Theme.scaled(90)
+                                            imageKey: {
+                                                if (bagTile.isGhost) return ""
+                                                return BeanUiService.bagImageKey(bagTile.modelData.id,
+                                                    bagTile.modelData.beanBaseId ? String(bagTile.modelData.beanBaseId) : "")
+                                            }
+                                            fallbackName: bagTile.isGhost ? "" : (bagTile.modelData.coffeeName || "")
+                                            link: {
+                                                if (bagTile.isGhost || !bagTile.modelData.beanBaseData
+                                                    || String(bagTile.modelData.beanBaseData).length === 0)
+                                                    return ""
+                                                try { return JSON.parse(bagTile.modelData.beanBaseData).link || "" } catch (e) { return "" }
+                                            }
+                                            iconSource: wizardPage.isTeaDrink
+                                                ? "qrc:/icons/tea.svg" : "qrc:/icons/coffeebeans.svg"
+                                            iconSize: Theme.scaled(28)
+                                            imageSourceSize: Theme.scaled(180)
+                                        }
+                                        ColoredIcon {
+                                            visible: bagTile.isGhost
+                                            Layout.alignment: Qt.AlignHCenter
+                                            Layout.topMargin: Theme.scaled(30)
+                                            source: bagTile.modelData.isAddNew ? "qrc:/icons/plus.svg"
+                                                : (wizardPage.isTeaDrink ? "qrc:/icons/tea.svg" : "qrc:/icons/coffeebeans.svg")
+                                            iconWidth: Theme.scaled(32)
+                                            iconHeight: Theme.scaled(32)
+                                            iconColor: bagTile.modelData.isAddNew ? Theme.primaryColor : Theme.textSecondaryColor
+                                            Accessible.ignored: true
+                                        }
+                                        Label {
+                                            visible: !bagTile.isGhost && (bagTile.modelData.roasterName || "") !== ""
+                                            Layout.fillWidth: true
+                                            text: bagTile.modelData.roasterName || ""
+                                            font: Theme.captionFont
+                                            color: Theme.textSecondaryColor
+                                            elide: Text.ElideRight
+                                            Accessible.ignored: true
+                                        }
+                                        Label {
+                                            Layout.fillWidth: true
+                                            Layout.alignment: bagTile.isGhost ? Qt.AlignHCenter : Qt.AlignLeft
+                                            horizontalAlignment: bagTile.isGhost ? Text.AlignHCenter : Text.AlignLeft
+                                            text: bagTile.tileTitle
+                                            font: Theme.bodyFont
+                                            color: bagTile.modelData.isAddNew ? Theme.primaryColor : Theme.textColor
+                                            wrapMode: Text.WordWrap
+                                            maximumLineCount: 2
+                                            elide: Text.ElideRight
+                                            Accessible.ignored: true
+                                        }
+                                        Label {
+                                            visible: !bagTile.isGhost && bagGridFlick.roastAgeLine(bagTile.modelData) !== ""
+                                            Layout.fillWidth: true
+                                            text: bagTile.isGhost ? "" : bagGridFlick.roastAgeLine(bagTile.modelData)
+                                            font: Theme.captionFont
+                                            color: Theme.textSecondaryColor
+                                            elide: Text.ElideRight
+                                            Accessible.ignored: true
+                                        }
+                                        Item { Layout.fillHeight: true }
+                                    }
+
+                                    AccessibleMouseArea {
+                                        anchors.fill: parent
+                                        accessibleName: bagTile.isGhost ? bagTile.tileTitle
+                                            : (((bagTile.modelData.roasterName || "") + " " + (bagTile.modelData.coffeeName || "")).trim()
+                                               + (bagGridFlick.roastAgeLine(bagTile.modelData) !== ""
+                                                   ? ", " + bagGridFlick.roastAgeLine(bagTile.modelData) : ""))
+                                        accessibleItem: bagTile
+                                        onAccessibleClicked: {
+                                            if (bagTile.modelData.isAddNew) {
+                                                // Coffee: the search-first flow (the one
+                                                // they want may be in Bean Base /
+                                                // history). Tea: the tea entry (form-
+                                                // first when none exist).
+                                                if (wizardPage.isTeaDrink)
+                                                    wizardBeansDialog.openTeaEntry(bagGridFlick.gridModel.length > 2)
+                                                else {
+                                                    wizardBeansDialog.bagKind = "coffee"
+                                                    wizardBeansDialog.open()
+                                                }
+                                                return
+                                            }
+                                            wizardPage.selectBean(bagTile.modelData.isNone ? null : bagTile.modelData)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ===== Step 3: profile (shared ProfilePicker — profile-picker /
+                // recipe-wizard specs) =====
+                ColumnLayout {
+                    spacing: Theme.spacingSmall
+                    Label {
+                        Layout.topMargin: Theme.spacingMedium
+                        text: TranslationManager.translate("recipes.wizard.chooseProfile", "Which profile?")
+                        font: Theme.subtitleFont
+                        color: Theme.textColor
+                        Accessible.role: Accessible.Heading
+                        Accessible.name: text
+                    }
+                    ProfilePicker {
+                        id: wizardProfilePicker
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+
+                        beanBrand: wizardPage.fRoaster
+                        beanType: wizardPage.fCoffee
+                        // Coffee only — matches the old requestProfileRanking's
+                        // "!isTeaDrink" guard; a tea bag's roast level isn't a
+                        // coffee roast affinity signal.
+                        roastLevel: wizardPage.isTeaDrink ? "" : wizardPage._selectedBagRoastLevel
+                        teaType: wizardPage._wizardTeaType
+                        allowedBeverageTypes: wizardPage._wizardAllowedBeverages
+                        // The recipe's profile, not the machine's: on this
+                        // step "current" means what the recipe holds.
+                        highlightedFilename: wizardPage.fProfileTitle !== ""
+                            ? ProfileService.findProfileByTitle(wizardPage.fProfileTitle) : ""
+                        // No chip on initially (recipe-wizard spec); the
+                        // Beverage chip group is hidden automatically because
+                        // allowedBeverageTypes is non-empty (design D6).
+                        initialChips: ({})
+
+                        onProfileChosen: function(filename, title) {
+                            wizardPage.selectProfile({ title: title, name: filename })
+                        }
+                    }
+                    // Fixed card (tea only): a profile-less hot-water recipe.
+                    // Below the picker, visible regardless of its search/chips
+                    // (recipe-wizard spec).
+                    ItemDelegate {
+                        visible: wizardPage.isTeaDrink
+                        Layout.fillWidth: true
+                        contentItem: Label {
+                            text: trJustHotWater.text
+                            font: Theme.bodyFont
+                            color: Theme.textColor
+                        }
+                        Accessible.role: Accessible.Button
+                        Accessible.name: trJustHotWater.text
+                        onClicked: wizardPage.selectJustHotWater()
+                    }
+                }
+
+                // ===== Step 4: details (drink-type specific) =====
+                // A PINNED header row (the "everything is optional" caption
+                // + the Continue button) sits above the scrolling cards, so
+                // Continue is always visible — expanding a card never pushes
+                // it off screen. Section cards flow into two columns on
+                // landscape widths; below the threshold they stack. Input
+                // controls are sized to their content, never stretched to
+                // the page width.
+                ColumnLayout {
+                    spacing: Theme.spacingSmall
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: Theme.spacingSmall
+                        spacing: Theme.spacingMedium
+                        Label {
+                            Layout.fillWidth: true
+                            // Edit/clone/promote (entered at the summary):
+                            // this step commits directly — never send the
+                            // user hunting for a second Save press.
+                            text: wizardPage._enteredAtSummary
+                                ? TranslationManager.translate("recipes.wizard.detailsOptionalEdit",
+                                      "Everything here is optional — adjust it and Save.")
+                                : TranslationManager.translate("recipes.wizard.detailsWalk",
+                                      "Everything here is optional and prefilled. "
+                                      + "Adjust it if you like, then continue.")
+                            font: Theme.captionFont
+                            color: Theme.textSecondaryColor
+                            wrapMode: Text.WordWrap
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: text
+                        }
+                        AccessibleButton {
+                            visible: wizardPage._enteredAtSummary
+                            Layout.alignment: Qt.AlignVCenter
+                            text: TranslationManager.translate("common.cancel", "Cancel")
+                            accessibleName: TranslationManager.translate("recipes.composer.accessible.cancel", "Cancel recipe editing")
+                            onClicked: wizardPage.requestExit()
+                        }
+                        AccessibleButton {
+                            visible: wizardPage._enteredAtSummary
+                            Layout.alignment: Qt.AlignVCenter
+                            primary: true
+                            enabled: wizardPage.canSave
+                            text: TranslationManager.translate("common.save", "Save")
+                            accessibleName: TranslationManager.translate("recipes.composer.accessible.save", "Save the recipe")
+                            onClicked: wizardPage.save()
+                        }
+                        AccessibleButton {
+                            visible: !wizardPage._enteredAtSummary
+                            Layout.alignment: Qt.AlignVCenter
+                            primary: true
+                            // A window opened FROM the summary returns there
+                            // ("Done"); in the creation walk, Continue steps to
+                            // the next window and the LAST one says "Review" —
+                            // the next stop is the named, WYSIWYG summary with
+                            // Save, so it never reads like a commit.
+                            text: wizardPage._fromSummary
+                                ? TranslationManager.translate("common.done", "Done")
+                                : (wizardPage.isLastDetailsPage
+                                    ? TranslationManager.translate("recipes.wizard.review", "Review")
+                                    : TranslationManager.translate("common.continue", "Continue"))
+                            accessibleName: text
+                            onClicked: wizardPage.detailsContinue()
+                        }
+                    }
+
+                    // Pinned with the header (matching the summary step) so a
+                    // save failure from the details step is never hidden.
+                    Label {
+                        visible: wizardPage.errorMessage !== ""
+                        Layout.fillWidth: true
+                        text: wizardPage.errorMessage
+                        font: Theme.bodyFont
+                        color: Theme.errorColor
+                        wrapMode: Text.WordWrap
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+
+                    Flickable {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    contentHeight: detailsColumn.implicitHeight + Theme.scaled(24)
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    GridLayout {
+                        id: detailsColumn
+                        width: parent.width
+                        // One facet per window now, so a single column keeps each
+                        // window's card(s) full-width — no half-empty row from the
+                        // old 2-column all-in-one step. The numbers window's two
+                        // cards (dose/yield/temp + grind) simply stack.
+                        columns: 1
+                        columnSpacing: Theme.spacingMedium
+                        rowSpacing: Theme.spacingMedium
+
+                        SectionCard {
+                            id: numbersCard
+                            // The dose/yield/temp/grind window — its own screen,
+                            // so the fields show expanded (no collapse chrome).
+                            visible: wizardPage._detailsPage === "numbers"
+                            collapsible: false
+                            // Concrete title: name the fields, not "numbers".
+                            title: wizardPage.isTeaDrink
+                                ? TranslationManager.translate("recipes.wizard.sectionLeafTemp", "Leaf & temperature")
+                                : TranslationManager.translate("recipes.wizard.sectionDoseYield", "Dose, yield & temperature")
+                            // The wizard says where the prefills came from and
+                            // why the user might change them — never a wall of
+                            // unexplained values.
+                            Label {
+                                Layout.fillWidth: true
+                                text: wizardPage.numbersHint
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                                Accessible.role: Accessible.StaticText
+                                Accessible.name: text
+                            }
+                            // WRAPS rather than squeezing (add-yield-ratio-anchor):
+                            // the Ratio control made this a FOUR-control row, and
+                            // dose+yield+ratio+temp simply do not fit side by side
+                            // in a narrow card — the layout paid for it by crushing
+                            // whichever child had the smallest minimum, clipping
+                            // "36.0" to "6.0". A grid drops to 2x2 instead, and only
+                            // goes single-row where there is genuinely room.
+                            // Bound to the CARD's width, never this grid's own, or
+                            // the columns binding would feed back into the layout.
+                            // Invisible children take no cell, so the tea variants
+                            // (no ratio; no yield for hot-water tea) reflow for free.
+                            GridLayout {
+                                Layout.fillWidth: true
+                                columns: numbersCard.width >= Theme.scaled(620) ? 4 : 2
+                                columnSpacing: Theme.spacingMedium
+                                rowSpacing: Theme.spacingSmall
+                                NumberField {
+                                    id: doseField
+                                    Layout.preferredWidth: Theme.scaled(120)
+                                    label: wizardPage.isTeaDrink
+                                        ? TranslationManager.translate("recipes.wizard.leafDose", "Leaf (g)")
+                                        : TranslationManager.translate("recipes.composer.doseLabel", "Dose (g)")
+                                    onEdited: {
+                                        wizardPage._detailsUserEdited = true
+                                        // A dose edit re-derives the NON-anchored
+                                        // yield field; the anchor never moves.
+                                        wizardPage.syncDerivedYieldFields()
+                                    }
+                                }
+                                // Yield anchor pair (add-yield-ratio-anchor): a
+                                // three-state choice — nothing, a fixed yield, or a
+                                // ratio of the dose. Whichever was LAST EDITED is the
+                                // anchor (stored); the other shows the derived value,
+                                // dimmed, never blank. Clearing the anchored field
+                                // clears the yield entirely (mode "none").
+                                NumberField {
+                                    id: yieldField
+                                    visible: !wizardPage.isHotWaterTea
+                                    Layout.preferredWidth: Theme.scaled(120)
+                                    label: TranslationManager.translate("recipes.composer.yieldLabel", "Yield (g)")
+                                    dim: wizardPage.fYieldMode === "ratio"
+                                    onEdited: function(newText) {
+                                        wizardPage._detailsUserEdited = true
+                                        wizardPage.fYieldMode = (parseFloat(newText) || 0) > 0 ? "absolute" : "none"
+                                        if (wizardPage.fYieldMode === "none")
+                                            ratioField.text = ""
+                                        wizardPage.syncDerivedYieldFields()
+                                    }
+                                }
+                                // Ratio: a STYLE choice, picked from the named
+                                // chooser (Ristretto / Normale / Lungo — the
+                                // user's own configured presets, with the
+                                // descriptions that explain them). Designing a
+                                // drink is exactly where that vocabulary
+                                // belongs. Same framed, edit-icon'd,
+                                // tap-to-choose control as Brew Settings' Ratio
+                                // row — one idiom in both places; the Yield
+                                // field beside it stays the precise-grams
+                                // control (the two are one anchor, two views).
+                                // Renders "1:2.5" rather than a bare 2.5, and
+                                // "Pick…" when unset so the presets are
+                                // discoverable.
+                                ColumnLayout {
+                                    id: ratioField
+                                    visible: !wizardPage.isHotWaterTea && !wizardPage.isTeaDrink
+                                    // The typed-value API the rest of the page
+                                    // uses (syncDerivedYieldFields, save map,
+                                    // applyRecipeMap) — kept so the ratio's
+                                    // storage path is unchanged by the control swap.
+                                    property string text: ""
+                                    readonly property double _r: parseFloat(text) || 0
+                                    Layout.preferredWidth: Theme.scaled(120)
+                                    // A minimum is load-bearing here: the tap
+                                    // control below is a bare Rectangle
+                                    // (implicitWidth 0), so with this row
+                                    // crowded the layout would shrink it to
+                                    // nothing while the text-field columns
+                                    // held their size — the value elided to
+                                    // "…" and the ratio became unreadable.
+                                    // Sized to fit "1:2.5" + the edit icon.
+                                    Layout.minimumWidth: Theme.scaled(96)
+                                    spacing: Theme.scaled(4)
+                                    Label {
+                                        text: TranslationManager.translate("recipes.composer.ratioLabel", "Ratio")
+                                        font: Theme.captionFont
+                                        color: Theme.textSecondaryColor
+                                        Accessible.ignored: true
+                                    }
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: Theme.scaled(40)
+                                        radius: Theme.scaled(8)
+                                        color: wizardRatioMa.pressed ? Qt.darker(Theme.backgroundColor, 1.1) : "transparent"
+                                        border.width: 1
+                                        border.color: Theme.textSecondaryColor
+                                        opacity: wizardPage.fYieldMode === "ratio" ? 1.0 : 0.55
+                                        Accessible.role: Accessible.Button
+                                        Accessible.name: TranslationManager.translate(
+                                            "recipes.composer.chooseNamedRatio", "Choose a named brew ratio")
+                                            + (ratioField._r > 0 ? ". 1:" + ratioField._r.toFixed(1) : "")
+                                        Accessible.focusable: true
+                                        Accessible.onPressAction: wizardRatioPicker.open()
+                                        RowLayout {
+                                            anchors.fill: parent
+                                            anchors.leftMargin: Theme.spacingSmall
+                                            anchors.rightMargin: Theme.spacingSmall
+                                            spacing: Theme.scaled(2)
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: ratioField._r > 0
+                                                    ? "1:" + ratioField._r.toFixed(1)
+                                                    : TranslationManager.translate("recipes.composer.pickRatio", "Pick…")
+                                                font: Theme.bodyFont
+                                                color: ratioField._r > 0 ? Theme.textColor : Theme.textSecondaryColor
+                                                horizontalAlignment: Text.AlignHCenter
+                                                elide: Text.ElideRight
+                                                Accessible.ignored: true
+                                            }
+                                            ColoredIcon {
+                                                source: "qrc:/icons/edit.svg"
+                                                iconWidth: Theme.scaled(14)
+                                                iconHeight: Theme.scaled(14)
+                                                iconColor: Theme.primaryColor
+                                                Accessible.ignored: true
+                                            }
+                                        }
+                                        MouseArea {
+                                            id: wizardRatioMa
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: wizardRatioPicker.open()
+                                        }
+                                    }
+                                }
+                                // Coffee drinks: temperature as an OFFSET on the
+                                // profile (shot-plan semantics). Tea: absolute.
+                                ColumnLayout {
+                                    visible: !wizardPage.isTeaDrink
+                                    Layout.fillWidth: true
+                                    spacing: Theme.scaled(4)
+                                    // Label row carries the RESULTING temperature beside
+                                    // the "Temp offset" caption (issue #1604) — the
+                                    // stepper alone shows "+2°" and a user can't dial to
+                                    // a target without knowing the profile's default.
+                                    // Sitting on the caption row (not below the stepper)
+                                    // keeps this column the same height as Dose/Yield/
+                                    // Ratio, so the inputs stay aligned across the grid.
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: Theme.scaled(6)
+                                        Label {
+                                            text: TranslationManager.translate("recipes.composer.tempOffsetLabel", "Temp offset")
+                                            font: Theme.captionFont
+                                            color: Theme.textSecondaryColor
+                                            Accessible.ignored: true
+                                        }
+                                        // temperatureDisplayForSteps — NOT temperatureDisplay
+                                        // — because the wizard edits an arbitrarily selected
+                                        // profile, not the host's current machine profile;
+                                        // fProfileStepTemps carries the picked profile's
+                                        // frames. The last arg (baselineShift == fTempDeltaC)
+                                        // shifts every frame to the eventual value (at most
+                                        // two temps: "94°C", "80 · 94°C", or "80…96°C"). The
+                                        // hasOverride arg is false: it would append a signed
+                                        // "-2°" tag that just repeats the stepper right below.
+                                        Text {
+                                            visible: wizardPage.fProfileTempC > 0
+                                            Layout.fillWidth: true
+                                            text: {
+                                                // Theme reads the unit in QML so this binding
+                                                // updates when the user switches °C/°F.
+                                                return "→ " + TemperatureDisplay.formatForSteps(
+                                                    wizardPage.fProfileStepTemps,
+                                                    wizardPage.fProfileTempC,
+                                                    false,
+                                                    wizardPage.fProfileTempC,
+                                                    Theme.tempIsFahrenheit(),
+                                                    wizardPage.fTempDeltaC)
+                                            }
+                                            font.family: Theme.bodyFont.family
+                                            font.pixelSize: Theme.captionFont.pixelSize
+                                            font.italic: true
+                                            elide: Text.ElideRight
+                                            color: Math.abs(wizardPage.fTempDeltaC) > 0.1
+                                                ? Theme.temperatureColor : Theme.textSecondaryColor
+                                            Accessible.role: Accessible.StaticText
+                                            Accessible.name: text
+                                        }
+                                    }
+                                    ValueInput {
+                                        // Sized to content — a temp stepper must
+                                        // never span the page width.
+                                        Layout.preferredWidth: Theme.scaled(190)
+                                        enabled: wizardPage.fProfileTempC > 0
+                                        readonly property real displayDelta: Theme.cDeltaToDisplay(wizardPage.fTempDeltaC)
+                                        value: displayDelta
+                                        from: wizardPage.fProfileTempC > 0
+                                            ? Theme.cDeltaToDisplay(70 - wizardPage.fProfileTempC) : -10
+                                        to: wizardPage.fProfileTempC > 0
+                                            ? Theme.cDeltaToDisplay(100 - wizardPage.fProfileTempC) : 10
+                                        stepSize: 1
+                                        decimals: 0
+                                        suffix: "°"
+                                        displayText: (displayDelta > 0 ? "+" : "") + displayDelta.toFixed(0) + "°"
+                                        valueColor: Math.abs(wizardPage.fTempDeltaC) > 0.1 ? Theme.temperatureColor : Theme.textSecondaryColor
+                                        accentColor: Theme.temperatureColor
+                                        accessibleName: TranslationManager.translate("recipes.composer.tempOffsetAccessible", "Brew temperature offset")
+                                        onValueModified: function(newValue) {
+                                            wizardPage.fTempDeltaC = Theme.displayToCDelta(newValue)
+                                            wizardPage._detailsUserEdited = true
+                                        }
+                                    }
+                                }
+                                NumberField {
+                                    // Portafilter tea only: this edits an ABSOLUTE steep
+                                    // temperature that converts to the stored offset against
+                                    // the profile. Hot-water tea has no profile — its
+                                    // temperature belongs to the water vessel (recipe-model:
+                                    // the vessel is the single source of amount/temperature/
+                                    // flow; a separate field here stored a value activation
+                                    // never used). Disabled when the profile can't be
+                                    // resolved: without an anchor the save path preserves the
+                                    // stored offset untouched, so the field must not accept
+                                    // input it would silently discard.
+                                    visible: wizardPage.isTeaDrink && !wizardPage.isHotWaterTea
+                                    enabled: wizardPage.fProfileTempC > 0
+                                    Layout.preferredWidth: Theme.scaled(120)
+                                    label: TranslationManager.translate("recipes.wizard.teaTemp", "Temp (°C)")
+                                    text: wizardPage.fTeaTempC > 0 ? String(Math.round(wizardPage.fTeaTempC)) : ""
+                                    onEdited: function(newText) {
+                                        wizardPage.fTeaTempC = parseFloat(newText) || 0
+                                        wizardPage._detailsUserEdited = true
+                                    }
+                                }
+                                // (The RowLayout's trailing fillWidth spacer is
+                                // gone: in a grid it would consume a cell and
+                                // shove the wrap point one control early.)
+                            }
+                            // The way back after editing: revert to the
+                            // profile's own numbers (no revert exists on the
+                            // other cards because they have no canonical
+                            // source — grind's revert is the Override toggle).
+                            AccessibleButton {
+                                visible: wizardPage.fProfileTitle !== ""
+                                Layout.alignment: Qt.AlignRight
+                                height: Theme.scaled(36)
+                                _customFontSize: Theme.captionFont.pixelSize
+                                leftPadding: Theme.scaled(10)
+                                rightPadding: Theme.scaled(10)
+                                text: TranslationManager.translate("recipes.wizard.resetToProfile", "Reset to profile")
+                                accessibleName: TranslationManager.translate(
+                                    "recipes.wizard.accessible.resetToProfile",
+                                    "Reset dose, yield, and temperature to the profile's values")
+                                onClicked: wizardPage.resetNumbersToProfile()
+                            }
+                        }
+
+                        // Grind: coffee drinks only (tea has nothing to grind).
+                        // Equipment BEFORE grind: the rpm field's visibility
+                        // depends on the chosen grinder's rpm capability, so
+                        // the user sees (and can correct) the equipment choice
+                        // before reaching the field it gates
+                        // (fix-recipe-grind-integrity). Prefilled from the
+                        // per-drink-type default; a row, not a step (it rarely
+                        // changes once set).
+                        SectionCard {
+                            // The equipment window — first in the walk.
+                            visible: wizardPage._detailsPage === "equipment"
+                            title: TranslationManager.translate("recipes.composer.sectionEquipment", "Equipment")
+                            Label {
+                                Layout.fillWidth: true
+                                text: TranslationManager.translate("recipes.wizard.equipmentHint",
+                                      "Prefilled from the gear you last used for this drink — pick a "
+                                      + "different package only if this recipe uses another grinder or basket.")
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                            }
+                            // The in-inventory packages as inline, tap-to-select
+                            // tiles (no dialog): the current one is highlighted,
+                            // "None" clears the link, and picking one moves on.
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingMedium
+                                Repeater {
+                                    model: wizardPage.equipmentTileModel()
+                                    delegate: ChoiceTile {
+                                        id: equipmentTile
+                                        required property var modelData
+
+                                        readonly property bool isNone: equipmentTile.modelData.isNone === true
+                                        readonly property string grinder:
+                                            ((equipmentTile.modelData.grinderBrand || "") + " " + (equipmentTile.modelData.grinderModel || "")).trim()
+                                        readonly property string basket:
+                                            ((equipmentTile.modelData.basketBrand || "") + " " + (equipmentTile.modelData.basketModel || "")).trim()
+                                        title: isNone ? trNone.text
+                                            : (equipmentTile.modelData.name || grinder || basket)
+                                        meta: {
+                                            if (isNone) return ""
+                                            var parts = []
+                                            if (grinder !== "" && grinder !== title) parts.push(grinder)
+                                            if (basket !== "") parts.push(basket)
+                                            return parts.join(" · ")
+                                        }
+                                        selected: isNone
+                                            ? wizardPage.fEquipmentId <= 0
+                                            : equipmentTile.modelData.id === wizardPage.fEquipmentId
+                                        onChosen: {
+                                            wizardPage.selectEquipment(isNone ? null : equipmentTile.modelData)
+                                            // Picking a tile is the choice — move
+                                            // on without a second Continue tap.
+                                            wizardPage.detailsContinue()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        SectionCard {
+                            id: grindCard
+                            // Grind rides with the numbers window — after
+                            // equipment, so the rpm field's grinder gate is set.
+                            // Shown expanded (its own screen, no collapse).
+                            visible: wizardPage.showSavedGrind && wizardPage._detailsPage === "numbers"
+                            collapsible: false
+                            title: TranslationManager.translate("recipes.composer.grindLabel", "Grind")
+                            Label {
+                                visible: wizardPage.hasBean
+                                Layout.fillWidth: true
+                                text: TranslationManager.translate("recipes.wizard.grindHistoryHelp",
+                                      "This recipe's own grind. "
+                                      + "Adjusting the grind while this recipe is selected keeps it up "
+                                      + "to date.")
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                            }
+                            Label {
+                                visible: wizardPage._grindDefaultContext !== ""
+                                Layout.fillWidth: true
+                                text: TranslationManager.translate("recipes.wizard.grindHistoryContext",
+                                      "Last used with: %1").arg(wizardPage._grindDefaultContext)
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                            }
+                            // The knowledge-base grind hint as an anchored
+                            // callout (icon + tinted background), not muted
+                            // caption text.
+                            Rectangle {
+                                visible: wizardPage.grindHint !== "" || wizardPage._hasGrindSuggestion
+                                Layout.fillWidth: true
+                                implicitHeight: grindHintRow.implicitHeight + 2 * Theme.spacingSmall
+                                radius: Theme.scaled(8)
+                                color: Qt.alpha(Theme.primaryColor, 0.10)
+                                RowLayout {
+                                    id: grindHintRow
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.leftMargin: Theme.spacingSmall
+                                    anchors.rightMargin: Theme.spacingSmall
+                                    spacing: Theme.spacingSmall
+                                    ColoredIcon {
+                                        Layout.alignment: Qt.AlignTop
+                                        source: "qrc:/icons/info.svg"
+                                        iconWidth: Theme.scaled(18)
+                                        iconHeight: Theme.scaled(18)
+                                        iconColor: Theme.primaryColor
+                                        Accessible.ignored: true
+                                    }
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: wizardPage._hasGrindSuggestion ? wizardPage.grindSuggestionText
+                                                                             : wizardPage.grindHint
+                                        font: Theme.captionFont
+                                        color: Theme.textColor
+                                        wrapMode: Text.WordWrap
+                                        Accessible.role: Accessible.StaticText
+                                        Accessible.name: text
+                                    }
+                                    // Tap to accept: an estimate can be wrong (#1223),
+                                    // so it never fills the field by itself.
+                                    AccessibleButton {
+                                        visible: wizardPage._hasGrindSuggestion
+                                                 && wizardPage.fGrind.trim() !== wizardPage.grindSuggestion.setting
+                                        Layout.alignment: Qt.AlignVCenter
+                                        _customFontSize: Theme.captionFont.pixelSize
+                                        text: TranslationManager.translate("recipes.wizard.grindSuggestion.use", "Use %1")
+                                                  .arg(wizardPage.grindSuggestion.setting || "")
+                                        accessibleName: text
+                                        onClicked: {
+                                            wizardPage.fGrind = wizardPage.grindSuggestion.setting
+                                            wizardPage._grindUserEdited = true
+                                            wizardPage._grindDefaultContext = ""
+                                            wizardPage._detailsUserEdited = true
+                                        }
+                                    }
+                                }
+                            }
+                            // One tap-to-open control for both dial-in halves
+                            // ("grind · rpm"); typing lives in the picker's
+                            // text mode. Context is the RECIPE's selected
+                            // package, never the active grinder.
+                            GrindField {
+                                Layout.fillWidth: true
+                                presentation: "field"
+                                grinderBrand: wizardPage.fEquipmentGrinderBrand
+                                grinderModel: wizardPage.fEquipmentGrinderModel
+                                grindSetting: wizardPage.fGrind
+                                rpmValue: wizardPage.fRpmPinned
+                                accessibleName: TranslationManager.translate("recipes.composer.grindLabel", "Grind")
+                                onGrindCommitted: function(v) {
+                                    wizardPage.fGrind = v
+                                    wizardPage._grindUserEdited = true
+                                    wizardPage._grindDefaultContext = ""
+                                    wizardPage._detailsUserEdited = true
+                                }
+                                onRpmCommitted: function(rpm) {
+                                    wizardPage.fRpmPinned = rpm
+                                    wizardPage._grindUserEdited = true
+                                    wizardPage._grindDefaultContext = ""
+                                    wizardPage._detailsUserEdited = true
+                                }
+                            }
+                            AccessibleButton {
+                                visible: wizardPage.fRpmPinned > 0 && !wizardPage.fEquipmentRpmCapable
+                                text: TranslationManager.translate("recipes.wizard.clearSavedRpm", "Remove saved RPM (%1)").arg(wizardPage.fRpmPinned)
+                                accessibleName: text
+                                onClicked: {
+                                    wizardPage.fRpmPinned = 0
+                                    wizardPage._grindUserEdited = true
+                                    wizardPage._grindDefaultContext = ""
+                                    wizardPage._detailsUserEdited = true
+                                }
+                            }
+                        }
+
+                        // Milk block (latte template, or added on the summary).
+                        // No milk-weight capture here: milk is weighed each
+                        // time you steam — the recipe only needs the pitcher
+                        // (whose preset carries steam time/flow/temperature)
+                        // and the milk INTENT, which drives the heater hold.
+                        SectionCard {
+                            // The steam window (milk drinks).
+                            visible: (wizardPage.fHasMilk || wizardPage.legacySteamSettings) && wizardPage._detailsPage === "steam"
+                            title: TranslationManager.translate("recipes.composer.sectionSteam", "Steam")
+                            Label {
+                                Layout.fillWidth: true
+                                text: TranslationManager.translate("recipes.composer.steamHint",
+                                      "Pick the pitcher you steam this drink with — its preset sets the "
+                                      + "steam time and flow. You'll weigh the milk when you steam. With "
+                                      + "Let the recipe decide on, this drink warms the steam heater when "
+                                      + "its shot starts; pick Heater off to keep the boiler cold.")
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                            }
+                            // The pitcher presets as inline, tap-to-select
+                            // tiles (like equipment): the chosen one is
+                            // highlighted, and picking one moves on.
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingMedium
+                                Repeater {
+                                    model: wizardPage.pitcherTileModel()
+                                    delegate: ChoiceTile {
+                                        id: pitcherTile
+                                        required property var modelData
+
+                                        title: wizardPage.pitcherTileTitle(pitcherTile.modelData)
+                                        meta: wizardPage.pitcherTileMeta(pitcherTile.modelData)
+                                        iconSource: "qrc:/icons/pitcher.svg"
+                                        selected: pitcherTile.modelData.disabled === true
+                                            ? wizardPage.fHeaterOff
+                                            : (!wizardPage.fHeaterOff && wizardPage.fPitcherName !== ""
+                                               && (pitcherTile.modelData.name || "") === wizardPage.fPitcherName)
+                                        onChosen: {
+                                            wizardPage.selectPitcher(pitcherTile.modelData)
+                                            wizardPage.detailsContinue()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Hot-water block (americano/long black/hot-water tea
+                        // templates, or added on the summary).
+                        SectionCard {
+                            // The hot-water window.
+                            visible: (wizardPage.fHasWater || wizardPage.legacyWaterSettings) && wizardPage._detailsPage === "water"
+                            title: TranslationManager.translate("recipes.composer.sectionHotWater", "Hot water")
+                            // Order BEFORE the vessel: the vessel tile is the
+                            // terminal choice and moves on by itself, so the
+                            // order — a modifier that arrives template-defaulted
+                            // — is offered first, while the user is still here.
+                            // Nothing forces that sequence; both orders are
+                            // valid whenever this block is shown.
+                            ColumnLayout {
+                                // A drink carrying BOTH milk and water pours the
+                                // water first, so it gets no order choice. Gated
+                                // on the blocks rather than on fDrinkType: the
+                                // summary's "Add milk" button adds the milk block
+                                // without rewriting the type, so an americano can
+                                // reach this window with milk on it.
+                                visible: !wizardPage.isHotWaterTea
+                                    && !(wizardPage.fHasMilk && wizardPage.fHasWater)
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingSmall
+                                Label {
+                                    text: TranslationManager.translate("recipes.composer.waterOrder", "When to add the water")
+                                    font: Theme.captionFont
+                                    color: Theme.textSecondaryColor
+                                    Accessible.ignored: true
+                                }
+                                Flow {
+                                    Layout.fillWidth: true
+                                    spacing: Theme.spacingMedium
+                                    ChoiceTile {
+                                        title: TranslationManager.translate("recipes.composer.waterAfter", "After espresso (Americano)")
+                                        selected: wizardPage.fWaterOrder !== "before"
+                                        onChosen: wizardPage.setWaterOrder("after")
+                                    }
+                                    ChoiceTile {
+                                        title: TranslationManager.translate("recipes.composer.waterBefore", "Before espresso (long black)")
+                                        selected: wizardPage.fWaterOrder === "before"
+                                        onChosen: wizardPage.setWaterOrder("before")
+                                    }
+                                }
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: TranslationManager.translate("recipes.wizard.vesselHint",
+                                      "Pick the vessel this drink is poured into — its preset sets the "
+                                      + "water amount and temperature.")
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                                Accessible.role: Accessible.StaticText
+                                Accessible.name: text
+                            }
+                            RowLayout {
+                                AccessibleButton {
+                                    text: TranslationManager.translate("water.vessel.add", "Add vessel")
+                                    accessibleName: text
+                                    onClicked: wizardPage.editRecipeVessel(true)
+                                }
+                                AccessibleButton {
+                                    visible: wizardPage.fVesselName !== ""
+                                    text: TranslationManager.translate("water.vessel.edit", "Edit vessel")
+                                    accessibleName: text
+                                    onClicked: wizardPage.editRecipeVessel(false)
+                                }
+                            }
+                            // The vessel presets as inline, tap-to-select tiles
+                            // (like the pitchers on the steam window): the chosen
+                            // one is highlighted, and picking one moves on.
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingMedium
+                                Repeater {
+                                    model: wizardPage.vesselTileModel()
+                                    delegate: ChoiceTile {
+                                        id: vesselTile
+                                        required property var modelData
+
+                                        title: vesselTile.modelData.name || ""
+                                        meta: wizardPage.vesselTileMeta(vesselTile.modelData)
+                                        iconSource: wizardPage.vesselTileIcon(vesselTile.modelData)
+                                        // The empty-name test matters: a preset
+                                        // saved with a blank name would otherwise
+                                        // match the wizard's own empty default and
+                                        // show as chosen before anything is tapped.
+                                        selected: wizardPage.fVesselName !== ""
+                                            && (vesselTile.modelData.name || "") === wizardPage.fVesselName
+                                        onChosen: {
+                                            wizardPage.selectVessel(vesselTile.modelData)
+                                            wizardPage.detailsContinue()
+                                        }
+                                    }
+                                }
+                            }
+                            Label {
+                                visible: (RecipeContext.preferences.waterVesselPresets || []).length === 0
+                                Layout.fillWidth: true
+                                text: TranslationManager.translate("recipes.wizard.noVessels",
+                                      "No water vessels saved yet — use Add vessel to create one.")
+                                font: Theme.captionFont
+                                color: Theme.textSecondaryColor
+                                wrapMode: Text.WordWrap
+                                Accessible.role: Accessible.StaticText
+                                Accessible.name: text
+                            }
+                        }
+
+                    }
+                    }
+                }
+
+                // ===== Step 5: summary — the edit page =====
+                // Pinned header (name + Cancel/Save + errors) above the
+                // scrolling body, matching the details step; the component
+                // cards flow in the same responsive grid.
+                ColumnLayout {
+                    spacing: Theme.spacingSmall
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: Theme.spacingSmall
+                        spacing: Theme.spacingMedium
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.scaled(4)
+                            RecipeNameEditor {
+                                id: recipeNameEditor
+                                Layout.fillWidth: true
+                                controlStyle: recipeNameControlStyle
+                                labelText: TranslationManager.translate(
+                                    "recipes.composer.nameLabel", "Recipe name") + " *"
+                                placeholderText: TranslationManager.translate(
+                                    "recipes.composer.namePlaceholder", "e.g. Morning cappuccino")
+                                conflictText: TranslationManager.translate("recipes.dialog.nameInUse",
+                                    "That name is already in use — choose a different name.")
+                                nameConflict: wizardPage.nameInUse
+                                fieldAccessibleName: TranslationManager.translate(
+                                    "recipes.composer.nameLabel", "Recipe name")
+                                captionFont: Theme.captionFont
+                                conflictColor: Theme.warningColor
+                                accessibilityMode: AccessibilityManager.enabled
+                                onKeyboardShowRequested: Keyboard.show()
+                                onKeyboardHideRequested: Keyboard.hide()
+                            }
+                        }
+                        AccessibleButton {
+                            Layout.alignment: Qt.AlignBottom
+                            text: TranslationManager.translate("common.cancel", "Cancel")
+                            accessibleName: TranslationManager.translate("recipes.composer.accessible.cancel", "Cancel recipe editing")
+                            onClicked: wizardPage.requestExit()
+                        }
+                        AccessibleButton {
+                            Layout.alignment: Qt.AlignBottom
+                            primary: true
+                            enabled: wizardPage.canSave
+                            text: TranslationManager.translate("common.save", "Save")
+                            accessibleName: TranslationManager.translate("recipes.composer.accessible.save", "Save the recipe")
+                            onClicked: wizardPage.save()
+                        }
+                    }
+
+                    // Pinned with the header so a save failure is never
+                    // hidden below the scroll.
+                    Label {
+                        visible: wizardPage.errorMessage !== ""
+                        Layout.fillWidth: true
+                        text: wizardPage.errorMessage
+                        font: Theme.bodyFont
+                        color: Theme.errorColor
+                        wrapMode: Text.WordWrap
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                    }
+
+                    Flickable {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        contentHeight: summaryColumn.implicitHeight + Theme.scaled(24)
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                    ColumnLayout {
+                        id: summaryColumn
+                        width: parent.width
+                        spacing: Theme.spacingMedium
+
+                        // WYSIWYG hero: the SAME card component the Recipes
+                        // management page renders — what you build here is
+                        // what the list will show (design D4).
+                        RecipeDrinkCard {
+                            Layout.fillWidth: true
+                            recipe: wizardPage.previewMap
+                            active: false
+                            profileTempC: wizardPage.fProfileTempC
+                            profileYieldG: wizardPage.fProfileYieldG
+                            profileStepTemps: wizardPage.fProfileStepTemps
+                            imageKey: BeanUiService.bagImageKey(wizardPage.fBagId, wizardPage.fBeanBaseId)
+                        }
+
+                        GridLayout {
+                            Layout.fillWidth: true
+                            columns: wizardPage.width >= Theme.scaled(720) ? 2 : 1
+                            columnSpacing: Theme.spacingMedium
+                            rowSpacing: Theme.spacingMedium
+
+                        SummaryRow {
+                            label: TranslationManager.translate("recipes.wizard.rowDrink", "Drink")
+                            value: wizardPage.fDrinkType !== ""
+                                ? wizardPage.drinkTypeLabel(wizardPage.fDrinkType) : "—"
+                            step: "drink"
+                        }
+                        SummaryRow {
+                            label: wizardPage.isTeaDrink
+                                ? TranslationManager.translate("recipes.wizard.rowTea", "Tea")
+                                : TranslationManager.translate("recipes.wizard.rowBean", "Bean")
+                            showThumbnail: wizardPage.hasBean
+                            thumbnailKey: BeanUiService.bagImageKey(wizardPage.fBagId, wizardPage.fBeanBaseId)
+                            thumbnailLink: wizardPage.bagImageLink()
+                            thumbnailFallback: wizardPage.fCoffee
+                            thumbnailIcon: wizardPage.isTeaDrink
+                                ? "qrc:/icons/tea.svg" : "qrc:/icons/coffeebeans.svg"
+                            value: wizardPage.hasBean
+                                ? wizardPage.summaryBeanValue()
+                                : (wizardPage.isTeaDrink ? trNoTea.text : trNoBean.text)
+                            step: "bean"
+                        }
+                        SummaryRow {
+                            id: profileSummaryRow
+                            visible: !wizardPage.isHotWaterTea
+                            label: TranslationManager.translate("recipes.wizard.rowProfile", "Profile")
+                            value: wizardPage.summaryProfileValue()
+                            accessibleValue: wizardPage.fProfileTitle !== "" ? wizardPage.fProfileTitle : "—"
+                            step: "profile"
+                            // The two info affordances the profile-step tiles
+                            // offer — the sparkle KB popup and the Profile Info
+                            // page — reachable without leaving the summary.
+                            headerActions: RowLayout {
+                                spacing: Theme.spacingSmall
+                                readonly property string profileFilename:
+                                    wizardPage.fProfileTitle !== ""
+                                        ? ProfileService.findProfileByTitle(wizardPage.fProfileTitle) : ""
+                                readonly property bool hasKb: {
+                                    if (wizardPage.fProfileTitle === "") return false
+                                    var info = ProfileService.profileCatalogInfoForTitle(wizardPage.fProfileTitle)
+                                    return info && info.hasKnowledgeBase === true
+                                }
+                                ColoredIcon {
+                                    visible: parent.hasKb
+                                    source: "qrc:/icons/sparkle.svg"
+                                    iconWidth: Theme.scaled(18)
+                                    iconHeight: Theme.scaled(18)
+                                    iconColor: Theme.textSecondaryColor
+                                    Accessible.ignored: true
+                                    AccessibleMouseArea {
+                                        anchors.fill: parent
+                                        anchors.margins: Theme.scaled(-6)
+                                        accessibleName: TranslationManager.translate(
+                                            "profileselector.accessible.view_knowledge",
+                                            "View AI knowledge base")
+                                        accessibleItem: parent
+                                        onAccessibleClicked:
+                                            wizardKnowledgeDialog.openFor(wizardPage.fProfileTitle)
+                                    }
+                                }
+                                ProfileInfoButton {
+                                    visible: parent.profileFilename !== ""
+                                    Layout.preferredWidth: Theme.scaled(26)
+                                    Layout.preferredHeight: Theme.scaled(26)
+                                    buttonSize: Theme.scaled(26)
+                                    profileFilename: parent.profileFilename
+                                    profileName: wizardPage.fProfileTitle
+                                    onClicked: AppShell.profileInfoRequested(parent.profileFilename, wizardPage.fProfileTitle)
+                                }
+                            }
+                        }
+                        // Equipment sits ABOVE dose/yield/temp: the grinder must
+                        // be chosen before grind/rpm (the rpm field is gated by
+                        // the grinder's capability), matching the walk order.
+                        SummaryRow {
+                            id: equipmentSummaryRow
+                            label: TranslationManager.translate("recipes.composer.sectionEquipment", "Equipment")
+                            // No package, or one not yet resolved from inventory:
+                            // fall back to the plain name / "None".
+                            value: wizardPage.fEquipmentId > 0 ? wizardPage.fEquipmentName : trNone.text
+                            accessibleValue: value
+                            step: "details"
+                            detailsPage: "equipment"
+                            // A resolved package renders through the shared
+                            // EquipmentSummary — grinder, basket, puck prep —
+                            // but NOT its dial memory (grind/rpm): those are
+                            // recipe-owned and shown on the Dose/yield/temp card.
+                            contentComponent: (wizardPage.fEquipmentId > 0
+                                && wizardPage._selectedPackage
+                                && wizardPage._selectedPackage.id === wizardPage.fEquipmentId)
+                                ? equipmentSummaryComponent : null
+                        }
+                        SummaryRow {
+                            // Coffee drinks pin a grind; tea does not — keep the
+                            // title honest for each.
+                            label: wizardPage.showSavedGrind
+                                ? TranslationManager.translate("recipes.wizard.rowDoseYieldTempGrind", "Dose, yield, temp & grind")
+                                : TranslationManager.translate("recipes.wizard.rowDoseYieldTemp", "Dose, yield & temp")
+                            value: wizardPage.summaryDetailsValue()
+                            step: "details"
+                            detailsPage: "numbers"
+                        }
+                        // Every stored block gets a visible row: a latte's
+                        // milk shows ON the summary, not only behind an edit.
+                        SummaryRow {
+                            visible: wizardPage.fHasMilk || wizardPage.legacySteamSettings
+                            label: wizardPage.legacySteamSettings
+                                ? TranslationManager.translate("recipes.wizard.savedSteam", "Saved steam settings (milk off)")
+                                : TranslationManager.translate("recipes.wizard.rowSteam", "Steam / milk")
+                            value: {
+                                var parts = []
+                                if (wizardPage.fHeaterOff)
+                                    parts.push(SteamLabels.heaterOffName)
+                                else if (wizardPage.fPitcherName !== "")
+                                    parts.push(wizardPage.fPitcherName)
+                                if (wizardPage.fMilkWeightG > 0)
+                                    parts.push(TranslationManager.translate(
+                                        "recipes.list.milkWeight", "%1g milk").arg(wizardPage.fMilkWeightG))
+                                if (wizardPage.legacySteamSettings) {
+                                    if (wizardPage.fPitcherDurationSec > 0) parts.push(wizardPage.fPitcherDurationSec + "s")
+                                    if (wizardPage.fPitcherFlow > 0)
+                                        parts.push(TranslationManager.translate("recipes.wizard.savedFlow", "flow %1").arg(wizardPage.fPitcherFlow))
+                                    if (wizardPage.fPitcherTemperatureC > 0)
+                                        parts.push(Theme.formatTemperature(wizardPage.fPitcherTemperatureC, 0))
+                                }
+                                return parts.length > 0 ? parts.join(" · ") : "—"
+                            }
+                            step: "details"
+                            detailsPage: "steam"
+                        }
+                        SummaryRow {
+                            visible: wizardPage.fHasWater || wizardPage.legacyWaterSettings
+                            label: wizardPage.legacyWaterSettings
+                                ? TranslationManager.translate("recipes.wizard.savedWater", "Saved water settings (water off)")
+                                : TranslationManager.translate("recipes.wizard.rowHotWater", "Hot water")
+                            value: {
+                                var parts = []
+                                if (wizardPage.fVesselName !== "")
+                                    parts.push(wizardPage.fVesselName)
+                                if (wizardPage.fWaterAmountMode === "ratio")
+                                    parts.push(wizardPage.vesselTileMeta(wizardPage.recipeVesselSnapshot()))
+                                else if (wizardPage.fVesselVolume > 0)
+                                    parts.push(wizardPage.fVesselVolume
+                                        + (wizardPage.fVesselMode === "volume" ? "ml" : "g"))
+                                if (wizardPage.legacyWaterSettings && wizardPage.fVesselTemperatureC > 0)
+                                    parts.push(Theme.formatTemperature(wizardPage.fVesselTemperatureC, 0))
+                                if (wizardPage.legacyWaterSettings && wizardPage.fVesselFlowRate > 0)
+                                    parts.push(TranslationManager.translate("recipes.wizard.savedFlow", "flow %1").arg(wizardPage.fVesselFlowRate))
+                                if (!wizardPage.isHotWaterTea)
+                                    parts.push(wizardPage.fWaterOrder === "before"
+                                        ? TranslationManager.translate("recipes.wizard.waterBeforeShort", "before the espresso")
+                                        : TranslationManager.translate("recipes.wizard.waterAfterShort", "after the espresso"))
+                                return parts.length > 0 ? parts.join(" · ") : "—"
+                            }
+                            step: "details"
+                            detailsPage: "water"
+                        }
+                        }
+
+                        // Template escape hatches: any block combination the
+                        // model allows stays expressible.
+                        Flow {
+                            Layout.fillWidth: true
+                            Layout.topMargin: Theme.spacingSmall
+                            spacing: Theme.spacingMedium
+                            AccessibleButton {
+                                text: wizardPage.fHasMilk
+                                    ? TranslationManager.translate("recipes.wizard.removeMilk", "Remove milk")
+                                    : TranslationManager.translate("recipes.wizard.addMilk", "Add milk")
+                                accessibleName: text
+                                onClicked: {
+                                    wizardPage.setMilkIncluded(!wizardPage.fHasMilk)
+                                    if (wizardPage.fHasMilk) {
+                                        wizardPage._detailsPage = "steam"
+                                        wizardPage.openStep("details")
+                                    }
+                                }
+                            }
+                            AccessibleButton {
+                                visible: wizardPage.legacySteamSettings
+                                text: TranslationManager.translate("recipes.wizard.removeSavedSteam", "Remove saved steam settings")
+                                accessibleName: text
+                                onClicked: {
+                                    wizardPage._steamChoiceEdited = true
+                                    wizardPage._steamRemoved = true
+                                }
+                            }
+                            AccessibleButton {
+                                text: wizardPage.fHasWater
+                                    ? TranslationManager.translate("recipes.wizard.removeWater", "Remove hot water")
+                                    : TranslationManager.translate("recipes.wizard.addWater", "Add hot water")
+                                accessibleName: text
+                                onClicked: {
+                                    wizardPage.setWaterIncluded(!wizardPage.fHasWater)
+                                    if (wizardPage.fHasWater) {
+                                        wizardPage._detailsPage = "water"
+                                        wizardPage.openStep("details")
+                                    }
+                                }
+                            }
+                            AccessibleButton {
+                                visible: wizardPage.legacyWaterSettings
+                                text: TranslationManager.translate("recipes.wizard.removeSavedWater", "Remove saved water settings")
+                                accessibleName: text
+                                onClicked: { wizardPage._waterChoiceEdited = true; wizardPage._waterRemoved = true }
+                            }
+                        }
+                    }
+                    }
+                }
+            }
+        }
+    }
+
+    // Create-a-bag entry point ON the bean step (add-recipe-wizard-tea):
+    // the full Change Beans dialog in the right kind mode — coffee gets the
+    // search-first flow, tea the tea form. The created bag becomes the
+    // active bag (inventory-context semantics, same as the Beans page) and
+    // is immediately selected as this recipe's bean, advancing the wizard.
+    ChangeBeansDialog {
+        id: wizardBeansDialog
+        context: "inventory"
+        onBagSelected: function(bagId, bag) {
+            if (wizardPage.currentStep === "bean")
+                wizardPage.selectBean(bag)
+        }
+    }
+
+    // Shared KB popup (qml/components/ProfileKnowledgeDialog.qml), opened
+    // from the sparkle on a profile tile.
+    ProfileKnowledgeDialog {
+        id: wizardKnowledgeDialog
+    }
+
+    // The summary Equipment card's body — the shared EquipmentSummary fed the
+    // resolved package's identity. Grind setting and rpm are DELIBERATELY not
+    // passed (grindSetting/rpm/rpmCapable left at defaults), so its dial line
+    // stays empty: those are recipe-owned and appear on the Details card.
+    Component {
+        id: equipmentSummaryComponent
+        EquipmentSummary {
+            grinderName: wizardPage._selectedPackage.name || ""
+            grinderBrand: wizardPage._selectedPackage.grinderBrand || ""
+            grinderModel: wizardPage._selectedPackage.grinderModel || ""
+            grinderBurrs: wizardPage._selectedPackage.grinderBurrs || ""
+            basketBrand: wizardPage._selectedPackage.basketBrand || ""
+            basketModel: wizardPage._selectedPackage.basketModel || ""
+            puckPrepCanonical: wizardPage._selectedPackage.puckPrepCanonical || ""
+        }
+    }
+
+    // Unsaved-changes intercept (requestExit): leaving with edits offers
+    // Save / Discard — closing the dialog (Esc / tap outside) keeps editing.
+    UnsavedChangesDialog {
+        id: exitDialog
+        itemType: "recipe"
+        showSaveAs: false
+        onLeaveCancelled: AppShell.browserBackCancelled()
+        canSave: wizardPage.canSave
+        onDiscardClicked: AppShell.backRequested()
+        onSaveClicked: wizardPage.save()
+    }
+
+    BottomBar {
+        barColor: "transparent"
+        onBackClicked: wizardPage.goBackOneStep()
+    }
+
+    WaterVesselDialog {
+        id: recipeVesselEditor
+        recipeEditing: true
+        allowRatio: !wizardPage.isHotWaterTea
+        espressoTargetG: wizardPage.waterEspressoTargetG
+        onSaved: function(vessel, index) {
+            wizardPage.selectVessel(vessel)
+            wizardPage._detailsUserEdited = true
+        }
+    }
+
+    // The named-ratio chooser (Ristretto / Normale / Lungo), opened from the
+    // Ratio field's 1:X.X readout. PICK-ONLY: it fills the wizard's field and
+    // anchors the ratio, never touching the live session — this page designs a
+    // recipe, it does not arm the next brew.
+    RatioPresetDialog {
+        id: wizardRatioPicker
+        pickOnly: true
+        compareRatio: parseFloat(ratioField.text) || 0
+        onRatioPicked: function(r) {
+            ratioField.text = Number(r).toFixed(1)
+            wizardPage.fYieldMode = "ratio"
+            wizardPage._detailsUserEdited = true
+            wizardPage.syncDerivedYieldFields()
+        }
+    }
+}

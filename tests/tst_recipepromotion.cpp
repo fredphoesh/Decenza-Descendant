@@ -1,0 +1,247 @@
+#include <QtTest>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QRegularExpression>
+
+#include "history/recipepromotion.h"
+#include "history/shothistory_types.h"
+
+// RecipePromotion::fieldsFromShotRecord: the shared promotion field-builder
+// behind the recipe_create_from_shot MCP tool and the web promote endpoint.
+
+static ShotRecord sampleShotRecord() {
+    ShotRecord record;
+    record.summary.id = 42;
+    record.summary.profileName = "D-Flow / default";
+    record.summary.beanBrand = "Roaster";
+    record.summary.beanType = "Guji";
+    record.summary.doseWeight = 18.0;
+    record.profileJson = "{\"title\":\"D-Flow / default\",\"espresso_temperature\":\"90\"}";
+    record.equipmentId = 7;
+    record.targetWeight = 36.0;
+    record.temperatureOverride = 92.5;
+    record.grinderSetting = "22";
+    record.steamJson = "{\"hasMilk\":false,\"milkWeightG\":0}";
+    record.hotWaterJson = "{\"hasWater\":false}";
+    return record;
+}
+
+class tst_RecipePromotion : public QObject {
+    Q_OBJECT
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+
+    void promotionPreservesCustomWaterRatio() {
+        auto record = sampleShotRecord();
+        record.hotWaterJson = R"({"hasWater":true,"vesselName":"Cup","amountMode":"ratio","waterToEspressoRatio":2.7,"resolvedTargetG":108,"mode":"weight"})";
+        const auto fields = RecipePromotion::fieldsFromShotRecord(record, "Water recipe", std::nullopt, QString());
+        QCOMPARE(fields.value("hotWaterJson").toString(), record.hotWaterJson);
+    }
+
+    // The shot's bag becomes the recipe's hard bag link (recipes link a
+    // specific bag); a pre-bag shot (bagId <= 0) stores no link — the bean
+    // identity fields still carry as the relink matching key.
+    void carriesShotBagId() {
+        ShotRecord record = sampleShotRecord();
+        record.bagId = 5;
+        QCOMPARE(RecipePromotion::fieldsFromShotRecord(record, "R", std::nullopt, QString())
+                     .value("bagId").toLongLong(), (qint64)5);
+        record.bagId = -1;  // pre-bag shot
+        QCOMPARE(RecipePromotion::fieldsFromShotRecord(record, "R", std::nullopt, QString())
+                     .value("bagId").toLongLong(), (qint64)0);
+    }
+    // Promotion COPIES the shot's recorded yield anchor (add-yield-ratio-
+    // anchor): a ratio shot promotes to a ratio recipe, an absolute shot to
+    // an absolute one, and the ratio is NEVER reconstructed from target ÷
+    // dose — a post-shot dose correction must not distort a promoted ratio.
+    void promotionCopiesYieldAnchor() {
+        ShotRecord ratioShot = sampleShotRecord();
+        ratioShot.yieldMode = "ratio";
+        ratioShot.yieldAnchorValue = 2.0;
+        // Simulate a post-shot dose correction: 18 -> 19 g. The promoted
+        // ratio must stay 2.0, not become 36/19 = 1.89.
+        ratioShot.summary.doseWeight = 19.0;
+        QVariantMap f = RecipePromotion::fieldsFromShotRecord(ratioShot, "R", std::nullopt, QString());
+        QCOMPARE(f.value("yieldMode").toString(), QStringLiteral("ratio"));
+        QCOMPARE(f.value("yieldValue").toDouble(), 2.0);
+        QCOMPARE(f.value("doseG").toDouble(), 19.0);
+
+        ShotRecord absShot = sampleShotRecord();
+        absShot.yieldMode = "absolute";
+        absShot.yieldAnchorValue = 36.0;
+        f = RecipePromotion::fieldsFromShotRecord(absShot, "A", std::nullopt, QString());
+        QCOMPARE(f.value("yieldMode").toString(), QStringLiteral("absolute"));
+        QCOMPARE(f.value("yieldValue").toDouble(), 36.0);
+
+        // No anchor and no target: mode none, no value key.
+        ShotRecord bare = sampleShotRecord();
+        bare.targetWeight = 0;
+        f = RecipePromotion::fieldsFromShotRecord(bare, "B", std::nullopt, QString());
+        QCOMPARE(f.value("yieldMode").toString(), QStringLiteral("none"));
+        QVERIFY(!f.contains("yieldValue"));
+    }
+
+    // Ambient steam settings are not ingredients of an espresso recipe.
+    void fieldsCarryShotDataWithoutAmbientSteam() {
+        const ShotRecord record = sampleShotRecord();
+        const QVariantMap fields = RecipePromotion::fieldsFromShotRecord(
+            record, "My espresso", std::nullopt, QString());
+
+        QCOMPARE(fields.value("name").toString(), QStringLiteral("My espresso"));
+        QCOMPARE(fields.value("profileTitle").toString(), QStringLiteral("D-Flow / default"));
+        QCOMPARE(fields.value("profileJson").toString(), record.profileJson);
+        QCOMPARE(fields.value("roasterName").toString(), QStringLiteral("Roaster"));
+        QCOMPARE(fields.value("coffeeName").toString(), QStringLiteral("Guji"));
+        QCOMPARE(fields.value("equipmentId").toLongLong(), qint64(7));
+        QCOMPARE(fields.value("doseG").toDouble(), 18.0);
+        // A record with no recorded anchor promotes its target as an
+        // ABSOLUTE spec (add-yield-ratio-anchor).
+        QCOMPARE(fields.value("yieldValue").toDouble(), 36.0);
+        QCOMPARE(fields.value("yieldMode").toString(), QStringLiteral("absolute"));
+        // The shot's 92.5 absolute converts to an offset against the profile
+        // snapshot's 90° (recipe-relative-temp-offset).
+        QCOMPARE(fields.value("tempOffsetC").toDouble(), 2.5);
+        QVERIFY(fields.value("steamJson").toString().isEmpty());
+        QCOMPARE(fields.value("hotWaterJson").toString(), record.hotWaterJson);
+        QCOMPARE(fields.value("createdFromShotId").toLongLong(), qint64(42));
+    }
+
+    // Temperature conversion edges (recipe-relative-temp-offset): no override
+    // → offset 0; an override whose profile snapshot carries no temperature
+    // → offset 0 (a delta against an unknown baseline is meaningless); an
+    // override matching the snapshot temp → offset 0 (rounds away).
+    void temperatureOffsetConversionEdges() {
+        ShotRecord noOverride = sampleShotRecord();
+        noOverride.temperatureOverride = 0;
+        QCOMPARE(RecipePromotion::fieldsFromShotRecord(noOverride, "n", std::nullopt, QString())
+                     .value("tempOffsetC").toDouble(), 0.0);
+
+        ShotRecord noAnchor = sampleShotRecord();
+        noAnchor.profileJson = "{\"title\":\"D-Flow / default\"}";  // no espresso_temperature
+        // Deliberate edge case (see comment above) — expect the warning it logs.
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("no espresso_temperature - dropping the temperature pin"));
+        QCOMPARE(RecipePromotion::fieldsFromShotRecord(noAnchor, "n", std::nullopt, QString())
+                     .value("tempOffsetC").toDouble(), 0.0);
+
+        ShotRecord atProfile = sampleShotRecord();
+        atProfile.temperatureOverride = 90.0;  // equals the snapshot's 90°
+        QCOMPARE(RecipePromotion::fieldsFromShotRecord(atProfile, "n", std::nullopt, QString())
+                     .value("tempOffsetC").toDouble(), 0.0);
+    }
+
+    // The shot's own recorded grind/rpm become the recipe's grind regardless
+    // of a bean link (fix-recipe-grind-integrity: grind always lives on the
+    // recipe — the old empty-means-inherit encoding is retired).
+    void grindAlwaysCarriesFromShot() {
+        ShotRecord withBean = sampleShotRecord();
+        withBean.rpm = 90;
+        const QVariantMap withBeanFields = RecipePromotion::fieldsFromShotRecord(
+            withBean, "n", std::nullopt, QString());
+        QCOMPARE(withBeanFields.value("grindPinned").toString(), QStringLiteral("22"));
+        QCOMPARE(withBeanFields.value("rpmPinned").toLongLong(), qint64(90));
+
+        ShotRecord noBean = sampleShotRecord();
+        noBean.summary.beanBrand.clear();
+        noBean.summary.beanType.clear();
+        const QVariantMap noBeanFields = RecipePromotion::fieldsFromShotRecord(
+            noBean, "n", std::nullopt, QString());
+        QCOMPARE(noBeanFields.value("grindPinned").toString(), QStringLiteral("22"));
+    }
+
+    // A bean link resolved purely through the Bean Base canonical id (no
+    // free-text brand/type on the shot) still carries the canonical id — and
+    // the shot's grind rides along like any other promotion.
+    void beanBaseIdOnlyLinkStillCarries() {
+        ShotRecord record = sampleShotRecord();
+        record.summary.beanBrand.clear();
+        record.summary.beanType.clear();
+        record.beanBaseJson = "{\"visualizerCanonicalId\":\"bb-uuid-1\"}";
+        const QVariantMap fields = RecipePromotion::fieldsFromShotRecord(
+            record, "n", std::nullopt, QString());
+        QCOMPARE(fields.value("grindPinned").toString(), QStringLiteral("22"));
+        QCOMPARE(fields.value("beanBaseId").toString(), QStringLiteral("bb-uuid-1"));
+    }
+
+    // hasMilkOverride stamps hasMilk onto an existing steam snapshot without
+    // disturbing its other fields (e.g. milkWeightG).
+    void hasMilkOverrideStampsExistingSteamJson() {
+        ShotRecord record = sampleShotRecord();
+        record.steamJson = "{\"hasMilk\":false,\"milkWeightG\":150}";
+        const QVariantMap fields = RecipePromotion::fieldsFromShotRecord(
+            record, "n", std::optional<bool>(true), QString());
+
+        const QJsonObject steam = QJsonDocument::fromJson(
+            fields.value("steamJson").toString().toUtf8()).object();
+        QCOMPARE(steam.value("hasMilk").toBool(), true);
+        QCOMPARE(steam.value("milkWeightG").toDouble(), 150.0);
+    }
+
+    // A current pitcher is not silently copied to a legacy espresso shot.
+    void emptySteamJsonDoesNotInheritCurrentPitcher() {
+        ShotRecord record = sampleShotRecord();
+        record.steamJson.clear();
+        const QString fallback = "{\"hasMilk\":false,\"pitcherName\":\"Small\"}";
+        const QVariantMap fields = RecipePromotion::fieldsFromShotRecord(
+            record, "n", std::nullopt, fallback);
+        QVERIFY(fields.value("steamJson").toString().isEmpty());
+    }
+
+    void espressoOverrideDiscardsShotPitcherAndLastMilk() {
+        ShotRecord record = sampleShotRecord();
+        record.steamJson = R"({"hasMilk":true,"pitcherName":"80","milkWeightG":125})";
+        const auto fields = RecipePromotion::fieldsFromShotRecord(
+            record, "Espresso", std::optional<bool>(false), QString());
+        QVERIFY(fields.value("steamJson").toString().isEmpty());
+    }
+
+    void milkRecipeRetainsItsExplicitSteamBlock() {
+        ShotRecord record = sampleShotRecord();
+        record.steamJson = R"({"hasMilk":true,"pitcherName":"Small","milkWeightG":150})";
+        const auto fields = RecipePromotion::fieldsFromShotRecord(
+            record, "Milk", std::nullopt, QString());
+        QCOMPARE(fields.value("steamJson").toString(), record.steamJson);
+    }
+
+    void explicitlyAddingMilkRetainsSelectedPitcher() {
+        ShotRecord record = sampleShotRecord();
+        record.steamJson = R"({"hasMilk":false,"pitcherName":"Small","durationSec":30})";
+        const auto fields = RecipePromotion::fieldsFromShotRecord(
+            record, "Espresso with milk", std::optional<bool>(true), QString());
+        const auto steam = QJsonDocument::fromJson(fields.value("steamJson").toString().toUtf8()).object();
+        QVERIFY(steam.value("hasMilk").toBool());
+        QCOMPARE(steam.value("pitcherName").toString(), QStringLiteral("Small"));
+        QCOMPARE(steam.value("durationSec").toInt(), 30);
+    }
+
+    // hasMilkOverride with no steam snapshot AND no fallback synthesizes a
+    // minimal steam block carrying just the override — never leaves the
+    // recipe's steam block silently empty when the user made an explicit
+    // Espresso/Milk choice.
+    void hasMilkOverrideSynthesizesSteamJsonWhenNoneAvailable() {
+        ShotRecord record = sampleShotRecord();
+        record.steamJson.clear();
+        const QVariantMap fields = RecipePromotion::fieldsFromShotRecord(
+            record, "n", std::optional<bool>(true), QString());
+        const QJsonObject steam = QJsonDocument::fromJson(
+            fields.value("steamJson").toString().toUtf8()).object();
+        QCOMPARE(steam.value("hasMilk").toBool(), true);
+    }
+
+    // Hot water carries verbatim from the shot snapshot only — no
+    // current-settings fallback, regardless of fallbackSteamJson (which only
+    // covers the steam block).
+    void hotWaterCarriesVerbatimNeverFallsBack() {
+        ShotRecord record = sampleShotRecord();
+        record.hotWaterJson = "{\"hasWater\":true,\"vesselName\":\"Kettle\"}";
+        record.hotWaterResultJson = R"({"status":"dispensed","amountSource":"scale","weightG":103.2})";
+        const QVariantMap fields = RecipePromotion::fieldsFromShotRecord(
+            record, "n", std::nullopt, "{\"hasWater\":false}");
+        QCOMPARE(fields.value("hotWaterJson").toString(), record.hotWaterJson);
+    }
+
+};
+
+QTEST_GUILESS_MAIN(tst_RecipePromotion)
+#include "tst_recipepromotion.moc"

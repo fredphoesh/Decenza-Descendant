@@ -1,0 +1,210 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Decenza
+
+DecenzaDialog {
+    id: root
+    anchors.centerIn: parent
+    width: Theme.dialogWidth + 2 * padding
+    modal: true
+    dim: true
+    padding: Theme.dialogPadding
+    closePolicy: Dialog.NoAutoClose
+    browserBackDismissible: false
+
+    property string toolDescription: ""
+    // Opaque handle for the pending confirmation, echoed back untouched. NOT a
+    // session id — the gate stopped borrowing one so a stateless MCP caller can
+    // hold a confirmation too.
+    property string confirmationId: ""
+    property double deadlineEpochMs: 0
+    property bool userResponded: false
+    property bool actionsEnabled: true
+    property int countdown: 0
+
+    signal confirmed(string confirmationId)
+    signal denied(string confirmationId)
+
+    onDeadlineEpochMsChanged: updateRemainingTime()
+
+    function updateRemainingTime(): void {
+        countdown = Math.max(0, Math.ceil((deadlineEpochMs - Date.now()) / 1000))
+    }
+
+    // This timer only refreshes the visible countdown. The host owns the actual
+    // deadline and sends one correlated timeout decision to McpServer.
+    Timer {
+        interval: 1000
+        running: root.visible
+        repeat: true
+        onTriggered: root.updateRemainingTime()
+    }
+
+    // Dialog closure drives the callback — not the raw timer
+    onClosed: {
+        if (!root.userResponded)
+            root.denied(root.confirmationId)
+        root.userResponded = false
+        root.updateRemainingTime()
+    }
+
+    onOpened: {
+        root.userResponded = false
+        root.updateRemainingTime()
+        if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+            AccessibilityManager.announce(
+                TranslationManager.translate("mcp.confirm.announce",
+                    "AI assistant wants to %1. Allow or Deny. Auto-denies in 15 seconds.")
+                    .arg(root.toolDescription))
+        }
+    }
+
+    background: Rectangle {
+        color: Theme.surfaceColor
+        radius: Theme.cardRadius
+        border.width: 2
+        border.color: Theme.warningButtonColor
+    }
+
+    contentItem: ColumnLayout {
+        spacing: 0
+
+        // Header
+        Item {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Theme.scaled(50)
+            Layout.topMargin: Theme.scaled(10)
+
+            RowLayout {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.scaled(20)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.scaled(12)
+
+                Rectangle {
+                    Layout.preferredWidth: Theme.scaled(32)
+                    Layout.preferredHeight: Theme.scaled(32)
+                    radius: Theme.scaled(16)
+                    color: Theme.warningButtonColor
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "!"
+                        font.pixelSize: Theme.scaled(18)
+                        font.bold: true
+                        color: Theme.primaryContrastColor
+                        Accessible.ignored: true
+                    }
+                }
+
+                Text {
+                    text: TranslationManager.translate("mcp.confirm.title", "AI Confirmation")
+                    font: Theme.titleFont
+                    color: Theme.textColor
+                    Accessible.ignored: true
+                }
+            }
+
+            Rectangle {
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 1
+                color: Theme.borderColor
+            }
+        }
+
+        // Message
+        Text {
+            text: TranslationManager.translate("mcp.confirm.body",
+                "An AI assistant wants to:\n\n%1\n\nAllow this action?").arg(root.toolDescription)
+            font: Theme.bodyFont
+            color: Theme.textColor
+            wrapMode: Text.Wrap
+            Layout.fillWidth: true
+            Layout.margins: Theme.scaled(20)
+            Accessible.ignored: true
+        }
+
+        // Countdown
+        Text {
+            text: TranslationManager.translate("mcp.confirm.countdown",
+                "Auto-denying in %1 seconds").arg(root.countdown)
+            font.family: Theme.labelFont.family
+            font.pixelSize: Theme.labelFont.pixelSize
+            color: Theme.textSecondaryColor
+            Layout.leftMargin: Theme.scaled(20)
+            Layout.bottomMargin: Theme.scaled(10)
+            Accessible.ignored: true
+        }
+
+        // Buttons
+        Grid {
+            Layout.fillWidth: true
+            Layout.leftMargin: Theme.scaled(20)
+            Layout.rightMargin: Theme.scaled(20)
+            Layout.bottomMargin: Theme.scaled(20)
+            columns: 2
+            spacing: Theme.scaled(10)
+
+            property real buttonWidth: (width - spacing) / 2
+            property real buttonHeight: Theme.scaled(50)
+
+            AccessibleButton {
+                id: denyButton
+                width: parent.buttonWidth
+                height: parent.buttonHeight
+                text: TranslationManager.translate("mcp.confirm.deny", "Deny")
+                accessibleName: TranslationManager.translate("mcp.confirm.denyAccessible", "Deny AI action")
+                enabled: root.actionsEnabled
+                onClicked: {
+                    root.userResponded = true
+                    root.denied(root.confirmationId)
+                    root.close()
+                }
+                background: Rectangle {
+                    implicitHeight: Theme.scaled(60)
+                    radius: Theme.buttonRadius
+                    color: denyButton.down || denyButton.isPressed ? Qt.darker(Theme.errorColor, 1.2) : Theme.errorColor
+                }
+                contentItem: Text {
+                    text: denyButton.text
+                    font: Theme.bodyFont
+                    color: Theme.primaryContrastColor
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    Accessible.ignored: true
+                }
+            }
+
+            AccessibleButton {
+                id: allowButton
+                width: parent.buttonWidth
+                height: parent.buttonHeight
+                text: TranslationManager.translate("mcp.confirm.allow", "Allow")
+                accessibleName: TranslationManager.translate("mcp.confirm.allowAccessible",
+                    "Allow AI action: %1").arg(root.toolDescription)
+                enabled: root.actionsEnabled
+                onClicked: {
+                    root.userResponded = true
+                    root.confirmed(root.confirmationId)
+                    root.close()
+                }
+                background: Rectangle {
+                    implicitHeight: Theme.scaled(60)
+                    radius: Theme.buttonRadius
+                    color: allowButton.down || allowButton.isPressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                }
+                contentItem: Text {
+                    text: allowButton.text
+                    font: Theme.bodyFont
+                    color: Theme.primaryContrastColor
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    Accessible.ignored: true
+                }
+            }
+        }
+    }
+}

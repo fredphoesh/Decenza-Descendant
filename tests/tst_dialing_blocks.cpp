@@ -1,0 +1,5022 @@
+// tst_mcptools_dialing_blocks — DB-backed coverage for the four shared
+// block builders that drive both `dialing_get_context` (MCP) and the
+// in-app advisor's user-prompt enrichment (issue #1044).
+//
+// Pre-existing tst_aimanager.cpp coverage exercises the *gating* paths
+// (empty kbId, empty grinderModel, no-flow shot). This file covers the
+// *populated* paths: stand up a real SQLite schema, insert curated
+// shots, call each builder, and pin the produced JSON.
+//
+// Determinism: the helpers under test read `QDateTime::currentSecsSinceEpoch()`
+// directly (windowFloor for bestRecentShot, daysSinceShot computation).
+// Tests construct fixtures with timestamps relative to "now" so the
+// computed offsets are stable, and assert the time-derived fields
+// against the same offsets used to build the fixtures. Static-shape
+// fields (id, grinder/bean strings, ratios, change diffs) are compared
+// directly to expected JSON literals.
+
+#include <QtTest>
+#include <tuple>
+#include <QSet>
+#include <QFile>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QTemporaryDir>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QDir>
+#include <QRegularExpression>
+#include <QThread>
+#include <QCoreApplication>
+
+#include "history/shothistorystorage.h"
+#include "history/shotprojection.h"
+#include "history/equipmentstorage.h"
+#include "ai/dialing_blocks.h"
+#include "ai/shotsummarizer.h"  // initTestCase pins the missing-resource qWarning
+#include "shotcurvefixtures.h"
+#include "shotrowfixtures.h"
+
+namespace {
+
+using ShotRowFixtures::ShotRow;
+using ShotRowFixtures::withRawDb;
+using ShotRowFixtures::insertShot;
+using ShotRowFixtures::projectionForShot;
+using ShotRowFixtures::soleScope;
+
+
+constexpr qint64 kSecPerDay = 24 * 3600;
+
+// editorType derived EXACTLY as Profile::editorType() does: strip a single
+// leading '*' (unsaved-modified marker) BEFORE the prefix-test. Omitting the
+// strip would false-green a "*D-Flow / x" title (resolves via editor-default
+// in the app but not here). Shared by kbCoverage_everyBuiltInProfileResolves
+// and kbCoverage_shotCorpusProfileTitlesResolve so a future editor-type rule
+// change can't be fixed in one KB-coverage gate and silently missed in the
+// other.
+QString editorTypeForTitle(const QString& title)
+{
+    QString t = title;
+    if (t.startsWith(QLatin1Char('*'))) t = t.mid(1);
+    if (t.startsWith(QStringLiteral("D-Flow"), Qt::CaseInsensitive))
+        return QStringLiteral("dflow");
+    if (t.startsWith(QStringLiteral("A-Flow"), Qt::CaseInsensitive))
+        return QStringLiteral("aflow");
+    return QString();
+}
+
+} // namespace
+
+class TstDialingBlocks : public QObject
+{
+    Q_OBJECT
+
+private:
+    QTemporaryDir m_tempDir;
+
+    QString freshDbPath()
+    {
+        static int counter = 0;
+        return m_tempDir.path() + QStringLiteral("/dialing_%1.db").arg(++counter);
+    }
+
+    QString m_templateDbPath;
+
+    // Stand up a fresh DB at `path` with the full ShotHistoryStorage schema.
+    // The schema template is built exactly once in initTestCase(); each test's
+    // DB is a file copy of it (a few ms) rather than a fresh
+    // createTables()+migration-chain run (~300ms each) — 37 call sites × the
+    // migration chain was the bulk of this binary's runtime.
+    void initAndClose(const QString& path)
+    {
+        QVERIFY(!m_templateDbPath.isEmpty());
+        QVERIFY(QFile::copy(m_templateDbPath, path));
+        // Copy any WAL/SHM sidecars so the schema copy is complete even if the
+        // template wasn't fully checkpointed on close.
+        for (const QString& suffix : {QStringLiteral("-wal"), QStringLiteral("-shm")}) {
+            if (QFile::exists(m_templateDbPath + suffix))
+                QFile::copy(m_templateDbPath + suffix, path + suffix);
+        }
+        // Self-check the copy actually carried the schema. Today the schema is
+        // durably checkpointed into the main .db before the copy (see
+        // initTestCase), so this always holds — but if that ever changes (schema
+        // migrates into an uncopied/torn WAL) an empty-schema DB would let the
+        // read-only "empty DB" tests pass silently. Fail loudly instead.
+        bool schemaOk = false;
+        withRawDb(path, QStringLiteral("tmpl_verify"), [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            schemaOk = q.exec(QStringLiteral(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shots'"))
+                && q.next();
+        });
+        QVERIFY2(schemaOk, "copied template DB is missing the 'shots' schema");
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    void initTestCase()
+    {
+        QVERIFY(m_tempDir.isValid());
+        // Pre-warm the profile-knowledge singleton so the one-time DB load
+        // happens here (in initTestCase) rather than inside individual tests.
+        // ai.qrc is linked by this binary, so the load succeeds silently.
+        ShotSummarizer::computeProfileKbId(QStringLiteral("dummy"), QStringLiteral("advanced"));
+
+        // Build the schema template ONCE. initAndClose() copies this file per
+        // test instead of re-running the migration chain each time. initialize()
+        // creates the tables/runs migrations and then durably checkpoints them
+        // into the main .db (PRAGMA wal_checkpoint(TRUNCATE)) before spawning its
+        // read-only distinct-cache prewarm — so the copied .db carries the full
+        // schema regardless of that detached prewarm thread (which the destructor
+        // does NOT join; it's read-only and m_destroyed-guarded, so harmless).
+        m_templateDbPath = m_tempDir.path() + QStringLiteral("/dialing_template.db");
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(m_templateDbPath));
+        storage.close();
+    }
+
+    // -------------------------------------------------------------------
+    // beanInputsFromProjection — the single shared ShotProjection→currentBean
+    // mapper. Regression guard for the advisor/dialing drift where puck-prep
+    // and freeze/thaw data were dropped: a shot carrying them must surface a
+    // puckPrep sub-object and a known beanFreshness block through the mapper.
+    // Pure (no DB), so it runs anywhere.
+    // -------------------------------------------------------------------
+    void beanInputsFromProjection_carriesPuckPrepAndFreeze()
+    {
+        ShotProjection sd;
+        sd.beanBrand = QStringLiteral("Prodigal");
+        sd.beanType = QStringLiteral("Milk Blend");
+        sd.roastDate = QStringLiteral("2026-04-15");
+        sd.frozenDate = QStringLiteral("2026-04-16");
+        sd.defrostDate = QStringLiteral("2026-06-20");
+        sd.puckPrep = QStringLiteral("rdt,shaker"); // canonical sorted set
+        sd.basketBrand = QStringLiteral("Decent");
+        sd.basketModel = QStringLiteral("18g Ridged");
+        sd.doseWeightG = 18.0;
+
+        const QJsonObject bean = DialingBlocks::buildCurrentBeanBlock(
+            DialingBlocks::beanInputsFromProjection(sd));
+
+        // Puck-prep flowed through as a sub-object with the set flags true.
+        QVERIFY2(bean.contains(QStringLiteral("puckPrep")),
+                 "currentBean must carry the puckPrep sub-object");
+        const QJsonObject puck = bean[QStringLiteral("puckPrep")].toObject();
+        QCOMPARE(puck[QStringLiteral("rdt")].toBool(), true);
+        QCOMPARE(puck[QStringLiteral("shaker")].toBool(), true);
+        QCOMPARE(puck[QStringLiteral("wdt")].toBool(), false);
+
+        // Basket flowed through too — the advisor's old hand-roll dropped it
+        // entirely, so pin its identity here as part of the same regression.
+        QVERIFY2(bean.contains(QStringLiteral("basket")),
+                 "currentBean must carry the basket sub-object");
+        const QJsonObject basket = bean[QStringLiteral("basket")].toObject();
+        QCOMPARE(basket[QStringLiteral("brand")].toString(), QStringLiteral("Decent"));
+        QCOMPARE(basket[QStringLiteral("model")].toString(), QStringLiteral("18g Ridged"));
+
+        // Freeze/thaw flowed through and marked storage known.
+        const QJsonObject fresh = bean[QStringLiteral("beanFreshness")].toObject();
+        QCOMPARE(fresh[QStringLiteral("freshnessKnown")].toBool(), true);
+        QCOMPARE(fresh[QStringLiteral("frozenDate")].toString(), QStringLiteral("2026-04-16"));
+        QCOMPARE(fresh[QStringLiteral("defrostDate")].toString(), QStringLiteral("2026-06-20"));
+    }
+
+    // bean-freshness-followup: the non-frozen storage lifecycle (storageHint +
+    // openedDate) flows through the same mapper for a never-frozen bag.
+    void beanInputsFromProjection_carriesNonFrozenStorage()
+    {
+        ShotProjection sd;
+        sd.beanBrand = QStringLiteral("Sey");
+        sd.roastDate = QStringLiteral("2026-06-01");
+        sd.storageHint = QStringLiteral("airtight");
+        sd.openedDate = QStringLiteral("2026-06-25");
+
+        const QJsonObject bean = DialingBlocks::buildCurrentBeanBlock(
+            DialingBlocks::beanInputsFromProjection(sd));
+        const QJsonObject fresh = bean[QStringLiteral("beanFreshness")].toObject();
+        QCOMPARE(fresh[QStringLiteral("freshnessKnown")].toBool(), true);
+        QCOMPARE(fresh[QStringLiteral("storageHint")].toString(), QStringLiteral("airtight"));
+        QCOMPARE(fresh[QStringLiteral("openedDate")].toString(), QStringLiteral("2026-06-25"));
+        QVERIFY2(!fresh.contains(QStringLiteral("frozenDate")),
+                 "never-frozen bag must omit frozenDate");
+    }
+
+    // -------------------------------------------------------------------
+    // dialInSessionsBlock — 4 shots on profile A across 2 sessions.
+    // The first three shots cluster within the 60-min session window;
+    // the fourth is 24h later, so it lands in its own session.
+    // -------------------------------------------------------------------
+    void dialInSessionsBlock_groupsAndHoistsAcrossSessions()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        // Anchor "fixture now" two days ago so daysSinceShot stays
+        // strictly positive even on day-boundary races.
+        const qint64 fixtureBase = now - 2 * kSecPerDay;
+
+        withRawDb(path, QStringLiteral("dial_sessions"), [&](QSqlDatabase& db) {
+            // Session A: three shots within ~30 min, varying grinder setting.
+            ShotRow base;
+            base.profileName = QStringLiteral("80's Espresso");
+            base.profileKbId = QStringLiteral("kb-80s");
+            base.beanBrand = QStringLiteral("Northbound");
+            base.beanType = QStringLiteral("Spring Tour");
+            base.grinderBrand = QStringLiteral("Niche");
+            base.grinderModel = QStringLiteral("Zero");
+            base.grinderBurrs = QStringLiteral("63mm conical");
+            // The rest of the package. EquipmentJoin exists because the history
+            // read joined the grinder alone, so a basket switch reached the model
+            // looking like one setup — a fixture with no basket cannot tell that
+            // it is fixed.
+            base.basketBrand = QStringLiteral("Decent");
+            base.basketModel = QStringLiteral("18g Ridged");
+
+            ShotRow s1 = base;
+            s1.uuid = QStringLiteral("uuid-s1");
+            s1.timestamp = fixtureBase - 24 * 3600 - 30 * 60; // session A, oldest
+            s1.grinderSetting = QStringLiteral("4.0");
+            s1.doseWeight = 18.0; s1.finalWeight = 38.0; s1.duration = 30.0;
+            QVERIFY(insertShot(db, s1) > 0);
+
+            ShotRow s2 = base;
+            s2.uuid = QStringLiteral("uuid-s2");
+            s2.timestamp = fixtureBase - 24 * 3600 - 15 * 60;
+            s2.grinderSetting = QStringLiteral("4.2");
+            s2.doseWeight = 18.0; s2.finalWeight = 36.0; s2.duration = 28.0;
+            QVERIFY(insertShot(db, s2) > 0);
+
+            ShotRow s3 = base;
+            s3.uuid = QStringLiteral("uuid-s3");
+            s3.timestamp = fixtureBase - 24 * 3600;             // session A, newest
+            s3.grinderSetting = QStringLiteral("4.4");
+            s3.doseWeight = 18.0; s3.finalWeight = 35.0; s3.duration = 27.0;
+            QVERIFY(insertShot(db, s3) > 0);
+
+            // Session B: one shot ~24h later than session A.
+            ShotRow s4 = base;
+            s4.uuid = QStringLiteral("uuid-s4");
+            s4.timestamp = fixtureBase;
+            s4.grinderSetting = QStringLiteral("4.4");
+            s4.doseWeight = 18.0; s4.finalWeight = 36.0; s4.duration = 30.0;
+            QVERIFY(insertShot(db, s4) > 0);
+
+            // Resolved shot: the most recent (session B). historyLimit big
+            // enough to pull all four older shots.
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-80s"), soleScope(db), /*resolvedShotId=*/-1, /*historyLimit=*/10);
+
+            // Two sessions, newest first (session B with 1 shot, session A
+            // with 3 shots).
+            QCOMPARE(sessions.size(), 2);
+
+            const QJsonObject sessionB = sessions[0].toObject();
+            QCOMPARE(sessionB.value(QStringLiteral("shotCount")).toInt(), 1);
+            const QJsonObject contextB = sessionB.value(QStringLiteral("context")).toObject();
+            QCOMPARE(contextB.value(QStringLiteral("grinderModel")).toString(),
+                     QStringLiteral("Zero"));
+            // The basket reaches the model, not just the grinder. Delete the
+            // basket rows from EquipmentJoin::columns() and this is what goes
+            // red; without it that deletion reproduces the original defect —
+            // a basket switch arriving as one setup — with every test passing.
+            // (Puck prep rides the same join and the same two columns; the
+            // fixture has no way to set it, so the basket stands for both.)
+            QCOMPARE(contextB.value(QStringLiteral("basketBrand")).toString(),
+                     QStringLiteral("Decent"));
+            QCOMPARE(contextB.value(QStringLiteral("basketModel")).toString(),
+                     QStringLiteral("18g Ridged"));
+
+            const QJsonObject sessionA = sessions[1].toObject();
+            QCOMPARE(sessionA.value(QStringLiteral("shotCount")).toInt(), 3);
+
+            // Within session A, shots are ordered ASC (older->newer) so
+            // changeFromPrev reads "older then newer". The first shot in
+            // each session has changeFromPrev=null.
+            const QJsonArray sessionAShots = sessionA.value(QStringLiteral("shots")).toArray();
+            QCOMPARE(sessionAShots.size(), 3);
+            QVERIFY(sessionAShots[0].toObject().value(QStringLiteral("changeFromPrev")).isNull());
+            // The second shot's diff should mention the grinder change 4.0->4.2.
+            const QJsonObject diff1 = sessionAShots[1].toObject()
+                .value(QStringLiteral("changeFromPrev")).toObject();
+            const QJsonObject diff1Grind = diff1.value(QStringLiteral("inputs")).toObject()
+                .value(QStringLiteral("grinderSetting")).toObject();
+            QCOMPARE(diff1Grind.value(QStringLiteral("from")).toString(), QStringLiteral("4.0"));
+            QCOMPARE(diff1Grind.value(QStringLiteral("to")).toString(), QStringLiteral("4.2"));
+            // Third shot: 4.2->4.4.
+            const QJsonObject diff2 = sessionAShots[2].toObject()
+                .value(QStringLiteral("changeFromPrev")).toObject();
+            const QJsonObject diff2Grind = diff2.value(QStringLiteral("inputs")).toObject()
+                .value(QStringLiteral("grinderSetting")).toObject();
+            QCOMPARE(diff2Grind.value(QStringLiteral("from")).toString(), QStringLiteral("4.2"));
+            QCOMPARE(diff2Grind.value(QStringLiteral("to")).toString(), QStringLiteral("4.4"));
+
+            // Identity hoisting: the per-shot block should NOT carry
+            // grinderModel etc. (they live on the session context).
+            for (const QJsonValue& v : sessionAShots) {
+                const QJsonObject sh = v.toObject();
+                QVERIFY2(!sh.contains(QStringLiteral("grinderModel")),
+                         "session-invariant grinderModel must hoist to context");
+                QVERIFY2(!sh.contains(QStringLiteral("beanBrand")),
+                         "session-invariant beanBrand must hoist to context");
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // dialInSessionsBlock — bean-freshness-followup: the storage-lifecycle
+    // fields hoist/override through the REAL block builder, not just the pure
+    // hoistSessionContext helper. Exercises the projection->ShotIdentity copy
+    // (dialing_blocks.cpp), the context emission, and the per-shot override in
+    // shotToJson — the three segments the pure-function test can't reach.
+    // -------------------------------------------------------------------
+    void dialInSessionsBlock_hoistsLifecycleAndOverridesOnThaw()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        const qint64 base = now - 2 * kSecPerDay;
+
+        withRawDb(path, QStringLiteral("dial_lifecycle"), [&](QSqlDatabase& db) {
+            // One session, three shots within ~30 min. All share a storageHint
+            // (should hoist to context); shots 1-2 share a defrostDate and shot
+            // 3 was pulled after a new thaw (should override per-shot).
+            ShotRow b;
+            b.profileName = QStringLiteral("80's Espresso");
+            b.profileKbId = QStringLiteral("kb-lc2");
+            b.beanBrand = QStringLiteral("Northbound");
+            b.grinderModel = QStringLiteral("Zero");
+            b.storageHint = QStringLiteral("airtight");
+
+            ShotRow s1 = b; s1.uuid = QStringLiteral("lc-s1");
+            s1.timestamp = base - 30 * 60; s1.defrostDate = QStringLiteral("2026-05-01");
+            QVERIFY(insertShot(db, s1) > 0);
+            ShotRow s2 = b; s2.uuid = QStringLiteral("lc-s2");
+            s2.timestamp = base - 15 * 60; s2.defrostDate = QStringLiteral("2026-05-01");
+            QVERIFY(insertShot(db, s2) > 0);
+            ShotRow s3 = b; s3.uuid = QStringLiteral("lc-s3");
+            s3.timestamp = base; s3.defrostDate = QStringLiteral("2026-05-13");
+            QVERIFY(insertShot(db, s3) > 0);
+
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-lc2"), soleScope(db), -1, 10);
+            QCOMPARE(sessions.size(), 1);
+            const QJsonObject session = sessions[0].toObject();
+            const QJsonObject context = session.value(QStringLiteral("context")).toObject();
+            const QJsonArray shots = session.value(QStringLiteral("shots")).toArray();
+            QCOMPARE(shots.size(), 3);
+
+            // storageHint is uniform -> hoisted to context, absent per-shot.
+            QCOMPARE(context.value(QStringLiteral("storageHint")).toString(),
+                     QStringLiteral("airtight"));
+            for (const QJsonValue& v : shots)
+                QVERIFY2(!v.toObject().contains(QStringLiteral("storageHint")),
+                         "uniform storageHint must hoist to context");
+
+            // defrostDate: shared value hoists; the differing (newest) shot
+            // overrides. Shots are ASC (oldest first): [0]=s1,[1]=s2,[2]=s3.
+            QCOMPARE(context.value(QStringLiteral("defrostDate")).toString(),
+                     QStringLiteral("2026-05-01"));
+            QVERIFY2(!shots[0].toObject().contains(QStringLiteral("defrostDate")),
+                     "shot matching context must not carry an override");
+            QVERIFY2(!shots[1].toObject().contains(QStringLiteral("defrostDate")),
+                     "shot matching context must not carry an override");
+            QCOMPARE(shots[2].toObject().value(QStringLiteral("defrostDate")).toString(),
+                     QStringLiteral("2026-05-13"));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // dialInSessionsBlock — empty when no rows.
+    // -------------------------------------------------------------------
+    void dialInSessionsBlock_emptyWhenNoRows()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("dial_empty"), [&](QSqlDatabase& db) {
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-no-rows"), soleScope(db), -1, 10);
+            QVERIFY(sessions.isEmpty());
+        });
+    }
+
+    // A package with no history states the absence and names the gear, rather
+    // than the payload simply going quiet. An omitted block reads to the model
+    // as "this user has no history at all", and a model with no anchor supplies
+    // one — the failure behind this change cited a "70/100 shot" that appeared
+    // nowhere in its context.
+    //
+    // The fixture is the real shape: the shot exists, it is the FIRST on its
+    // package, and it is excluded from its own history by resolvedShotId, so the
+    // query runs and matches nothing.
+    void noDialInHistoryBlock_statesTheAbsenceAndNamesTheEquipment()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("dial_no_history"), [&](QSqlDatabase& db) {
+            ShotRow row;
+            row.uuid = QStringLiteral("uuid-first-on-package");
+            row.timestamp = QDateTime::currentSecsSinceEpoch() - kSecPerDay;
+            row.profileName = QStringLiteral("80's Espresso");
+            row.profileKbId = QStringLiteral("kb-80s");
+            row.beanBrand = QStringLiteral("Northbound");
+            row.beanType = QStringLiteral("Spring Tour");
+            row.grinderBrand = QStringLiteral("Niche");
+            row.grinderModel = QStringLiteral("Zero");
+            row.grinderBurrs = QStringLiteral("63mm Mazzer Kony conical");
+            row.basketBrand = QStringLiteral("Graph Coffee");
+            row.basketModel = QStringLiteral("Stepped 58→46mm");
+            row.grinderSetting = QStringLiteral("4.0");
+            const qint64 shotId = insertShot(db, row);
+            QVERIFY(shotId > 0);
+
+            ShotProjection shot;
+            shot.id = shotId;
+            shot.profileKbId = row.profileKbId;
+            shot.grinderBrand = row.grinderBrand;
+            shot.grinderModel = row.grinderModel;
+            shot.grinderBurrs = row.grinderBurrs;
+            shot.basketBrand = row.basketBrand;
+            shot.basketModel = row.basketModel;
+            shot.puckPrep = QStringLiteral("shaker, puck screen");
+            // The package comes off the inserted ROW. Left at the default the
+            // scope is bucket 0, which matches nothing for a reason the test
+            // does not intend — the query would return empty even with the
+            // scope derivation broken.
+            shot.equipmentId = projectionForShot(db, shotId).equipmentId;
+            QVERIFY2(shot.equipmentId > 0,
+                     "the fixture row did not land in a package, so this asserts bucket 0");
+            // Bean fields are identity but NOT equipment — the block names the
+            // gear it filtered on, and naming the coffee here would describe a
+            // different filter than the one that ran.
+            shot.beanBrand = row.beanBrand;
+            shot.beanType = row.beanType;
+
+            const auto blocks = DialingBlocks::buildAdvisorContextBlocks(db, shot, shotId, {});
+
+            QVERIFY(blocks.dialInSessions.isEmpty());
+            QVERIFY2(!blocks.noDialInHistory.isEmpty(),
+                     "a query that ran and matched nothing must say so");
+
+            const QJsonObject equipment =
+                blocks.noDialInHistory.value(QStringLiteral("equipment")).toObject();
+            QCOMPARE(equipment.value("grinderModel").toString(), QStringLiteral("Zero"));
+            QCOMPARE(equipment.value("basketBrand").toString(), QStringLiteral("Graph Coffee"));
+            QCOMPARE(equipment.value("basketModel").toString(),
+                     QStringLiteral("Stepped 58→46mm"));
+            QCOMPARE(equipment.value("puckPrep").toString(),
+                     QStringLiteral("shaker, puck screen"));
+            QVERIFY2(!equipment.contains(QStringLiteral("beanBrand")),
+                     "the equipment set is the gear, not the coffee");
+            QCOMPARE(blocks.noDialInHistory.value("matchedShotCount").toInt(), 0);
+        });
+    }
+
+    // A component with no recorded value is omitted, never emitted as an empty
+    // string — the same sparse rule the hoisted session context follows, and the
+    // reason both read the one field table rather than two lists.
+    void noDialInHistoryBlock_omitsComponentsThePackageDoesNotRecord()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("dial_no_history_sparse"), [&](QSqlDatabase& db) {
+            ShotRow row;
+            row.uuid = QStringLiteral("uuid-sparse-package");
+            row.timestamp = QDateTime::currentSecsSinceEpoch() - kSecPerDay;
+            row.profileName = QStringLiteral("80's Espresso");
+            row.profileKbId = QStringLiteral("kb-80s");
+            row.grinderBrand = QStringLiteral("Niche");
+            row.grinderModel = QStringLiteral("Zero");
+            const qint64 shotId = insertShot(db, row);
+            QVERIFY(shotId > 0);
+
+            ShotProjection shot;
+            shot.id = shotId;
+            shot.profileKbId = row.profileKbId;
+            shot.grinderBrand = row.grinderBrand;
+            shot.grinderModel = row.grinderModel;
+            shot.equipmentId = projectionForShot(db, shotId).equipmentId;
+            QVERIFY2(shot.equipmentId > 0,
+                     "the fixture row did not land in a package, so this asserts bucket 0");
+
+            const auto blocks = DialingBlocks::buildAdvisorContextBlocks(db, shot, shotId, {});
+
+            const QJsonObject equipment =
+                blocks.noDialInHistory.value(QStringLiteral("equipment")).toObject();
+            QVERIFY(equipment.contains(QStringLiteral("grinderModel")));
+            QVERIFY2(!equipment.contains(QStringLiteral("basketBrand")),
+                     "an unrecorded basket must be absent, not empty");
+            QVERIFY2(!equipment.contains(QStringLiteral("puckPrep")),
+                     "an unrecorded puck prep must be absent, not empty");
+        });
+    }
+
+    // The distinction the block rests on. A shot with no profile identity asks
+    // the history query nothing at all, so there is no "matched nothing" to
+    // report — stating one would assert something no query established. Same
+    // reasoning covers a failed query, which also returns an empty list.
+    void noDialInHistoryBlock_silentWhenNoQueryWasAsked()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("dial_no_query"), [&](QSqlDatabase& db) {
+            ShotRow row;
+            row.uuid = QStringLiteral("uuid-no-kbid");
+            row.timestamp = QDateTime::currentSecsSinceEpoch() - kSecPerDay;
+            row.profileName = QStringLiteral("80's Espresso");
+            row.grinderModel = QStringLiteral("Zero");
+            const qint64 shotId = insertShot(db, row);
+            QVERIFY(shotId > 0);
+
+            ShotProjection shot;
+            shot.id = shotId;
+            shot.profileKbId = QString();   // nothing to match on
+            shot.grinderModel = row.grinderModel;
+            shot.equipmentId = projectionForShot(db, shotId).equipmentId;
+
+            const auto blocks = DialingBlocks::buildAdvisorContextBlocks(db, shot, shotId, {});
+
+            QVERIFY(blocks.dialInSessions.isEmpty());
+            QVERIFY2(blocks.noDialInHistory.isEmpty(),
+                     "no query ran, so nothing was established to state");
+        });
+    }
+
+    // The other half of the same distinction, at the storage layer. The block
+    // tests above reach `queryRan == false` through the short-circuit (no
+    // profile identity, so nothing is asked); this reaches the `ok` out-param
+    // itself, in both directions.
+    //
+    // The false direction needs a query that genuinely fails, which is one
+    // statement away and needs no fault injection: drop the table it selects
+    // from. Moving `*ok = true` above the exec() — the natural mistake, and the
+    // one the header comment is written against — passes every other test while
+    // making the advisor state "no prior shot matches this equipment package"
+    // on a database error.
+    void loadRecentShots_reportsWhetherTheQueryRan()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("history_ok_flag"), [&](QSqlDatabase& db) {
+            const AdviceScope scope(0);
+
+            bool ran = false;
+            const QVariantList matchedNothing = ShotHistoryStorage::loadRecentShotsByKbIdStatic(
+                db, QStringLiteral("kb-nothing-here"), scope, 5, -1, &ran);
+            QVERIFY(matchedNothing.isEmpty());
+            QVERIFY2(ran, "a query that ran and matched nothing must report that it RAN — "
+                          "that is what separates an empty history from a broken one");
+
+            QSqlQuery drop(db);
+            QVERIFY(drop.exec ("DROP TABLE shots"));
+
+            // init() calls QTest::failOnWarning(), and the failure path logs one
+            // warning by design — the diagnostic is the point. Expect it rather
+            // than silencing the logging.
+            QTest::ignoreMessage(QtWarningMsg,
+                                 QRegularExpression(QStringLiteral(
+                                     "loadRecentShotsByKbIdStatic: (prepare|query) failed")));
+            bool ranAfterFailure = true;
+            const QVariantList failed = ShotHistoryStorage::loadRecentShotsByKbIdStatic(
+                db, QStringLiteral("kb-nothing-here"), scope, 5, -1, &ranAfterFailure);
+            QVERIFY(failed.isEmpty());
+            QVERIFY2(!ranAfterFailure,
+                     "a failed query reported itself as having run — the advisor would then "
+                     "state an empty history as a fact the database never established");
+        });
+    }
+
+    // The shot page's "Shot results": the previous shot is the one before on the SAME
+    // profile (a shot in between on another profile is skipped), and a first shot on
+    // its profile is compared with nothing.
+    void shotOutcome_comparesWithThePreviousShotOnTheSameProfile()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("shot_outcome"), [&](QSqlDatabase& db) {
+            const qint64 first = insertShot(db, { .timestamp = 1000, .profileName = QStringLiteral("D-Flow / Q"),
+                                                  .grinderSetting = QStringLiteral("10") });
+            insertShot(db, { .timestamp = 1500, .profileName = QStringLiteral("Blooming") });
+            const qint64 latest = insertShot(db, { .timestamp = 2000, .profileName = QStringLiteral("D-Flow / Q"),
+                                                   .grinderSetting = QStringLiteral("9.5") });
+
+            const QVariantMap outcome = ShotHistoryStorage::shotOutcomeStatic(db, latest);
+            QCOMPARE(outcome.value(QStringLiteral("previousShotId")).toLongLong(), first);
+            QVERIFY2(!outcome.value(QStringLiteral("previousDateTime")).toString().isEmpty(),
+                     "the card names the previous shot by its time");
+            const QJsonObject comparison = QJsonObject::fromVariantMap(
+                outcome.value(QStringLiteral("comparison")).toMap());
+            QCOMPARE(comparison.value(QStringLiteral("baseShotId")).toInteger(), first);
+            const QJsonArray comparisons = comparison.value(QStringLiteral("comparisons")).toArray();
+            QCOMPARE(comparisons.size(), 1);
+            QVERIFY(comparisons[0].toObject().value(QStringLiteral("changedInputs")).toArray()
+                        .contains(QStringLiteral("grinderSetting")));
+            bool sawGrind = false;
+            for (const QJsonValue& row : comparison.value(QStringLiteral("inputs")).toArray()) {
+                if (row[QStringLiteral("key")].toString() != QLatin1String("grinderSetting")) continue;
+                sawGrind = true;
+                QCOMPARE(row[QStringLiteral("cells")][1][QStringLiteral("delta")].toDouble(), -0.5);
+            }
+            QVERIFY2(sawGrind, "the grind change must be an input row");
+
+            const QVariantMap alone = ShotHistoryStorage::shotOutcomeStatic(db, first);
+            QCOMPARE(alone.value(QStringLiteral("previousShotId")).toLongLong(), 0);
+            QVERIFY(alone.value(QStringLiteral("previousDateTime")).toString().isEmpty());
+            // The web route's 404 is this emptiness (the loader logs the miss).
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("operation=loadShotRecord.*shotId=\\s*999999")));
+            QVERIFY(ShotHistoryStorage::shotOutcomeStatic(db, 999999).isEmpty());
+            const QJsonObject aloneComparison = QJsonObject::fromVariantMap(
+                alone.value(QStringLiteral("comparison")).toMap());
+            QCOMPARE(aloneComparison.value(QStringLiteral("shots")).toArray().size(), 1);
+            QVERIFY(aloneComparison.value(QStringLiteral("comparisons")).toArray().isEmpty());
+            QVERIFY2(!aloneComparison.value(QStringLiteral("metrics")).toArray().isEmpty(),
+                     "a shot with no previous one still reports what happened");
+        });
+    }
+
+    // The production arm of the previous-shot query: every shot since migration 9 has
+    // a profile kb id. The kb id beats the name (a renamed profile still matches, the
+    // same name under another kb id does not), and a pre-migration row with no kb id
+    // is matched by the shot's own name.
+    void previousShot_matchesByKbIdThenByNameForOldRows()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("prev_kb"), [&](QSqlDatabase& db) {
+            const qint64 preMigration = insertShot(db, { .timestamp = 1000, .profileName = QStringLiteral("D-Flow / Q") });
+            insertShot(db, { .timestamp = 1500, .profileName = QStringLiteral("D-Flow / Q"), .profileKbId = QStringLiteral("kb-other") });
+            const qint64 mid = insertShot(db, { .timestamp = 1700, .profileName = QStringLiteral("D-Flow / Q"),
+                                                .profileKbId = QStringLiteral("kb-dflow") });
+            const qint64 renamed = insertShot(db, { .timestamp = 1800, .profileName = QStringLiteral("D-Flow / Q v2"),
+                                                    .profileKbId = QStringLiteral("kb-dflow") });
+            const qint64 latest = insertShot(db, { .timestamp = 2000, .profileName = QStringLiteral("D-Flow / Q"),
+                                                   .profileKbId = QStringLiteral("kb-dflow") });
+            QCOMPARE(ShotHistoryStorage::previousShotIdStatic(db, latest), renamed);
+            QCOMPARE(ShotHistoryStorage::previousShotIdStatic(db, renamed), mid);
+            QCOMPARE(ShotHistoryStorage::previousShotIdStatic(db, mid), preMigration);
+        });
+    }
+
+    // Newer and Older on the web page step by (timestamp, id): two imported shots
+    // that share a second are both reachable, and the ends answer 0.
+    void neighbourShots_orderByTimestampThenId()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("neighbours"), [&](QSqlDatabase& db) {
+            const qint64 a = insertShot(db, { .timestamp = 1000, .profileName = QStringLiteral("A") });
+            const qint64 b = insertShot(db, { .timestamp = 1000, .profileName = QStringLiteral("B") });
+            const qint64 c = insertShot(db, { .timestamp = 1200, .profileName = QStringLiteral("C") });
+            QCOMPARE(ShotHistoryStorage::neighbourShotIdStatic(db, c, false), b);
+            QCOMPARE(ShotHistoryStorage::neighbourShotIdStatic(db, b, false), a);
+            QCOMPARE(ShotHistoryStorage::neighbourShotIdStatic(db, a, true), b);
+            QCOMPARE(ShotHistoryStorage::neighbourShotIdStatic(db, b, true), c);
+            QCOMPARE(ShotHistoryStorage::neighbourShotIdStatic(db, a, false), qint64(0));
+            QCOMPARE(ShotHistoryStorage::neighbourShotIdStatic(db, c, true), qint64(0));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // bestRecentShotBlock — rated shot inside the 90-day window emits
+    // the full block, with daysSinceShot reflecting fixture-relative age
+    // and a non-empty changeFromBest diff.
+    // -------------------------------------------------------------------
+    void bestRecentShotBlock_emitsFullBlock_whenRatedShotInWindow()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        constexpr qint64 kBestAgeDays = 14;
+        const qint64 bestTimestamp = now - kBestAgeDays * kSecPerDay;
+
+        withRawDb(path, QStringLiteral("best_in"), [&](QSqlDatabase& db) {
+            ShotRow best;
+            best.uuid = QStringLiteral("uuid-best");
+            best.profileName = QStringLiteral("80's Espresso");
+            best.profileKbId = QStringLiteral("kb-80s");
+            best.beanBrand = QStringLiteral("Northbound");
+            best.beanType = QStringLiteral("Spring Tour");
+            best.grinderModel = QStringLiteral("Zero");
+            best.grinderSetting = QStringLiteral("4.0");
+            best.timestamp = bestTimestamp;
+            best.doseWeight = 18.0;
+            best.finalWeight = 38.0;
+            best.duration = 30.0;
+            best.enjoyment = 92;
+            best.espressoNotes = QStringLiteral("balanced and sweet");
+            const qint64 bestId = insertShot(db, best);
+            QVERIFY(bestId > 0);
+
+            // Current shot (separate row) — the diff should be against this.
+            ShotRow current = best;
+            current.uuid = QStringLiteral("uuid-current");
+            current.timestamp = now - kSecPerDay; // 1 day ago
+            current.grinderSetting = QStringLiteral("4.4");
+            current.doseWeight = 18.0;
+            current.finalWeight = 35.0;
+            current.duration = 27.0;
+            current.enjoyment = 70;
+            current.espressoNotes = QString();
+            const qint64 currentId = insertShot(db, current);
+            QVERIFY(currentId > 0);
+
+            const ShotProjection currentProj = projectionForShot(db, currentId);
+            QVERIFY(currentProj.isValid());
+
+            const QJsonObject best_ = DialingBlocks::buildBestRecentShotBlock(
+                db, QStringLiteral("kb-80s"), soleScope(db), currentId, currentProj);
+
+            QVERIFY(!best_.isEmpty());
+            QCOMPARE(best_.value(QStringLiteral("id")).toVariant().toLongLong(), bestId);
+            QCOMPARE(best_.value(QStringLiteral("enjoyment0to100")).toInt(), 92);
+            QCOMPARE(best_.value(QStringLiteral("doseG")).toDouble(), 18.0);
+            QCOMPARE(best_.value(QStringLiteral("yieldG")).toDouble(), 38.0);
+            QCOMPARE(best_.value(QStringLiteral("ratio")).toString(), QStringLiteral("1:2.11"));
+            QCOMPARE(best_.value(QStringLiteral("daysSinceShot")).toInt(), int(kBestAgeDays));
+
+            const QJsonObject diff = best_.value(QStringLiteral("changeFromBest")).toObject();
+            QVERIFY2(!diff.isEmpty(), "changeFromBest must capture grind/yield/duration shifts");
+            const QJsonObject diffGrind = diff.value(QStringLiteral("inputs")).toObject()
+                .value(QStringLiteral("grinderSetting")).toObject();
+            QCOMPARE(diffGrind.value(QStringLiteral("from")).toString(), QStringLiteral("4.0"));
+            QCOMPARE(diffGrind.value(QStringLiteral("to")).toString(), QStringLiteral("4.4"));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // bean-freshness-followup: the best-recent-shot anchor carries its OWN
+    // snapshotted lifecycle dates directly, distinct from the resolved shot —
+    // the raw data the AI needs to notice the anchor came from a different,
+    // longer-rested portion of the same bag. No hoisting, no derived flag.
+    // -------------------------------------------------------------------
+    void bestRecentShotBlock_carriesOwnLifecycleDates()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+
+        withRawDb(path, QStringLiteral("best_lifecycle"), [&](QSqlDatabase& db) {
+            // Best anchor: an older, longer-rested thaw.
+            ShotRow best;
+            best.uuid = QStringLiteral("uuid-best-lc");
+            best.profileName = QStringLiteral("80's Espresso");
+            best.profileKbId = QStringLiteral("kb-lc");
+            best.beanBrand = QStringLiteral("Northbound");
+            best.timestamp = now - 14 * kSecPerDay;
+            best.doseWeight = 18.0;
+            best.finalWeight = 38.0;
+            best.duration = 30.0;
+            best.enjoyment = 92;
+            best.defrostDate = QStringLiteral("2026-05-01");
+            // Also set the non-frozen lifecycle fields so the appended
+            // positional read (cols 50/51 in loadShotRecordStatic) and the
+            // block-emission branch are both exercised across a real DB read,
+            // not just defrostDate.
+            best.storageHint = QStringLiteral("airtight");
+            best.openedDate = QStringLiteral("2026-05-02");
+            const qint64 bestId = insertShot(db, best);
+            QVERIFY(bestId > 0);
+
+            // Current shot: a newer thaw (different portion).
+            ShotRow current = best;
+            current.uuid = QStringLiteral("uuid-current-lc");
+            current.timestamp = now - kSecPerDay;
+            current.enjoyment = 70;
+            current.defrostDate = QStringLiteral("2026-05-13");
+            const qint64 currentId = insertShot(db, current);
+            QVERIFY(currentId > 0);
+
+            const ShotProjection currentProj = projectionForShot(db, currentId);
+            const QJsonObject best_ = DialingBlocks::buildBestRecentShotBlock(
+                db, QStringLiteral("kb-lc"), soleScope(db), currentId, currentProj);
+
+            QVERIFY(!best_.isEmpty());
+            // The anchor carries its own defrostDate, distinct from the current
+            // shot's 2026-05-13 — the mismatch signal is now visible.
+            QCOMPARE(best_.value(QStringLiteral("defrostDate")).toString(),
+                     QStringLiteral("2026-05-01"));
+            QCOMPARE(currentProj.defrostDate, QStringLiteral("2026-05-13"));
+            // storageHint/openedDate survive the DB read (cols 50/51) and reach
+            // both the projection and the emitted block.
+            QCOMPARE(best_.value(QStringLiteral("storageHint")).toString(),
+                     QStringLiteral("airtight"));
+            QCOMPARE(best_.value(QStringLiteral("openedDate")).toString(),
+                     QStringLiteral("2026-05-02"));
+            QCOMPARE(currentProj.storageHint, QStringLiteral("airtight"));
+            QCOMPARE(currentProj.openedDate, QStringLiteral("2026-05-02"));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // bestRecentShotBlock — only-stale rated shots produce empty (>90d).
+    // -------------------------------------------------------------------
+    void bestRecentShotBlock_emptyWhenAllRatedShotsAreStale()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        // Window is 90 days; place the rated shot at 100 days old.
+        const qint64 staleTimestamp = now
+            - (DialingBlocks::kBestRecentShotWindowDays + 10) * kSecPerDay;
+
+        withRawDb(path, QStringLiteral("best_stale"), [&](QSqlDatabase& db) {
+            ShotRow stale;
+            stale.uuid = QStringLiteral("uuid-stale");
+            stale.profileName = QStringLiteral("80's Espresso");
+            stale.profileKbId = QStringLiteral("kb-80s");
+            stale.timestamp = staleTimestamp;
+            stale.enjoyment = 95;
+            QVERIFY(insertShot(db, stale) > 0);
+
+            // Current shot — also rated, but it's the resolved shot so it
+            // is excluded by the query's `id != ?` clause.
+            ShotRow current;
+            current.uuid = QStringLiteral("uuid-current");
+            current.profileName = QStringLiteral("80's Espresso");
+            current.profileKbId = QStringLiteral("kb-80s");
+            current.timestamp = now - kSecPerDay;
+            current.enjoyment = 70;
+            const qint64 currentId = insertShot(db, current);
+            QVERIFY(currentId > 0);
+
+            const ShotProjection currentProj = projectionForShot(db, currentId);
+
+            const QJsonObject best_ = DialingBlocks::buildBestRecentShotBlock(
+                db, QStringLiteral("kb-80s"), soleScope(db), currentId, currentProj);
+            QVERIFY2(best_.isEmpty(),
+                     "no rated shot in the 90-day window must produce an empty block");
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // grinderContextBlock — when bean-scoped query is sparse (<2 rows),
+    // the cross-bean fallback fires and `allBeansSettings` carries the
+    // wider observed set.
+    // -------------------------------------------------------------------
+    void grinderContextBlock_emitsAllBeansSettings_whenBeanScopedSparse()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        withRawDb(path, QStringLiteral("grinder_sparse"), [&](QSqlDatabase& db) {
+            // One Northbound shot at setting 4.0 (sparse for that bean) —
+            // forces the cross-bean fallback.
+            ShotRow nb;
+            nb.uuid = QStringLiteral("uuid-nb");
+            nb.profileName = QStringLiteral("p");
+            nb.beanBrand = QStringLiteral("Northbound");
+            nb.grinderModel = QStringLiteral("Zero");
+            nb.grinderSetting = QStringLiteral("4.0");
+            QVERIFY(insertShot(db, nb) > 0);
+
+            // Three Onyx shots at varying settings — cross-bean rich.
+            for (const auto& setting : {QStringLiteral("3.5"),
+                                         QStringLiteral("3.8"),
+                                         QStringLiteral("4.2")}) {
+                ShotRow o;
+                o.uuid = QStringLiteral("uuid-onyx-") + setting;
+                o.profileName = QStringLiteral("p");
+                o.beanBrand = QStringLiteral("Onyx");
+                o.grinderModel = QStringLiteral("Zero");
+                o.grinderSetting = setting;
+                QVERIFY(insertShot(db, o) > 0);
+            }
+
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"),
+                QStringLiteral("Northbound"));
+
+            QCOMPARE(ctx.value(QStringLiteral("model")).toString(), QStringLiteral("Zero"));
+            QCOMPARE(ctx.value(QStringLiteral("beverageType")).toString(),
+                     QStringLiteral("espresso"));
+            QVERIFY(ctx.value(QStringLiteral("isNumeric")).toBool());
+
+            // Bean-scoped settings: only Northbound's single setting.
+            const QJsonArray observed = ctx.value(QStringLiteral("settingsObserved")).toArray();
+            QCOMPARE(observed.size(), 1);
+            QCOMPARE(observed[0].toString(), QStringLiteral("4.0"));
+
+            // Cross-bean fallback present — sees all four settings.
+            const QJsonArray allBeans = ctx.value(QStringLiteral("allBeansSettings")).toArray();
+            QCOMPARE(allBeans.size(), 4);
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // grinderContextBlock — bean-scoped is rich, no allBeansSettings key.
+    // -------------------------------------------------------------------
+    void grinderContextBlock_omitsAllBeansSettings_whenBeanScopedRich()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        withRawDb(path, QStringLiteral("grinder_rich"), [&](QSqlDatabase& db) {
+            // Three Northbound shots — bean-scoped is already rich
+            // (settingsObserved.size() >= 2) so the fallback should not fire.
+            for (const auto& setting : {QStringLiteral("4.0"),
+                                         QStringLiteral("4.2"),
+                                         QStringLiteral("4.4")}) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-nb-") + setting;
+                r.profileName = QStringLiteral("p");
+                r.beanBrand = QStringLiteral("Northbound");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = setting;
+                QVERIFY(insertShot(db, r) > 0);
+            }
+
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"),
+                QStringLiteral("Northbound"));
+            QCOMPARE(ctx.value(QStringLiteral("settingsObserved")).toArray().size(), 3);
+            QVERIFY2(!ctx.contains(QStringLiteral("allBeansSettings")),
+                     "rich bean-scoped result must not trigger cross-bean fallback");
+            QCOMPARE(ctx.value(QStringLiteral("observedMinSetting")).toDouble(), 4.0);
+            QCOMPARE(ctx.value(QStringLiteral("observedMaxSetting")).toDouble(), 4.4);
+            // Typical (modal) step is 0.2 (gaps 0.2, 0.2). Allow tiny FP slack.
+            const double step = ctx.value(QStringLiteral("stepSize")).toDouble();
+            QVERIFY2(qAbs(step - 0.2) < 0.0001,
+                     qPrintable(QString("expected stepSize ~0.2, got %1").arg(step)));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // stepSize — smallest commonly-repeated gap (deriveGrindStep). A lone
+    // mistyped setting must not collapse the step the way a raw minimum-gap
+    // would (the typo's gap occurs once and is skipped), while the finest step
+    // the user makes repeatedly (0.25 here) wins over coarser ones.
+    // -------------------------------------------------------------------
+    void grinderContextBlock_stepSizeIsNoiseFiltered()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        withRawDb(path, QStringLiteral("grinder_step"), [&](QSqlDatabase& db) {
+            auto add = [&](const QString& setting) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-step-") + setting;
+                r.profileName = QStringLiteral("p");
+                r.beanBrand = QStringLiteral("Cimarron");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = setting;
+                QVERIFY(insertShot(db, r) > 0);
+            };
+
+            auto stepFor = [&]() {
+                const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                    db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"),
+                    QStringLiteral("Cimarron"));
+                return ctx.value(QStringLiteral("stepSize")).toDouble();
+            };
+
+            // Clean history: gaps 0.5, 0.5, 0.25, 0.25 → modal tie resolved toward
+            // the smaller step → 0.25.
+            for (const auto& s : {QStringLiteral("7.5"), QStringLiteral("8"),
+                                   QStringLiteral("8.5"), QStringLiteral("8.75"),
+                                   QStringLiteral("9")})
+                add(s);
+            QVERIFY2(qAbs(stepFor() - 0.25) < 0.0001,
+                     qPrintable(QString("clean history expected 0.25, got %1").arg(stepFor())));
+
+            // A single mistyped 8.1: a raw minimum-gap would now report 0.1; the
+            // modal estimator keeps 0.25 (the outlier's odd gaps each occur once).
+            add(QStringLiteral("8.1"));
+            QVERIFY2(qAbs(stepFor() - 0.25) < 0.0001,
+                     qPrintable(QString("outlier must not collapse step; expected 0.25, got %1")
+                                .arg(stepFor())));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // stepSize — omitted when fewer than 2 distinct numeric settings exist
+    // (deriveGrindStep returns 0 → the block does not emit the field).
+    // -------------------------------------------------------------------
+    void grinderContextBlock_stepSizeOmittedWhenTooFewSettings()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        withRawDb(path, QStringLiteral("grinder_one"), [&](QSqlDatabase& db) {
+            ShotRow r;
+            r.uuid = QStringLiteral("uuid-one");
+            r.profileName = QStringLiteral("p");
+            r.grinderModel = QStringLiteral("Zero");
+            r.grinderSetting = QStringLiteral("8");
+            QVERIFY(insertShot(db, r) > 0);
+
+            // Unscoped (empty beanBrand) so the single value isn't widened by the
+            // cross-bean fallback — one distinct setting, no derivable step.
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"), QString());
+            QVERIFY2(!ctx.contains(QStringLiteral("stepSize")),
+                     "a single distinct setting must not yield a stepSize");
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // stepSize — the finest REPEATED step wins even when coarser moves are
+    // more common. Real-history regression: a user who dials mostly in 0.5
+    // steps across beans but fine-tunes in 0.25 on the working bean should get
+    // 0.25 (the grinder's resolution), not 0.5 (the most-common move). The step
+    // is grinder-model-wide (all beans), independent of the bean argument.
+    // -------------------------------------------------------------------
+    void grinderContextBlock_stepSizeIsFinestRepeatedNotModal()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        withRawDb(path, QStringLiteral("grinder_finest"), [&](QSqlDatabase& db) {
+            // Distinct settings for one grinder: five 0.5 gaps, two 0.25 gaps.
+            // Modal gap would be 0.5; the finest repeated gap is 0.25.
+            int i = 0;
+            for (const auto& s : {QStringLiteral("5"), QStringLiteral("5.5"),
+                                   QStringLiteral("6"), QStringLiteral("7"),
+                                   QStringLiteral("7.5"), QStringLiteral("8"),
+                                   QStringLiteral("8.5"), QStringLiteral("8.75"),
+                                   QStringLiteral("9"), QStringLiteral("10"),
+                                   QStringLiteral("12")}) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-finest-%1").arg(i++);
+                r.profileName = QStringLiteral("p");
+                r.beanBrand = QStringLiteral("Mixed");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = s;
+                QVERIFY(insertShot(db, r) > 0);
+            }
+
+            // Bean argument present, but the step must be grinder-wide → 0.25.
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"),
+                QStringLiteral("Mixed"));
+            const double step = ctx.value(QStringLiteral("stepSize")).toDouble();
+            QVERIFY2(qAbs(step - 0.25) < 0.0001,
+                     qPrintable(QString("finest repeated step expected 0.25, got %1").arg(step)));
+        });
+    }
+
+    // stepSize — the step is grinder-model-wide, NOT scoped to the bean
+    // argument. Split a grinder's settings across two beans: bean A alone is
+    // coarse (would give 1.0), bean B contributes the fine 0.25 gaps. Passing
+    // bean A must still yield 0.25, proving the step pools all beans.
+    void grinderContextBlock_stepSizeIsGrinderWideAcrossBeans()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("grinder_wide"), [&](QSqlDatabase& db) {
+            auto add = [&](const QString& bean, const QString& setting) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-gw-") + bean + setting;
+                r.profileName = QStringLiteral("p");
+                r.beanBrand = bean;
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = setting;
+                QVERIFY(insertShot(db, r) > 0);
+            };
+            // Bean A: coarse only (8, 9 → a single 1.0 gap → no repeat).
+            add(QStringLiteral("BeanA"), QStringLiteral("8"));
+            add(QStringLiteral("BeanA"), QStringLiteral("9"));
+            // Bean B: the fine steps (8.25, 8.5 → with 8 give two 0.25 gaps).
+            add(QStringLiteral("BeanB"), QStringLiteral("8.25"));
+            add(QStringLiteral("BeanB"), QStringLiteral("8.5"));
+
+            // Scope the query to Bean A; the grinder-wide step still sees Bean B.
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"),
+                QStringLiteral("BeanA"));
+            const double step = ctx.value(QStringLiteral("stepSize")).toDouble();
+            QVERIFY2(qAbs(step - 0.25) < 0.0001,
+                     qPrintable(QString("grinder-wide step expected 0.25, got %1").arg(step)));
+        });
+    }
+
+    // stepSize — a repeated gap below the 0.05 floor clamps up to 0.05.
+    void grinderContextBlock_stepSizeFloorClamps()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("grinder_floor"), [&](QSqlDatabase& db) {
+            int i = 0;
+            for (const auto& s : {QStringLiteral("8"), QStringLiteral("8.02"),
+                                   QStringLiteral("8.04")}) {  // two 0.02 gaps
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-floor-%1").arg(i++);
+                r.profileName = QStringLiteral("p");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = s;
+                QVERIFY(insertShot(db, r) > 0);
+            }
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"), QString());
+            const double step = ctx.value(QStringLiteral("stepSize")).toDouble();
+            QVERIFY2(qAbs(step - 0.05) < 0.0001,
+                     qPrintable(QString("sub-floor gap should clamp to 0.05, got %1").arg(step)));
+        });
+    }
+
+    // stepSize — when NO gap repeats (scattered history), fall back to the
+    // smallest gap rather than omitting or picking a coarse one.
+    void grinderContextBlock_stepSizeFallsBackToSmallestWhenNoRepeat()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("grinder_norepeat"), [&](QSqlDatabase& db) {
+            int i = 0;
+            // Gaps 1, 2, 3 — all distinct, none repeats → smallest = 1.0.
+            for (const auto& s : {QStringLiteral("5"), QStringLiteral("6"),
+                                   QStringLiteral("8"), QStringLiteral("11")}) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-nr-%1").arg(i++);
+                r.profileName = QStringLiteral("p");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = s;
+                QVERIFY(insertShot(db, r) > 0);
+            }
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"), QString());
+            const double step = ctx.value(QStringLiteral("stepSize")).toDouble();
+            QVERIFY2(qAbs(step - 1.0) < 0.0001,
+                     qPrintable(QString("no-repeat fallback expected 1.0, got %1").arg(step)));
+        });
+    }
+
+    // stepSize is decoupled from allNumeric: a grinder with a mix of numeric and
+    // non-numeric settings still gets a numeric step, but min/max (which need an
+    // all-numeric range) are omitted.
+    void grinderContextBlock_stepSizeDecoupledFromAllNumeric()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("grinder_mixed"), [&](QSqlDatabase& db) {
+            int i = 0;
+            for (const auto& s : {QStringLiteral("8"), QStringLiteral("8.5"),
+                                   QStringLiteral("9"), QStringLiteral("medium")}) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-mixed-%1").arg(i++);
+                r.profileName = QStringLiteral("p");
+                r.beanBrand = QStringLiteral("Mix");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = s;
+                QVERIFY(insertShot(db, r) > 0);
+            }
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, QStringLiteral("Zero"), soleScope(db), QStringLiteral("espresso"),
+                QStringLiteral("Mix"));
+            // Numeric step present (0.5 from 8/8.5/9)...
+            QVERIFY2(qAbs(ctx.value(QStringLiteral("stepSize")).toDouble() - 0.5) < 0.0001,
+                     "mixed history should still yield a numeric stepSize");
+            // ...but the min/max range is omitted (history is not all-numeric).
+            QVERIFY2(!ctx.contains(QStringLiteral("observedMinSetting")),
+                     "min/max must be absent for a non-all-numeric history");
+            QVERIFY(!ctx.contains(QStringLiteral("observedMaxSetting")));
+            QVERIFY(!ctx.value(QStringLiteral("isNumeric")).toBool());
+        });
+    }
+
+    // summarizeStructuredNext renders a recommended rpm as a whole-number
+    // predicted part, alongside the grind (the advisor's RPM coaching output),
+    // and a recommended stop-at-weight yield.
+    void summarizeStructuredNext_rendersRpmAndYield()
+    {
+        QJsonObject sn;
+        sn["grinderSetting"] = QStringLiteral("8.5");
+        sn["rpm"] = 1350;
+        sn["targetWeightG"] = 32;
+        const DialingBlocks::StructuredNextSummary s =
+            DialingBlocks::summarizeStructuredNext(sn);
+        QVERIFY(s.predictedParts.contains(QStringLiteral("grinder 8.5")));
+        QVERIFY2(s.predictedParts.contains(QStringLiteral("1350 RPM")),
+                 "recommended rpm should appear as a whole-number predicted part");
+        QVERIFY(s.predictedParts.contains(QStringLiteral("stop at 32.0g")));
+
+        // A number written as a string or null is left out, not shown as 0.
+        sn["targetWeightG"] = QStringLiteral("32");
+        sn["doseG"] = QJsonValue::Null;
+        const QStringList parts = DialingBlocks::summarizeStructuredNext(sn).predictedParts;
+        QVERIFY2(!parts.join(' ').contains(QStringLiteral("0.0g")), qPrintable(parts.join(", ")));
+    }
+
+    // -------------------------------------------------------------------
+    // End-to-end parity (issue #1044's headline test).
+    //
+    // What this pinned originally — that two hand-written surfaces derived the
+    // same arguments — is gone: both surfaces now call
+    // buildAdvisorContextBlocks, so emulating them would be f(x) == f(x).
+    //
+    // What is left to pin is the ONE difference between them. The MCP read tool
+    // passes GrinderCalibration::Omit (#1164) and no assistant turns; the in-app
+    // advisor passes neither. Every other block must be identical, and the two
+    // that differ must differ in exactly that way — otherwise "the MCP surface
+    // omits calibration" quietly becomes "the MCP surface builds less history".
+    // -------------------------------------------------------------------
+    void endToEndParity_theTwoSurfacesDifferOnlyInWhatMcpOmits()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        const qint64 bestTs = now - 5 * kSecPerDay;
+
+        withRawDb(path, QStringLiteral("dial_parity"), [&](QSqlDatabase& db) {
+            ShotRow base;
+            base.profileName = QStringLiteral("80's Espresso");
+            base.profileKbId = QStringLiteral("kb-80s");
+            base.beanBrand = QStringLiteral("Northbound");
+            base.beanType = QStringLiteral("Spring Tour");
+            base.grinderBrand = QStringLiteral("Niche");
+            base.grinderModel = QStringLiteral("Zero");
+            base.grinderBurrs = QStringLiteral("63mm conical");
+
+            ShotRow s1 = base; s1.uuid = QStringLiteral("u1");
+            s1.timestamp = now - 4 * kSecPerDay;
+            s1.grinderSetting = QStringLiteral("4.4");
+            s1.doseWeight = 18.0; s1.finalWeight = 36.0; s1.duration = 30.0;
+            QVERIFY(insertShot(db, s1) > 0);
+
+            ShotRow rated = base; rated.uuid = QStringLiteral("u-best");
+            rated.timestamp = bestTs;
+            rated.grinderSetting = QStringLiteral("4.0");
+            rated.enjoyment = 90;
+            rated.doseWeight = 18.0; rated.finalWeight = 38.0; rated.duration = 30.0;
+            QVERIFY(insertShot(db, rated) > 0);
+
+            ShotRow current = base; current.uuid = QStringLiteral("u-current");
+            current.timestamp = now - kSecPerDay / 2;
+            current.grinderSetting = QStringLiteral("4.4");
+            current.doseWeight = 18.0; current.finalWeight = 36.0; current.duration = 27.0;
+            const qint64 currentId = insertShot(db, current);
+            QVERIFY(currentId > 0);
+
+            const ShotProjection shot = projectionForShot(db, currentId);
+
+            // The two production invocations, verbatim.
+            const auto inApp = DialingBlocks::buildAdvisorContextBlocks(
+                db, shot, currentId, {}, DialingBlocks::kDialInHistoryLimit);
+            const auto mcp = DialingBlocks::buildAdvisorContextBlocks(
+                db, shot, currentId, {}, DialingBlocks::kDialInHistoryLimit,
+                DialingBlocks::GrinderCalibration::Omit);
+
+            const auto toJson = [](const auto& v) {
+                return QString::fromUtf8(QJsonDocument(v).toJson(QJsonDocument::Compact));
+            };
+
+            QCOMPARE(toJson(mcp.dialInSessions), toJson(inApp.dialInSessions));
+            QCOMPARE(toJson(mcp.bestRecentShot), toJson(inApp.bestRecentShot));
+            QCOMPARE(toJson(mcp.grinderContext), toJson(inApp.grinderContext));
+            QCOMPARE(toJson(mcp.noDialInHistory), toJson(inApp.noDialInHistory));
+
+            // Not vacuous: the blocks compared above have content.
+            QVERIFY2(!inApp.dialInSessions.isEmpty(),
+                     "fixture produced no history, so the comparisons above compare nothing");
+            QVERIFY(!inApp.bestRecentShot.isEmpty());
+            QVERIFY(!inApp.grinderContext.isEmpty());
+
+            // And the one documented difference is the only one.
+            QVERIFY2(mcp.grinderCalibration.isEmpty(),
+                     "the MCP read tool must NOT ship the ~33-row calibration table (#1164)");
+        });
+    }
+
+    // ---------------------------------------------------------------
+    // recentAdvice block (issue #1053). Builds attribution between a
+    // prior advisor turn (with structuredNext) and the user's actual
+    // follow-up shot.
+    // ---------------------------------------------------------------
+
+    static QJsonObject sampleStructuredNext()
+    {
+        return QJsonObject{
+            {"grinderSetting", "4.75"},
+            {"expectedDurationSec", QJsonArray{32, 38}},
+            {"expectedFlowMlPerSec", QJsonArray{1.0, 1.5}},
+            {"successCondition", "OK"},
+            {"reasoning", "Slow flow toward profile target"}
+        };
+    }
+
+    void recentAdvice_qualifyingTurnRendersWithAdherenceFollowed()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+
+        // Prior shot (the one the advisor was asked about) at T-2h with
+        // grinder 5.0; follow-up shot at T-1h on the same profile with
+        // grinder 4.75 (matching the recommendation), within the
+        // expectedDurationSec / expectedFlowMlPerSec ranges.
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+        const qint64 priorTs = nowSec - 2 * 3600;
+        const qint64 nextTs = nowSec - 1 * 3600;
+
+        qint64 priorId = -1, nextId = -1;
+        withRawDb(dbPath, "rec_advice_followed", [&](QSqlDatabase& db) {
+            priorId = insertShot(db, ShotRow{
+                .uuid = "uuid-prior", .timestamp = priorTs,
+                .profileName = "80's Espresso", .profileKbId = "kb-80s",
+                .duration = 28.0, .finalWeight = 36.0, .doseWeight = 18.0,
+                .grinderSetting = "5.0",
+                .enjoyment = 0
+            });
+            QVERIFY(priorId > 0);
+            nextId = insertShot(db, ShotRow{
+                .uuid = "uuid-next", .timestamp = nextTs,
+                .profileName = "80's Espresso", .profileKbId = "kb-80s",
+                .duration = 35.0, .finalWeight = 42.0, .doseWeight = 18.0,
+                .grinderSetting = "4.75",
+                .enjoyment = 75, .espressoNotes = "balanced and sweet"
+            });
+            QVERIFY(nextId > 0);
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = QList<AIConversation::HistoricalAssistantTurn>{
+                AIConversation::HistoricalAssistantTurn{
+                    priorId, "Try grinder 4.75.", sampleStructuredNext()
+                }
+            };
+            in.currentProfileKbId = "kb-80s";
+            // currentShotId points at a hypothetical "now-being-analyzed"
+            // shot (later than nextId). Set higher than the follow-up so
+            // the follow-up qualifies.
+            in.currentShotId = 99999;
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QCOMPARE(out.size(), 1);
+            const QJsonObject entry = out.first().toObject();
+            QCOMPARE(entry.value("turnsAgo").toInt(), 1);
+            const QJsonObject ur = entry.value("userResponse").toObject();
+            QCOMPARE(ur.value("adherence").toString(), QStringLiteral("followed"));
+            QCOMPARE(ur.value("outcomeRating0to100").toInt(), 75);
+            QCOMPARE(ur.value("outcomeNotes").toString(), QStringLiteral("balanced and sweet"));
+            const QJsonObject rng = ur.value("outcomeInPredictedRange").toObject();
+            QVERIFY(rng.value("duration").toBool());  // 35s in [32,38]
+            // avg flow = 42/35 = 1.2 ml/s, in [1.0, 1.5]
+            QVERIFY(rng.value("flow").toBool());
+        });
+    }
+
+    // synthesizeRecommendationSummary's fallback (used when the prior turn's
+    // structuredNext omits `reasoning`) was previously untested — the shared
+    // DialingBlocks::summarizeStructuredNext extraction risked silently
+    // widening its both-duration-and-flow-required gate for the "expect"
+    // clause into a per-field-independent one. Pins the original gate: a
+    // single range alone must NOT produce a partial "expect" clause.
+    void recentAdvice_synthesizedRecommendation_requiresBothDurationAndFlowForExpectClause()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+        const qint64 priorTs = nowSec - 2 * 3600;
+        const qint64 nextTs = nowSec - 1 * 3600;
+
+        withRawDb(dbPath, "rec_advice_synth_summary", [&](QSqlDatabase& db) {
+            const qint64 priorId = insertShot(db, ShotRow{
+                .uuid = "uuid-prior-synth", .timestamp = priorTs,
+                .profileName = "80's Espresso", .profileKbId = "kb-80s-synth",
+                .duration = 28.0, .finalWeight = 36.0, .doseWeight = 18.0,
+                .grinderSetting = "5.0", .enjoyment = 0
+            });
+            QVERIFY(priorId > 0);
+            const qint64 nextId = insertShot(db, ShotRow{
+                .uuid = "uuid-next-synth", .timestamp = nextTs,
+                .profileName = "80's Espresso", .profileKbId = "kb-80s-synth",
+                .duration = 35.0, .finalWeight = 42.0, .doseWeight = 18.0,
+                .grinderSetting = "4.75", .enjoyment = 0
+            });
+            QVERIFY(nextId > 0);
+
+            // No `reasoning` — forces the synthesized-summary fallback.
+            // Only expectedDurationSec present, no expectedFlowMlPerSec.
+            const QJsonObject durationOnly{
+                {"grinderSetting", "4.75"},
+                {"expectedDurationSec", QJsonArray{32, 38}},
+                {"successCondition", "OK"}
+            };
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = QList<AIConversation::HistoricalAssistantTurn>{
+                AIConversation::HistoricalAssistantTurn{priorId, "unused prose", durationOnly}
+            };
+            in.currentProfileKbId = "kb-80s-synth";
+            in.currentShotId = 99999;
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QCOMPARE(out.size(), 1);
+            const QString recommendation = out.first().toObject().value("recommendation").toString();
+            QVERIFY2(recommendation.contains(QStringLiteral("grinder 4.75")),
+                     "predicted field must still be summarized");
+            QVERIFY2(!recommendation.contains(QStringLiteral("expect")),
+                     "a single range (duration without flow) must not produce a partial expect clause");
+        });
+    }
+
+    void recentAdvice_omitsRatingWhenUnrated()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+
+        qint64 priorId = -1;
+        withRawDb(dbPath, "rec_advice_unrated", [&](QSqlDatabase& db) {
+            priorId = insertShot(db, ShotRow{
+                .uuid = "u-prior", .timestamp = nowSec - 7200,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "5.0"
+            });
+            insertShot(db, ShotRow{
+                .uuid = "u-next", .timestamp = nowSec - 3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 35, .finalWeight = 42, .doseWeight = 18,
+                .grinderSetting = "4.75",
+                .enjoyment = 0  // unrated
+            });
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{
+                priorId, "advice", sampleStructuredNext()}};
+            in.currentProfileKbId = "kb";
+            in.currentShotId = 99999;
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QCOMPARE(out.size(), 1);
+            const QJsonObject ur = out.first().toObject().value("userResponse").toObject();
+            QVERIFY2(!ur.contains("outcomeRating0to100"),
+                     "outcomeRating0to100 must be omitted when the actual shot is unrated");
+            // outcomeInPredictedRange survives — curve-based attribution
+            // doesn't require a taste signal.
+            QVERIFY(ur.value("outcomeInPredictedRange").toObject().contains("duration"));
+        });
+    }
+
+    void recentAdvice_crossProfileFiltersOut()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+
+        qint64 priorId = -1;
+        withRawDb(dbPath, "rec_advice_xprof", [&](QSqlDatabase& db) {
+            priorId = insertShot(db, ShotRow{
+                .uuid = "u-A", .timestamp = nowSec - 7200,
+                .profileName = "Profile A", .profileKbId = "kb-A",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "5.0"
+            });
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{
+                priorId, "advice", sampleStructuredNext()}};
+            in.currentProfileKbId = "kb-B";  // different profile
+            in.currentShotId = 99999;
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QVERIFY2(out.isEmpty(),
+                     "cross-profile prior turn must be filtered out, leaving recentAdvice empty");
+        });
+    }
+
+    void recentAdvice_ignoredWhenUserDidNotFollow()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+
+        qint64 priorId = -1;
+        withRawDb(dbPath, "rec_advice_ignored", [&](QSqlDatabase& db) {
+            priorId = insertShot(db, ShotRow{
+                .uuid = "u-prior", .timestamp = nowSec - 7200,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "5.0"
+            });
+            // User kept grinder at 5.0 — ignored the 4.75 recommendation.
+            insertShot(db, ShotRow{
+                .uuid = "u-next", .timestamp = nowSec - 3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "5.0"
+            });
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{
+                priorId, "advice", sampleStructuredNext()}};
+            in.currentProfileKbId = "kb";
+            in.currentShotId = 99999;
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QCOMPARE(out.size(), 1);
+            const QJsonObject ur = out.first().toObject().value("userResponse").toObject();
+            QCOMPARE(ur.value("adherence").toString(), QStringLiteral("ignored"));
+        });
+    }
+
+    // Shared driver for the grinderSetting adherence cases. Seeds a prior shot
+    // and a follow-up, runs one recommendation through buildRecentAdviceBlock,
+    // and returns the adherence verdict.
+    // priorDose/nextDose default to the same value so every existing caller
+    // varies only the grind, as before. The ranges-only cases need a second
+    // axis: with nothing recommended, the dose is one of the things that
+    // decides whether the predicted repeat actually happened.
+    QString adherenceForStructured(const QString& tag, const QJsonObject& sn,
+                                   const QString& priorGrind, const QString& nextGrind,
+                                   double priorDose = 18, double nextDose = 18,
+                                   qint64 priorRpm = 0, qint64 nextRpm = 0,
+                                   double priorTarget = 0, double nextTarget = 0)
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+        QString verdict;
+
+        withRawDb(dbPath, tag, [&](QSqlDatabase& db) {
+            const qint64 priorId = insertShot(db, ShotRow{
+                .uuid = "u-prior", .timestamp = nowSec - 7200,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = priorDose,
+                .grinderSetting = priorGrind, .rpm = priorRpm, .targetWeight = priorTarget
+            });
+            insertShot(db, ShotRow{
+                .uuid = "u-next", .timestamp = nowSec - 3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = nextDose,
+                .grinderSetting = nextGrind, .rpm = nextRpm, .targetWeight = nextTarget
+            });
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{priorId, "advice", sn}};
+            in.currentProfileKbId = "kb";
+            in.currentShotId = 99999;
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QCOMPARE(out.size(), 1);
+            verdict = out.first().toObject().value("userResponse").toObject()
+                          .value("adherence").toString();
+        });
+        return verdict;
+    }
+
+    // Convenience for the common case: vary only the recommended grind.
+    QString adherenceFor(const QString& tag, const QJsonValue& recommendedGrind,
+                         const QString& priorGrind, const QString& nextGrind)
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn["grinderSetting"] = recommendedGrind;
+        return adherenceForStructured(tag, sn, priorGrind, nextGrind);
+    }
+
+    // A ranges-only turn recommends no parameter change, so the implicit
+    // instruction is "run this again, here is what I expect". That is an
+    // experiment, and the verdict has to say whether it ran.
+    //
+    // Repeat on the same setup: it ran. This is the case that must keep
+    // working — most ranges-only turns are ordinary "try that again" advice.
+    void recentAdvice_rangesOnlyRepeatOnSameSetupIsFollowed()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+        QCOMPARE(adherenceForStructured("adh_ranges_same", sn, "9.0", "9.0"),
+                 QStringLiteral("followed"));
+    }
+
+    // Changed the grind nobody asked them to change: the predicted repeat did
+    // not happen, so the prediction was never tested. Asserting BOTH verdicts
+    // because "followed" is the specific wrong answer this replaced — it told
+    // the model "the experiment ran and failed", so a bad outcome made it
+    // revise a direction its prediction never covered.
+    void recentAdvice_rangesOnlyWithChangedGrindIsIgnored()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+        const QString verdict =
+            adherenceForStructured("adh_ranges_grind", sn, "9.0", "7.5");
+        QCOMPARE(verdict, QStringLiteral("ignored"));
+        QVERIFY2(verdict != QStringLiteral("followed"),
+                 "a regrind is not the controlled repeat that was predicted");
+    }
+
+    // Same for a dose change, and the tolerance has to hold: 18.0 -> 19.5 is a
+    // decision, 18.0 -> 18.2 is scale noise and must stay "followed".
+    void recentAdvice_rangesOnlyDoseChangeRespectsTolerance()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+        QCOMPARE(adherenceForStructured("adh_ranges_dose_big", sn, "9.0", "9.0", 18.0, 19.5),
+                 QStringLiteral("ignored"));
+        QCOMPARE(adherenceForStructured("adh_ranges_dose_noise", sn, "9.0", "9.0", 18.0, 18.2),
+                 QStringLiteral("followed"));
+    }
+
+    // Notation is not a setup change. "1 + 4" and "1+4" are the same dial
+    // position, and a shot recorded with the RPM annotation is the same
+    // setting as one recorded without it — neither may read as a regrind.
+    void recentAdvice_rangesOnlyNotationIsNotAChange()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+        QCOMPARE(adherenceForStructured("adh_ranges_compound", sn, "1 + 4", "1+4"),
+                 QStringLiteral("followed"));
+        QCOMPARE(adherenceForStructured("adh_ranges_annot", sn, "23.5", "23.5 1400rpm"),
+                 QStringLiteral("followed"));
+    }
+
+    // A blank grinder setting is missing data, not proof of a regrind. Older
+    // shots have no recorded setting, and downgrading those to "ignored" would
+    // rewrite long-settled history on no evidence at all.
+    // Lettered dials ("3F" -> "3C") are an unmistakable regrind, but they
+    // parse as NO number — leadingDialNumber() only knows the numeric and
+    // compound shapes. The first version of sameGrinderSetting() answered
+    // "same" for anything it could not compare numerically, which swallowed
+    // this case whole and scored it "followed": the precise defect this
+    // function exists to catch, surviving inside the fix for it.
+    void recentAdvice_rangesOnlyLetteredRegrindIsIgnored()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+        const QString verdict =
+            adherenceForStructured("adh_ranges_lettered", sn, "3F", "3C");
+        QCOMPARE(verdict, QStringLiteral("ignored"));
+        QVERIFY2(verdict != QStringLiteral("followed"),
+                 "a lettered-dial regrind is still a regrind");
+    }
+
+    // The RPM axis, which nothing reached before: ShotRow had no rpm field, so
+    // every fixture wrote NULL and the comparison skipped. 1400 -> 1200 is a
+    // deliberate move; 1400 -> 1410 is inside the +/-25 band and is not.
+    void recentAdvice_rangesOnlyRpmChangeRespectsTolerance()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+        QCOMPARE(adherenceForStructured("adh_ranges_rpm_big", sn, "9.0", "9.0",
+                                        18, 18, 1400, 1200),
+                 QStringLiteral("ignored"));
+        QCOMPARE(adherenceForStructured("adh_ranges_rpm_noise", sn, "9.0", "9.0",
+                                        18, 18, 1400, 1410),
+                 QStringLiteral("followed"));
+        // Unrecorded on one side is missing data, not a change.
+        QCOMPARE(adherenceForStructured("adh_ranges_rpm_unset", sn, "9.0", "9.0",
+                                        18, 18, 1400, 0),
+                 QStringLiteral("followed"));
+    }
+
+    // A recommended stop-at-weight yield is scored like dose: the follow-up's
+    // target must land within ±0.5g of it AND have moved from the prior.
+    void recentAdvice_targetWeightIsScored()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove(QStringLiteral("grinderSetting"));   // yield is the only axis
+        sn["targetWeightG"] = 32;
+        QCOMPARE(adherenceForStructured("adh_yield_followed", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 36, 32),
+                 QStringLiteral("followed"));
+        QCOMPARE(adherenceForStructured("adh_yield_ignored", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 36, 36),
+                 QStringLiteral("ignored"));
+        // A recommendation equal to where the user already was moves nothing.
+        QCOMPARE(adherenceForStructured("adh_yield_nomove", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 32, 32),
+                 QStringLiteral("ignored"));
+        // A shot with no known target cannot show whether the yield moved.
+        QCOMPARE(adherenceForStructured("adh_yield_noprior", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 0, 32),
+                 QStringLiteral("unclear"));
+        QCOMPARE(adherenceForStructured("adh_yield_noactual", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 36, 0),
+                 QStringLiteral("unclear"));
+        sn["targetWeightG"] = QStringLiteral("32");
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("targetWeightG is not a JSON number"));
+        QCOMPARE(adherenceForStructured("adh_yield_string", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 36, 32),
+                 QStringLiteral("unclear"));
+    }
+
+    // A shot with no stored target (imported, or the profile's own) carries it in
+    // the profile JSON; the model saw that effective target, so adherence scores it.
+    void recentAdvice_targetWeightUsesTheProfileTarget()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+        withRawDb(dbPath, "adh_yield_profile", [&](QSqlDatabase& db) {
+            const qint64 priorId = insertShot(db, ShotRow{
+                .uuid = "u-prior", .timestamp = nowSec - 7200,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "9.0", .profileJson = R"({"target_weight": 36})"
+            });
+            insertShot(db, ShotRow{
+                .uuid = "u-next", .timestamp = nowSec - 3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 28, .finalWeight = 32, .doseWeight = 18,
+                .grinderSetting = "9.0", .profileJson = R"({"target_weight": 32})"
+            });
+            QJsonObject sn = sampleStructuredNext();
+            sn.remove(QStringLiteral("grinderSetting"));
+            sn["targetWeightG"] = 32;
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{priorId, "advice", sn}};
+            in.currentProfileKbId = "kb";
+            in.currentShotId = 99999;
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QCOMPARE(out.size(), 1);
+            const QJsonObject ur = out.first().toObject().value("userResponse").toObject();
+            QCOMPARE(ur.value("adherence").toString(), QStringLiteral("followed"));
+            QCOMPARE(ur.value("targetWeightG").toDouble(), 32.0);
+        });
+    }
+
+    // With nothing recommended, a changed yield target means the predicted
+    // repeat did not happen; a sub-tolerance change is not a decision.
+    void recentAdvice_rangesOnlyTargetWeightChangeRespectsTolerance()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove(QStringLiteral("grinderSetting"));
+        QCOMPARE(adherenceForStructured("adh_ranges_yield_big", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 36, 32),
+                 QStringLiteral("ignored"));
+        QCOMPARE(adherenceForStructured("adh_ranges_yield_noise", sn, "9.0", "9.0",
+                                        18, 18, 0, 0, 36, 36.3),
+                 QStringLiteral("followed"));
+    }
+
+    // A profile RENAME must not read as a setup change. buildRecentAdviceBlock
+    // only ever pairs shots sharing profile_kb_id, so differing stored titles
+    // mean the user renamed the profile between them — nothing about the
+    // coffee moved. The profile comparison was removed for this reason; this
+    // pins that it stays removed.
+    void recentAdvice_rangesOnlyProfileRenameIsNotAChange()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+
+        withRawDb(dbPath, "adh_ranges_rename", [&](QSqlDatabase& db) {
+            const qint64 priorId = insertShot(db, ShotRow{
+                .uuid = "u-prior", .timestamp = nowSec - 7200,
+                .profileName = "Old Title", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "9.0"
+            });
+            insertShot(db, ShotRow{
+                .uuid = "u-next", .timestamp = nowSec - 3600,
+                .profileName = "New Title", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "9.0"
+            });
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{priorId, "advice", sn}};
+            in.currentProfileKbId = "kb";
+            in.currentShotId = 99999;
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QCOMPARE(out.size(), 1);
+            QCOMPARE(out.first().toObject().value("userResponse").toObject()
+                         .value("adherence").toString(),
+                     QStringLiteral("followed"));
+        });
+    }
+
+    void recentAdvice_rangesOnlyUnknownSettingStaysFollowed()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove("grinderSetting");
+        QCOMPARE(adherenceForStructured("adh_ranges_blank_next", sn, "9.0", ""),
+                 QStringLiteral("followed"));
+        QCOMPARE(adherenceForStructured("adh_ranges_blank_prior", sn, "", "9.0"),
+                 QStringLiteral("followed"));
+    }
+
+    // Prose in `grinderSetting` — "a touch coarser than 9" (GPT-5.6 Terra,
+    // observed live 2026-07-30). It matches no setting and parses as no number,
+    // so whether the user followed it is UNKNOWABLE.
+    //
+    // It must not report "ignored" (the user may have complied) and must not
+    // report "followed" (they may have changed nothing) — "followed" is the
+    // worse of the two, because the system prompt reads it as "the experiment
+    // ran" and tells the model to revise direction or commit harder on that
+    // basis. Both wrong answers are asserted against here, because the first
+    // version of this fix produced the second one.
+    void recentAdvice_proseGrinderSettingIsUnclear()
+    {
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("grinderSetting is prose"));
+        // User DID move — still unknowable, because the advice named no value.
+        QCOMPARE(adherenceFor("adh_prose_moved", "a touch coarser than 9", "9.0", "8.75"),
+                 QStringLiteral("unclear"));
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("grinderSetting is prose"));
+        // User did NOT move. Same verdict — the point is that the recommendation
+        // is unscoreable, so the follow-up shot cannot change the answer. If this
+        // case ever diverges from the one above, scoring is reading the seeded
+        // data it must not be able to reach.
+        QCOMPARE(adherenceFor("adh_prose_still", "slightly coarser than 9", "9.0", "9.0"),
+                 QStringLiteral("unclear"));
+    }
+
+    // Compound notation ("1 + 4") is a REAL setting for every Eureka Mignon
+    // the Eureka Mignon and 1Zpresso families — not prose, despite the spaces.
+    // An earlier version of the guard rejected on any whitespace and silently
+    // stopped scoring every one of them.
+    void recentAdvice_compoundNotationScoresNormally()
+    {
+        QCOMPARE(adherenceFor("adh_compound_followed", "1 + 4", "1 + 2", "1 + 4"),
+                 QStringLiteral("followed"));
+        QCOMPARE(adherenceFor("adh_compound_ignored", "1 + 4", "1 + 2", "1 + 2"),
+                 QStringLiteral("ignored"));
+    }
+
+    // A non-numeric single-token setting ("3F") scores via exact string
+    // equality. Both verdicts are exercised so the test cannot pass by simply
+    // never scoring.
+    void recentAdvice_nonNumericSettingStillScores()
+    {
+        QCOMPARE(adherenceFor("adh_3f_followed", "3F", "3C", "3F"),
+                 QStringLiteral("followed"));
+        QCOMPARE(adherenceFor("adh_3f_ignored", "3F", "3C", "3C"),
+                 QStringLiteral("ignored"));
+    }
+
+    // Incidental padding is not prose. " 8.75 " is the same dial position as
+    // "8.75" and must score, not fall into the unscoreable path.
+    void recentAdvice_paddedSettingIsTrimmedNotRejected()
+    {
+        QCOMPARE(adherenceFor("adh_padded", " 8.75 ", "9.0", "8.75"),
+                 QStringLiteral("followed"));
+    }
+
+    // The schema says grinderSetting is a string, but a model may emit it
+    // unquoted. QJsonValue::toString() returns an EMPTY QString for a non-string
+    // type, which previously read as "no grind change" and scored the turn as
+    // fully followed — a recommendation nobody could check, reported as complied
+    // with. It must be unscoreable instead.
+    void recentAdvice_numericJsonGrinderSettingIsUnclear()
+    {
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("grinderSetting is not a JSON string"));
+        QCOMPARE(adherenceFor("adh_numeric_json", QJsonValue(8.75), "9.0", "9.0"),
+                 QStringLiteral("unclear"));
+    }
+
+    // Single-word prose ("coarser") has no whitespace. An earlier version of
+    // looksLikeSetting() returned true for ANY whitespace-free string, so this
+    // was classified scoreable, failed the numeric compare, and reported
+    // "ignored" — the false-non-adherence bug the guard exists to prevent,
+    // surviving in the one shape the prose tests didn't cover.
+    void recentAdvice_singleWordProseIsUnclear()
+    {
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("grinderSetting is prose"));
+        QCOMPARE(adherenceFor("adh_word_prose", "coarser", "9.0", "8.75"),
+                 QStringLiteral("unclear"));
+    }
+
+    // The comparator must accept every form looksLikeSetting() admits.
+    // Compound spacing is not meaningful: recommending "1 + 4" against a
+    // recorded "1+4" is adherence. Before grinderMatches() went through
+    // GrinderAliases, only byte-identical strings could score.
+    void recentAdvice_compoundSpacingDoesNotDecideAdherence()
+    {
+        QCOMPARE(adherenceFor("adh_compound_spacing", "1 + 4", "1 + 2", "1+4"),
+                 QStringLiteral("followed"));
+    }
+
+    // Variable-RPM grinders commonly annotate the recorded setting with the
+    // RPM. A recommended "23.5" against a recorded "23.5 1400rpm" is the user
+    // doing exactly what was asked; a bare QString::toDouble() rejected the
+    // trailing text and scored it "ignored".
+    void recentAdvice_annotatedSettingStillScores()
+    {
+        QCOMPARE(adherenceFor("adh_annotated", "23.5", "24 1400rpm", "23.5 1400rpm"),
+                 QStringLiteral("followed"));
+    }
+
+    // rpm had the same fail-open hazard grinderSetting was fixed for:
+    // QJsonValue::toInt() yields 0 for a JSON string, and the matcher treated
+    // <= 0 as a free match, so a malformed rpm scored "followed" — "the
+    // experiment ran". It must be unscoreable.
+    void recentAdvice_malformedRpmIsUnclearNotFollowed()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove(QStringLiteral("grinderSetting"));   // rpm is the only axis
+        sn["rpm"] = QStringLiteral("1400");            // string, not number
+
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("rpm is not a JSON number"));
+        QCOMPARE(adherenceForStructured("adh_rpm_string", sn, "9.0", "9.0"),
+                 QStringLiteral("unclear"));
+    }
+
+    // A model writing rpm: 0 to mean "unchanged" violates the schema (which says
+    // omit), and previously bought a free match. Also unscoreable.
+    void recentAdvice_zeroRpmIsUnclearNotFollowed()
+    {
+        QJsonObject sn = sampleStructuredNext();
+        sn.remove(QStringLiteral("grinderSetting"));
+        sn["rpm"] = 0;
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("rpm is 0"));
+        QCOMPARE(adherenceForStructured("adh_rpm_zero", sn, "9.0", "9.0"),
+                 QStringLiteral("unclear"));
+    }
+
+    void recentAdvice_emptyTurnsOmitsBlock()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        withRawDb(dbPath, "rec_advice_empty", [&](QSqlDatabase& db) {
+            DialingBlocks::RecentAdviceInputs in;
+            in.currentProfileKbId = "kb";
+            in.currentShotId = 99999;
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QVERIFY(out.isEmpty());
+        });
+    }
+
+    void recentAdvice_skipsTurnsWithoutFollowUpShot()
+    {
+        // A prior turn with a shotId on the right profile but no later
+        // shot recorded → entry is skipped (user hasn't pulled a
+        // follow-up yet, attribution is impossible).
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+
+        qint64 priorId = -1;
+        withRawDb(dbPath, "rec_advice_no_followup", [&](QSqlDatabase& db) {
+            priorId = insertShot(db, ShotRow{
+                .uuid = "u-prior", .timestamp = nowSec - 600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "5.0"
+            });
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{
+                priorId, "advice", sampleStructuredNext()}};
+            in.currentProfileKbId = "kb";
+            in.currentShotId = priorId;  // analyzing this same shot, no later one
+
+            const QJsonArray out = DialingBlocks::buildRecentAdviceBlock(db, in);
+            QVERIFY2(out.isEmpty(),
+                     "prior turn without a follow-up shot must be skipped");
+        });
+    }
+
+    // Parity test (in-app surface vs MCP surface) lives in tst_aimanager.cpp
+    // where AIManager + AIConversation are linked. This file's test binary
+    // intentionally avoids the AI module to stay focused on the SQL block
+    // builders.
+    // -----------------------------------------------------------------
+    // bestRecentShot — user-rated only (Layer 3 inferred fallback removed)
+    // -----------------------------------------------------------------
+
+    void bestRecentShot_highestUserRatedWins()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+
+        withRawDb(dbPath, "best_user_only", [&](QSqlDatabase& db) {
+            insertShot(db, ShotRow{
+                .uuid = "user70", .timestamp = now - 24*3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "4.0", .enjoyment = 70
+            });
+            insertShot(db, ShotRow{
+                .uuid = "user85", .timestamp = now - 12*3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "4.0", .enjoyment = 85
+            });
+            const qint64 currentId = insertShot(db, ShotRow{
+                .uuid = "current", .timestamp = now - 3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "4.0", .enjoyment = 0
+            });
+
+            ShotRecord rec = ShotHistoryStorage::loadShotRecordStatic(db, currentId);
+            const ShotProjection cur = ShotHistoryStorage::convertShotRecord(rec);
+
+            const QJsonObject best = DialingBlocks::buildBestRecentShotBlock(
+                db, "kb", soleScope(db), currentId, cur);
+            QVERIFY(!best.isEmpty());
+            QCOMPARE(best.value("enjoyment0to100").toInt(), 85);
+            // Layer 3 removed: bestRecentShot no longer carries `confidence`.
+            QVERIFY2(!best.contains("confidence"),
+                     "bestRecentShot must not carry the removed `confidence` field");
+        });
+    }
+
+    void bestRecentShot_emptyWhenNoCandidates()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+
+        withRawDb(dbPath, "best_empty", [&](QSqlDatabase& db) {
+            // Only unrated rows in the window — block must be omitted.
+            insertShot(db, ShotRow{
+                .uuid = "u-cur", .timestamp = now - 3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "4.0", .enjoyment = 0
+            });
+            const qint64 currentId = insertShot(db, ShotRow{
+                .uuid = "current", .timestamp = now - 60,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "4.0", .enjoyment = 0
+            });
+            ShotRecord rec = ShotHistoryStorage::loadShotRecordStatic(db, currentId);
+            const ShotProjection cur = ShotHistoryStorage::convertShotRecord(rec);
+
+            const QJsonObject best = DialingBlocks::buildBestRecentShotBlock(
+                db, "kb", soleScope(db), currentId, cur);
+            QVERIFY2(best.isEmpty(), "no rated rows → block omitted");
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // buildGrinderCalibrationBlock — rewritten for issue #1223
+    // (openspec fix-grinder-calibration-cross-profile). Within-batch
+    // paired slope, dimensionless gate, per-batch anchor, hard cap,
+    // directional fallback. KB UGS: d-flow 0.5, d-flow-q-variant 1.0,
+    // adaptive-v2 1.25, allonge 8.0, londinium 0.0, turboturbo 6.0,
+    // blooming-espresso -0.5, gentle-and-sweet 2.0.
+    //
+    // Fixtures default beanBrand/beanType empty and use close
+    // timestamps, so every dialed-in shot is one undated roast batch.
+    // A shot qualifies as dialed-in via enjoyment >= 50 (insertShot
+    // writes no roast_date / drink_tds; targetWeight → yield_override,
+    // not profile_json, so the on-target path is not exercised here).
+    // ------------------------------------------------------------------
+
+    // Helper: seed a UGS-placed dialed-in shot on the shared batch.
+    qint64 calSeed(QSqlDatabase& db, const QString& uuid, qint64 ts,
+                   const QString& name, const QString& kbId,
+                   const QString& setting, const QString& model = QStringLiteral("Niche Zero"),
+                   const QString& burrs = QStringLiteral("63mm conical"),
+                   const QString& basket = QString())
+    {
+        // Non-empty bean so the shot is batch-knowable (PR Kulitorum/Decenza#1236 empty-bean
+        // guard); shared across calSeed calls so they form one roast batch.
+        // `basket` forks a second package off the same grinder.
+        return insertShot(db, ShotRow{
+            .uuid = uuid, .timestamp = ts,
+            .profileName = name, .profileKbId = kbId,
+            .finalWeight = 36.0,
+            .beanBrand = QStringLiteral("TestRoaster"),
+            .beanType = QStringLiteral("TestBean"),
+            .grinderModel = model, .grinderBurrs = burrs,
+            .basketBrand = basket.isEmpty() ? QString() : QStringLiteral("TestBasket"),
+            .basketModel = basket,
+            .grinderSetting = setting, .enjoyment = 80 });
+    }
+
+    static bool calAnyHasRgs(const QJsonObject& block)
+    {
+        const QJsonArray ps = block.value(QStringLiteral("profiles")).toArray();
+        for (const QJsonValue& v : ps)
+            if (v.toObject().contains(QStringLiteral("rgs"))) return true;
+        return false;
+    }
+    static QJsonObject calProfile(const QJsonObject& block, const QString& name)
+    {
+        const QJsonArray ps = block.value(QStringLiteral("profiles")).toArray();
+        for (const QJsonValue& v : ps)
+            if (v.toObject().value(QStringLiteral("profileName")).toString() == name)
+                return v.toObject();
+        return {};
+    }
+
+    void calibrationBlock_emptyWhenGrinderModelEmpty()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_empty_model"), [&](QSqlDatabase& db) {
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral(""), soleScope(db), QStringLiteral("espresso"), 0);
+            QVERIFY2(r.isEmpty(), "empty grinderModel → empty block");
+        });
+    }
+
+    void calibrationBlock_emptyWhenFilterBeverage()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_filter_bev"), [&](QSqlDatabase& db) {
+            QVERIFY(DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("filter"), 0).isEmpty());
+            QVERIFY(DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("pourover"), 0).isEmpty());
+        });
+    }
+
+    void calibrationBlock_emptyWhenResolvedShotInvalid()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_bad_shot"), [&](QSqlDatabase& db) {
+            // No such shot id → resolved shot invalid → empty block.
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), 999999);
+            QVERIFY2(r.isEmpty(), "invalid resolved shot → empty block");
+        });
+    }
+
+    void calibrationBlock_emptyWhenNoDialedInShots()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_no_dialed"), [&](QSqlDatabase& db) {
+            // Current shot exists (resolved OK) but is unrated, no TDS,
+            // no target → not dialed-in → no rows → empty block.
+            const qint64 cur = insertShot(db, ShotRow{
+                .uuid = QStringLiteral("u-cur"), .timestamp = 1000,
+                .profileName = QStringLiteral("D-Flow / Q"),
+                .profileKbId = QStringLiteral("d-flow-q-variant"),
+                .grinderModel = QStringLiteral("Niche Zero"),
+                .grinderBurrs = QStringLiteral("63mm conical"),
+                .grinderSetting = QStringLiteral("6"), .enjoyment = 0 });
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QVERIFY2(r.isEmpty(), "no dialed-in shots → empty block");
+        });
+    }
+    void calibrationBlock_directionalSparse_1223()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_1223"), [&](QSqlDatabase& db) {
+            calSeed(db, QStringLiteral("u1"), 1000,
+                    QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                    QStringLiteral("6"));
+            const qint64 cur = calSeed(db, QStringLiteral("u2"), 1100,
+                    QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                    QStringLiteral("6"));
+            QTest::ignoreMessage(QtDebugMsg, QRegularExpression(
+                "\\[AI\\]\\[dialing_blocks\\].*key= unavailable:no-valid-pairs.*validUGS= unavailable:no-valid-pairs"));
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QVERIFY(!r.isEmpty());
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(),
+                     QStringLiteral("directional"));
+            QVERIFY2(!r.contains(QStringLiteral("conversionKey")),
+                     "directional must carry no conversionKey");
+            QVERIFY2(!calAnyHasRgs(r), "directional must emit no rgs anywhere");
+            const QJsonObject tt = calProfile(r, QStringLiteral("TurboTurbo"));
+            QVERIFY(!tt.isEmpty());
+            QCOMPARE(tt.value(QStringLiteral("source")).toString(),
+                     QStringLiteral("directional"));
+            QCOMPARE(tt.value(QStringLiteral("direction")).toString(),
+                     QStringLiteral("coarser"));
+            QVERIFY2(!tt.contains(QStringLiteral("rgs")),
+                     "TurboTurbo must not carry a number (#1223)");
+        });
+    }
+
+    // The legacy pooled cross-coffee path produced conversionKey = -2.4
+    // here. Different beans → different batches → no within-batch pair →
+    // directional; a wrong-signed key can no longer be emitted.
+    void calibrationBlock_wrongSignImpossible_1223()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_wrongsign"), [&](QSqlDatabase& db) {
+            // Londinium (UGS 0) high settings on bean A; Adaptive v2
+            // (UGS 1.25) low settings on bean B — the real-data shape
+            // that pooled to a negative slope.
+            for (int i = 0; i < 3; ++i) {
+                insertShot(db, ShotRow{
+                    .uuid = QStringLiteral("u-lon-%1").arg(i), .timestamp = 1000 + i,
+                    .profileName = QStringLiteral("Londinium"),
+                    .profileKbId = QStringLiteral("londinium"),
+                    .beanBrand = QStringLiteral("RoasterA"), .beanType = QStringLiteral("BeanA"),
+                    .grinderModel = QStringLiteral("Niche Zero"),
+                    .grinderBurrs = QStringLiteral("63mm conical"),
+                    .grinderSetting = QStringLiteral("12"), .enjoyment = 80 });
+            }
+            qint64 cur = 0;
+            for (int i = 0; i < 3; ++i) {
+                cur = insertShot(db, ShotRow{
+                    .uuid = QStringLiteral("u-av-%1").arg(i), .timestamp = 5000 + i,
+                    .profileName = QStringLiteral("Adaptive v2"),
+                    .profileKbId = QStringLiteral("adaptive-v2"),
+                    .beanBrand = QStringLiteral("RoasterB"), .beanType = QStringLiteral("BeanB"),
+                    .grinderModel = QStringLiteral("Niche Zero"),
+                    .grinderBurrs = QStringLiteral("63mm conical"),
+                    .grinderSetting = QStringLiteral("9"), .enjoyment = 80 });
+            }
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QVERIFY(!r.isEmpty());
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(),
+                     QStringLiteral("directional"));
+            QVERIFY2(!r.contains(QStringLiteral("conversionKey")),
+                     "no conversionKey from cross-batch data (no wrong sign)");
+            QVERIFY2(!calAnyHasRgs(r), "no numbers from cross-batch data");
+        });
+    }
+
+    // Same batch, three profiles on an exact line → gate passes →
+    // approximate. Within-cap profile derived; far profile (TurboTurbo)
+    // capped to directional with no number.
+    // Closes the gap the equipment-scope invariant documents: that test lists
+    // buildGrinderCalibrationBlock but its fixture is too thin to make the block
+    // publish a number, so it cannot observe a leak. This one is built on the
+    // same UGS line as calibrationBlock_approximatePublishesAndCaps, duplicated
+    // onto a second basket six steps coarser.
+    //
+    // Both baskets carry the SAME conversion key (setting = c + 2*UGS), so a
+    // pooled read still produces a plausible key and passes the IQR gate. Only
+    // the published SETTINGS separate the two, which is the point: pooling here
+    // does not look broken, it looks confident and is six steps wrong.
+    void calibrationBlock_settingsComeFromTheAnchorsOwnBasket()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_basket"), [&](QSqlDatabase& db) {
+            const QString kBasket = QStringLiteral("Stepped 58-46mm");
+            for (int i = 0; i < 2; ++i) {
+                calSeed(db, QStringLiteral("d-lo-%1").arg(i), 1000 + i,
+                        QStringLiteral("Londinium"), QStringLiteral("londinium"),
+                        QStringLiteral("2"));
+                calSeed(db, QStringLiteral("d-dq-%1").arg(i), 1100 + i,
+                        QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                        QStringLiteral("4"));
+                calSeed(db, QStringLiteral("d-gs-%1").arg(i), 1200 + i,
+                        QStringLiteral("Gentle & Sweet"), QStringLiteral("gentle-and-sweet"),
+                        QStringLiteral("6"));
+
+                calSeed(db, QStringLiteral("g-lo-%1").arg(i), 1300 + i,
+                        QStringLiteral("Londinium"), QStringLiteral("londinium"),
+                        QStringLiteral("8"), QStringLiteral("Niche Zero"),
+                        QStringLiteral("63mm conical"), kBasket);
+                calSeed(db, QStringLiteral("g-dq-%1").arg(i), 1400 + i,
+                        QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                        QStringLiteral("10"), QStringLiteral("Niche Zero"),
+                        QStringLiteral("63mm conical"), kBasket);
+            }
+            qint64 graphCur = 0;
+            for (int i = 0; i < 2; ++i)
+                graphCur = calSeed(db, QStringLiteral("g-gs-%1").arg(i), 1500 + i,
+                        QStringLiteral("Gentle & Sweet"), QStringLiteral("gentle-and-sweet"),
+                        QStringLiteral("12"), QStringLiteral("Niche Zero"),
+                        QStringLiteral("63mm conical"), kBasket);
+            QVERIFY(graphCur > 0);
+
+            const ShotProjection cur = projectionForShot(db, graphCur);
+            QVERIFY2(cur.equipmentId > 0, "anchor shot did not land in a package");
+
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), AdviceScope(cur.equipmentId),
+                QStringLiteral("espresso"), graphCur);
+            QVERIFY2(!r.isEmpty(), "calibration published nothing — fixture too thin to test scoping");
+
+            // Same line on both baskets, so the key survives pooling and cannot
+            // discriminate. The settings can.
+            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 2.0);
+
+            const QJsonArray profiles = r.value(QStringLiteral("profiles")).toArray();
+            QVERIFY(!profiles.isEmpty());
+            int checked = 0;
+            for (const QJsonValue& v : profiles) {
+                const QJsonObject po = v.toObject();
+                if (!po.contains(QStringLiteral("rgs"))) continue;
+                // rgs is a FORMATTED string (GrinderAliases::formatGrinderSetting),
+                // not a number — toDouble() on the JSON value yields 0.
+                bool ok = false;
+                const double rgs = po.value(QStringLiteral("rgs")).toString().toDouble(&ok);
+                if (!ok) continue;
+                ++checked;
+                QVERIFY2(rgs >= 7.0,
+                         qPrintable(QStringLiteral(
+                             "profile %1 published rgs %2 for a shot on the coarse "
+                             "basket; that basket dials 8/10/12 and the other 2/4/6, "
+                             "so anything under 7 came from the other package")
+                             .arg(po.value(QStringLiteral("profileName")).toString())
+                             .arg(rgs)));
+            }
+            QVERIFY2(checked > 0,
+                     "no profile published a numeric rgs — the assertion above "
+                     "never ran, so this test would pass without testing anything");
+        });
+    }
+
+    void calibrationBlock_approximatePublishesAndCaps()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_approx"), [&](QSqlDatabase& db) {
+            // Three profiles, every pairwise UGS gap ≥ 0.75 so all 3
+            // pairs survive the span filter, settings on an exact line
+            // (setting = 2 + 2·UGS) → every pairwise slope = 2 → IQR 0 →
+            // gate passes. londinium 0.0→2, d-flow-q-variant 1.0→4,
+            // gentle-and-sweet 2.0→6.
+            for (int i = 0; i < 2; ++i) {
+                calSeed(db, QStringLiteral("u-lo-%1").arg(i), 1000 + i,
+                        QStringLiteral("Londinium"), QStringLiteral("londinium"),
+                        QStringLiteral("2"));
+                calSeed(db, QStringLiteral("u-dq-%1").arg(i), 1100 + i,
+                        QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                        QStringLiteral("4"));
+            }
+            qint64 cur = 0;
+            for (int i = 0; i < 2; ++i)
+                cur = calSeed(db, QStringLiteral("u-gs-%1").arg(i), 1200 + i,
+                        QStringLiteral("Gentle & Sweet"), QStringLiteral("gentle-and-sweet"),
+                        QStringLiteral("6"));
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QVERIFY(!r.isEmpty());
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(),
+                     QStringLiteral("approximate"));
+            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 2.0);
+            QVERIFY(r.contains(QStringLiteral("coffeeAnchor")));
+            // Seeded profiles are in the current batch → history median.
+            const QJsonObject lo = calProfile(r, QStringLiteral("Londinium"));
+            QCOMPARE(lo.value(QStringLiteral("source")).toString(),
+                     QStringLiteral("history"));
+            QCOMPARE(lo.value(QStringLiteral("rgs")).toString(), QStringLiteral("2"));
+            // Validated span 0.0..2.0; cap 1.5 → numeric in [-1.5, 3.5].
+            // Adaptive v2 (UGS 1.25) is in range but unseeded → derived;
+            // anchor = recent Gentle&Sweet (UGS 2.0, setting 6) →
+            // 6 + (1.25 − 2.0)·2 = 4.5.
+            const QJsonObject av = calProfile(r, QStringLiteral("Adaptive v2"));
+            QCOMPARE(av.value(QStringLiteral("source")).toString(),
+                     QStringLiteral("derived"));
+            QCOMPARE(av.value(QStringLiteral("rgs")).toString(),
+                     QStringLiteral("4.5"));
+            // TurboTurbo UGS 6 far outside → directional, no number.
+            const QJsonObject tt = calProfile(r, QStringLiteral("TurboTurbo"));
+            QCOMPARE(tt.value(QStringLiteral("source")).toString(),
+                     QStringLiteral("directional"));
+            QVERIFY2(!tt.contains(QStringLiteral("rgs")),
+                     "out-of-cap profile must have no rgs");
+            QCOMPARE(tt.value(QStringLiteral("direction")).toString(),
+                     QStringLiteral("coarser"));
+        });
+    }
+
+    // ---- Calibration anchors (add-grinder-ugs-calibration) ----
+    // Anchors are seeded UNRATED: a marked shot is exempt from the dialed-in
+    // gate, so if marking stopped counting, these rows would vanish entirely.
+    qint64 anchorSeed(QSqlDatabase& db, const QString& uuid, qint64 ts,
+                      const QString& name, const QString& kbId, const QString& setting,
+                      const QString& beanBrand = QStringLiteral("TestRoaster"))
+    {
+        return insertShot(db, ShotRow{
+            .uuid = uuid, .timestamp = ts,
+            .profileName = name, .profileKbId = kbId,
+            .finalWeight = 36.0,
+            .beanBrand = beanBrand, .beanType = QStringLiteral("TestBean"),
+            .grinderModel = QStringLiteral("Niche Zero"), .grinderBurrs = QStringLiteral("63mm conical"),
+            .grinderSetting = setting, .enjoyment = 0 });
+    }
+
+    void calibrationAnchors_alonePublishAndWidenRange()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_anchor_alone"), [&](QSqlDatabase& db) {
+            const qint64 fine = anchorSeed(db, QStringLiteral("a-fine"), 1000,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("2"));
+            const qint64 coarse = anchorSeed(db, QStringLiteral("a-coarse"), 1100,
+                    QStringLiteral("Rao Allongé"), QStringLiteral("allonge"), QStringLiteral("18"));
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, fine, QStringLiteral("fine")), QString());
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, coarse, QStringLiteral("coarse")), QString());
+
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), AdviceScope(projectionForShot(db, coarse).equipmentId),
+                QStringLiteral("espresso"), coarse);
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(), QStringLiteral("approximate"));
+            QCOMPARE(r.value(QStringLiteral("basis")).toString(), QStringLiteral("anchors"));
+            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 2.0);
+            const QJsonArray range = r.value(QStringLiteral("calibratedUgsRange")).toArray();
+            QCOMPARE(range.at(0).toDouble(), 0.0);
+            QCOMPARE(range.at(1).toDouble(), 8.0);
+            QCOMPARE(r.value(QStringLiteral("markedAnchors")).toObject()
+                         .value(QStringLiteral("status")).toString(), QStringLiteral("valid"));
+            // The pair's span opens the long hop: anchored on the coarse shot
+            // (UGS 8, setting 18), TurboTurbo (UGS 6) = 18 + (6 − 8)·2 = 14.
+            const QJsonObject tt = calProfile(r, QStringLiteral("TurboTurbo"));
+            QCOMPARE(tt.value(QStringLiteral("source")).toString(), QStringLiteral("derived"));
+            QCOMPARE(tt.value(QStringLiteral("rgs")).toString(), QStringLiteral("14"));
+        });
+    }
+
+    // History's three pairs say 2 steps/UGS; the anchors say 4. A marked pair
+    // defines the span outright (Decenza-Descendant), and the disagreement is reported.
+    void calibrationAnchors_overrideHistoryAndReportDisagreement()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_anchor_both"), [&](QSqlDatabase& db) {
+            for (int i = 0; i < 2; ++i) {
+                calSeed(db, QStringLiteral("m-lo-%1").arg(i), 1000 + i,
+                        QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("2"));
+                calSeed(db, QStringLiteral("m-dq-%1").arg(i), 1100 + i,
+                        QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"), QStringLiteral("4"));
+                calSeed(db, QStringLiteral("m-gs-%1").arg(i), 1200 + i,
+                        QStringLiteral("Gentle & Sweet"), QStringLiteral("gentle-and-sweet"), QStringLiteral("6"));
+            }
+            const qint64 fine = anchorSeed(db, QStringLiteral("b-fine"), 1300,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("10"));
+            const qint64 coarse = anchorSeed(db, QStringLiteral("b-coarse"), 1310,
+                    QStringLiteral("Rao Allongé"), QStringLiteral("allonge"), QStringLiteral("42"));
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, fine, QStringLiteral("fine")), QString());
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, coarse, QStringLiteral("coarse")), QString());
+
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), AdviceScope(projectionForShot(db, coarse).equipmentId),
+                QStringLiteral("espresso"), coarse);
+            QCOMPARE(r.value(QStringLiteral("basis")).toString(), QStringLiteral("anchors"));
+            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 4.0);
+            const QJsonObject marked = r.value(QStringLiteral("markedAnchors")).toObject();
+            QCOMPARE(marked.value(QStringLiteral("status")).toString(), QStringLiteral("valid"));
+            QCOMPARE(marked.value(QStringLiteral("agreesWithHistory")).toBool(), false);
+        });
+    }
+
+    void calibrationAnchors_markRefusesWithReason()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_anchor_refuse"), [&](QSqlDatabase& db) {
+            const qint64 fine = anchorSeed(db, QStringLiteral("r-fine"), 1000,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("2"));
+            const qint64 otherBag = anchorSeed(db, QStringLiteral("r-bag"), 1100,
+                    QStringLiteral("Rao Allongé"), QStringLiteral("allonge"), QStringLiteral("18"),
+                    QStringLiteral("OtherRoaster"));
+            const qint64 tooClose = anchorSeed(db, QStringLiteral("r-close"), 1200,
+                    QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"), QStringLiteral("4"));
+            // Badges are recomputed from samples on load, so a per-shot refusal is
+            // exercised through the weight floor instead.
+            const qint64 light = anchorSeed(db, QStringLiteral("r-light"), 1300,
+                    QStringLiteral("Rao Allongé"), QStringLiteral("allonge"), QStringLiteral("18"));
+            QSqlQuery shrink(db);
+            QVERIFY(shrink.exec(QStringLiteral("UPDATE shots SET final_weight = 10 WHERE id = %1").arg(light)));
+            const qint64 unplaced = anchorSeed(db, QStringLiteral("r-custom"), 1400,
+                    QStringLiteral("My Secret Pull"), QString(), QStringLiteral("18"));
+
+            const auto mark = [&](qint64 id, const char* side) {
+                return DialingBlocks::markGrindCalibrationAnchor(db, id, QString::fromLatin1(side));
+            };
+            QCOMPARE(mark(fine, "fine"), QString());
+            // Another bag replaces the old pair instead of refusing: the other side
+            // is cleared so the new bag's second anchor can follow.
+            QCOMPARE(mark(otherBag, "coarse"), QString());
+            QCOMPARE(EquipmentStorage::loadCalibrationAnchorsStatic(
+                         db, projectionForShot(db, fine).equipmentId).fineShotId, qint64(0));
+            QCOMPARE(mark(fine, "fine"), QString());
+            QCOMPARE(mark(tooClose, "coarse"), QStringLiteral("tooClose"));
+            QCOMPARE(mark(light, "coarse"), QStringLiteral("tooLight"));
+            QCOMPARE(mark(unplaced, "coarse"), QStringLiteral("noUgs"));
+            QCOMPARE(mark(fine, "coarse"), QStringLiteral("sameShot"));
+
+            const CalibrationAnchors stored = EquipmentStorage::loadCalibrationAnchorsStatic(
+                db, projectionForShot(db, fine).equipmentId);
+            QCOMPARE(stored.fineShotId, fine);
+            QCOMPARE(stored.coarseShotId, qint64(0));  // re-marking fine cleared otherBag; refusals wrote nothing
+
+            // Migration 46's trigger: deleting an anchor shot clears its side.
+            QSqlQuery del(db);
+            QVERIFY(del.exec(QStringLiteral("DELETE FROM shots WHERE id = %1").arg(fine)));
+            QCOMPARE(EquipmentStorage::loadCalibrationAnchorsStatic(
+                         db, projectionForShot(db, tooClose).equipmentId).fineShotId, qint64(0));
+        });
+    }
+
+    // Genius Grind: a rated shot is the baseline until the bean's reference is
+    // marked, which then wins; the package's anchors supply the span.
+    void geniusSuggestion_referenceThenRating()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("genius_reference"), [&](QSqlDatabase& db) {
+            const qint64 fine = anchorSeed(db, QStringLiteral("g-fine"), 1000,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("2"));
+            const qint64 coarse = anchorSeed(db, QStringLiteral("g-coarse"), 1100,
+                    QStringLiteral("Rao Allongé"), QStringLiteral("allonge"), QStringLiteral("18"));
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, fine, QStringLiteral("fine")), QString());
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, coarse, QStringLiteral("coarse")), QString());
+            const qint64 pkg = projectionForShot(db, fine).equipmentId;
+            const qint64 ref = anchorSeed(db, QStringLiteral("g-ref"), 1200,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("4"),
+                    QString());
+            const auto genius = [&](const QString& title) {
+                return DialingBlocks::geniusSuggestionFor(db, pkg, QString(), QStringLiteral("TestBean"),
+                                                          QString(), title);
+            };
+            QSqlQuery rate(db);
+            QVERIFY(rate.exec(QStringLiteral("UPDATE shots SET enjoyment = 80, grinder_setting = '6' "
+                                             "WHERE id = %1").arg(ref)));
+            const QVariantMap rated = genius(QStringLiteral("Londinium"));
+            QCOMPARE(rated.value(QStringLiteral("basis")).toString(), QStringLiteral("rating"));
+            QCOMPARE(rated.value(QStringLiteral("setting")).toString().toDouble(), 6.0);
+            QVERIFY(rate.exec(QStringLiteral("UPDATE shots SET enjoyment = 0, grinder_setting = '4' "
+                                             "WHERE id = %1").arg(ref)));
+            QCOMPARE(DialingBlocks::markBeanReferenceShot(db, ref, nullptr, pkg), QString());
+            QCOMPARE(genius(QStringLiteral("Londinium")).value(QStringLiteral("basis")).toString(),
+                     QStringLiteral("reference"));
+            QCOMPARE(genius(QStringLiteral("Londinium")).value(QStringLiteral("setting")).toString().toDouble(), 4.0);
+            QCOMPARE(genius(QStringLiteral("Rao Allongé")).value(QStringLiteral("setting")).toString().toDouble(), 20.0);
+        });
+    }
+
+    // An anchor is re-checked on every read: editing it onto another bag later
+    // stops the pair counting, and the status says why.
+    void calibrationAnchors_editedAnchorStopsCounting()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_anchor_stale"), [&](QSqlDatabase& db) {
+            const qint64 fine = anchorSeed(db, QStringLiteral("s-fine"), 1000,
+                    QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("2"));
+            const qint64 coarse = anchorSeed(db, QStringLiteral("s-coarse"), 1100,
+                    QStringLiteral("Rao Allongé"), QStringLiteral("allonge"), QStringLiteral("18"));
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, fine, QStringLiteral("fine")), QString());
+            QCOMPARE(DialingBlocks::markGrindCalibrationAnchor(db, coarse, QStringLiteral("coarse")), QString());
+            QSqlQuery edit(db);
+            QVERIFY(edit.exec(QStringLiteral("UPDATE shots SET bean_brand = 'OtherRoaster' WHERE id = %1").arg(coarse)));
+
+            const qint64 pkg = projectionForShot(db, fine).equipmentId;
+            const QVariantMap status = DialingBlocks::grindCalibrationForPackage(db, pkg);
+            QCOMPARE(status.value(QStringLiteral("pairStatus")).toString(), QStringLiteral("differentCoffee"));
+            QCOMPARE(status.value(QStringLiteral("keyPublished")).toBool(), false);
+        });
+    }
+
+    // The recipe wizard's starting grind: the block's own number for the picked
+    // profile on this bag, and nothing where the block publishes none.
+    void grindSuggestion_onlyWhereCalibrationPublishes()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_suggest"), [&](QSqlDatabase& db) {
+            // setting = 2 + 2·UGS on one bag: key 2, validated range 0..2 (cap 1.5).
+            qint64 cur = 0;
+            for (int i = 0; i < 2; ++i) {
+                calSeed(db, QStringLiteral("g-lo-%1").arg(i), 1000 + i,
+                        QStringLiteral("Londinium"), QStringLiteral("londinium"), QStringLiteral("2"));
+                calSeed(db, QStringLiteral("g-dq-%1").arg(i), 1100 + i,
+                        QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"), QStringLiteral("4"));
+                cur = calSeed(db, QStringLiteral("g-gs-%1").arg(i), 1200 + i,
+                        QStringLiteral("Gentle & Sweet"), QStringLiteral("gentle-and-sweet"), QStringLiteral("6"));
+            }
+            const qint64 pkg = projectionForShot(db, cur).equipmentId;
+            const auto suggest = [&](const char* brand, const char* profile) {
+                return DialingBlocks::grindSuggestionFor(db, pkg, QString::fromLatin1(brand),
+                    QStringLiteral("TestBean"), QString(), QString::fromLatin1(profile));
+            };
+
+            // Anchored on the latest Gentle & Sweet shot (UGS 2, setting 6):
+            // Adaptive v2 (UGS 1.25) = 6 + (1.25 − 2)·2 = 4.5.
+            const QVariantMap av = suggest("TestRoaster", "Adaptive v2");
+            QCOMPARE(av.value(QStringLiteral("setting")).toString(), QStringLiteral("4.5"));
+            QCOMPARE(av.value(QStringLiteral("source")).toString(), QStringLiteral("derived"));
+            QCOMPARE(av.value(QStringLiteral("anchorProfileName")).toString(), QStringLiteral("Gentle & Sweet"));
+            QVERIFY2(suggest("TestRoaster", "TurboTurbo").isEmpty(), "outside the range: no number");
+            QVERIFY2(suggest("OtherRoaster", "Adaptive v2").isEmpty(), "no shot of this bag: no number");
+        });
+    }
+
+    // Zero history beyond one current shot: direction still correct from
+    // KB ordering alone (anchor-free, grinder-convention-free, D5a).
+    void calibrationBlock_directionAnchorFreeZeroData()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_zero"), [&](QSqlDatabase& db) {
+            const qint64 cur = calSeed(db, QStringLiteral("only"), 1000,
+                    QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                    QStringLiteral("6"));
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(),
+                     QStringLiteral("directional"));
+            QVERIFY(r.value(QStringLiteral("currentProfileUgsPlaced")).toBool());
+            QCOMPARE(calProfile(r, QStringLiteral("TurboTurbo"))
+                         .value(QStringLiteral("direction")).toString(),
+                     QStringLiteral("coarser"));
+            QCOMPARE(calProfile(r, QStringLiteral("Blooming Espresso"))
+                         .value(QStringLiteral("direction")).toString(),
+                     QStringLiteral("finer"));
+            QVERIFY2(!calAnyHasRgs(r), "zero-data must yield no numbers");
+        });
+    }
+
+    // Current profile not on the UGS chart → ordering withheld, flagged.
+    void calibrationBlock_currentProfileNoUgsWithholdsDirection()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_nougs"), [&](QSqlDatabase& db) {
+            const qint64 cur = insertShot(db, ShotRow{
+                .uuid = QStringLiteral("u-custom"), .timestamp = 1000,
+                .profileName = QStringLiteral("My Secret Pull"),
+                .grinderModel = QStringLiteral("Niche Zero"),
+                .grinderBurrs = QStringLiteral("63mm conical"),
+                .grinderSetting = QStringLiteral("6"), .enjoyment = 80 });
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QVERIFY(!r.isEmpty());
+            QVERIFY2(!r.value(QStringLiteral("currentProfileUgsPlaced")).toBool(),
+                     "custom profile is not UGS-placed");
+            const QJsonObject tt = calProfile(r, QStringLiteral("TurboTurbo"));
+            QCOMPARE(tt.value(QStringLiteral("source")).toString(),
+                     QStringLiteral("directional"));
+            QVERIFY2(!tt.contains(QStringLiteral("direction")),
+                     "no direction when current profile has no UGS");
+        });
+    }
+
+    // Both consumer surfaces call this one builder; identical input →
+    // byte-identical JSON (cross-surface drift guard, review S4).
+    void calibrationBlock_byteStableForIdenticalInput()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_bytestable"), [&](QSqlDatabase& db) {
+            const qint64 cur = calSeed(db, QStringLiteral("b1"), 1000,
+                    QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                    QStringLiteral("6"));
+            const QJsonObject a = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            const QJsonObject b = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QCOMPARE(QJsonDocument(a).toJson(QJsonDocument::Compact),
+                     QJsonDocument(b).toJson(QJsonDocument::Compact));
+        });
+    }
+
+    // Variable-RPM grinder (DF83V): users annotate dial with RPM
+    // ("24 1400rpm"). The parser accepts the leading dial and the rest
+    // is ignorable annotation; without this fix 93% of such users' data
+    // was silently discarded (review on PR Kulitorum/Decenza#1236 / #1223 reporter DB).
+    void calibrationBlock_acceptsNumericWithSuffix_DF83V()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_suffix"), [&](QSqlDatabase& db) {
+            // Three profiles on an exact line through (setting = 2 + 2·UGS).
+            // Settings written WITH the variable-RPM suffix.
+            auto seed = [&](const QString& uuid, qint64 ts,
+                            const QString& name, const QString& kbId,
+                            const QString& setting) {
+                return insertShot(db, ShotRow{
+                    .uuid = uuid, .timestamp = ts,
+                    .profileName = name, .profileKbId = kbId,
+                    .finalWeight = 36.0,
+                    .beanBrand = QStringLiteral("TestRoaster"),
+                    .beanType = QStringLiteral("TestBean"),
+                    .grinderModel = QStringLiteral("DF83V"),
+                    .grinderBurrs = QStringLiteral("83mm flat steel"),
+                    .grinderSetting = setting, .enjoyment = 80 });
+            };
+            for (int i = 0; i < 2; ++i) {
+                seed(QStringLiteral("u-lo-%1").arg(i), 1000 + i,
+                     QStringLiteral("Londinium"), QStringLiteral("londinium"),
+                     QStringLiteral("2 1400rpm"));
+                seed(QStringLiteral("u-dq-%1").arg(i), 1100 + i,
+                     QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                     QStringLiteral("4 1400rpm"));
+            }
+            qint64 cur = 0;
+            for (int i = 0; i < 2; ++i)
+                cur = seed(QStringLiteral("u-gs-%1").arg(i), 1200 + i,
+                           QStringLiteral("Gentle & Sweet"),
+                           QStringLiteral("gentle-and-sweet"),
+                           QStringLiteral("6 1400rpm"));
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("DF83V"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(),
+                     QStringLiteral("approximate"));
+            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 2.0);
+            // History rgs emits dial-only (no rpm round-trip).
+            const QJsonObject lo = calProfile(r, QStringLiteral("Londinium"));
+            QCOMPARE(lo.value(QStringLiteral("rgs")).toString(), QStringLiteral("2"));
+        });
+    }
+
+    // Compound notation (Eureka Mignon Specialita): "1+4" → linear
+    // 1·100 + 4 = 104; recommended-grind round-trips back as "a+b".
+    void calibrationBlock_compoundNotation_MignonSpecialita()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_compound"), [&](QSqlDatabase& db) {
+            // setting = 100 + 4·linearUGS, linear = a·100 + b.
+            // londinium(0)→1+4 (=104); d-flow-q(1)→2+8 (=208); g&s(2)→3+12 (=312)
+            // pairwise slopes consistent (104→208→312 over ugs 0/1/2):
+            // slope per UGS = 104; all pairs equal → gate passes.
+            auto seed = [&](const QString& uuid, qint64 ts,
+                            const QString& name, const QString& kbId,
+                            const QString& setting) {
+                return insertShot(db, ShotRow{
+                    .uuid = uuid, .timestamp = ts,
+                    .profileName = name, .profileKbId = kbId,
+                    .finalWeight = 36.0,
+                    .beanBrand = QStringLiteral("TestRoaster"),
+                    .beanType = QStringLiteral("TestBean"),
+                    .grinderModel = QStringLiteral("Mignon Specialita"),
+                    .grinderBurrs = QStringLiteral("55mm flat steel"),
+                    .grinderSetting = setting, .enjoyment = 80 });
+            };
+            for (int i = 0; i < 2; ++i) {
+                seed(QStringLiteral("u-lo-%1").arg(i), 1000 + i,
+                     QStringLiteral("Londinium"), QStringLiteral("londinium"),
+                     QStringLiteral("1+4"));
+                seed(QStringLiteral("u-dq-%1").arg(i), 1100 + i,
+                     QStringLiteral("D-Flow / Q"), QStringLiteral("d-flow-q-variant"),
+                     QStringLiteral("2+8"));
+            }
+            qint64 cur = 0;
+            for (int i = 0; i < 2; ++i)
+                cur = seed(QStringLiteral("u-gs-%1").arg(i), 1200 + i,
+                           QStringLiteral("Gentle & Sweet"),
+                           QStringLiteral("gentle-and-sweet"),
+                           QStringLiteral("3+12"));
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Mignon Specialita"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(),
+                     QStringLiteral("approximate"));
+            QCOMPARE(r.value(QStringLiteral("conversionKey")).toDouble(), 104.0);
+            // History rgs round-trips in "a+b" notation.
+            const QJsonObject lo = calProfile(r, QStringLiteral("Londinium"));
+            QCOMPARE(lo.value(QStringLiteral("rgs")).toString(), QStringLiteral("1+4"));
+            const QJsonObject gs = calProfile(r, QStringLiteral("Gentle & Sweet"));
+            QCOMPARE(gs.value(QStringLiteral("rgs")).toString(), QStringLiteral("3+12"));
+        });
+    }
+
+    // Eureka multi-turn "1+4" must NOT be silently mis-parsed as "1" on
+    // a non-compound (plain numeric) grinder — those rows are excluded
+    // so a future grinder added without a Compound entry can't fabricate
+    // numbers from misread multi-turn notation. Same guard catches
+    // "1 + 4" (spaced multi-turn) on every grinder.
+    void calibrationBlock_compoundSyntax_rejectedOnNonCompoundGrinder()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("calib_compound_rej"), [&](QSqlDatabase& db) {
+            // All shots on a plain-numeric grinder ("Niche Zero") with
+            // compound notation in the setting field → all rejected at
+            // parse → no dialed-in rows → block empty.
+            for (int i = 0; i < 3; ++i) {
+                insertShot(db, ShotRow{
+                    .uuid = QStringLiteral("u-%1").arg(i),
+                    .timestamp = 1000 + i,
+                    .profileName = QStringLiteral("D-Flow / Q"),
+                    .profileKbId = QStringLiteral("d-flow-q-variant"),
+                    .finalWeight = 36.0,
+                    .beanBrand = QStringLiteral("TestRoaster"),
+                    .beanType = QStringLiteral("TestBean"),
+                    .grinderModel = QStringLiteral("Niche Zero"),
+                    .grinderBurrs = QStringLiteral("63mm conical"),
+                    .grinderSetting = i == 0 ? QStringLiteral("1+4")
+                                   : i == 1 ? QStringLiteral("1 + 4")
+                                            : QStringLiteral("medium"),
+                    .enjoyment = 80 });
+            }
+            // Need a valid resolved shot — add one current shot with a
+            // proper numeric setting (it just provides the bean/profile).
+            const qint64 cur = insertShot(db, ShotRow{
+                .uuid = QStringLiteral("u-cur"), .timestamp = 1100,
+                .profileName = QStringLiteral("D-Flow / Q"),
+                .profileKbId = QStringLiteral("d-flow-q-variant"),
+                .finalWeight = 36.0,
+                .beanBrand = QStringLiteral("TestRoaster"),
+                .beanType = QStringLiteral("TestBean"),
+                .grinderModel = QStringLiteral("Niche Zero"),
+                .grinderBurrs = QStringLiteral("63mm conical"),
+                .grinderSetting = QStringLiteral("6"), .enjoyment = 80 });
+            const QJsonObject r = DialingBlocks::buildGrinderCalibrationBlock(
+                db, QStringLiteral("Niche Zero"), soleScope(db),
+                QStringLiteral("espresso"), cur);
+            // 3 compound-syntax shots rejected; the one cur shot is the
+            // only kept row → only one profile, no pairs → directional.
+            // Crucially: no numbers anywhere, no `1` rgs leaking from
+            // a mis-parsed `1+4`.
+            QCOMPARE(r.value(QStringLiteral("confidence")).toString(),
+                     QStringLiteral("directional"));
+            QVERIFY(!calAnyHasRgs(r));
+        });
+    }
+
+    void recentAdvice_byteStabilityAcrossCalls()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+        const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+
+        qint64 priorId = -1;
+        withRawDb(dbPath, "rec_advice_byte_stable", [&](QSqlDatabase& db) {
+            priorId = insertShot(db, ShotRow{
+                .uuid = "u-prior", .timestamp = nowSec - 7200,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 30, .finalWeight = 36, .doseWeight = 18,
+                .grinderSetting = "5.0"
+            });
+            insertShot(db, ShotRow{
+                .uuid = "u-next", .timestamp = nowSec - 3600,
+                .profileName = "P", .profileKbId = "kb",
+                .duration = 35, .finalWeight = 42, .doseWeight = 18,
+                .grinderSetting = "4.75",
+                .enjoyment = 75
+            });
+
+            DialingBlocks::RecentAdviceInputs in;
+            in.turns = {AIConversation::HistoricalAssistantTurn{
+                priorId, "advice", sampleStructuredNext()}};
+            in.currentProfileKbId = "kb";
+            in.currentShotId = 99999;
+
+            const QByteArray a = QJsonDocument(DialingBlocks::buildRecentAdviceBlock(db, in))
+                .toJson(QJsonDocument::Compact);
+            const QByteArray b = QJsonDocument(DialingBlocks::buildRecentAdviceBlock(db, in))
+                .toJson(QJsonDocument::Compact);
+            QCOMPARE(a, b);
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // pourControlFromProfileJson (issue #1158) — pure derivation, no DB.
+    // Reads the profile steps (`steps`), picks the longest frame (the
+    // pour), and reports its `pump`. Empty / malformed / step-less JSON
+    // → "" so the field stays sparse (a confidently-wrong value is
+    // worse than an absent one — that was the v1 phase-marker bug). A
+    // short trailing decline frame must not flip the classification.
+    // -------------------------------------------------------------------
+    void pourControlFromProfileJson_derivesFromLongestFrame()
+    {
+        // Empty / malformed / no steps → omitted.
+        QCOMPARE(DialingBlocks::pourControlFromProfileJson(QString()), QString());
+        QCOMPARE(DialingBlocks::pourControlFromProfileJson(QStringLiteral("{not json")), QString());
+        QCOMPARE(DialingBlocks::pourControlFromProfileJson(QStringLiteral("{\"steps\":[]}")), QString());
+
+        // D-Flow / Q shape: Filling(25s,P) Infusing(1s,P) Pouring(127s,FLOW)
+        // — the long pour is flow-controlled. This is the exact #1147
+        // shot whose v1 phase-marker derivation wrongly said "pressure".
+        const QString dflowQ = QStringLiteral(
+            "{\"steps\":["
+            "{\"name\":\"Filling\",\"pump\":\"pressure\",\"seconds\":25},"
+            "{\"name\":\"Infusing\",\"pump\":\"pressure\",\"seconds\":1},"
+            "{\"name\":\"Pouring\",\"pump\":\"flow\",\"seconds\":127}]}");
+        QCOMPARE(DialingBlocks::pourControlFromProfileJson(dflowQ), QStringLiteral("flow"));
+
+        // Classic pressure pour: preinfusion(flow,short) then long
+        // pressure pour.
+        const QString ninebar = QStringLiteral(
+            "{\"steps\":["
+            "{\"name\":\"Preinfusion\",\"pump\":\"flow\",\"seconds\":10},"
+            "{\"name\":\"Pour\",\"pump\":\"pressure\",\"seconds\":40}]}");
+        QCOMPARE(DialingBlocks::pourControlFromProfileJson(ninebar), QStringLiteral("pressure"));
+
+        // A short trailing pressure "decline" frame must NOT flip a
+        // long flow pour to "pressure".
+        const QString flowWithTail = QStringLiteral(
+            "{\"steps\":["
+            "{\"name\":\"Fill\",\"pump\":\"pressure\",\"seconds\":20},"
+            "{\"name\":\"Pour\",\"pump\":\"flow\",\"seconds\":110},"
+            "{\"name\":\"Decline\",\"pump\":\"pressure\",\"seconds\":3}]}");
+        QCOMPARE(DialingBlocks::pourControlFromProfileJson(flowWithTail),
+                 QStringLiteral("flow"));
+
+        // `seconds` as a string (de1app Tcl-origin JSON) still parses.
+        const QString stringSeconds = QStringLiteral(
+            "{\"steps\":["
+            "{\"name\":\"Fill\",\"pump\":\"pressure\",\"seconds\":\"25\"},"
+            "{\"name\":\"Pour\",\"pump\":\"flow\",\"seconds\":\"127\"}]}");
+        QCOMPARE(DialingBlocks::pourControlFromProfileJson(stringSeconds),
+                 QStringLiteral("flow"));
+    }
+
+    // -------------------------------------------------------------------
+    // withStopAtWeightNote (issue #1158) — pure, no DB. No-op on empty
+    // steps or non-positive target; appends exactly one note otherwise,
+    // preserving the original steps prefix.
+    // -------------------------------------------------------------------
+    void withStopAtWeightNote_appendsNoteOnlyWhenWeightAndStepsPresent()
+    {
+        // Empty steps → unchanged regardless of weight.
+        QCOMPARE(DialingBlocks::withStopAtWeightNote(QString(), 36.0), QString());
+
+        const QString steps =
+            QStringLiteral("## Profile Steps (1 frames)\n1. Pouring FLOW\n");
+        // Non-positive target → steps untouched (no note).
+        QCOMPARE(DialingBlocks::withStopAtWeightNote(steps, 0.0), steps);
+        QCOMPARE(DialingBlocks::withStopAtWeightNote(steps, -1.0), steps);
+
+        // Steps + positive target → exactly one note appended after the
+        // original step text.
+        const QString out = DialingBlocks::withStopAtWeightNote(steps, 36.0);
+        QVERIFY(out.startsWith(steps));
+        QVERIFY(out.contains(QStringLiteral("Stop-at-weight:")));
+        QVERIFY(out.contains(QStringLiteral("weight cutoff")));
+        QCOMPARE(out.count(QStringLiteral("Stop-at-weight:")), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // dialInSessions pourControl (issue #1158) — DB-level. A uniform
+    // session hoists pourControl to context with no per-shot field; a
+    // session that mixes flow/pressure variants emits it per-shot and
+    // omits the context value. (Previously only the pure derivation was
+    // covered; the hoist/per-shot wiring was dark.)
+    // -------------------------------------------------------------------
+    void dialInSessions_hoistsPourControlWhenUniform_elsePerShot()
+    {
+        const QString kFlow = QStringLiteral(
+            "{\"steps\":[{\"name\":\"Filling\",\"pump\":\"pressure\",\"seconds\":25},"
+            "{\"name\":\"Pouring\",\"pump\":\"flow\",\"seconds\":127}]}");
+        const QString kPressure = QStringLiteral(
+            "{\"steps\":[{\"name\":\"Preinfusion\",\"pump\":\"flow\",\"seconds\":10},"
+            "{\"name\":\"Pour\",\"pump\":\"pressure\",\"seconds\":40}]}");
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+
+        // Uniform-flow session → hoisted.
+        const QString pathU = freshDbPath();
+        initAndClose(pathU);
+        withRawDb(pathU, QStringLiteral("pc_uniform"), [&](QSqlDatabase& db) {
+            ShotRow a1;
+            a1.uuid = QStringLiteral("pc-a1");
+            a1.profileName = QStringLiteral("D-Flow / Q");
+            a1.profileKbId = QStringLiteral("kb-dfq");
+            a1.timestamp = now - 4000;
+            a1.grinderModel = QStringLiteral("Zero");
+            a1.grinderSetting = QStringLiteral("5");
+            a1.profileJson = kFlow;
+            QVERIFY(insertShot(db, a1) > 0);
+            ShotRow a2 = a1;
+            a2.uuid = QStringLiteral("pc-a2");
+            a2.timestamp = now - 3700;
+            QVERIFY(insertShot(db, a2) > 0);
+
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-dfq"), soleScope(db), /*resolvedShotId=*/-1, /*historyLimit=*/10);
+            QCOMPARE(sessions.size(), 1);
+            const QJsonObject session = sessions.at(0).toObject();
+            QCOMPARE(session.value(QStringLiteral("context")).toObject()
+                         .value(QStringLiteral("pourControl")).toString(),
+                     QStringLiteral("flow"));
+            const QJsonArray shots = session.value(QStringLiteral("shots")).toArray();
+            QCOMPARE(shots.size(), 2);
+            for (const auto& s : shots)
+                QVERIFY(!s.toObject().contains(QStringLiteral("pourControl")));
+        });
+
+        // Mixed flow/pressure session → per-shot, not hoisted.
+        const QString pathM = freshDbPath();
+        initAndClose(pathM);
+        withRawDb(pathM, QStringLiteral("pc_mixed"), [&](QSqlDatabase& db) {
+            ShotRow m1;
+            m1.uuid = QStringLiteral("pc-m1");
+            m1.profileName = QStringLiteral("D-Flow / Q");
+            m1.profileKbId = QStringLiteral("kb-dfq");
+            m1.timestamp = now - 4000;
+            m1.grinderModel = QStringLiteral("Zero");
+            m1.grinderSetting = QStringLiteral("5");
+            m1.profileJson = kFlow;
+            QVERIFY(insertShot(db, m1) > 0);
+            ShotRow m2 = m1;
+            m2.uuid = QStringLiteral("pc-m2");
+            m2.timestamp = now - 3700;
+            m2.profileJson = kPressure;
+            QVERIFY(insertShot(db, m2) > 0);
+
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-dfq"), soleScope(db), -1, 10);
+            QCOMPARE(sessions.size(), 1);
+            const QJsonObject session = sessions.at(0).toObject();
+            QVERIFY(!session.value(QStringLiteral("context")).toObject()
+                         .contains(QStringLiteral("pourControl")));
+            const QJsonArray shots = session.value(QStringLiteral("shots")).toArray();
+            QCOMPARE(shots.size(), 2);
+            bool sawFlow = false, sawPressure = false;
+            for (const auto& s : shots) {
+                const QString pc = s.toObject()
+                                       .value(QStringLiteral("pourControl")).toString();
+                if (pc == QStringLiteral("flow")) sawFlow = true;
+                if (pc == QStringLiteral("pressure")) sawPressure = true;
+            }
+            QVERIFY(sawFlow);
+            QVERIFY(sawPressure);
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // dialInSessions profileName / targetWeightG / temperatureOverrideC
+    // hoisting (issue #1164 finding #3) — DB-level. Same dedup discipline
+    // as pourControl: hoist to session context when uniform across the
+    // session, emit per-shot only when the session mixes the value.
+    // -------------------------------------------------------------------
+    void dialInSessions_hoistsProfileTargetTempWhenUniform_elsePerShot()
+    {
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+
+        // Uniform session: same profile, target weight, and temp override
+        // on both shots → all three hoist to context, absent per-shot.
+        const QString pathU = freshDbPath();
+        initAndClose(pathU);
+        withRawDb(pathU, QStringLiteral("ptt_uniform"), [&](QSqlDatabase& db) {
+            ShotRow a1;
+            a1.uuid = QStringLiteral("ptt-a1");
+            a1.profileName = QStringLiteral("D-Flow / Q");
+            a1.profileKbId = QStringLiteral("kb-dfq");
+            a1.timestamp = now - 4000;
+            a1.grinderModel = QStringLiteral("Zero");
+            a1.grinderSetting = QStringLiteral("5");
+            a1.targetWeight = 36.0;
+            a1.temperatureOverride = 84.0;
+            QVERIFY(insertShot(db, a1) > 0);
+            ShotRow a2 = a1;
+            a2.uuid = QStringLiteral("ptt-a2");
+            a2.timestamp = now - 3700;
+            a2.grinderSetting = QStringLiteral("5.5");
+            QVERIFY(insertShot(db, a2) > 0);
+
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-dfq"), soleScope(db), /*resolvedShotId=*/-1, /*historyLimit=*/10);
+            QCOMPARE(sessions.size(), 1);
+            const QJsonObject ctx = sessions.at(0).toObject()
+                .value(QStringLiteral("context")).toObject();
+            QCOMPARE(ctx.value(QStringLiteral("profileName")).toString(),
+                     QStringLiteral("D-Flow / Q"));
+            QCOMPARE(ctx.value(QStringLiteral("targetWeightG")).toDouble(), 36.0);
+            QCOMPARE(ctx.value(QStringLiteral("temperatureOverrideC")).toDouble(), 84.0);
+            const QJsonArray shots = sessions.at(0).toObject()
+                .value(QStringLiteral("shots")).toArray();
+            QCOMPARE(shots.size(), 2);
+            for (const auto& s : shots) {
+                const QJsonObject sh = s.toObject();
+                QVERIFY2(!sh.contains(QStringLiteral("profileName")),
+                         "uniform profileName must hoist to context");
+                QVERIFY2(!sh.contains(QStringLiteral("targetWeightG")),
+                         "uniform targetWeightG must hoist to context");
+                QVERIFY2(!sh.contains(QStringLiteral("temperatureOverrideC")),
+                         "uniform temperatureOverrideC must hoist to context");
+            }
+        });
+
+        // Mixed session: the two shots differ in all three fields → none
+        // hoisted, each emitted per-shot. They share kbId + timestamps so
+        // they still group into one session.
+        const QString pathM = freshDbPath();
+        initAndClose(pathM);
+        withRawDb(pathM, QStringLiteral("ptt_mixed"), [&](QSqlDatabase& db) {
+            ShotRow m1;
+            m1.uuid = QStringLiteral("ptt-m1");
+            m1.profileName = QStringLiteral("D-Flow / Q");
+            m1.profileKbId = QStringLiteral("kb-dfq");
+            m1.timestamp = now - 4000;
+            m1.grinderModel = QStringLiteral("Zero");
+            m1.grinderSetting = QStringLiteral("5");
+            m1.targetWeight = 36.0;
+            m1.temperatureOverride = 84.0;
+            QVERIFY(insertShot(db, m1) > 0);
+            ShotRow m2 = m1;
+            m2.uuid = QStringLiteral("ptt-m2");
+            m2.timestamp = now - 3700;
+            m2.profileName = QStringLiteral("Damian's LM Leva");
+            m2.targetWeight = 42.0;
+            m2.temperatureOverride = 89.0;
+            QVERIFY(insertShot(db, m2) > 0);
+
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-dfq"), soleScope(db), -1, 10);
+            QCOMPARE(sessions.size(), 1);
+            const QJsonObject ctx = sessions.at(0).toObject()
+                .value(QStringLiteral("context")).toObject();
+            QVERIFY(!ctx.contains(QStringLiteral("profileName")));
+            QVERIFY(!ctx.contains(QStringLiteral("targetWeightG")));
+            QVERIFY(!ctx.contains(QStringLiteral("temperatureOverrideC")));
+            const QJsonArray shots = sessions.at(0).toObject()
+                .value(QStringLiteral("shots")).toArray();
+            QCOMPARE(shots.size(), 2);
+            QSet<QString> profiles;
+            QList<double> weights;
+            QList<double> temps;
+            for (const auto& s : shots) {
+                const QJsonObject sh = s.toObject();
+                profiles.insert(sh.value(QStringLiteral("profileName")).toString());
+                weights.append(sh.value(QStringLiteral("targetWeightG")).toDouble());
+                temps.append(sh.value(QStringLiteral("temperatureOverrideC")).toDouble());
+            }
+            QVERIFY(profiles.contains(QStringLiteral("D-Flow / Q")));
+            QVERIFY(profiles.contains(QStringLiteral("Damian's LM Leva")));
+            QVERIFY(weights.contains(36.0));
+            QVERIFY(weights.contains(42.0));
+            QVERIFY(temps.contains(84.0));
+            QVERIFY(temps.contains(89.0));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // bestRecentShot pourControl + targetWeightG (issue #1158) — DB-level.
+    // -------------------------------------------------------------------
+    void bestRecentShot_emitsPourControlAndTargetWeightFromSteps()
+    {
+        const QString kFlow = QStringLiteral(
+            "{\"steps\":[{\"name\":\"Filling\",\"pump\":\"pressure\",\"seconds\":25},"
+            "{\"name\":\"Pouring\",\"pump\":\"flow\",\"seconds\":127}]}");
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("pc_best"), [&](QSqlDatabase& db) {
+            ShotRow best;
+            best.uuid = QStringLiteral("pc-best");
+            best.profileName = QStringLiteral("D-Flow / Q");
+            best.profileKbId = QStringLiteral("kb-dfq");
+            best.timestamp = now - 7 * kSecPerDay;
+            best.grinderModel = QStringLiteral("Zero");
+            best.grinderSetting = QStringLiteral("5");
+            best.enjoyment = 85;
+            best.profileJson = kFlow;
+            best.targetWeight = 36.0;
+            const qint64 bestId = insertShot(db, best);
+            QVERIFY(bestId > 0);
+
+            ShotRow current = best;
+            current.uuid = QStringLiteral("pc-cur");
+            current.timestamp = now - kSecPerDay;
+            current.enjoyment = 0;
+            const qint64 currentId = insertShot(db, current);
+            QVERIFY(currentId > 0);
+            const ShotProjection currentProj = projectionForShot(db, currentId);
+            QVERIFY(currentProj.isValid());
+
+            const QJsonObject best_ = DialingBlocks::buildBestRecentShotBlock(
+                db, QStringLiteral("kb-dfq"), soleScope(db), currentId, currentProj);
+            QVERIFY(!best_.isEmpty());
+            QCOMPARE(best_.value(QStringLiteral("id")).toVariant().toLongLong(), bestId);
+            QCOMPARE(best_.value(QStringLiteral("pourControl")).toString(),
+                     QStringLiteral("flow"));
+            QCOMPARE(best_.value(QStringLiteral("targetWeightG")).toDouble(), 36.0);
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // #1161: stoppedBy is surfaced sparsely. "manual"/"weight"/"volume"
+    // are emitted per-shot (and on bestRecentShot); "profileEnd" and ""
+    // are omitted so the AI falls back to yield-vs-target there.
+    // -------------------------------------------------------------------
+    void dialInSessions_and_bestRecentShot_surfaceStoppedBySparsely()
+    {
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        const QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, QStringLiteral("sb"), [&](QSqlDatabase& db) {
+            // One session, three shots with different stop reasons.
+            ShotRow base;
+            base.profileName = QStringLiteral("D-Flow / Q");
+            base.profileKbId = QStringLiteral("kb-dfq");
+            base.grinderModel = QStringLiteral("Zero");
+            base.grinderSetting = QStringLiteral("5");
+
+            ShotRow manual = base;
+            manual.uuid = QStringLiteral("sb-manual");
+            manual.timestamp = now - 3000;
+            manual.stoppedBy = QStringLiteral("manual");
+            QVERIFY(insertShot(db, manual) > 0);
+
+            ShotRow profileEnd = base;
+            profileEnd.uuid = QStringLiteral("sb-pe");
+            profileEnd.timestamp = now - 2700;
+            profileEnd.stoppedBy = QStringLiteral("profileEnd");
+            QVERIFY(insertShot(db, profileEnd) > 0);
+
+            ShotRow weight = base;
+            weight.uuid = QStringLiteral("sb-weight");
+            weight.timestamp = now - 2400;
+            weight.stoppedBy = QStringLiteral("weight");
+            QVERIFY(insertShot(db, weight) > 0);
+
+            ShotRow volume = base;
+            volume.uuid = QStringLiteral("sb-volume");
+            volume.timestamp = now - 2100;
+            volume.stoppedBy = QStringLiteral("volume");
+            QVERIFY(insertShot(db, volume) > 0);
+
+            const QJsonArray sessions = DialingBlocks::buildDialInSessionsBlock(
+                db, QStringLiteral("kb-dfq"), soleScope(db), /*resolvedShotId=*/-1, /*historyLimit=*/10);
+            QCOMPARE(sessions.size(), 1);
+            const QJsonArray shots = sessions.at(0).toObject()
+                .value(QStringLiteral("shots")).toArray();
+            QCOMPARE(shots.size(), 4);
+
+            int sawManual = 0, sawWeight = 0, sawVolume = 0, sawProfileEndKey = 0;
+            for (const auto& v : shots) {
+                const QJsonObject s = v.toObject();
+                if (!s.contains(QStringLiteral("stoppedBy"))) { ++sawProfileEndKey; continue; }
+                const QString sb = s.value(QStringLiteral("stoppedBy")).toString();
+                if (sb == QStringLiteral("manual")) ++sawManual;
+                if (sb == QStringLiteral("weight")) ++sawWeight;
+                if (sb == QStringLiteral("volume")) ++sawVolume;
+            }
+            QCOMPARE(sawManual, 1);
+            QCOMPARE(sawWeight, 1);
+            QCOMPARE(sawVolume, 1);
+            QVERIFY2(sawProfileEndKey == 1,
+                     "profileEnd must be omitted (no stoppedBy key)");
+
+            // bestRecentShot: a manually-stopped rated anchor surfaces it.
+            ShotRow bestManual = base;
+            bestManual.uuid = QStringLiteral("sb-best");
+            bestManual.timestamp = now - 5 * kSecPerDay;
+            bestManual.enjoyment = 90;
+            bestManual.stoppedBy = QStringLiteral("manual");
+            const qint64 bestId = insertShot(db, bestManual);
+            QVERIFY(bestId > 0);
+
+            ShotRow cur = base;
+            cur.uuid = QStringLiteral("sb-cur");
+            cur.timestamp = now - kSecPerDay;
+            const qint64 curId = insertShot(db, cur);
+            QVERIFY(curId > 0);
+            const ShotProjection curProj = projectionForShot(db, curId);
+            QVERIFY(curProj.isValid());
+
+            const QJsonObject best_ = DialingBlocks::buildBestRecentShotBlock(
+                db, QStringLiteral("kb-dfq"), soleScope(db), curId, curProj);
+            QVERIFY(!best_.isEmpty());
+            QCOMPARE(best_.value(QStringLiteral("id")).toVariant().toLongLong(), bestId);
+            QCOMPARE(best_.value(QStringLiteral("stoppedBy")).toString(),
+                     QStringLiteral("manual"));
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // #1160: the D-Flow umbrella section is split so pressure-distinct
+    // variants resolve to distinct UGS positions and canonical names,
+    // instead of all collapsing to one UGS 0.5 / "D-Flow". Asserts the
+    // content contract from the correct-dflow-variant-ugs spec.
+    // -------------------------------------------------------------------
+    void dflowVariantUgs_distinctPositions_1160()
+    {
+        const QString kbBase =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / default"),
+                                               QStringLiteral("dflow"));
+        const QString kbQ =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / Q"),
+                                               QStringLiteral("dflow"));
+        const QString kbDamianQ =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Damian's Q"),
+                                               QStringLiteral("dflow"));
+        const QString kbLrv3 =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Damian's LRv3"),
+                                               QStringLiteral("dflow"));
+        QVERIFY(!kbBase.isEmpty());
+        QVERIFY(!kbQ.isEmpty());
+        QVERIFY(!kbDamianQ.isEmpty());
+        QVERIFY(!kbLrv3.isEmpty());
+
+        const double ugsBase = ShotSummarizer::ugsForKbId(kbBase);
+        const double ugsQ    = ShotSummarizer::ugsForKbId(kbQ);
+        const double ugsLrv3 = ShotSummarizer::ugsForKbId(kbLrv3);
+
+        // Base D-Flow keeps the chart-authoritative canonical 0.5.
+        QVERIFY(qFuzzyCompare(ugsBase, 0.5));
+        QVERIFY(!ShotSummarizer::ugsInferredForKbId(kbBase));
+
+        // D-Flow/Q resolves strictly coarser than base, and is inferred,
+        // with a canonical name distinct from base D-Flow.
+        QVERIFY(ugsQ > ugsBase);
+        QVERIFY(ShotSummarizer::ugsInferredForKbId(kbQ));
+        QVERIFY(ShotSummarizer::canonicalNameForKbId(kbQ)
+                != ShotSummarizer::canonicalNameForKbId(kbBase));
+
+        // "Damian's Q" resolves to the same position as D-Flow/Q.
+        QCOMPARE(ShotSummarizer::canonicalNameForKbId(kbDamianQ),
+                 ShotSummarizer::canonicalNameForKbId(kbQ));
+        QVERIFY(qFuzzyCompare(ShotSummarizer::ugsForKbId(kbDamianQ), ugsQ));
+
+        // Damian's LRv3 == canonical Londinium/LRv3 position (0),
+        // strictly finer than base D-Flow.
+        QVERIFY(qFuzzyIsNull(ugsLrv3));
+        QVERIFY(ugsLrv3 < ugsBase);
+
+        // Shared behavioral suppression preserved on every variant.
+        const QString kbLrv2 =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Damian's LRv2"),
+                                               QStringLiteral("dflow"));
+        QVERIFY(!kbLrv2.isEmpty());
+        // LRv2 and LRv3 land on DIFFERENT sections, and both by real
+        // Also-matches keys rather than a fuzzy substring fallback on the bare
+        // "lrv3" title token — which is what #1160 was guarding against, and
+        // is still what this asserts.
+        //
+        // They used to share a section. They are not the same profile: LRv2 is
+        // byte-identical in extraction to the shipped Londonium profile (its
+        // notes say so) and belongs to the `londinium` entry; LRv3 has eight
+        // frames to their seven, 90C, and a 9-bar hold. Same UGS, different
+        // sections — which is exactly why this pins the NAMES and the UGS
+        // separately rather than treating one as evidence of the other.
+        QCOMPARE(ShotSummarizer::canonicalNameForKbId(kbLrv2),
+                 QStringLiteral("Londinium"));
+        QCOMPARE(ShotSummarizer::canonicalNameForKbId(kbLrv3),
+                 QStringLiteral("Damian's LRv3"));
+        QVERIFY(qFuzzyCompare(ShotSummarizer::ugsForKbId(kbLrv2) + 1.0,
+                              ugsLrv3 + 1.0));
+        QVERIFY(ShotSummarizer::getAnalysisFlags(kbBase)
+                .contains(QStringLiteral("flow_trend_ok")));
+        QVERIFY(ShotSummarizer::getAnalysisFlags(kbQ)
+                .contains(QStringLiteral("flow_trend_ok")));
+        QVERIFY(ShotSummarizer::getAnalysisFlags(kbLrv2)
+                .contains(QStringLiteral("flow_trend_ok")));
+    }
+
+    // split-dflow-la-pavoni-kb-section: completes the #1160 per-profile
+    // split for the profile #1160 deferred. D-Flow / La Pavoni must
+    // resolve to its own section (84°C / 6–9 bar dial-in), NOT inherit
+    // the base ## D-Flow (default, 0.5, 88°C) section.
+    void dflowLaPavoniVariant_distinctPosition()
+    {
+        const QString kbBase =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / default"),
+                                               QStringLiteral("dflow"));
+        const QString kbLP =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / La Pavoni"),
+                                               QStringLiteral("dflow"));
+        const QString kbQ =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / Q"),
+                                               QStringLiteral("dflow"));
+        QVERIFY(!kbBase.isEmpty());
+        QVERIFY(!kbLP.isEmpty());
+        QVERIFY(!kbQ.isEmpty());
+
+        // La Pavoni resolves to its own canonical name, distinct from base
+        // D-Flow / default (it no longer aliases the base section) and from
+        // the Q variant (it is its own section).
+        QVERIFY(ShotSummarizer::canonicalNameForKbId(kbLP)
+                != ShotSummarizer::canonicalNameForKbId(kbBase));
+        QVERIFY(ShotSummarizer::canonicalNameForKbId(kbLP)
+                != ShotSummarizer::canonicalNameForKbId(kbQ));
+        // Pin the positive resolution target absolutely: a future KB edit
+        // that renamed/merged the section but kept it distinct from base
+        // and Q would leave the relative checks above green while still
+        // violating the "resolves to its own section" spec invariant.
+        // Also defeats the bare-"d-flow" fuzzy-fallback confound (the base
+        // section's title-split emits a bare "d-flow" key that would
+        // prefix-match "d-flow / la pavoni" if the direct alias regressed).
+        QCOMPARE(ShotSummarizer::canonicalNameForKbId(kbLP),
+                 QStringLiteral("D-Flow La Pavoni variant"));
+
+        // Strictly coarser than base, and inferred (same lower-pressure +
+        // 84°C-fill mechanism the Q variant documents).
+        QVERIFY(ShotSummarizer::ugsForKbId(kbLP)
+                > ShotSummarizer::ugsForKbId(kbBase));
+        QVERIFY(ShotSummarizer::ugsInferredForKbId(kbLP));
+
+        // Shared lever-decline behavioral suppression preserved.
+        QVERIFY(ShotSummarizer::getAnalysisFlags(kbLP)
+                .contains(QStringLiteral("flow_trend_ok")));
+    }
+
+    // #1198: deterministic profile-alias longest-boundary-prefix resolution.
+    // A user-renamed/numbered variant of a documented profile inherits that
+    // profile's KB entry; built-ins still resolve by exact match; the editor
+    // namespace is never a prefix anchor; matching is profile-general.
+    void profileVariantPrefixResolution_1198()
+    {
+        const QString kbBase =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / default"),
+                                               QStringLiteral("dflow"));
+        const QString kbQ =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / Q"),
+                                               QStringLiteral("dflow"));
+        const QString kbLP =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / La Pavoni"),
+                                               QStringLiteral("dflow"));
+        QVERIFY(!kbBase.isEmpty());
+        QVERIFY(!kbQ.isEmpty());
+        QVERIFY(!kbLP.isEmpty());
+        QCOMPARE(ShotSummarizer::canonicalNameForKbId(kbQ),
+                 QStringLiteral("D-Flow Q variant"));
+
+        // (3.1a) D-Flow/Q cluster: suffixed, bean-suffixed, numbered, and
+        // hyphen-joined renames all resolve to the Q variant via the
+        // profile-prefix step (separator ∈ { / - space digit }, D1/D3).
+        for (const QString& t : {
+                 QStringLiteral("D-Flow / Q - Jeff"),
+                 QStringLiteral("D-Flow / Q - Ethiopia Natural"),
+                 QStringLiteral("D-Flow / Q2"),
+                 QStringLiteral("D-Flow / Q3"),
+                 QStringLiteral("D-Flow / Q-Jeff"),
+                 QStringLiteral("Damian's Q - decaf") }) {
+            QCOMPARE(ShotSummarizer::computeProfileKbId(t, QStringLiteral("dflow")), kbQ);
+        }
+        // La Pavoni suffixed → its own variant (longest-prefix wins over the
+        // shorter, excluded "D-Flow" editor anchor), strictly coarser than base.
+        const QString kbLP80 =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / La Pavoni 80s"),
+                                               QStringLiteral("dflow"));
+        QCOMPARE(kbLP80, kbLP);
+        QVERIFY(ShotSummarizer::ugsForKbId(kbLP) > ShotSummarizer::ugsForKbId(kbBase));
+
+        // (3.1b) Generality (D9) — NOT D-Flow-specific. No editor hint, so
+        // resolution is the profile-prefix step itself, not editor-default.
+        // (normalizeProfileKey folds é→e, so the ASCII form suffices.)
+        const QString kbAdaptive =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Adaptive v2"), QString());
+        const QString kbLond =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Londinium"), QString());
+        const QString kbAllonge =
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Allonge"), QString());
+        QVERIFY(!kbAdaptive.isEmpty());
+        QVERIFY(!kbLond.isEmpty());
+        QVERIFY(!kbAllonge.isEmpty());
+        QCOMPARE(ShotSummarizer::computeProfileKbId(
+                     QStringLiteral("Adaptive v2 - Jeff"), QString()), kbAdaptive);
+        QCOMPARE(ShotSummarizer::computeProfileKbId(
+                     QStringLiteral("Londinium - Jeff"), QString()), kbLond);
+        QCOMPARE(ShotSummarizer::computeProfileKbId(
+                     QStringLiteral("Allonge - decaf"), QString()), kbAllonge);
+
+        // (3.2) Negatives: a following LETTER is not a boundary, so
+        // "D-Flow / Quark" must NOT absorb the "D-Flow / Q" alias, and
+        // "D-FlowX" must NOT absorb "D-Flow". The editor name is not an
+        // anchor (D2): a fully-custom title falls to the editor default
+        // with a hint, and is unresolved without one.
+        QVERIFY(ShotSummarizer::computeProfileKbId(
+                    QStringLiteral("D-Flow / Quark"), QString()).isEmpty());
+        QVERIFY(ShotSummarizer::computeProfileKbId(
+                    QStringLiteral("D-Flow / Quark"), QString()) != kbQ);
+        QCOMPARE(ShotSummarizer::computeProfileKbId(
+                     QStringLiteral("D-FlowX"), QStringLiteral("dflow")), kbBase);
+        QCOMPARE(ShotSummarizer::computeProfileKbId(
+                     QStringLiteral("My Morning Pull"), QStringLiteral("dflow")), kbBase);
+        QVERIFY(ShotSummarizer::computeProfileKbId(
+                    QStringLiteral("My Morning Pull"), QString()).isEmpty());
+
+        // (3.2a / D8) Built-ins resolve by EXACT match and are never
+        // collapsed by the prefix step: the three canonical D-Flow built-ins
+        // stay three distinct entries, exact precedence intact.
+        QVERIFY(kbBase != kbQ);
+        QVERIFY(kbBase != kbLP);
+        QVERIFY(kbQ != kbLP);
+        QCOMPARE(ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / Q"),
+                                                    QStringLiteral("dflow")), kbQ);
+        QCOMPARE(ShotSummarizer::computeProfileKbId(QStringLiteral("Damian's Q"),
+                                                    QStringLiteral("dflow")), kbQ);
+
+        // (3.3 / D6) A legacy persisted normalized-title kbId heals to the
+        // parent profile id via the SAME shared step (resolveKbId →
+        // resolveKbInput), under the recompute-on-load contract.
+        QCOMPARE(ShotSummarizer::resolveKbId(QStringLiteral("d-flow / q - jeff")), kbQ);
+    }
+
+    // flag-off-expert-band-in-shot-summary: a shot saved before the
+    // #1160/#1175 KB splits can carry a STALE persisted profileKbId
+    // (real case: shot 819 — profileName "D-Flow / Q" but stored
+    // "d-flow / default"). prepareAnalysisInputs must NOT key the band
+    // off that stale value; it re-resolves canonical identity from the
+    // title via computeProfileKbId against the CURRENT KB (D7/D14).
+    // This pins the mechanism the fix depends on: keying off the stale
+    // stored kbId loses the band; the fresh title resolution recovers it.
+    void expertBand_staleKbId_freshTitleResolutionRecoversBand()
+    {
+
+        // The stale stored value the buggy path used → no band (this is
+        // exactly why shot 819 wrongly read "Clean shot").
+        const auto stale =
+            ShotSummarizer::expertBandForKbId(QStringLiteral("d-flow / default"));
+        QVERIFY2(!stale.has_value(),
+                 "stale 'd-flow / default' kbId resolves to the band-less "
+                 "base section — keying off it loses the band (the bug)");
+
+        // The fix: fresh re-resolution from the real title against the
+        // current KB → the gold band.
+        const QString freshKb = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("D-Flow / Q"), QStringLiteral("dflow"));
+        const auto fresh = ShotSummarizer::expertBandForKbId(freshKb);
+        QVERIFY2(fresh.has_value(),
+                 "fresh title resolution must recover the D-Flow/Q band");
+        QCOMPARE(fresh->axis, ExpertBand::Axis::PressurePeak);
+        QCOMPARE(*fresh->lo, 6.0);
+        QCOMPARE(*fresh->hi, 9.0);
+
+        // Twin collapses to the same canonical entry.
+        const auto twin = ShotSummarizer::expertBandForKbId(
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Damian's Q"),
+                                               QStringLiteral("dflow")));
+        QVERIFY(twin.has_value());
+        QCOMPARE(*twin->lo, *fresh->lo);
+        QCOMPARE(*twin->hi, *fresh->hi);
+
+        // Inverse: a genuinely band-less profile stays absent — the fresh
+        // resolution governs in both directions, never fabricates a band.
+        const auto none = ShotSummarizer::expertBandForKbId(
+            ShotSummarizer::computeProfileKbId(QStringLiteral("D-Flow / default"),
+                                               QStringLiteral("dflow")));
+        QVERIFY2(!none.has_value(),
+                 "D-Flow / default has no cited band — absent by fresh "
+                 "resolution too");
+    }
+
+    // Phase B end-to-end: the kBands["A-Flow"] row must be reachable via
+    // the real KB-resolution path (computeProfileKbId → expertBandForKbId),
+    // not just constructed inline in a slice test. This is the guard that
+    // catches a key typo / `## A-Flow` heading rename — either would make
+    // every A-Flow shot silently lose its band in production.
+    void expertBand_aflow_resolvesFromTitle()
+    {
+
+        const QString kb = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("A-Flow / default-medium"), QStringLiteral("aflow"));
+        const auto band = ShotSummarizer::expertBandForKbId(kb);
+        QVERIFY2(band.has_value(),
+                 "A-Flow / default-medium must resolve to the cited band "
+                 "via the production KB path");
+        QCOMPARE(band->axis, ExpertBand::Axis::PressurePeak);
+        QCOMPARE(*band->lo, 6.0);
+        QCOMPARE(*band->hi, 9.0);
+        // Reviewed-correction (restructure-kb-as-validated-json): src is now
+        // a followable real-doc URL, not the old "[SRC:token]" form.
+        QCOMPARE(band->src, QStringLiteral("https://github.com/Jan3kJ/A_Flow"));
+        QCOMPARE(band->confidence, QStringLiteral("medium"));
+
+        // All shipped A-Flow variants canonical-key to the one `## A-Flow`
+        // section → identical band (structural dedup, like the gold pair).
+        for (const QString& title : { QStringLiteral("A-Flow / default-light"),
+                                      QStringLiteral("A-Flow / default-dark"),
+                                      QStringLiteral("A-Flow / default-very-dark"),
+                                      QStringLiteral("A-Flow / default-like-dflow") }) {
+            const auto v = ShotSummarizer::expertBandForKbId(
+                ShotSummarizer::computeProfileKbId(title, QStringLiteral("aflow")));
+            QVERIFY2(v.has_value(), qPrintable(title + " must resolve to the A-Flow band"));
+            QCOMPARE(*v->lo, *band->lo);
+            QCOMPARE(*v->hi, *band->hi);
+            QCOMPARE(v->src, band->src);
+        }
+    }
+
+    // Phase C end-to-end: the kBands["Londinium"] row resolves via the
+    // production KB path, and — critically — the standalone Londinium key
+    // does NOT collide with Damian's LRv2/LRv3. They stay separate because
+    // those titles resolve to their own canonical section
+    // (`Damian's LRv2 / LRv3`) absent from kBands — NOT because of the
+    // `## Londinium` Note (inert LLM prose). Guards a key typo /
+    // `## Londinium` rename and the Damian-LR separation in one shot.
+    void expertBand_londinium_resolvesAndDoesNotCatchDamianLRv3()
+    {
+        // Londinium, Londonium and Damian's LRv2 are ONE profile under three
+        // names — londonium.json and damian_s_lrv2.json are byte-identical
+        // across all seven frames, and Londonium's own notes say so. All three
+        // therefore carry the cited decent-guide band.
+        //
+        // This test previously asserted the opposite for LRv2, on the strength
+        // of a KB claim ("different fill/infuse behavior and higher frame
+        // temperatures") that the shipped files disprove: both run
+        // 89/89/88.5/88.5/88/88/88. The entries were merged; this is the
+        // corrected pin.
+        for (const QString& title : { QStringLiteral("Londinium"),
+                                      QStringLiteral("Londonium"),
+                                      QStringLiteral("Damian's LRv2") }) {
+            const auto band = ShotSummarizer::expertBandForKbId(
+                ShotSummarizer::computeProfileKbId(title, QStringLiteral("advanced")));
+            QVERIFY2(band.has_value(),
+                     qPrintable(title + " must resolve to the decent-guide band"));
+            QCOMPARE(band->axis, ExpertBand::Axis::PressurePeak);
+            QCOMPARE(*band->lo, 8.0);
+            QCOMPARE(*band->hi, 9.0);
+            QCOMPARE(band->src,
+                     QStringLiteral("https://decentespresso.com/first_decent_espresso"));
+            QCOMPARE(band->confidence, QStringLiteral("medium"));
+        }
+
+        // Damian's LRv3 IS a different profile — eight frames against seven,
+        // 90C, a 9-bar hold before declining to 5.5 bar, and no flow-control
+        // safety step. Its pressure story is not Londinium's 9->8 taper, so it
+        // must not pick up this band.
+        const auto v3 = ShotSummarizer::expertBandForKbId(
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Damian's LRv3"),
+                                               QStringLiteral("advanced")));
+        QVERIFY2(!v3.has_value() ||
+                 v3->src != QStringLiteral("https://decentespresso.com/first_decent_espresso"),
+                 "Damian's LRv3 must NOT resolve to the Londinium band");
+    }
+
+    // Phase C — Adaptive v2: Decent authored the profile, so decent-guide
+    // is the author authority. Band is 6–9 (contains the by-design
+    // adaptive envelope; observational "could be better" outside it).
+    // `## Gagné Adaptive` is a separate canonical section and must not
+    // pick up this band.
+    void expertBand_adaptiveV2_resolvesAndDoesNotCatchGagne()
+    {
+        const auto band = ShotSummarizer::expertBandForKbId(
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Adaptive v2"),
+                                               QStringLiteral("advanced")));
+        QVERIFY2(band.has_value(), "Adaptive v2 must resolve to the band");
+        QCOMPARE(band->axis, ExpertBand::Axis::PressurePeak);
+        QCOMPARE(*band->lo, 6.0);
+        QCOMPARE(*band->hi, 9.0);
+        QCOMPARE(band->src,
+                 QStringLiteral("https://decentespresso.com/first_decent_espresso"));
+
+        const auto g = ShotSummarizer::expertBandForKbId(
+            ShotSummarizer::computeProfileKbId(QStringLiteral("Gagné Adaptive"),
+                                               QStringLiteral("advanced")));
+        QVERIFY2(!g.has_value()
+                     || g->src != QStringLiteral("https://decentespresso.com/first_decent_espresso")
+                     || *g->lo != 6.0,
+                 "Gagné Adaptive must NOT pick up the Adaptive v2 band");
+    }
+
+    // Phase C — Allongé: a ONE-SIDED flow floor (lo set, hi unset). All
+    // its aliases resolve to the single `## Allonge` section.
+    void expertBand_allonge_resolvesAsOneSidedFlowFloor()
+    {
+        for (const QString& title : { QStringLiteral("Rao Allongé"),
+                                      QStringLiteral("Allongé"),
+                                      QStringLiteral("Allonge") }) {
+            const auto band = ShotSummarizer::expertBandForKbId(
+                ShotSummarizer::computeProfileKbId(title, QStringLiteral("advanced")));
+            QVERIFY2(band.has_value(),
+                     qPrintable(title + " must resolve to the Allongé flow floor"));
+            QCOMPARE(band->axis, ExpertBand::Axis::ExtractionFlow);
+            QVERIFY2(band->lo.has_value(), "floor must set lo");
+            QCOMPARE(*band->lo, 4.5);
+            QVERIFY2(!band->hi.has_value(),
+                     "one-sided floor must leave hi unset (no fabricated ceiling)");
+            QCOMPARE(band->src,
+                     QStringLiteral("https://decentespresso.com/blog/5_espresso_profiles_for_light_roasted_coffee_beans"));
+        }
+    }
+
+    // Phase D (D1): complete seed-coverage — every shipped kBands row
+    // resolves to its EXACT cited band via the production KB path. One
+    // table locks the whole expert-band surface: a dropped/mis-keyed row,
+    // a changed bound, a wrong [SRC] tag, or a confidence drift all fail
+    // here. (Per-row tests above also assert non-collision; this is the
+    // single completeness pin across all five canonical entries.)
+    void expertBand_allShippedRows_seedCoverage()
+    {
+        using Axis = ExpertBand::Axis;
+        struct Row {
+            QString title; QString editor; Axis axis;
+            double lo; bool hasHi; double hi; QString src; QString conf;
+        };
+        const QVector<Row> rows = {
+            // src is now a real-doc URL / intrinsic token (reviewed-correction,
+            // restructure-kb-as-validated-json — was the old "[SRC:token]").
+            { "D-Flow / Q",          "dflow",    Axis::PressurePeak,  6.0, true, 9.0, "profile-notes", "high"   },
+            { "D-Flow / La Pavoni",  "dflow",    Axis::PressurePeak,  6.0, true, 9.0, "profile-notes", "high"   },
+            { "A-Flow / default-medium", "aflow", Axis::PressurePeak, 6.0, true, 9.0, "https://github.com/Jan3kJ/A_Flow", "medium" },
+            { "Londinium",           "advanced", Axis::PressurePeak,  8.0, true, 9.0, "https://decentespresso.com/first_decent_espresso", "medium" },
+            { "Adaptive v2",         "advanced", Axis::PressurePeak,  6.0, true, 9.0, "https://decentespresso.com/first_decent_espresso", "medium" },
+            { "Rao Allongé",         "advanced", Axis::ExtractionFlow,4.5, false,0.0, "https://decentespresso.com/blog/5_espresso_profiles_for_light_roasted_coffee_beans", "medium" },
+        };
+        for (const Row& r : rows) {
+            const auto b = ShotSummarizer::expertBandForKbId(
+                ShotSummarizer::computeProfileKbId(r.title, r.editor));
+            QVERIFY2(b.has_value(), qPrintable(r.title + " must resolve to a band"));
+            QCOMPARE(b->axis, r.axis);
+            QVERIFY2(b->lo.has_value(), qPrintable(r.title + " lo must be set"));
+            QCOMPARE(*b->lo, r.lo);
+            QCOMPARE(b->hi.has_value(), r.hasHi);
+            if (r.hasHi) QCOMPARE(*b->hi, r.hi);
+            QCOMPARE(b->src, r.src);
+            QCOMPARE(b->confidence, r.conf);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // correct-dflow-aflow-editor-profile-docs: regression guard for the
+    // shipped KB the LLM ingests. It is a *known-bad blocklist + known-good
+    // allow-list*, NOT a full referential-integrity check: (a) none of the
+    // four KNOWN stale fictitious A-Flow names, and every real shipped
+    // built-in title present (the asserted title set is the authoritative
+    // list from resources/profiles/*.json — a brand-new fictitious name
+    // would still pass; that gap is accepted for a doc guard) — now checked
+    // by RESOLUTION (each real title → a non-empty canonical id) rather than
+    // md-text presence; (b) no reintroduction of the exact profile-implying
+    // "base D-Flow / variant / family" framings this change removed
+    // (paraphrases are not caught — the guard prevents *this* drift back, it
+    // does not prove the prose teaches the right model); (c) the #1160/#1175
+    // split mechanics as RESOLUTION invariants (D-Flow/Q ≡ Damian's Q same
+    // id; D-Flow/La Pavoni ≠ default; Damian LRv2 ≠ standalone Londinium) +
+    // a "id": entry-count pin — replacing the obsolete md heading/alias-line
+    // byte-count drift-check (the structured format + build-time validator
+    // now enforce alias→exactly-one-id integrity).
+    // -------------------------------------------------------------------
+    void shippedKb_editorModelAndRealProfileNames_guard()
+    {
+        QFile f(QStringLiteral(":/ai/profile_knowledge.json"));
+        QVERIFY2(f.open(QIODevice::ReadOnly),
+                 "shipped KB resource :/ai/profile_knowledge.json not found "
+                 "(ai.qrc must be linked)");
+        const QString kb = QString::fromUtf8(f.readAll());
+        f.close();
+        QVERIFY(!kb.isEmpty());
+        // Structural-stability pin (restructure-kb-as-validated-json): exactly
+        // 48 entries. Parsed (not a raw "id": substring count, which a future
+        // prose/rationale string containing `"id":` would falsely break). If a
+        // KB entry is intentionally added/removed, update this count AND
+        // re-verify #1160 resolution.
+        //
+        // 43 -> 47 (sync-builtin-profiles): the seven profiles Decaid shipped and
+        // Decenza did not are now built-ins, and every built-in needs a KB entry —
+        // baseline-contact-series covers all four Baseline levels through
+        // alsoMatches, plus icbinf, psph and soup-58.
+        //
+        // 47 -> 48: de1app added a new built-in, Adaptive v3 (best_practice.tcl),
+        // synced in with KB entry `adaptive-v3`.
+        const QJsonArray kbProfiles =
+            QJsonDocument::fromJson(kb.toUtf8()).object()
+                .value(QStringLiteral("profiles")).toArray();
+        QCOMPARE(kbProfiles.size(), 48);
+
+        // LLM-facing scope: the (a)/(c) framing checks target what the model
+        // ingests — `prose` + identity. `rationale` (and `src`) are
+        // human/validator audit metadata: never read by the loader, never
+        // assembled into the prompt. The verbatim kBands audit text legally
+        // contains loose phrasing ("other shipped A-Flow variants' limiters
+        // …"); excluding `"rationale":` lines scopes the guard to its true
+        // intent without weakening it (prose/displayName/alsoMatches stay).
+        QStringList llmLines;
+        for (const QString& ln : kb.split(QLatin1Char('\n')))
+            if (!ln.contains(QStringLiteral("\"rationale\":")))
+                llmLines << ln;
+        const QString llmText = llmLines.join(QLatin1Char('\n'));
+
+        // (a) Stale, fictitious A-Flow names must be gone. None of these is
+        // a substring of a real built-in title (e.g. "A-Flow / dark" is NOT
+        // a substring of "A-Flow / default-dark"), so plain contains() is
+        // a safe exact check.
+        for (const QString& stale : {
+                 QStringLiteral("A-Flow / medium"),
+                 QStringLiteral("A-Flow / dark"),
+                 QStringLiteral("A-Flow / very dark"),
+                 QStringLiteral("A-Flow / like D-Flow") }) {
+            QVERIFY2(!llmText.contains(stale),
+                     qPrintable(QStringLiteral("shipped KB still references "
+                         "stale non-existent A-Flow profile name: ") + stale));
+        }
+
+        // (b) Every real shipped built-in D-Flow/A-Flow title must RESOLVE
+        // (stronger than the old md-text presence check): each maps to a
+        // non-empty canonical id via the production resolver — D-Flow/* by
+        // explicit alias, A-Flow/* via the editor-type default fallback.
+        const QVector<QPair<QString, QString>> reals = {
+            { QStringLiteral("D-Flow / default"),          QStringLiteral("dflow") },
+            { QStringLiteral("D-Flow / La Pavoni"),         QStringLiteral("dflow") },
+            { QStringLiteral("D-Flow / Q"),                 QStringLiteral("dflow") },
+            { QStringLiteral("A-Flow / default-light"),     QStringLiteral("aflow") },
+            { QStringLiteral("A-Flow / default-medium"),    QStringLiteral("aflow") },
+            { QStringLiteral("A-Flow / default-dark"),      QStringLiteral("aflow") },
+            { QStringLiteral("A-Flow / default-very-dark"), QStringLiteral("aflow") },
+            { QStringLiteral("A-Flow / default-like-dflow"),QStringLiteral("aflow") },
+        };
+        for (const auto& rp : reals) {
+            QVERIFY2(!ShotSummarizer::computeProfileKbId(rp.first, rp.second).isEmpty(),
+                     qPrintable(QStringLiteral("real built-in profile no longer "
+                         "resolves to a KB id: ") + rp.first));
+        }
+
+        // (c) Profile-implying wrong-model phrasing must not return. These
+        // are the exact framings this change removed; "D-Flow"/"A-Flow"
+        // unqualified mean the editor type, never a profile.
+        for (const QString& bad : {
+                 QStringLiteral("base D-Flow"),
+                 QStringLiteral("D-Flow (base)"),
+                 QStringLiteral("D-Flow / Damian family"),
+                 QStringLiteral("D-Flow variant"),
+                 QStringLiteral("A-Flow variant"),
+                 QStringLiteral("standard D-Flow variant") }) {
+            QVERIFY2(!llmText.contains(bad, Qt::CaseInsensitive),
+                     qPrintable(QStringLiteral("shipped KB reintroduced "
+                         "profile-implying D-Flow/A-Flow framing: ") + bad));
+        }
+
+        // (d) #1160 / PR Kulitorum/Decenza#1175 split mechanics — now expressed as RESOLUTION
+        // invariants on the structured KB (stronger and more direct than
+        // the old md heading/alias-line byte-count drift-check, which the
+        // JSON format obsoletes; the validator additionally enforces unique
+        // id + alias→exactly-one-id integrity at build time).
+        const QString idQ        = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("D-Flow / Q"), QStringLiteral("dflow"));
+        const QString idDamianQ  = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("Damian's Q"), QStringLiteral("advanced"));
+        const QString idDefault  = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("D-Flow / default"), QStringLiteral("dflow"));
+        const QString idLaPavoni = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("D-Flow / La Pavoni"), QStringLiteral("dflow"));
+        const QString idLondinium = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("Londinium"), QStringLiteral("advanced"));
+        const QString idLRv2 = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("Damian's LRv2"), QStringLiteral("dflow"));
+
+        QVERIFY2(!idQ.isEmpty() && idQ == idDamianQ,
+                 "#1160 twin: D-Flow / Q and Damian's Q must collapse to the "
+                 "same canonical id");
+        QVERIFY2(!idLaPavoni.isEmpty() && idLaPavoni != idDefault,
+                 "PR Kulitorum/Decenza#1175 split: D-Flow / La Pavoni must resolve to its OWN id, "
+                 "distinct from D-Flow / default");
+        // Reversed deliberately. This once asserted the opposite, on the
+        // strength of a KB claim the shipped files disprove: londonium.json
+        // and damian_s_lrv2.json are byte-identical across all seven frames,
+        // and Londonium's notes read "This is identical to the LRv2 profile,
+        // but renamed to be easier to understand." One profile, one entry.
+        QVERIFY2(!idLondinium.isEmpty() && idLRv2 == idLondinium,
+                 "Damian's LRv2 IS the Londonium profile and must resolve to "
+                 "the same entry");
+        // LRv3 is the one that genuinely differs — eight frames, 90C, a 9-bar
+        // hold — and keeps its own id.
+        const QString idLRv3 = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("Damian's LRv3"), QStringLiteral("dflow"));
+        QVERIFY2(!idLRv3.isEmpty() && idLRv3 != idLondinium,
+                 "Damian's LRv3 must keep its OWN id, distinct from Londinium");
+    }
+
+    // -------------------------------------------------------------------
+    // KB roastAffinity (add-recipe-wizard-tea): the wizard's "suits your
+    // roast" tier resolves through the same title/alias matching as every
+    // other KB lookup. Pins a dark-affinity entry (Londinium), a
+    // light-affinity entry resolved via alias (Blooming Espresso), a
+    // no-claim entry staying empty, and the unresolved-title fallback.
+    // -------------------------------------------------------------------
+    void shippedKb_roastAffinityResolution()
+    {
+        const QStringList londinium =
+            ShotSummarizer::roastAffinityForTitle(QStringLiteral("Londinium"));
+        QVERIFY(londinium.contains(QStringLiteral("dark")));
+        QVERIFY(londinium.contains(QStringLiteral("medium-dark")));
+        QVERIFY(!londinium.contains(QStringLiteral("light")));
+
+        const QStringList blooming =
+            ShotSummarizer::roastAffinityForTitle(QStringLiteral("Blooming Espresso"));
+        QVERIFY(blooming.contains(QStringLiteral("light")));
+        QVERIFY(!blooming.contains(QStringLiteral("dark")));
+
+        // Entries with no stated affinity make NO claim (never guessed).
+        QVERIFY(ShotSummarizer::roastAffinityForTitle(
+                    QStringLiteral("Filter 2.0")).isEmpty());
+        // Unresolved titles fall to empty, not a fabricated affinity.
+        QVERIFY(ShotSummarizer::roastAffinityForTitle(
+                    QStringLiteral("No Such Profile XYZ")).isEmpty());
+    }
+
+    // -------------------------------------------------------------------
+    // KB UGS grind direction (add-recipe-wizard-tea): the wizard's grind
+    // hint gives DIRECTION ONLY between two profiles' UGS positions — per
+    // the KB's own cross-profile rule, never a click count. Cremina anchors
+    // UGS 0 (finest); Rao Allongé anchors UGS 8 (coarsest).
+    // -------------------------------------------------------------------
+    void shippedKb_grindDirectionBetween()
+    {
+        QCOMPARE(ShotSummarizer::grindDirectionBetween(
+                     QStringLiteral("Cremina lever machine"), QStringLiteral("Rao Allongé")),
+                 QStringLiteral("coarser"));
+        QCOMPARE(ShotSummarizer::grindDirectionBetween(
+                     QStringLiteral("Rao Allongé"), QStringLiteral("Cremina lever machine")),
+                 QStringLiteral("finer"));
+        // Same profile (via alias resolution) → "same".
+        QCOMPARE(ShotSummarizer::grindDirectionBetween(
+                     QStringLiteral("D-Flow / default"), QStringLiteral("D-Flow / default")),
+                 QStringLiteral("same"));
+        // Either side unresolved or UGS-less → empty (no fabricated direction).
+        QVERIFY(ShotSummarizer::grindDirectionBetween(
+                    QStringLiteral("No Such Profile XYZ"), QStringLiteral("Rao Allongé")).isEmpty());
+        QVERIFY(ShotSummarizer::grindDirectionBetween(
+                    QString(), QStringLiteral("Rao Allongé")).isEmpty());
+    }
+
+    // -------------------------------------------------------------------
+    // restructure-kb-as-validated-json (task 5.2 / 6.6): KB-COVERAGE GATE.
+    // Every shipped built-in profile (resources/profiles/*.json) MUST
+    // resolve to a KB entry via the production resolver. A NEW built-in
+    // added without a matching KB entry FAILS here — forcing the KB to be
+    // extended (an explicit alias or entry). This is the permanent guard
+    // for "when a new built-in profile is added, a matching KB is added
+    // too". Tea converges to the `tea` entry (whose prose tells the AI
+    // "this is tea, do not run espresso analysis") so the advisor never
+    // mis-handles a tea shot. No allowlist: post alias-fixes every one of
+    // the ~94 built-ins resolves; if a genuinely uncoverable profile is
+    // ever shipped, add an explicit commented exception WITH rationale —
+    // never a silent gap.
+    // -------------------------------------------------------------------
+    void kbCoverage_everyBuiltInProfileResolves()
+    {
+        QDir dir(QStringLiteral(PROFILES_DIR));
+        QVERIFY2(dir.exists(),
+                 qPrintable(QStringLiteral("profiles dir not found: ") + dir.path()));
+        const QStringList files = dir.entryList({ QStringLiteral("*.json") },
+                                                QDir::Files);
+        QVERIFY2(files.size() >= 90,
+                 qPrintable(QStringLiteral("expected the full built-in corpus, "
+                     "found %1").arg(files.size())));
+
+        QStringList unresolved;
+        int resolved = 0;
+        for (const QString& fn : files) {
+            QFile pf(dir.filePath(fn));
+            QVERIFY2(pf.open(QIODevice::ReadOnly),
+                     qPrintable(QStringLiteral("cannot open ") + fn));
+            const QJsonObject po =
+                QJsonDocument::fromJson(pf.readAll()).object();
+            pf.close();
+            const QString title = po.value(QStringLiteral("title")).toString();
+            if (title.isEmpty()) continue;  // not a titled brew profile
+
+            if (ShotSummarizer::computeProfileKbId(title, editorTypeForTitle(title)).isEmpty())
+                unresolved << title;
+            else
+                ++resolved;
+        }
+        QVERIFY2(unresolved.isEmpty(),
+                 qPrintable(QStringLiteral("built-in profile(s) with NO matching "
+                     "KB entry — add a KB entry or an alsoMatches alias "
+                     "(restructure-kb-as-validated-json):\n  ")
+                     + unresolved.join(QStringLiteral("\n  "))));
+        // Floor: a regression that blanked many titles would shrink the
+        // checked set via the isEmpty()-continue above without tripping
+        // `unresolved`. Assert a healthy resolved count too.
+        QVERIFY2(resolved >= 85,
+                 qPrintable(QStringLiteral("only %1 built-ins resolved — "
+                     "expected >= 85 (have titles been blanked?)")
+                     .arg(resolved)));
+    }
+
+    // -------------------------------------------------------------------
+    // restructure-kb-as-validated-json task 5.2 supplement: the spec's
+    // "corpus resolution test" (`## A corpus resolution test SHALL be a
+    // hard gate`) names "every profile title appearing in tests/data/
+    // shots/" as required coverage, distinct from kbCoverage_
+    // everyBuiltInProfileResolves above (which only walks resources/
+    // profiles/*.json shipped built-ins). Enumerate every shot fixture's
+    // `profile_title` and assert it resolves — EXCEPT fixtures manifest.json
+    // marks `"kbResolvable": false` (deliberately-unresolvable
+    // regression-guard fixtures, not a coverage gap — see each entry's own
+    // `description` for why). Data-driven so a new deliberately-unresolvable
+    // fixture only needs a manifest.json edit, not a code change here. Any
+    // OTHER unresolved title is a real gap: add a KB entry/alias, per the
+    // "no allowlist" policy kbCoverage_everyBuiltInProfileResolves documents
+    // above.
+    // -------------------------------------------------------------------
+    void kbCoverage_shotCorpusProfileTitlesResolve()
+    {
+        QDir dir(QStringLiteral(SHOTS_CORPUS_DIR));
+        QVERIFY2(dir.exists(),
+                 qPrintable(QStringLiteral("shots corpus dir not found: ") + dir.path()));
+        const QStringList files = dir.entryList({ QStringLiteral("*.json") }, QDir::Files);
+        QVERIFY2(files.size() >= 15,
+                 qPrintable(QStringLiteral("expected the full shot corpus, found %1")
+                     .arg(files.size())));
+
+        QFile manifestFile(dir.filePath(QStringLiteral("manifest.json")));
+        QVERIFY2(manifestFile.open(QIODevice::ReadOnly), "cannot open manifest.json");
+        const QJsonArray manifestShots =
+            QJsonDocument::fromJson(manifestFile.readAll())
+                .object().value(QStringLiteral("shots")).toArray();
+        manifestFile.close();
+        QSet<QString> kbUnresolvableFiles;
+        for (const QJsonValue& v : manifestShots) {
+            const QJsonObject entry = v.toObject();
+            if (!entry.value(QStringLiteral("kbResolvable")).toBool(true))
+                kbUnresolvableFiles.insert(entry.value(QStringLiteral("file")).toString());
+        }
+        QVERIFY2(!kbUnresolvableFiles.isEmpty(),
+                 "expected at least the two known kbResolvable:false manifest entries");
+
+        QStringList unresolved;
+        int resolved = 0, checked = 0;
+        for (const QString& fn : files) {
+            if (fn == QStringLiteral("manifest.json")) continue;  // not a shot fixture
+            if (kbUnresolvableFiles.contains(fn)) continue;  // manifest-marked exception
+            QFile pf(dir.filePath(fn));
+            QVERIFY2(pf.open(QIODevice::ReadOnly),
+                     qPrintable(QStringLiteral("cannot open ") + fn));
+            const QJsonObject po = QJsonDocument::fromJson(pf.readAll()).object();
+            pf.close();
+            const QString title = po.value(QStringLiteral("profile_title")).toString();
+            if (title.isEmpty()) continue;  // synthetic curve-only fixture, no profile identity
+            ++checked;
+
+            if (ShotSummarizer::computeProfileKbId(title, editorTypeForTitle(title)).isEmpty())
+                unresolved << (title + QStringLiteral(" (") + fn + QLatin1Char(')'));
+            else
+                ++resolved;
+        }
+        QVERIFY2(unresolved.isEmpty(),
+                 qPrintable(QStringLiteral("shot corpus profile title(s) with NO matching "
+                     "KB entry — add a KB entry/alias, or if genuinely intentional mark the "
+                     "fixture \"kbResolvable\": false in manifest.json:\n  ")
+                     + unresolved.join(QStringLiteral("\n  "))));
+        // Sanity floor: confirm the exclusion filters above did not eat the
+        // whole corpus silently (e.g. a profile_title field rename).
+        QVERIFY2(checked >= 10 && resolved == checked,
+                 qPrintable(QStringLiteral("only checked %1 / resolved %2 shot-corpus "
+                     "titles — expected >= 10 checked, all resolved")
+                     .arg(checked).arg(resolved)));
+    }
+
+    // -------------------------------------------------------------------
+    // restructure-kb-as-validated-json task 5.3: fact-value parity as a
+    // frozen-baseline regression guard. The literal pre-migration markdown
+    // source (resources/ai/profile_knowledge.md) no longer exists in the
+    // repo (task 6.1e deleted it), so a live pre/post diff is impossible
+    // now — this instead PINS the currently-resolved UGS/inferred/
+    // analysisFlags facts for a representative profile set as one
+    // consolidated table, so a future KB edit that silently drifts one of
+    // them fails loudly here. Deliberately does NOT re-pin exact band
+    // axis/lo/hi values — those are already the exclusive, precisely-pinned
+    // concern of expertBand_allShippedRows_seedCoverage (bands present) and
+    // expertBand_staleKbId_freshTitleResolutionRecoversBand (D-Flow /
+    // default's no-band case); duplicating those numbers here would create
+    // a second, driftable "known-good" set for the same facts. This table
+    // only asserts band *presence* (has/hasn't a cited band), which those
+    // band-value tests don't independently guarantee stays in sync with
+    // UGS/flags drift.
+    // -------------------------------------------------------------------
+    void factValueParity_frozenBaselineForRepresentativeProfiles()
+    {
+        struct Row {
+            QString title, editor;
+            double ugs; bool ugsInferred;
+            QStringList analysisFlags;
+            bool hasBand;
+        };
+        const QVector<Row> rows = {
+            // D-Flow / default: base section, no band (matches
+            // expertBand_staleKbId_freshTitleResolutionRecoversBand's
+            // "D-Flow / default has no cited band" assertion).
+            { "D-Flow / default", "dflow", 0.5, false, { "flow_trend_ok" }, false },
+            // D-Flow / Q ≡ Damian's Q (structural zero-dup).
+            { "D-Flow / Q", "dflow", 1.0, true, { "flow_trend_ok" }, true },
+            // D-Flow / La Pavoni: strictly coarser than base (1.0 > 0.5).
+            { "D-Flow / La Pavoni", "dflow", 1.0, true, { "flow_trend_ok" }, true },
+            // Damian's LRv2 IS the Londonium profile (byte-identical frames)
+            // and resolves to `londinium`, band and all. LRv3 is genuinely
+            // different (eight frames, 90C, 9-bar hold) and keeps its own
+            // band-free section. Same UGS, opposite band answers — which is
+            // the point of listing both rows.
+            { "Damian's LRv2", "dflow", 0.0, false, { "flow_trend_ok" }, true },
+            { "Damian's LRv3", "dflow", 0.0, false, { "flow_trend_ok" }, false },
+            // A-Flow / default-medium: cited band, matches
+            // expertBand_aflow_resolvesFromTitle.
+            { "A-Flow / default-medium", "aflow", 1.5, false, { "flow_trend_ok" }, true },
+            // Londinium: matches expertBand_londinium_resolvesAndDoesNotCatchDamianLRv3.
+            { "Londinium", "advanced", 0.0, false, { "flow_trend_ok" }, true },
+            // Adaptive v2: matches expertBand_adaptiveV2_resolvesAndDoesNotCatchGagne.
+            { "Adaptive v2", "advanced", 1.25, false, {}, true },
+            // Rao Allongé: one-sided flow floor, matches
+            // expertBand_allonge_resolvesAsOneSidedFlowFloor.
+            { "Rao Allongé", "advanced", 8.0, false,
+              { "channeling_expected", "grind_check_skip" }, true },
+        };
+
+        for (const Row& row : rows) {
+            const QString kbId = ShotSummarizer::computeProfileKbId(row.title, row.editor);
+            QVERIFY2(!kbId.isEmpty(), qPrintable(row.title + QStringLiteral(" must resolve")));
+
+            QVERIFY2(qFuzzyIsNull(ShotSummarizer::ugsForKbId(kbId) - row.ugs),
+                     qPrintable(QStringLiteral("%1: ugs drifted, expected %2 got %3")
+                         .arg(row.title).arg(row.ugs).arg(ShotSummarizer::ugsForKbId(kbId))));
+            QCOMPARE(ShotSummarizer::ugsInferredForKbId(kbId), row.ugsInferred);
+
+            const QStringList flags = ShotSummarizer::getAnalysisFlags(kbId);
+            QCOMPARE(flags.size(), row.analysisFlags.size());
+            for (const QString& f : row.analysisFlags)
+                QVERIFY2(flags.contains(f),
+                         qPrintable(QStringLiteral("%1: analysisFlags missing %2")
+                             .arg(row.title, f)));
+
+            QCOMPARE(ShotSummarizer::expertBandForKbId(kbId).has_value(), row.hasBand);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // restructure-kb-as-validated-json task 5.4: the assembled LLM-facing
+    // blob for a profile with a cited expertBand carries the band claim
+    // rendered from the struct EXACTLY once. Mirrors the real assembly
+    // split (shotAnalysisSystemPrompt's "## Current Profile Knowledge"
+    // section emits the raw KB `prose`; buildUserPrompt/
+    // renderShotAnalysisProse's "## Detector Observations" section emits
+    // ShotAnalysis::analyzeShot's struct-rendered band-deviation sentence,
+    // which only fires when the shot's actual peak/flow falls outside the
+    // band): concatenating both halves — the way the real advisor turn
+    // does — must not contain two copies of the same band claim (D9: prose
+    // numbers are commentary, the struct is the sole source of the cited
+    // band). Uses A-Flow (cited provenance, no `proseRestatesBand`
+    // acknowledgement needed — its prose narrates "9–10 bar" as the
+    // profile's own ramp-target commentary, distinct from the struct's
+    // "6.0–9.0 band" formatted clause) rather than the D-Flow/Q example
+    // named in the task description, whose prose is a REVIEWED, ACKED
+    // near-verbatim restatement (see its expertBand.proseRestatesBand) —
+    // deliberately picking the profile whose prose does NOT already
+    // license restating the bound keeps this test unambiguous about what
+    // "duplicate" means.
+    // -------------------------------------------------------------------
+    void assembledBlob_bandRenderedOnceFromStruct_notDuplicatedInProse()
+    {
+
+        const QString kbId = ShotSummarizer::computeProfileKbId(
+            QStringLiteral("A-Flow / default-medium"), QStringLiteral("aflow"));
+        QVERIFY(!kbId.isEmpty());
+
+        const auto band = ShotSummarizer::expertBandForKbId(kbId);
+        QVERIFY2(band.has_value(), "A-Flow must carry a cited expertBand for this test");
+        QCOMPARE(band->axis, ExpertBand::Axis::PressurePeak);
+        QVERIFY(band->lo.has_value() && band->hi.has_value());
+        QCOMPARE(*band->lo, 6.0);
+        QCOMPARE(*band->hi, 9.0);
+
+        const QString prose = ShotSummarizer::profileKnowledgeForKbId(kbId);
+        QVERIFY2(!prose.isEmpty(), "A-Flow KB prose must be present");
+
+        // ShotCurveFixtures::bandFixture (shared with tst_shotanalysis.cpp):
+        // a clean shot (no channeling, no truncation, flow tracking goal)
+        // whose pressure peak (10 bar) sits outside the 6.0-9.0 band by more
+        // than EXPERT_BAND_PRESSURE_MARGIN_BAR (0.3), isolating the
+        // band-deviation line with no other detector confounding it.
+        QList<HistoryPhaseMarker> phases;
+        QVector<QPointF> pressure, flow, weight, dCdt, pressureGoal, flowGoal;
+        ShotCurveFixtures::bandFixture(/*peakBar=*/10.0, phases, pressure, flow, weight,
+                                        dCdt, pressureGoal, flowGoal);
+
+        const auto result = ShotAnalysis::analyzeShot(
+            pressure, flow, weight, dCdt, phases,
+            QStringLiteral("espresso"), 30.0, pressureGoal, flowGoal,
+            ShotSummarizer::getAnalysisFlags(kbId),
+            -1.0, 36.0, 36.0, -1, band, /*profileKbResolved=*/true);
+
+        QString deviationLine;
+        for (const QVariant& v : result.lines) {
+            const QVariantMap m = v.toMap();
+            if (m.value(QStringLiteral("kind")).toString() == QStringLiteral("expert_band_deviation")) {
+                deviationLine = m.value(QStringLiteral("text")).toString();
+                break;
+            }
+        }
+        QVERIFY2(!deviationLine.isEmpty(),
+                 "expected the struct-rendered expert_band_deviation line to fire "
+                 "for a 10 bar peak vs the 6.0-9.0 A-Flow band");
+        QVERIFY2(deviationLine.contains(QStringLiteral("outside"))
+                     && deviationLine.contains(QStringLiteral("judge by taste")),
+                 qPrintable(deviationLine));
+
+        // Assemble the blob the way the real advisor turn does: the KB
+        // prose (system-prompt "## Current Profile Knowledge" section)
+        // followed by the detector observation (user-prompt "## Detector
+        // Observations" section).
+        const QString blob = prose + QStringLiteral("\n\n") + deviationLine;
+
+        QVERIFY2(!blob.isEmpty(), "assembled blob must be non-empty");
+        QVERIFY2(blob.contains(deviationLine),
+                 "assembled blob must carry the struct-rendered band sentence");
+
+        // The exact struct-formatted clause (matches the %1–%2 formatting
+        // in ShotAnalysis::analyzeShot's expert-band block: fixed one
+        // decimal, en-dash, the word "band") — this precise substring is
+        // what a duplicate-copy regression (D9: a `prose` line hand-
+        // authored to restate the band) would double up. It must appear
+        // in the blob exactly once, contributed solely by the struct-
+        // rendered line, never a second time from raw prose text.
+        const QString bandClause = QStringLiteral("%1–%2 band")
+            .arg(*band->lo, 0, 'f', 1).arg(*band->hi, 0, 'f', 1);
+        QCOMPARE(blob.count(bandClause), 1);
+        // And confirm prose alone (without the struct line) does NOT
+        // already contain it — otherwise the count-of-1 above would be
+        // vacuously true for the wrong reason (both halves contributing
+        // zero, or prose alone already carrying it once and the struct
+        // line's copy pushing it to 2, which the QCOMPARE above would
+        // have already caught, but this isolates *which* half the one
+        // occurrence came from).
+        QCOMPARE(prose.count(bandClause), 0);
+    }
+
+    // restructure-kb-as-validated-json: the resolver's CENTRAL safety
+    // property — an UNKNOWN input is a strict no-op across every consumer
+    // (the order-dependent greedy startsWith/contains fallback is deleted
+    // and must stay dead). Success paths are covered above; this is the
+    // only test pinning the negative branch, so a future re-introduced
+    // fuzzy fallback or default-entry leak fails loudly here.
+    void resolver_unknownInput_isStrictNoOpAcrossConsumers()
+    {
+        const QString junk = QStringLiteral("no-such-profile-xyz-9000");
+        const QString editor = QStringLiteral("advanced");  // not dflow/aflow
+        QVERIFY(ShotSummarizer::computeProfileKbId(junk, editor).isEmpty());
+        QVERIFY(ShotSummarizer::getAnalysisFlags(junk).isEmpty());
+        QVERIFY(qIsNaN(ShotSummarizer::ugsForKbId(junk)));
+        QVERIFY(!ShotSummarizer::ugsInferredForKbId(junk));
+        QVERIFY(ShotSummarizer::canonicalNameForKbId(junk).isEmpty());
+        QVERIFY(!ShotSummarizer::expertBandForKbId(junk).has_value());
+        QVERIFY(ShotSummarizer::profileKnowledgeForKbId(junk).isEmpty());
+    }
+    // =====================================================================
+    // Bean Base snapshot: advisor remap + DB round-trip (review follow-up)
+    // =====================================================================
+
+    // The blob-key -> advisor-key remap IS the advisor contract: a silent
+    // rename upstream would empty currentBean.beanBase with no failure
+    // anywhere (the builder omits empty values by design). Pin it.
+    void beanBaseBlockRemapsBlobKeys()
+    {
+        DialingBlocks::CurrentBeanBlockInputs in;
+        in.identity.beanBrand = "Prodigal Coffee";
+        in.identity.beanType = "Milk Blend";
+        in.beanBaseJson = QStringLiteral(
+            "{\"id\":\"abc-123\",\"tastingNotes\":\"Orange, Honeycomb\","
+            "\"degree\":\"Light To Medium-light\",\"beanType\":\"Espresso\","
+            "\"origin\":\"Brazil, Colombia\",\"process\":\"Natural\","
+            "\"elevation\":\"1100-1200 m\","
+            "\"minElevationM\":1100,\"maxElevationM\":1200}");
+
+        const QJsonObject bean = DialingBlocks::buildCurrentBeanBlock(in);
+        QVERIFY(bean.contains("beanBase"));
+        const QJsonObject bb = bean["beanBase"].toObject();
+        QCOMPARE(bb["roasterTastingNotes"].toString(), QString("Orange, Honeycomb"));
+        QCOMPARE(bb["roastLevel"].toString(), QString("Light To Medium-light"));
+        QCOMPARE(bb["roastedFor"].toString(), QString("Espresso"));
+        QCOMPARE(bb["origin"].toString(), QString("Brazil, Colombia"));
+        QCOMPARE(bb["process"].toString(), QString("Natural"));
+        QCOMPARE(bb["elevation"].toString(), QString("1100-1200 m"));
+        QCOMPARE(bb["minElevationM"].toInt(), 1100);
+        QCOMPARE(bb["maxElevationM"].toInt(), 1200);
+    }
+
+    void beanBaseBlockOmittedWhenEmptyOrGarbage()
+    {
+        DialingBlocks::CurrentBeanBlockInputs in;
+        in.identity.beanBrand = "X";
+        QVERIFY(!DialingBlocks::buildCurrentBeanBlock(in).contains("beanBase"));
+        in.beanBaseJson = "not json";
+        QVERIFY(!DialingBlocks::buildCurrentBeanBlock(in).contains("beanBase"));
+        in.beanBaseJson = "{\"tastingNotes\":\"\",\"minElevationM\":0}";
+        QVERIFY(!DialingBlocks::buildCurrentBeanBlock(in).contains("beanBase"));
+    }
+
+    // add-basket-equipment: this helper produces the currentBean.basket payload
+    // for BOTH dialing_get_context (MCP) and the in-app advisor, so it is the
+    // single point that proves basket info reaches the AI. Identity + registry-
+    // derived specs when present; omitted when absent; identity-only for a custom
+    // (off-registry) basket — never fabricated specs.
+    void basketBlockEmitsIdentityAndDerivedSpecs()
+    {
+        DialingBlocks::CurrentBeanBlockInputs in;
+        in.identity.beanBrand = "Saka";
+        // No basket -> no sub-object.
+        QVERIFY(!DialingBlocks::buildCurrentBeanBlock(in).contains("basket"));
+
+        // Registry basket -> identity + derived specs (human-readable strings).
+        in.identity.basketBrand = "Weber Workshops";
+        in.identity.basketModel = "20g Unibasket";
+        const QJsonObject bean = DialingBlocks::buildCurrentBeanBlock(in);
+        QVERIFY(bean.contains("basket"));
+        const QJsonObject b = bean["basket"].toObject();
+        QCOMPARE(b["brand"].toString(), QString("Weber Workshops"));
+        QCOMPARE(b["model"].toString(), QString("20g Unibasket"));
+        QCOMPARE(b["wallProfile"].toString(), QString("straight"));
+        QCOMPARE(b["relativeFlow"].toString(), QString("open"));  // the key cross-basket signal
+        QCOMPARE(b["precision"].toBool(), true);
+        QVERIFY(b.contains("doseRangeG"));
+        QCOMPARE(b["doseRangeG"].toObject()["max"].toDouble(), 21.0);
+
+        // Custom (off-registry) basket -> identity only, derived specs omitted.
+        in.identity.basketBrand = "Acme";
+        in.identity.basketModel = "Mystery Basket";
+        const QJsonObject custom = DialingBlocks::buildCurrentBeanBlock(in)["basket"].toObject();
+        QCOMPARE(custom["brand"].toString(), QString("Acme"));
+        QVERIFY(!custom.contains("wallProfile"));
+        QVERIFY(!custom.contains("relativeFlow"));
+        QVERIFY(!custom.contains("doseRangeG"));
+    }
+
+    // add-puckprep-equipment: the puckPrep sub-object carries the set flags + the
+    // derived distribution rollup the advisor branches channeling guidance on;
+    // omitted when the package has no puck prep.
+    void puckPrepBlockEmitsFlagsAndDistribution()
+    {
+        DialingBlocks::CurrentBeanBlockInputs in;
+        in.identity.beanBrand = "Saka";
+        // No puck prep -> no sub-object.
+        QVERIFY(!DialingBlocks::buildCurrentBeanBlock(in).contains("puckPrep"));
+
+        // Canonical flag string -> flags + derived distribution.
+        in.identity.puckPrep = "shaker,wdt";
+        const QJsonObject bean = DialingBlocks::buildCurrentBeanBlock(in);
+        QVERIFY(bean.contains("puckPrep"));
+        const QJsonObject p = bean["puckPrep"].toObject();
+        QCOMPARE(p["wdt"].toBool(), true);
+        QCOMPARE(p["shaker"].toBool(), true);
+        QCOMPARE(p["puckScreen"].toBool(), false);
+        QCOMPARE(p["paperFilter"].toBool(), false);
+        QCOMPARE(p["rdt"].toBool(), false);
+        QCOMPARE(p["distribution"].toString(), QString("thorough"));
+
+        // Shaker alone is ALSO thorough — equal weight with WDT, not ranked below it.
+        in.identity.puckPrep = "shaker";
+        QCOMPARE(DialingBlocks::buildCurrentBeanBlock(in)["puckPrep"].toObject()["distribution"].toString(),
+                 QString("thorough"));
+        // A non-distribution flag alone → none; RDT alone (anti-static) → light.
+        in.identity.puckPrep = "puckScreen";
+        QCOMPARE(DialingBlocks::buildCurrentBeanBlock(in)["puckPrep"].toObject()["distribution"].toString(),
+                 QString("none"));
+        in.identity.puckPrep = "rdt";
+        QCOMPARE(DialingBlocks::buildCurrentBeanBlock(in)["puckPrep"].toObject()["distribution"].toString(),
+                 QString("light"));
+    }
+
+    // beanbase_json is read by POSITIONAL index in loadShotRecordStatic — a
+    // future column inserted mid-SELECT would silently shift the read and
+    // every consumer would treat the garbage as "unlinked". Round-trip via
+    // the production write path (updateShotMetadataStatic) pins the index,
+    // the sparse-emit contract, the ""-clears contract, and partial-update
+    // preservation in one go.
+    void beanBaseJsonDbRoundTripAndClear()
+    {
+        const QString dbPath = freshDbPath();
+        initAndClose(dbPath);
+
+        const QString blob = QStringLiteral(
+            "{\"id\":\"abc-123\",\"visualizerCanonicalId\":\"abc-123\","
+            "\"roasterName\":\"Prodigal Coffee\",\"origin\":\"Colombia\"}");
+
+        withRawDb(dbPath, "beanbase_roundtrip", [&](QSqlDatabase& db) {
+            const qint64 id = insertShot(db, ShotRow{
+                .uuid = "uuid-bb", .timestamp = QDateTime::currentSecsSinceEpoch(),
+                .profileName = "D-Flow", .profileKbId = "kb-dflow",
+                .duration = 28.0, .finalWeight = 36.0, .doseWeight = 18.0,
+                .grinderSetting = "5.0", .enjoyment = 0
+            });
+            QVERIFY(id > 0);
+
+            // Unlinked: empty field, sparse-emit omits the key.
+            ShotRecord rec = ShotHistoryStorage::loadShotRecordStatic(db, id);
+            QCOMPARE(rec.beanBaseJson, QString());
+            QVERIFY(!projectionForShot(db, id).toVariantMap().contains("beanBaseJson"));
+
+            // Link via the production edit path; byte-identical round-trip.
+            QVERIFY(ShotHistoryStorage::updateShotMetadataStatic(
+                db, id, {{"beanBaseJson", blob}}));
+            rec = ShotHistoryStorage::loadShotRecordStatic(db, id);
+            QCOMPARE(rec.beanBaseJson, blob);
+            QCOMPARE(projectionForShot(db, id).toVariantMap()
+                         .value("beanBaseJson").toString(), blob);
+
+            // Partial update of an unrelated field preserves the snapshot.
+            QVERIFY(ShotHistoryStorage::updateShotMetadataStatic(
+                db, id, {{"enjoyment", 80}}));
+            rec = ShotHistoryStorage::loadShotRecordStatic(db, id);
+            QCOMPARE(rec.beanBaseJson, blob);
+
+            // "" clears (the unlink-in-edit-mode / MCP {} contract).
+            QVERIFY(ShotHistoryStorage::updateShotMetadataStatic(
+                db, id, {{"beanBaseJson", QString()}}));
+            rec = ShotHistoryStorage::loadShotRecordStatic(db, id);
+            QCOMPARE(rec.beanBaseJson, QString());
+            QVERIFY(!projectionForShot(db, id).toVariantMap().contains("beanBaseJson"));
+        });
+    }
+    // ==========================================
+    // Grind step derivation and the distinct-value getters
+    // ==========================================
+    //
+    // Not migration tests — nothing here touches the schema. They live in this
+    // binary because it already owns a DB fixture that COPIES a prebuilt schema
+    // template per test instead of re-running the migration chain, and because
+    // queryGrinderContext's stepSize coverage is already here. Adding a target
+    // for them would have cost a whole compile+link on every build to buy
+    // nothing but a filename.
+
+    // Seed `count` settings stepping by 0.25 on one grinder, so deriveGrindStep's
+    // smallest-repeated-gap is unambiguously 0.25.
+    void seedQuarterStepHistory(const QString& path, const QString& model, int count) {
+        withRawDb(path, "seed_" + model + QString::number(count), [&](QSqlDatabase& db) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            for (int i = 0; i < count; ++i) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-%1-%2").arg(model).arg(i);
+                r.timestamp = now - i * 3600;
+                r.profileName = QStringLiteral("p");
+                r.grinderBrand = QStringLiteral("Niche");
+                r.grinderModel = model;
+                r.grinderSetting = QString::number(7.5 + 0.25 * i);
+                QVERIFY(insertShot(db, r) > 0);
+            }
+        });
+    }
+
+    // ==========================================
+    // Grind step derivation and the distinct-value getters.
+    //
+    // NOT migration tests — nothing below touches the schema. They live here
+    // because this file already owns the DB fixtures and links decenza_shotlib,
+    // and a separate target for nine tests would cost a build target to buy
+    // nothing but a better filename.
+    // ==========================================
+
+    // THE regression test for this change. The step derived correctly as 0.25 and
+    // was then lost: it lived behind a distinct-cache key, an invalidation cleared
+    // that key, and the re-fetch racing the next refresh was discarded in silence.
+    // The widget sat on its 1.0 fallback for the rest of the session while the AI
+    // payload still reported 0.25 for the same grinder.
+    //
+    // The trigger was a data change — every shot save wiped the cache. So that is
+    // what this drives: derive, write a shot that MOVES the answer, derive again.
+    //
+    // The write must change the derived step, not just add a row. An earlier
+    // version of this test inserted a setting already on the seeded lattice, so
+    // SELECT DISTINCT returned byte-identical rows and the second assertion could
+    // not fail unless the first did — it was a copy of its own first half. Here
+    // the history starts on a 0.5 lattice and the new shot introduces the first
+    // repeated 0.25 gap, so a reader that did not see the write answers 0.5.
+    void grindStepSurvivesDataChange() {
+        QString path = freshDbPath();
+        initAndClose(path);
+
+        // 6.0, 6.5, 7.0, 7.5 — smallest repeated gap is 0.5.
+        withRawDb(path, "step_seed_half", [](QSqlDatabase& db) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            for (int i = 0; i < 4; ++i) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-half-%1").arg(i);
+                r.timestamp = now - i * 60;
+                r.profileName = QStringLiteral("p");
+                r.grinderBrand = QStringLiteral("Niche");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = QString::number(6.0 + 0.5 * i);
+                QVERIFY(insertShot(db, r) > 0);
+            }
+        });
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        QCOMPARE(s.grindStepForGrinder("Zero"), 0.5);
+
+        // 6.25 and 6.75 introduce two 0.25 gaps — the smallest repeated gap moves.
+        withRawDb(path, "step_after_write", [](QSqlDatabase& db) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            const char* settings[] = { "6.25", "6.75" };
+            for (int i = 0; i < 2; ++i) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-after-write-%1").arg(i);
+                r.timestamp = now + 1 + i;
+                r.profileName = QStringLiteral("p");
+                r.grinderBrand = QStringLiteral("Niche");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = QString::fromLatin1(settings[i]);
+                QVERIFY(insertShot(db, r) > 0);
+            }
+        });
+        QCOMPARE(s.grindStepForGrinder("Zero"), 0.25);
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // The getters read the database, so a write is visible to the very next call
+    // with no signal in between. Before this change they returned a cached list
+    // and the new value appeared only once an async refresh had landed — and for
+    // composite keys like this one, often never.
+    void distinctSettingsSeeWritesImmediately() {
+        QString path = freshDbPath();
+        initAndClose(path);
+        seedQuarterStepHistory(path, QStringLiteral("Zero"), 6);
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        const qsizetype before = s.getDistinctGrinderSettingsForGrinder("Zero").size();
+        QVERIFY(before > 0);
+
+        withRawDb(path, "distinct_after_write", [](QSqlDatabase& db) {
+            ShotRow r;
+            r.uuid = QStringLiteral("uuid-distinct-new");
+            r.timestamp = QDateTime::currentSecsSinceEpoch() + 1;
+            r.profileName = QStringLiteral("p");
+            r.grinderBrand = QStringLiteral("Niche");
+            r.grinderModel = QStringLiteral("Zero");
+            r.grinderSetting = QStringLiteral("42.5");   // not on the seeded lattice
+            QVERIFY(insertShot(db, r) > 0);
+        });
+
+        const QStringList after = s.getDistinctGrinderSettingsForGrinder("Zero");
+        QCOMPARE(after.size(), before + 1);
+        QVERIFY2(after.contains("42.5"), "a live getter must see a write immediately");
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // One distinct setting defines no step. 0 means "cannot derive" and the caller
+    // substitutes its own fallback — it is NOT a step of zero.
+    // Seeds a SECOND grinder that does derive, deliberately. 0.0 is this
+    // function's universal failure value — not-ready, query-failed and thin
+    // history all return it — so asserting only `Solo == 0` would pass just as
+    // well against a completely broken query path. Asserting Zero == 0.25 in the
+    // same database proves the query works, which is what makes Solo's 0 mean
+    // "one sample defines no step".
+    void grindStepThinHistoryReturnsZero() {
+        QString path = freshDbPath();
+        initAndClose(path);
+        seedQuarterStepHistory(path, QStringLiteral("Solo"), 1);
+        seedQuarterStepHistory(path, QStringLiteral("Zero"), 6);
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        QCOMPARE(s.grindStepForGrinder("Zero"), 0.25);   // the query works
+        QCOMPARE(s.grindStepForGrinder("Solo"), 0.0);    // ...and one sample still yields 0
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // Same grinder, differently typed. NOT a regression test — main folded here
+    // too (both its cached getter and its derivation used LOWER(TRIM())). This is
+    // a forward guard on the now-shared grinderModelMatchSql(): an exact compare
+    // would read a differently-cased model back as a grinder with no history,
+    // which is invisible because empty is indistinguishable from new.
+    void grindStepFoldsModelCaseAndWhitespace() {
+        QString path = freshDbPath();
+        initAndClose(path);
+        seedQuarterStepHistory(path, QStringLiteral("Zero"), 28);
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        QCOMPARE(s.grindStepForGrinder("  zero  "), 0.25);
+        QCOMPARE(s.grindStepForGrinder("ZERO"), 0.25);
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // An empty model means "no grinder selected" and must derive from the full
+    // cross-grinder history — the ShotServer /beans form depends on it, since a new
+    // bag has no equipment chosen yet.
+    void grindStepEmptyModelUsesFullHistory() {
+        QString path = freshDbPath();
+        initAndClose(path);
+        seedQuarterStepHistory(path, QStringLiteral("Zero"), 28);
+
+        // Shots with NO equipment row at all, stepping by 0.1. Only a query that
+        // drops the equipment join can see these, so without them the test cannot
+        // tell an all-grinders pass from a per-grinder one.
+        withRawDb(path, "no_equipment", [](QSqlDatabase& db) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            for (int i = 0; i < 6; ++i) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-bare-%1").arg(i);
+                r.timestamp = now - i * 60;
+                r.profileName = QStringLiteral("p");
+                // No grinder brand/model/burrs => insertShot leaves equipment_id NULL.
+                r.grinderSetting = QString::number(2.0 + 0.1 * i);
+                QVERIFY(insertShot(db, r) > 0);
+            }
+        });
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        // 0.1 is the smallest repeated gap across the full history, reachable only
+        // if equipment-less shots are included.
+        QCOMPARE(s.grindStepForGrinder(""), 0.1);
+        // The per-grinder answer is unchanged.
+        QCOMPARE(s.grindStepForGrinder("Zero"), 0.25);
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // grindRpmStepForGrinder had NO coverage at all while this change rewrote both
+    // it and its helper. It returns the same 0.0 sentinel for "no grinder", "not
+    // ready" and "query failed", and the caller silently substitutes a 50 RPM
+    // default — the same shape as the bug this PR fixes, on the RPM wheel.
+    void grindRpmStepDerivesFromHistory() {
+        QString path = freshDbPath();
+        initAndClose(path);
+
+        // 800, 900, 1000, 1100 — smallest repeated gap is 100.
+        withRawDb(path, "rpm_seed", [](QSqlDatabase& db) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            for (int i = 0; i < 4; ++i) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-rpm-%1").arg(i);
+                r.timestamp = now - i * 60;
+                r.profileName = QStringLiteral("p");
+                r.grinderBrand = QStringLiteral("Mahlkonig");
+                r.grinderModel = QStringLiteral("E80");
+                r.grinderSetting = QString::number(3.0 + i);
+                r.rpm = 800 + 100 * i;
+                QVERIFY(insertShot(db, r) > 0);
+            }
+        });
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        QCOMPARE(s.grindRpmStepForGrinder("E80"), 100.0);
+        // Folded like its settings twin — both go through grinderModelMatchSql().
+        QCOMPARE(s.grindRpmStepForGrinder("  e80  "), 100.0);
+        // An empty model has no meaningful RPM history to pool: the documented
+        // precondition of grinderWideRpmStep, guarded at the call site.
+        QCOMPARE(s.grindRpmStepForGrinder(""), 0.0);
+        // A grinder with no recorded RPMs at all.
+        QCOMPARE(s.grindRpmStepForGrinder("Zero"), 0.0);
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // The SQL orders lexicographically, so "10" sorts before "9". sortGrinderSettings()
+    // re-sorts numerically, and GrindRowSource pushes this list onto the wheel IN
+    // LIST ORDER — so the ordering is directly user-visible. Nothing asserted it:
+    // deleting the sortGrinderSettings() call left the whole suite green.
+    void distinctSettingsAreSortedNumerically() {
+        QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, "sort_seed", [](QSqlDatabase& db) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            const char* settings[] = { "9", "10", "11", "2" };
+            for (int i = 0; i < 4; ++i) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-sort-%1").arg(i);
+                r.timestamp = now - i * 60;
+                r.profileName = QStringLiteral("p");
+                r.grinderBrand = QStringLiteral("Niche");
+                r.grinderModel = QStringLiteral("Zero");
+                r.grinderSetting = QString::fromLatin1(settings[i]);
+                QVERIFY(insertShot(db, r) > 0);
+            }
+        });
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        const QStringList got = s.getDistinctGrinderSettingsForGrinder("Zero");
+        QCOMPARE(got, QStringList({ "2", "9", "10", "11" }));
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // getDistinctGrinderBurrsForModel binds brand and model POSITIONALLY. A
+    // transposition returns an empty list, which is indistinguishable from "no
+    // burrs recorded" — silent, and the only getter with two positional binds.
+    void distinctBurrsBindBrandAndModelInOrder() {
+        QString path = freshDbPath();
+        initAndClose(path);
+        withRawDb(path, "burrs_seed", [](QSqlDatabase& db) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            // Two models under ONE brand, so a swapped bind cannot accidentally match.
+            const char* models[] = { "Zero", "Duo" };
+            const char* burrs[]  = { "Steel", "Ceramic" };
+            for (int i = 0; i < 2; ++i) {
+                ShotRow r;
+                r.uuid = QStringLiteral("uuid-burrs-%1").arg(i);
+                r.timestamp = now - i * 60;
+                r.profileName = QStringLiteral("p");
+                r.grinderBrand = QStringLiteral("Niche");
+                r.grinderModel = QString::fromLatin1(models[i]);
+                r.grinderBurrs = QString::fromLatin1(burrs[i]);
+                r.grinderSetting = QStringLiteral("5");
+                QVERIFY(insertShot(db, r) > 0);
+            }
+        });
+
+        ShotHistoryStorage s;
+        QVERIFY(s.initialize(path));
+        QCOMPARE(s.getDistinctGrinderBurrsForModel("Niche", "Zero"), QStringList({ "Steel" }));
+        QCOMPARE(s.getDistinctGrinderBurrsForModel("Niche", "Duo"),  QStringList({ "Ceramic" }));
+        s.close();
+        QTRY_VERIFY(s.isDbWorkIdle());
+    }
+
+    // ---- Equipment-scope invariant ---------------------------------------
+    //
+    // ONE assertion for a whole class of defect, replacing the per-bug
+    // regression test each round of this work has otherwise produced.
+    //
+    // The premise, measured from real history: on one grinder with one set of
+    // burrs and identical puck prep, a Decent 18g Ridged basket dials in at
+    // 8-10 while a Graph stepped 58->46mm basket dials in at 15-17.5. The
+    // distributions do not overlap; five whole steps separate them. So any
+    // ADVICE-scoped selection that pools the two publishes a number the user
+    // cannot dial in -- with a large, reassuring sample behind it.
+    //
+    // The invariant: for a shot on package B, the five advice-scoped selections
+    // below return package-B rows only, asserted together so a new one is covered
+    // by extending the list rather than by discovering the bug again.
+    //
+    // There is no second shot list to cover any more: the in-app advisor used to
+    // build its own (loadQualifiedShots, file-static in aimanager.cpp and
+    // unreachable from here) and now reaches these same selections through
+    // buildAdvisorContextBlocks.
+    //
+    // adviceScope_stepSizeStaysGrinderWide() pins the OTHER side of the
+    // boundary, and is not optional: grind step size must stay grinder-wide to
+    // agree with the Grind quick-select widget's grindStepForGrinder(). Without
+    // it, "scope everything by package" reads as the fix and silently breaks
+    // that agreement.
+
+private:
+    // Seed one grinder + two baskets. Returns the resolved shot id on the
+    // Graph package (the minority basket -- the one a pooled median buries).
+    struct ScopeFixture {
+        qint64 graphShotId = 0;
+        QSet<QString> decentSettings;   // must never surface for a Graph shot
+        QSet<QString> graphSettings;
+    };
+
+    // Out-param rather than a return value: QVERIFY expands to a bare `return;`,
+    // which does not compile in a function with a non-void return type.
+    void seedTwoBaskets(QSqlDatabase& db, const QString& kbId, ScopeFixture& f)
+    {
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+
+        auto base = [&](const char* setting, int dayAgo, double dur) {
+            ShotRow r;
+            r.timestamp      = now - qint64(dayAgo) * kSecPerDay;
+            r.profileName    = QStringLiteral("D-Flow / Q");
+            r.profileKbId    = kbId;
+            r.beanBrand      = QStringLiteral("Sweet Bloom Coffee");
+            r.beanType       = QStringLiteral("Hometown Blend");
+            r.grinderBrand   = QStringLiteral("Niche");
+            r.grinderModel   = QStringLiteral("Zero");
+            r.grinderBurrs   = QStringLiteral("63mm Mazzer Kony conical");
+            r.grinderSetting = QString::fromLatin1(setting);
+            r.duration       = dur;
+            r.enjoyment      = 0;
+            return r;
+        };
+
+        // Package A -- Decent 18g Ridged. Fine settings, normal times.
+        // 9.5/9.75/10 give a REPEATED 0.25 gap; the Graph rows below never do.
+        // That is what lets the step-size test tell grinder-wide from
+        // package-scoped apart, so do not "tidy" these values.
+        for (auto [setting, day, dur] : { std::tuple{"8",    14, 31.2},
+                                          std::tuple{"8.5",  13, 30.4},
+                                          std::tuple{"9.5",  12, 28.5},
+                                          std::tuple{"9.75", 11, 29.2},
+                                          std::tuple{"10",   10, 28.9},
+                                          std::tuple{"10",    9, 27.9} }) {
+            ShotRow r = base(setting, day, dur);
+            r.basketBrand = QStringLiteral("Decent");
+            r.basketModel = QStringLiteral("18g Ridged");
+            r.enjoyment   = 70;   // the best-rated shot in the DB is a DECENT one
+            QVERIFY(insertShot(db, r) > 0);
+            f.decentSettings.insert(r.grinderSetting);
+        }
+
+        // Package B -- Graph stepped 58->46mm. Same grinder, same burrs, same
+        // bean, same profile. Coarser settings AND longer times: the restriction
+        // is the basket, not the grind.
+        for (auto [setting, day, dur] : { std::tuple{"15",   8, 52.1},
+                                          std::tuple{"16",   7, 52.3},
+                                          std::tuple{"16.5", 6, 58.3},
+                                          std::tuple{"17",   5, 34.8} }) {
+            ShotRow r = base(setting, day, dur);
+            r.basketBrand = QStringLiteral("Graph Coffee");
+            r.basketModel = QStringLiteral("Stepped 58-46mm");
+            r.enjoyment   = 43;   // strictly worse than every Decent shot
+            const qint64 id = insertShot(db, r);
+            QVERIFY(id > 0);
+            f.graphShotId = id;
+            f.graphSettings.insert(r.grinderSetting);
+        }
+    }
+
+    // Collect every grind SETTING a JSON value mentions, at any depth.
+    //
+    // Keyed on the key NAME containing "setting" rather than on a list of known
+    // keys, because the builders do not agree on one: the blocks say
+    // `grinderSetting`, grinderContext says `settingsObserved`,
+    // `observedMinSetting`, `observedMaxSetting` and `allBeansSettings`. A
+    // hardcoded list is how this check silently stops covering a builder that
+    // renames or adds a field -- the first version of this test scanned only
+    // `grinderSetting` and reported grinderContext as clean because it never
+    // looked at it. The rule deliberately does NOT match `stepSize` /
+    // `rpmStepSize` / `rpmsObserved`: a step is not a setting, and pooling it is
+    // correct (see adviceScope_stepSizeStaysGrinderWide).
+    static void collectSettings(const QJsonValue& v, QSet<QString>& out)
+    {
+        auto harvest = [&out](const QJsonValue& leaf) {
+            if (leaf.isString())
+                out.insert(leaf.toString());
+            else if (leaf.isDouble())
+                out.insert(QString::number(leaf.toDouble()));
+        };
+        if (v.isObject()) {
+            const QJsonObject o = v.toObject();
+            for (auto it = o.begin(); it != o.end(); ++it) {
+                // "rgs" is the calibration block's recommended-setting key and
+                // does NOT contain "setting", so a substring rule alone is blind
+                // to the one path that publishes a number.
+                const bool isSettingKey =
+                    it.key().contains(QLatin1String("setting"), Qt::CaseInsensitive)
+                    || it.key() == QLatin1String("rgs");
+                if (isSettingKey && it.value().isArray()) {
+                    for (const QJsonValue& e : it.value().toArray())
+                        harvest(e);
+                } else if (isSettingKey && !it.value().isObject()) {
+                    harvest(it.value());
+                } else {
+                    collectSettings(it.value(), out);
+                }
+            }
+        } else if (v.isArray()) {
+            for (const QJsonValue& e : v.toArray())
+                collectSettings(e, out);
+        }
+    }
+
+private slots:
+    void adviceScope_everySelectionAgreesOnPackage()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        const QString kbId = QStringLiteral("dflow_q");
+
+        withRawDb(path, QStringLiteral("scope_invariant"), [&](QSqlDatabase& db) {
+            ScopeFixture f;
+            seedTwoBaskets(db, kbId, f);
+            QVERIFY(f.graphShotId > 0);
+            const ShotProjection cur = projectionForShot(db, f.graphShotId);
+            // Named explicitly, not soleScope(): this DB deliberately holds TWO
+            // packages, and the scope under test is the shot's own.
+            const AdviceScope graphScope(cur.equipmentId);
+            QVERIFY2(graphScope.bucket() > 0,
+                     "the Graph shot resolved to bucket 0 -- the fixture did not "
+                     "create a second package, so this test would pass vacuously");
+
+            // Every advice-scoped selection, named so a failure says WHICH one
+            // pooled rather than just that something did.
+            // `mustProduce` marks the paths that MUST carry a Graph setting for
+            // this fixture. Without it a path that returns nothing reads as
+            // clean — the leak check can only fail on a foreign setting, so
+            // "produced nothing at all" and "produced only the right things"
+            // are the same answer. Two paths are documented inert below and are
+            // exempt.
+            struct Path { const char* name; QJsonValue produced; bool mustProduce; };
+            const QList<Path> paths = {
+                { "buildDialInSessionsBlock",
+                  DialingBlocks::buildDialInSessionsBlock(db, kbId, graphScope, f.graphShotId, 20),
+                  true },
+                { "buildBestRecentShotBlock",
+                  DialingBlocks::buildBestRecentShotBlock(db, kbId, graphScope, f.graphShotId, cur),
+                  true },
+                { "buildGrinderContextBlock",
+                  DialingBlocks::buildGrinderContextBlock(db, cur.grinderModel, graphScope,
+                                                             QStringLiteral("espresso"),
+                                                             cur.beanBrand),
+                  true },
+                // Inert in THIS fixture, for two reasons that are easy to
+                // mistake for a pass: the seeded shots are all one profile so no
+                // (batch, kbId) pair forms, and their enjoyment is below the
+                // dialed-in gate. Its leak coverage lives entirely in
+                // calibrationBlock_settingsComeFromTheAnchorsOwnBasket — do not
+                // delete that test as redundant with this one.
+                { "buildGrinderCalibrationBlock",
+                  DialingBlocks::buildGrinderCalibrationBlock(db, cur.grinderModel, graphScope,
+                                                              QStringLiteral("espresso"),
+                                                              f.graphShotId),
+                  false },
+            };
+
+            // Accumulate rather than QVERIFY2 per path: aborting on the first
+            // violation reports one pooling selection when there may be five, and
+            // the COUNT is the useful number -- it is the size of the remaining
+            // work. One assertion at the end, listing everything.
+            QStringList violations;
+            auto check = [&](const char* name, const QSet<QString>& seen) {
+                const QSet<QString> foreign = seen & f.decentSettings;
+                if (foreign.isEmpty())
+                    return;
+                QStringList sorted(foreign.begin(), foreign.end());
+                sorted.sort();
+                violations << QStringLiteral("  %1 surfaced %2")
+                                  .arg(QString::fromLatin1(name), sorted.join(", "));
+            };
+
+            for (const Path& p : paths) {
+                QSet<QString> seen;
+                collectSettings(p.produced, seen);
+                check(p.name, seen);
+                if (p.mustProduce)
+                    QVERIFY2(!(seen & f.graphSettings).isEmpty(),
+                             qPrintable(QStringLiteral(
+                                 "%1 published no Graph setting at all -- the leak check above "
+                                 "cannot tell that from a correctly scoped result")
+                                 .arg(QString::fromLatin1(p.name))));
+            }
+
+            // The fifth path returns rows rather than JSON, so it is asserted
+            // directly instead of through collectSettings().
+            const QVariantList recent = ShotHistoryStorage::loadRecentShotsByKbIdStatic(
+                db, kbId, graphScope, 20, /*excludeShotId=*/-1);
+            QSet<QString> recentSettings;
+            for (const QVariant& row : recent)
+                recentSettings.insert(row.toMap().value(QStringLiteral("grinderSetting")).toString());
+            check("loadRecentShotsByKbIdStatic", recentSettings);
+
+            QStringList graph(f.graphSettings.begin(), f.graphSettings.end());
+            graph.sort();
+            QVERIFY2(violations.isEmpty(),
+                     qPrintable(QStringLiteral(
+                         "%1 of 5 block-level advice-scoped selections pooled across the equipment "
+                         "package for a Graph-basket shot:\n%2\nGraph dials in at %3. "
+                         "Decent-basket settings are ~5 steps too fine and are not "
+                         "reachable on this basket, so every one of these publishes a "
+                         "number the user cannot dial in.")
+                         .arg(violations.size())
+                         .arg(violations.join("\n"), graph.join("/"))));
+        });
+    }
+
+    // The scope is CONSTRUCTED here, not handed in. Every other scope test
+    // builds an AdviceScope itself and checks the queries obey it, so a call
+    // site that resolves the wrong shot -- or falls back to bucket 0 -- compiles
+    // clean and passes the whole suite while the advisor reads the entire
+    // history again. This is the only test that exercises the line that reads
+    // equipmentId off a live shot, and buildAdvisorContextBlocks is now the one
+    // place that does it: the in-app advisor, ai_advisor_invoke and
+    // dialing_get_context all reach the blocks through it.
+    void adviceScope_theAssemblerDerivesItFromTheShotUnderReview()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        const QString kbId = QStringLiteral("dflow_q");
+
+        withRawDb(path, QStringLiteral("scope_from_shot"), [&](QSqlDatabase& db) {
+            ScopeFixture f;
+            seedTwoBaskets(db, kbId, f);
+            const ShotProjection cur = projectionForShot(db, f.graphShotId);
+            QVERIFY2(cur.equipmentId > 0,
+                     "the Graph shot resolved to bucket 0 -- the fixture did not create a "
+                     "second package, so this test would pass vacuously");
+
+            const DialingBlocks::AdvisorContextBlocks blocks =
+                DialingBlocks::buildAdvisorContextBlocks(db, cur, f.graphShotId, {}, 20);
+
+            QSet<QString> seen;
+            for (const QJsonValue& v : { QJsonValue(blocks.dialInSessions),
+                                         QJsonValue(blocks.bestRecentShot),
+                                         QJsonValue(blocks.grinderContext),
+                                         QJsonValue(blocks.grinderCalibration) })
+                collectSettings(v, seen);
+
+            // Both halves are load-bearing. Without the second, a scope of 0
+            // passes: it matches neither package, every block comes back empty,
+            // and "no Decent settings" is vacuously true.
+            const QSet<QString> foreign = seen & f.decentSettings;
+            QStringList sorted(foreign.begin(), foreign.end());
+            sorted.sort();
+            QVERIFY2(foreign.isEmpty(),
+                     qPrintable(QStringLiteral(
+                         "the assembler published Decent-basket settings (%1) for a "
+                         "Graph-basket shot -- it did not scope to the shot's own package")
+                         .arg(sorted.join(", "))));
+            QVERIFY2(!(seen & f.graphSettings).isEmpty(),
+                     "no block carried a single Graph setting -- the scope matched nothing at "
+                     "all, which an empty-payload check alone would report as clean");
+
+            // The absence block is the other half of the same decision, and it
+            // is the one a wrong scope turns on: a bucket that matches nothing
+            // makes the assembler announce "no prior shot on this package" for a
+            // package with four of them.
+            QVERIFY2(blocks.noDialInHistory.isEmpty(),
+                     "the assembler stated an empty history for a package that has one");
+        });
+    }
+
+    void adviceScope_stepSizeStaysGrinderWide()
+    {
+        const QString path = freshDbPath();
+        initAndClose(path);
+        const QString kbId = QStringLiteral("dflow_q");
+
+        withRawDb(path, QStringLiteral("scope_stepsize"), [&](QSqlDatabase& db) {
+            ScopeFixture f;
+            seedTwoBaskets(db, kbId, f);
+            const ShotProjection cur = projectionForShot(db, f.graphShotId);
+
+            const QJsonObject ctx = DialingBlocks::buildGrinderContextBlock(
+                db, cur.grinderModel, AdviceScope(cur.equipmentId),
+                QStringLiteral("espresso"), cur.beanBrand);
+            QVERIFY2(ctx.contains(QStringLiteral("stepSize")),
+                     "grinderContext produced no stepSize for a populated history");
+
+            // 0.25 exists ONLY across the Decent rows (9.5 -> 9.75 -> 10). The
+            // Graph rows alone yield 0.5. So 0.25 here proves the step is still
+            // derived grinder-wide, which is what keeps the advisor's step equal
+            // to the Grind quick-select widget's grindStepForGrinder(). If a
+            // future change scopes step derivation to the package, this fails --
+            // and it should, because the widget would then disagree with the
+            // advice on the same screen.
+            QCOMPARE(ctx.value(QStringLiteral("stepSize")).toDouble(), 0.25);
+        });
+    }
+
+};
+
+QTEST_GUILESS_MAIN(TstDialingBlocks)
+#include "tst_dialing_blocks.moc"

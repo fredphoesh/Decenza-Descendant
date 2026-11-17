@@ -1,0 +1,58 @@
+#pragma once
+
+#include <QObject>
+#include <QHash>
+#include <QSet>
+#include <QByteArray>
+#include <QString>
+#include <QBluetoothUuid>
+#include <QBluetoothDeviceInfo>
+
+#include "../scalebletransport.h"
+
+class CoreBluetoothScaleBleTransport final : public ScaleBleTransport
+{
+    Q_OBJECT
+public:
+    explicit CoreBluetoothScaleBleTransport(QObject* parent = nullptr,
+                                            BleGattQueue* queue = nullptr);
+    ~CoreBluetoothScaleBleTransport() override;
+
+    void connectToDevice(const QString& address, const QString& name) override;
+    void connectToDevice(const QBluetoothDeviceInfo& device) override;
+
+    void disconnectFromDevice() override;
+    bool isDisconnecting() const override;
+    void forgetTarget() override;
+
+    void discoverServices() override;
+    void discoverCharacteristics(const QBluetoothUuid& serviceUuid) override;
+
+    void enableNotifications(const QBluetoothUuid& serviceUuid,
+                             const QBluetoothUuid& characteristicUuid) override;
+
+    void writeCharacteristic(const QBluetoothUuid& serviceUuid,
+                             const QBluetoothUuid& characteristicUuid,
+                             const QByteArray& data,
+                             WriteType writeType = WriteType::WithResponse) override;
+
+    void readCharacteristic(const QBluetoothUuid& serviceUuid,
+                            const QBluetoothUuid& characteristicUuid) override;
+
+    bool isConnected() const override;
+    bool isConnecting() const override;
+
+protected:
+    // Drops the "which read is outstanding" key on every release path. See the
+    // base declaration for the stale-key hazard it closes.
+    void onGattSlotReleased() override;
+
+private:
+    void log(const QString& msg);
+
+public:
+    // PIMPL - must be public for ObjC delegate access
+    struct Impl;
+private:
+    Impl* m_impl = nullptr;
+};

@@ -1,0 +1,121 @@
+name: Bug report
+description: Report a problem with Decenza
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. The more detail you provide — especially **debug logs** — the faster we can fix it.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear description of the problem, what you expected to happen, and what actually happened.
+      placeholder: |
+        e.g. During a shot, the weight display froze at 18g and never updated, but the graph kept drawing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Decenza and connect to DE1
+        2. Start a shot with profile "X"
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Decenza version
+      description: Found under Settings → About (e.g. `1.6.7 (build 3286)`)
+      placeholder: "1.6.7 (build 3286)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options:
+        - Android
+        - iOS
+        - macOS
+        - Windows
+        - Linux
+        - Web browser (Wasm)
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Device / OS version
+      description: e.g. `Decent tablet (Android 11)`, `iPhone (iOS 26, Safari)`, `Windows 11 (Edge)`. For browser problems, also identify the device running the native Decenza host.
+    validations:
+      required: true
+
+  - type: input
+    id: scale
+    attributes:
+      label: Scale (if applicable)
+      description: Make/model of connected scale, or "virtual (flow-based)" if none
+      placeholder: "Decent Scale v2"
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        ## Files that help us investigate
+
+        These controls are available in the app and its browser interface.
+
+        **App, connection or crash problems — app log:**
+        Go to **Settings → Debug → Diagnostic log → Save log ZIP** and attach the ZIP below. This contains the app-wide diagnostic log; it is different from a single shot’s log.
+
+        **AI assistant problems — saved conversation:**
+        Go to **Settings → Debug → AI conversation archive → Browse saved AI conversations**, select the relevant conversation, and choose **Download JSON**. This includes its saved messages and system prompt. **Download Text** provides a readable copy.
+
+        **Problems with a specific shot — shot data:**
+        Open **History**, select the affected shot, scroll to the bottom of **Shot Review**, and choose **Download Shot Data (JSON)**. Attach that file: it includes the measurements, curves, metadata, recorded profile and shot debug log when available.
+
+        **If requested — separate shot log or profile:**
+        - **View Shot Debug Log → Download Debug Log** saves that shot’s diagnostic text as a `.log` file (Advanced mode).
+        - **Download Recorded Profile (JSON)** saves only the profile used for that shot, rather than the complete shot data.
+
+        Attach the relevant files below; screenshots alone do not contain the measurements or diagnostic log.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: App log / shot data files
+      description: Attach the app log ZIP and/or affected shot JSON as described above. Drag files in or use the attachment button.
+    validations:
+      required: false
+
+  - type: textarea
+    id: visualizer_links
+    attributes:
+      label: Visualizer.coffee shot links (if applicable)
+      description: |
+        If the bug involves a specific shot (weight, flow, pressure, stop-at-weight, etc.), share a link to that shot on Visualizer.coffee. This gives us the full shot data without needing a file upload.
+      placeholder: |
+        https://visualizer.coffee/shots/...
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or video
+      description: Optional but very helpful, especially for UI bugs.
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      description: Recent changes, workarounds you tried, related issues, etc.

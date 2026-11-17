@@ -1,0 +1,189 @@
+{
+    "author": "Decent",
+    "beverage_type": "calibrate",
+    "changes_since_last_espresso": "",
+    "espresso_decline_time": "30.00",
+    "espresso_hold_time": "30.00",
+    "espresso_pressure": "10.00",
+    "espresso_temperature": "90.00",
+    "flow_profile_decline": "1.20",
+    "flow_profile_decline_time": "17.00",
+    "flow_profile_hold": "2.00",
+    "flow_profile_hold_time": "8.00",
+    "flow_profile_minimum_pressure": "4",
+    "flow_profile_preinfusion": "4",
+    "flow_profile_preinfusion_time": "5",
+    "has_recommended_dose": false,
+    "hidden": "1",
+    "lang": "en",
+    "legacy_profile_type": "settings_2c",
+    "maximum_flow": "0.00",
+    "maximum_flow_range_advanced": "0.60",
+    "maximum_flow_range_default": "1.00",
+    "maximum_pressure": "0.00",
+    "maximum_pressure_range_advanced": "0.60",
+    "maximum_pressure_range_default": "0.90",
+    "minimum_pressure": "4.00",
+    "mode": "frame_based",
+    "notes": "Put a 0.3mm puck simulator basket into a portafilter and connect a Bluetooth scale. Run this profile. Decenza calibrates flow automatically from your scale after every 5 qualifying shots — there is no value to enter by hand. See Settings → Calibration → Flow Calibration to view the current factor, clear it, or turn auto calibration off.",
+    "number_of_preinfuse_frames": "2",
+    "preinfusion_flow_rate": "1.50",
+    "preinfusion_stop_pressure": "10.00",
+    "preinfusion_time": "60.00",
+    "pressure_end": "10.00",
+    "read_only": 1,
+    "recommended_dose": "18.0",
+    "reference_file": "Test/Flow calibration",
+    "steps": [
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "1 bar",
+            "pressure": "1.00",
+            "pump": "pressure",
+            "seconds": "20.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "2 bar",
+            "pressure": "2.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "3 bar",
+            "pressure": "3.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "4 bar",
+            "pressure": "4.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "5 bar",
+            "pressure": "5.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "6 bar",
+            "pressure": "6.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "7 bar",
+            "pressure": "7.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "8 bar",
+            "pressure": "8.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        },
+        {
+            "flow": "1.50",
+            "limiter": {
+                "range": "0.60",
+                "value": "0.00"
+            },
+            "name": "9 bar",
+            "pressure": "9.00",
+            "pump": "pressure",
+            "seconds": "15.00",
+            "sensor": "coffee",
+            "temperature": "90.00",
+            "transition": "fast",
+            "volume": "0.0"
+        }
+    ],
+    "tank_desired_water_temperature": "0.0",
+    "tank_temperature": "0.0",
+    "target_volume": "0.0",
+    "target_volume_count_start": "2",
+    "target_weight": "0.0",
+    "temp_steps_enabled": true,
+    "temperature_presets": [
+        "0.00",
+        "0.00",
+        "0.00",
+        "0.00"
+    ],
+    "title": "Test/Flow calibration",
+    "type": "advanced",
+    "version": "2"
+}

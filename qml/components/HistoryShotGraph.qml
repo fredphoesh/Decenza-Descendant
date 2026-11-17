@@ -1,0 +1,772 @@
+// The delegates below read this file's ids; Bound makes them statically resolvable. Each
+// declares every injected role it uses required, so Bound cannot break role injection.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtGraphs
+import Decenza
+import "GraphUtils.js" as GraphUtils
+
+// Outer Item wraps the GraphsView so the inspect crosshair, marker labels, and the
+// right-axis label column render as siblings on top of the chart. GraphsView's
+// scene-graph paints over any direct QQuickItem children — overlays must be siblings.
+// Every line, dashed or solid, is a native series inside the GraphsView.
+Item {
+    id: chart
+
+    // Alias so PortalGraphOverlay and the series instantiators can reach the GraphsView:
+    // `graphsView: graphsView` would resolve the RHS to their own `graphsView` property.
+    readonly property alias graphsViewRef: graphsView
+
+    // Re-export the GraphsView's plot rect so parent pages can hit-test against
+    // it (e.g. the tap-to-inspect overlays distinguishing crosshair taps from
+    // right-axis toggles). Matches the legacy Qt Charts ChartView.plotArea API.
+    readonly property rect plotArea: graphsView.plotArea
+
+    // Controls for compact/widget rendering
+    property bool showLabels: true
+    property bool showPhaseLabels: true
+
+    // Series visibility binds straight to Settings.graph, so a toggle anywhere in the app
+    // reaches every instance of this graph.
+    //
+    // What used to be here: eleven mirror properties initialised from Settings.boolValue()
+    // — a Q_INVOKABLE, so the initialiser recorded no dependency and never re-evaluated —
+    // plus a twelve-case switch over Settings.valueChanged to write them back by hand.
+    // GraphLegend also assigned graph[key] directly on the one instance it was attached to,
+    // which is why the review page appeared to work while the last-shot background chart
+    // silently froze at its startup values after the first toggle.
+
+    property bool advancedMode: Settings.graph.advancedMode
+
+    // Right axis: "weight", "temperature" or "flow".
+    readonly property string rightAxisMode: RecipeContext.preferences.rightAxisMode || "weight"
+
+    PreferenceWrite { id: preferenceWrite; onFailed: message => writeError.show(message) }
+    StatusToast { id: writeError; error: true }
+
+    function toggleRightAxis() {
+        const current = RecipeContext.preferences.rightAxisMode || "weight"
+        const next = current === "weight" ? "temperature"
+            : current === "temperature" ? "flow" : "weight"
+        preferenceWrite.submit("rightAxisMode", next)
+    }
+
+    // Factor applied to the flow-family traces before plotting (1, 2 or 3).
+    property int flowMultiplier: Settings.graph.flowMultiplier
+
+    // Inspect state (crosshair + tooltip)
+    property bool inspecting: false
+    property real inspectTime: 0
+    property real inspectPixelX: 0
+    property var inspectValues: ({})
+
+    // Data to display (set from parent)
+    property var portalSamples: []
+    property var pressureData: []
+    property var flowData: []
+    property var temperatureData: []
+    property var weightData: []
+    property var weightFlowRateData: []
+    property var resistanceData: []
+    property var conductanceData: []
+    property var darcyResistanceData: []
+    property var conductanceDerivativeData: []
+    property var temperatureMixData: []
+    property var pressureGoalData: []
+    property var flowGoalData: []
+    property var temperatureGoalData: []
+    property var temperatureMixGoalData: []
+    property var phaseMarkers: []
+    property double maxTime: 60
+
+    // === Reload pipeline ===
+    // Qt.callLater coalesces sequential property reassignments from the parent
+    // (pressureData, flowData, weightData…) so loadData() runs once with a
+    // consistent snapshot rather than N times with mixed old/new arrays.
+    function doReload() {
+        dismissInspect()
+        loadSeries()
+        updateTimeAxis()
+    }
+
+    // Every fixed series; the per-segment goal series load themselves on creation.
+    function loadSeries() {
+        // One replace() per series; per-point append() cost ~27 ms per graph on a Galaxy
+        // Tab A9+. {x, y} objects convert to QPointF since point is a structured value type
+        // (qqmlvaluetype_p.h:118).
+        pressureSeries.replace(pressureData)
+        flowSeries.replace(flowData)
+        weightFlowRateSeries.replace(weightFlowRateData)
+        resistanceSeries.replace(resistanceData)
+        conductanceSeries.replace(conductanceData)
+        darcyResistanceSeries.replace(darcyResistanceData)
+        temperatureSeries.replace(temperatureData)
+        temperatureMixSeries.replace(temperatureMixData)
+        weightSeries.replace(weightData)
+        conductanceDerivativeSeries.replace(conductanceDerivativeData)
+        temperatureGoalSeries.replace(temperatureGoalData)
+        temperatureMixGoalSeries.replace(temperatureMixGoalData)
+    }
+
+    function updateTimeAxis() {
+        // Clip to the later of maxTime (extraction duration) or the last phase-
+        // marker time so any frame-transition marker landing just past duration
+        // still renders. Pixel-based padding keeps markers off the right edge.
+        // No early return on empty pressureData — temperature- or weight-only
+        // rows (corrupt/partial) still get a sensible axis from maxTime alone.
+        var markerMaxTime = 0
+        for (let m = 0; m < phaseMarkers.length; m++) {
+            if (phaseMarkers[m].time > markerMaxTime) markerMaxTime = phaseMarkers[m].time
+        }
+        var axisEnd = Math.max(maxTime, markerMaxTime, portalOverlay.lastTime)
+        timeAxis.max = Math.max(5, GraphUtils.paddedAxisEnd(axisEnd, graphsView.plotArea.width, Theme.scaled(5)))
+    }
+
+    // Split a goal data array into segments at time gaps (pump mode transitions).
+    // During recording, goal=0 samples are skipped, creating natural time gaps
+    // between segments. Normal sample interval is ~0.2 s; gaps > 0.5 s indicate
+    // a mode switch boundary.
+    function segmentGoalData(data, maxSegments) {
+        if (!data || data.length === 0) return []
+        var segments = [[data[0]]]
+        for (let i = 1; i < data.length; i++) {
+            if (data[i].x - data[i - 1].x > 0.5 && segments.length < maxSegments) {
+                segments.push([data[i]])
+            } else {
+                segments[segments.length - 1].push(data[i])
+            }
+        }
+        return segments
+    }
+
+    // Computed goal segments — the models of the goal series instantiators below.
+    readonly property var pressureGoalSegments: segmentGoalData(pressureGoalData, 5)
+    readonly property var flowGoalSegments: segmentGoalData(flowGoalData, 5)
+
+    // === Inspect: pixel → data, value lookup, accessibility ===
+
+    function _timeAtPixel(pixelX) {
+        return GraphUtils.timeAtPixel(pixelX, graphsView.plotArea, timeAxis.min, timeAxis.max)
+    }
+
+    // Find the y value in a data array closest to the given time.
+    // Reads from data arrays (not series) so right-axis-mapped traces — which are
+    // no longer Qt Graphs series — are queryable the same way as main-axis traces.
+    function findValueAtTime(data, time) {
+        if (!data || data.length === 0) return null
+        var closest = data[0]
+        var minDist = Math.abs(closest.x - time)
+        for (let i = 1; i < data.length; i++) {
+            let p = data[i]
+            let dist = Math.abs(p.x - time)
+            if (dist < minDist) {
+                closest = p
+                minDist = dist
+            } else if (dist > minDist) {
+                break  // sorted by x
+            }
+        }
+        return minDist < 1.0 ? closest.y : null
+    }
+
+    function inspectAtPosition(pixelX, pixelY) {
+        var time = _timeAtPixel(pixelX)
+        if (time < 0 || time > timeAxis.max) return
+
+        inspectTime = time
+        inspectPixelX = graphsView.plotArea.x + (time / timeAxis.max) * graphsView.plotArea.width
+
+        // Compute values for every curve — regardless of visibility — so the
+        // inspect bar can react live when the user toggles curves on/off without
+        // re-tapping the graph. GraphInspectBar filters by the current show*
+        // flags at display time.
+        //
+        // These read the SOURCE arrays, never the plotted series, so the flow multiplier
+        // cannot leak into a readout: a 2.4 mL/s sample reports 2.4 at every setting. Do
+        // not "simplify" this to read back from flowSeries. Decaid ships that exact bug —
+        // its weight trace is plotted at ÷10 and the tooltip prints the plotted number, so
+        // a 36 g shot reads "Weight: 3.6 g" (lib/src/util/shot_chart.dart:105, :359).
+        var vals = {}
+        var curves = [
+            { key: "pressure", name: "Pressure", data: pressureData, unit: "bar" },
+            { key: "flow", name: "Flow", data: flowData, unit: "mL/s" },
+            { key: "temperature", name: "Temp", data: temperatureData, unit: Theme.tempUnitSuffix(), convert: function(c){ return Theme.cToDisplay(c) } },
+            { key: "mixTemp", name: "Mix temp", data: temperatureMixData, unit: Theme.tempUnitSuffix(), convert: function(c){ return Theme.cToDisplay(c) } },
+            { key: "mixTempGoal", name: "Mix temp goal", data: temperatureMixGoalData, unit: Theme.tempUnitSuffix(), convert: function(c){ return Theme.cToDisplay(c) } },
+            { key: "weight", name: "Weight", data: weightData, unit: "g" },
+            { key: "weightFlow", name: "Weight flow", data: weightFlowRateData, unit: "g/s" },
+            { key: "resistance", name: "Resistance", data: resistanceData, unit: "" },
+            { key: "darcyResistance", name: "Darcy R", data: darcyResistanceData, unit: "" },
+            { key: "conductance", name: "Conductance", data: conductanceData, unit: "" },
+            { key: "dCdt", name: "dC/dt", data: conductanceDerivativeData, unit: "" }
+        ]
+
+        for (let i = 0; i < curves.length; i++) {
+            let v = findValueAtTime(curves[i].data, time)
+            if (v !== null) {
+                vals[curves[i].key] = { name: curves[i].name, value: curves[i].convert ? curves[i].convert(v) : v, unit: curves[i].unit }
+            }
+        }
+
+        var portal = portalValuesAtTime(time)
+        if (portal) {
+            vals.portalEc = portal.ec
+            vals.portalTemperature = portal.temperature
+        }
+        inspectValues = vals
+        inspecting = true
+        announceAtPosition(pixelX, pixelY)
+    }
+
+    function dismissInspect() {
+        inspecting = false
+    }
+
+    // === Crosshair values for GraphReadout, and phase chips for GraphChipRow ===
+
+    readonly property var readoutCurves: {
+        let out = []
+        for (const e of GraphSeries.entries) {
+            if (e.advanced && !advancedMode) continue
+            if (e.portal && portalSamples.length === 0) continue
+            if (!Settings.graph[e.key]) continue
+            out.push(e)
+        }
+        return out
+    }
+    readonly property int readoutRowCount: 1
+    function readoutRowVisible(row) { return true }
+    // GraphSeries dataKeys, read from inspectValues; "" when there is no value there.
+    function readoutText(row, dataKey) {
+        if (!inspecting) return ""
+        switch (dataKey) {
+        case "portalEc":   return inspectValues.portalEc ? inspectValues.portalEc.value.toFixed(3) : ""
+        case "portalTemp": return inspectValues.portalTemperature ? inspectValues.portalTemperature.value.toFixed(1) : ""
+        }
+        const key = dataKey === "temp" ? "temperature" : dataKey === "darcyR" ? "darcyResistance" : dataKey
+        const v = inspectValues[key]
+        return v ? v.value.toFixed(1) : ""
+    }
+
+    // One entry per phase the shot entered, for GraphChipRow. Start and End are
+    // structural markers, not phases.
+    readonly property var phaseEntries: {
+        let out = [], seen = {}
+        for (const m of phaseMarkers) {
+            if (m.label === "Start" || m.label === "End" || seen[m.label]) continue
+            seen[m.label] = true
+            out.push({ label: m.label, color: "transparent" })
+        }
+        return out
+    }
+    property var hiddenPhaseLabels: ({})
+    function togglePhaseLabel(label) {
+        hiddenPhaseLabels = GraphUtils.toggledPhaseLabels(hiddenPhaseLabels, label)
+    }
+
+    function portalValuesAtTime(time) {
+        var reading = GraphUtils.portalReadingAtTime(portalSamples, time)
+        if (!reading) return null
+        return {
+            ec: { label: "PORTAL " + TranslationManager.translate("portal.ecRaw", "EC (raw)"),
+                  value: reading.ecRaw, unit: "", decimals: 3, color: Theme.portalEcColor },
+            temperature: { label: "PORTAL", value: Theme.cToDisplay(reading.temperatureC),
+                           unit: Theme.tempUnitSuffix(), decimals: 1, color: Theme.portalTemperatureColor }
+        }
+    }
+
+    // Return the phase label active at the given time, or empty string if none.
+    // Skips "Start"/"End" sentinels — they are structural, not user-facing.
+    function getPhaseAtTime(time) {
+        var label = ""
+        for (let i = 0; i < phaseMarkers.length; i++) {
+            let m = phaseMarkers[i]
+            if (m.time <= time) {
+                if (m.label !== "Start" && m.label !== "End")
+                    label = m.label
+            } else {
+                break
+            }
+        }
+        return label
+    }
+
+    function announceAtPosition(pixelX, pixelY) {
+        var time = _timeAtPixel(pixelX)
+        if (time < 0 || time > timeAxis.max) return
+
+        var curves = [
+            { name: "Pressure", data: pressureData, show: Settings.graph.showPressure, unit: "bar" },
+            { name: "Flow", data: flowData, show: Settings.graph.showFlow, unit: "mL/s" },
+            { name: "Temp", data: temperatureData, show: Settings.graph.showTemperature, unit: Theme.tempUnitSuffix(), convert: function(c){ return Theme.cToDisplay(c) } },
+            { name: "Mix temp", data: temperatureMixData, show: Settings.graph.showTemperatureMix && chart.advancedMode, unit: Theme.tempUnitSuffix(), convert: function(c){ return Theme.cToDisplay(c) } },
+            { name: "Mix temp goal", data: temperatureMixGoalData, show: Settings.graph.showTemperatureMixGoal && chart.advancedMode, unit: Theme.tempUnitSuffix(), convert: function(c){ return Theme.cToDisplay(c) } },
+            { name: "Weight", data: weightData, show: Settings.graph.showWeight, unit: "g" },
+            { name: "Weight flow", data: weightFlowRateData, show: Settings.graph.showWeightFlow, unit: "g/s" },
+            { name: "Resistance", data: resistanceData, show: Settings.graph.showResistance && chart.advancedMode, unit: "" },
+            { name: "Darcy R", data: darcyResistanceData, show: Settings.graph.showDarcyResistance && chart.advancedMode, unit: "" },
+            { name: "Conductance", data: conductanceData, show: Settings.graph.showConductance && chart.advancedMode, unit: "" },
+            { name: "dC/dt", data: conductanceDerivativeData, show: Settings.graph.showConductanceDerivative && chart.advancedMode, unit: "" }
+        ]
+
+        var parts = []
+        for (let i = 0; i < curves.length; i++) {
+            if (!curves[i].show) continue
+            let v = findValueAtTime(curves[i].data, time)
+            if (v !== null) {
+                let dv = curves[i].convert ? curves[i].convert(v) : v
+                let entry = curves[i].name + " " + dv.toFixed(1)
+                if (curves[i].unit !== "") entry += " " + curves[i].unit
+                parts.push(entry)
+            }
+        }
+
+        var portal = portalValuesAtTime(time)
+        if (portal) {
+            if (Settings.graph.showPortalEc && chart.advancedMode)
+                parts.push(portal.ec.label + " " + portal.ec.value.toFixed(portal.ec.decimals))
+            if (Settings.graph.showPortalTemperature && chart.advancedMode)
+                parts.push(portal.temperature.label + " " + portal.temperature.value.toFixed(1) + " " + portal.temperature.unit)
+        }
+        if (parts.length === 0) return
+        if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null) {
+            let phase = getPhaseAtTime(time)
+            let header = "At " + time.toFixed(1) + " seconds"
+            if (phase !== "") header += ", " + phase + " phase"
+            AccessibilityManager.announce(header + ". " + parts.join(". "), true)
+        }
+    }
+
+    onPressureDataChanged: Qt.callLater(doReload)
+    onFlowDataChanged: Qt.callLater(doReload)
+    onWeightFlowRateDataChanged: Qt.callLater(doReload)
+    onResistanceDataChanged: Qt.callLater(doReload)
+    onConductanceDataChanged: Qt.callLater(doReload)
+    onDarcyResistanceDataChanged: Qt.callLater(doReload)
+    onTemperatureDataChanged: Qt.callLater(doReload)
+    onTemperatureMixDataChanged: Qt.callLater(doReload)
+    onWeightDataChanged: Qt.callLater(doReload)
+    onConductanceDerivativeDataChanged: Qt.callLater(doReload)
+    onTemperatureGoalDataChanged: Qt.callLater(doReload)
+    onTemperatureMixGoalDataChanged: Qt.callLater(doReload)
+    onPhaseMarkersChanged: Qt.callLater(doReload)
+    Component.onCompleted: doReload()
+
+    // Dynamic max for pressure/flow axis based on all data (ignores visibility
+    // toggles so the graph doesn't jump when toggling curves on/off).
+    //
+    // These walks MUST stay on the unscaled source arrays. The flow multiplier is applied
+    // by shrinking the range each flow-family trace is mapped through, never by rewriting
+    // points — precisely so this stays true. Feed multiplied values in here and the axis
+    // grows by the multiplier, the traces land in identical pixels, and the zoom silently
+    // does nothing while every test still passes.
+    //
+    // NOTHING TESTS THIS. The invariant — this value identical at 1x, 2x and 3x for the
+    // same shot — holds by construction only, because asserting it needs a QML-level
+    // harness the suite does not have. See tasks.md 8.2 in the change folder. Do not read
+    // this comment as a safety net; if you change how the flow family is plotted, check
+    // this by hand.
+    property double pressureAxisMax: {
+        var maxVal = 0
+        for (let i = 0; i < pressureData.length; i++) {
+            if (pressureData[i].y > maxVal) maxVal = pressureData[i].y
+        }
+        for (let i = 0; i < flowData.length; i++) {
+            if (flowData[i].y > maxVal) maxVal = flowData[i].y
+        }
+        for (let i = 0; i < weightFlowRateData.length; i++) {
+            if (weightFlowRateData[i].y > maxVal) maxVal = weightFlowRateData[i].y
+        }
+        for (let i = 0; i < pressureGoalData.length; i++) {
+            if (pressureGoalData[i].y > maxVal) maxVal = pressureGoalData[i].y
+        }
+        for (let i = 0; i < flowGoalData.length; i++) {
+            if (flowGoalData[i].y > maxVal) maxVal = flowGoalData[i].y
+        }
+        // Resistance excluded — values are clamped at source and clip at the
+        // axis boundary, matching the live graph behaviour.
+        if (maxVal < 0.1) return 12  // fallback when no data
+        var padded = maxVal * 1.15
+        if (padded <= 2) return 2
+        if (padded <= 4) return 4
+        if (padded <= 5) return 5
+        if (padded <= 6) return 6
+        if (padded <= 8) return 8
+        if (padded <= 10) return 10
+        if (padded <= 12) return 12
+        return Math.ceil(padded / 5) * 5
+    }
+
+    // === HIDDEN RIGHT-AXIS RANGES ===
+    // Invisible axes the right-axis series map through (a series may carry its own axisY
+    // since Qt 6.10); GraphRightAxisLabels draws the visible labels. A hidden axis
+    // reserves no plot space (axisrenderer.cpp:1082).
+
+    // Flow-family mapping: the multiplier shrinks this range, so the flow traces and their
+    // goal grow without touching the data, and the right-axis label column reads the same
+    // numbers.
+    ValueAxis {
+        id: flowRange
+        visible: false
+        min: 0
+        max: chart.pressureAxisMax / chart.flowMultiplier
+    }
+
+    ValueAxis {
+        id: tempRange
+        visible: false
+        min: 40
+        max: 100
+    }
+
+    ValueAxis {
+        id: weightRange
+        visible: false
+        min: 0
+        max: {
+            var maxW = 0
+            for (let i = 0; i < chart.weightData.length; i++) {
+                if (chart.weightData[i].y > maxW) maxW = chart.weightData[i].y
+            }
+            return Math.max(10, maxW * 1.1)
+        }
+    }
+
+    ValueAxis {
+        id: dCdtAxis
+        visible: false
+        min: {
+            var minV = 0
+            for (let i = 0; i < chart.conductanceDerivativeData.length; i++) {
+                if (chart.conductanceDerivativeData[i].y < minV) minV = chart.conductanceDerivativeData[i].y
+            }
+            return minV < 0 ? -Math.abs(minV) * 1.15 : 0
+        }
+        max: {
+            var maxV = 0
+            for (let i = 0; i < chart.conductanceDerivativeData.length; i++) {
+                if (chart.conductanceDerivativeData[i].y > maxV) maxV = chart.conductanceDerivativeData[i].y
+            }
+            var padded = maxV * 1.15
+            if (padded <= 2) return 2
+            if (padded <= 3) return 3
+            if (padded <= 5) return 5
+            if (padded <= 8) return 8
+            if (padded <= 10) return 10
+            return Math.ceil(padded / 5) * 5
+        }
+    }
+
+    PortalGraphOverlay {
+        id: portalOverlay
+        anchors.fill: parent
+        z: 2
+        graphsView: chart.graphsViewRef
+        axisX: timeAxis
+        samples: chart.portalSamples
+        showLabels: chart.showLabels
+        advancedMode: chart.advancedMode
+    }
+    onPortalSamplesChanged: Qt.callLater(chart.doReload)
+
+    GraphsView {
+        id: graphsView
+        anchors.fill: parent
+        anchors.rightMargin: portalOverlay.labelWidth + (chart.showLabels ? Theme.scaled(portalOverlay.hasVisibleData ? 55 : 35) : 0)
+        theme: DecenzaGraphsTheme {}
+
+        axisX: timeAxis
+        axisY: pressureAxis
+
+        onPlotAreaChanged: chart.updateTimeAxis()
+
+        ValueAxis {
+            id: timeAxis
+            min: 0
+            max: 60
+            tickInterval: 10
+            subTickCount: 0
+            labelFormat: "%.0f"
+            visible: chart.showLabels
+            // Caption goes on the axis, not in an overlay: Qt Graphs draws axis
+            // titles itself AND reserves layout space for them (axisrenderer.cpp:662-698
+            // counts titled axes into the margin math). The Qt Charts -> Qt Graphs
+            // migration (PR Kulitorum/Decenza#1146) carried this over as a Text positioned off `plotArea`
+            // bottom-right, which floated it ON TOP of the plot, over any trace running
+            // along the bottom.
+            titleText: TranslationManager.translate("graph.timeAxis", "Time (s)")
+        }
+
+        ValueAxis {
+            id: pressureAxis
+            min: 0
+            max: chart.pressureAxisMax
+            tickInterval: Math.max(1, Math.round(chart.pressureAxisMax / 4))
+            subTickCount: 0
+            labelFormat: "%.0f"
+            visible: chart.showLabels
+            // Pressure-only once a multiplier is active: the flow family no longer reads
+            // against this axis. It is also the only sign of an active multiplier that
+            // survives into a screenshot.
+            titleText: !chart.showLabels ? ""
+                                         : (chart.flowMultiplier === 1 ? "bar / mL/s" : "bar")
+        }
+
+        // === MAIN-AXIS DATA LINES (Qt Graphs native series) ===
+
+        LineSeries {
+            id: pressureSeries
+            color: Theme.pressureColor
+            width: Theme.scaled(3)
+            visible: Settings.graph.showPressure
+        }
+
+        LineSeries {
+            id: flowSeries
+            axisY: flowRange
+            color: Theme.flowColor
+            width: Theme.scaled(3)
+            visible: Settings.graph.showFlow
+        }
+
+        LineSeries {
+            id: weightFlowRateSeries
+            axisY: flowRange
+            color: Theme.weightFlowColor
+            width: Theme.scaled(2)
+            visible: Settings.graph.showWeightFlow
+        }
+
+        LineSeries {
+            id: resistanceSeries
+            color: Theme.resistanceColor
+            width: Theme.scaled(2)
+            visible: Settings.graph.showResistance && chart.advancedMode
+        }
+
+        LineSeries {
+            id: conductanceSeries
+            color: Theme.conductanceColor
+            width: Theme.scaled(2)
+            visible: Settings.graph.showConductance && chart.advancedMode
+        }
+
+        LineSeries {
+            id: darcyResistanceSeries
+            color: Theme.darcyResistanceColor
+            width: Theme.scaled(2)
+            visible: Settings.graph.showDarcyResistance && chart.advancedMode
+        }
+
+        // === RIGHT-AXIS DATA LINES (each on its own hidden axis) ===
+
+        LineSeries {
+            id: temperatureSeries
+            axisY: tempRange
+            color: Theme.temperatureColor
+            width: Theme.scaled(3)
+            visible: Settings.graph.showTemperature
+        }
+
+        LineSeries {
+            id: temperatureMixSeries
+            axisY: tempRange
+            color: Theme.temperatureMixColor
+            width: Theme.scaled(2)
+            visible: Settings.graph.showTemperatureMix && chart.advancedMode
+        }
+
+        LineSeries {
+            id: weightSeries
+            axisY: weightRange
+            color: Theme.weightColor
+            width: Theme.scaled(3)
+            visible: Settings.graph.showWeight
+        }
+
+        LineSeries {
+            id: conductanceDerivativeSeries
+            axisY: dCdtAxis
+            color: Theme.conductanceDerivativeColor
+            width: Theme.scaled(2)
+            visible: Settings.graph.showConductanceDerivative && chart.advancedMode
+        }
+
+        // === DASHED GOAL CURVES ===
+
+        LineSeries {
+            id: temperatureGoalSeries
+            axisY: tempRange
+            color: Theme.temperatureGoalColor
+            width: Theme.scaled(2)
+            strokeStyle: LineSeries.StrokeStyle.DashLine
+            dashPattern: [4, 4]
+            visible: Settings.graph.showTemperature
+        }
+
+        // Mix temperature goal (SetMixTemp) — advanced. Shots recorded before this
+        // series existed carry an empty array, so the line is hidden, not drawn at zero.
+        LineSeries {
+            id: temperatureMixGoalSeries
+            axisY: tempRange
+            color: Theme.temperatureMixGoalColor
+            width: Theme.scaled(2)
+            strokeStyle: LineSeries.StrokeStyle.DashLine
+            dashPattern: [4, 4]
+            visible: Settings.graph.showTemperatureMixGoal && chart.advancedMode && chart.temperatureMixGoalData.length > 0
+        }
+    }
+
+    // Goal segments: one series per segment. The model follows the goal data, and each
+    // series loads its segment when it is created.
+    GraphSeriesInstantiator {
+        graphsView: chart.graphsViewRef
+        model: chart.pressureGoalSegments
+        delegate: LineSeries {
+            id: pressureGoalSegment
+            required property var modelData
+            color: Theme.pressureGoalColor
+            width: Theme.scaled(2)
+            strokeStyle: LineSeries.StrokeStyle.DashLine
+            dashPattern: [4, 4]
+            visible: Settings.graph.showPressure
+            Component.onCompleted: pressureGoalSegment.replace(modelData)
+        }
+    }
+
+    GraphSeriesInstantiator {
+        graphsView: chart.graphsViewRef
+        model: chart.flowGoalSegments
+        delegate: LineSeries {
+            id: flowGoalSegment
+            required property var modelData
+            // Mapped through flowRange so the dashed target moves with the trace chasing it.
+            axisY: flowRange
+            color: Theme.flowGoalColor
+            width: Theme.scaled(2)
+            strokeStyle: LineSeries.StrokeStyle.DashLine
+            dashPattern: [4, 4]
+            visible: Settings.graph.showFlow
+            Component.onCompleted: flowGoalSegment.replace(modelData)
+        }
+    }
+
+    // === VERTICAL PHASE / FRAME MARKER LINES ===
+
+    GraphSeriesInstantiator {
+        graphsView: chart.graphsViewRef
+        model: chart.phaseMarkers
+        delegate: LineSeries {
+            required property var modelData
+            readonly property string markerLabel: modelData.label
+            readonly property bool isStart: markerLabel === "Start"
+            readonly property bool isEnd: markerLabel === "End"
+
+            values: [Qt.point(modelData.time, 0), Qt.point(modelData.time, 100)]
+            color: isStart ? Theme.accentColor : Theme.frameMarkerColor
+            width: isStart ? Theme.scaled(2) : Theme.scaled(1)
+            strokeStyle: LineSeries.StrokeStyle.DashLine
+            dashPattern: isStart ? [4, 2, 1, 2] : [1, 3]
+            // "End" markers were inconsistently emitted in older history rows; the
+            // last frame-transition marker already signals end of extraction.
+            visible: !isEnd && !chart.hiddenPhaseLabels[markerLabel]
+        }
+    }
+
+    // Phase marker labels
+    Repeater {
+        id: markerLabels
+        model: chart.phaseMarkers
+
+        delegate: Item {
+            id: markerDelegate
+            required property int index
+            required property var modelData
+            property double markerTime: modelData.time
+            property string markerLabel: modelData.label
+            property bool isStart: modelData.label === "Start"
+
+            x: graphsView.plotArea.x + (markerTime / timeAxis.max) * graphsView.plotArea.width
+            y: graphsView.plotArea.y
+            height: graphsView.plotArea.height
+            visible: markerTime <= timeAxis.max && markerTime >= 0 && chart.showPhaseLabels
+                     && markerLabel !== "End" && !chart.hiddenPhaseLabels[markerLabel]
+
+            Text {
+                text: markerDelegate.markerLabel + (markerDelegate.modelData.transitionSuffix || "")
+                font.pixelSize: Theme.scaled(14)
+                font.bold: markerDelegate.isStart
+                color: markerDelegate.isStart ? Theme.accentColor : Qt.rgba(1, 1, 1, 0.8)
+                rotation: -90
+                transformOrigin: Item.TopLeft
+                x: Theme.scaled(3)
+                y: Theme.scaled(6) + width
+
+                Rectangle {
+                    z: -1
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(-2)
+                    color: Qt.darker(Theme.surfaceColor, 1.5)
+                    radius: Theme.scaled(2)
+                }
+            }
+        }
+    }
+
+    // Pump mode indicator bars at bottom of chart
+    Repeater {
+        id: pumpModeIndicators
+        model: chart.phaseMarkers
+
+        delegate: Rectangle {
+            required property int index
+            required property var modelData
+            property double markerTime: modelData.time
+            property bool isFlowMode: modelData.isFlowMode || false
+            property double nextTime: {
+                if (index < chart.phaseMarkers.length - 1) {
+                    return chart.phaseMarkers[index + 1].time
+                }
+                return chart.maxTime
+            }
+
+            x: graphsView.plotArea.x + (markerTime / timeAxis.max) * graphsView.plotArea.width
+            y: graphsView.plotArea.y + graphsView.plotArea.height - Theme.scaled(4)
+            width: Math.max(0, ((nextTime - markerTime) / timeAxis.max) * graphsView.plotArea.width)
+            height: Theme.scaled(4)
+            color: isFlowMode ? Theme.flowColor : Theme.pressureColor
+            opacity: 0.8
+            visible: markerTime <= timeAxis.max && modelData.label !== "Start" && modelData.label !== "End"
+            Accessible.ignored: true
+        }
+    }
+
+    // Crosshair vertical line
+    Rectangle {
+        id: crosshairLine
+        visible: chart.inspecting
+        x: chart.inspectPixelX - width / 2
+        y: graphsView.plotArea.y
+        width: Theme.scaled(1)
+        height: graphsView.plotArea.height
+        color: Theme.textColor
+        opacity: 0.6
+        Accessible.ignored: true
+    }
+
+    // Right-axis label column, shared with the live graph.
+    GraphRightAxisLabels {
+        visible: chart.showLabels
+        x: graphsView.plotArea.x + graphsView.plotArea.width + Theme.scaled(4)
+        y: graphsView.plotArea.y
+        width: chart.width - x
+        height: graphsView.plotArea.height
+
+        mode: chart.rightAxisMode
+        weightAxis: weightRange
+        tempAxis: tempRange
+        flowAxis: flowRange
+        onTapped: chart.toggleRightAxis()
+    }
+}

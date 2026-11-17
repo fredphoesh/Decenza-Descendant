@@ -1,0 +1,1230 @@
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import QtQuick.Layouts
+import Decenza
+
+/**
+ * SimpleProfileEditorPage - Shared simple profile editor for flow (settings_2b) and pressure (settings_2a)
+ *
+ * Matches de1app's settings_2a/2b editor layout:
+ * Profile Temp → 1: Preinfuse → 2: Hold/Rise and Hold → 3: Decline → 4: Stop at Weight
+ *
+ * Set profileType to "flow" or "pressure" to switch behavior.
+ */
+T.Page {
+    id: editorPage
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: profile ? profile.title : editorPage.editorTitle
+
+    // The fallback title when no profile name is loaded. This USED to be a `var editorTitle`
+    // inside Component.onCompleted — assigned and never read — while the binding above
+    // referenced a name that existed nowhere at file scope. So `pageTitle` was `undefined`
+    // whenever currentProfileName was empty. A property now, so it is also reactive to the
+    // editor type and to a language change, which a local never was.
+    readonly property string editorTitle: editorPage.isFlow
+        ? editorPage.tr("title", "Flow Profile Editor")
+        : editorPage.tr("title", "Pressure Profile Editor")
+
+    objectName: isFlow ? "flowEditorPage" : "pressureEditorPage"
+    // suppressShotChart: this page draws its own graph, and the last-shot chart
+    // background would put a second set of curves behind it.
+    background: ThemedPageBackground { suppressShotChart: true }
+
+    required property string profileType
+    readonly property bool isFlow: profileType === "flow"
+
+    property var profile: null
+    ProfileEditorDraft { id: editorDraft }
+    property var params: ({})
+    readonly property bool profileModified: editorDraft.modified
+    property string originalProfileName: editorDraft.sourceFilename
+    property string sourceRouteFilename: ""
+    property string detailRequestId: ""
+    property string pendingWriteRequestId: ""
+    property string pendingWriteKind: ""
+    property bool reopenExitAfterError: false
+    property string saveErrorDetail: ""
+    property string editorEntryType: ""
+    property string editorEntryTitle: ""
+    property string editorEntryFilename: ""
+    property bool editorEntryIsNew: false
+    property string pendingSaveAsTitle: ""
+    property string pendingOverwriteRevision: ""
+    readonly property bool sourceReadOnly: !!profile && Number(profile.read_only || 0) === 1
+
+    property int selectedFrameIndex: -1
+    property bool scrollingFromSelection: false
+
+    function handleBack() {
+        flushPendingEdits()
+        if (profileModified) {
+            exitDialog.open()
+        } else {
+            AppShell.backRequested()
+        }
+    }
+
+    // Intercept Android system back button / Escape key
+    focus: true
+    Keys.onReleased: function(event) {
+        if (event.key === Qt.Key_Back || event.key === Qt.Key_Escape) {
+            event.accepted = true
+            handleBack()
+        }
+    }
+
+    // Translation helper to avoid repeating ternaries
+    function tr(key, fallback) {
+        var prefix = isFlow ? "flowEditor" : "pressureEditor"
+        return TranslationManager.translate(prefix + "." + key, fallback)
+    }
+
+    // Helper: get value with fallback, safe for 0 values (avoids JS falsy coercion)
+    function val(v, fallback) {
+        return (v !== undefined && v !== null) ? v : fallback
+    }
+
+    // Commit any text fields that use onEditingFinished (which won't fire on navigation)
+    function flushPendingEdits() {
+        if (profile && notesField.text !== (profile.profile_notes || "")) {
+            profile.profile_notes = notesField.text
+            uploadProfile()
+        }
+    }
+
+    // Helper: get display temp for a step
+    function stepTemp(stepKey) {
+        return val(params[stepKey], val(params.pourTemperature, 90))
+    }
+
+    function frameToSection(frameIndex) {
+        if (!profile || !profile.steps || frameIndex < 0 || frameIndex >= profile.steps.length)
+            return "preinfusion"
+        var name = (profile.steps[frameIndex].name || "").toLowerCase()
+        if (name.indexOf("preinfusion") !== -1 || name.indexOf("temp boost") !== -1) return "preinfusion"
+        if (isFlow) {
+            if (name.indexOf("hold") !== -1) return "hold"
+        } else {
+            if (name.indexOf("forced rise") !== -1) return "hold"
+            if (name.indexOf("rise and hold") !== -1) return "hold"
+        }
+        if (name.indexOf("decline") !== -1) return "decline"
+        // Position-based fallback for profiles with non-standard frame names
+        var totalFrames = profile.steps.length
+        if (frameIndex === 0) return "preinfusion"
+        if (frameIndex >= totalFrames - 1) return "decline"
+        return "hold"
+    }
+
+    function scrollToSection(sectionName) {
+        var targetY = 0
+        switch (sectionName) {
+            case "preinfusion": targetY = preinfusionSection.y; break
+            case "hold": targetY = holdSection.y; break
+            case "decline": targetY = declineSection.y; break
+            default: return
+        }
+        scrollingFromSelection = true
+        var flick = editorScrollView.contentItem as Flickable
+        flick.contentY = Math.max(0, targetY - editorScrollView.height / 4)
+        // Clear flag after synchronous binding updates have propagated
+        Qt.callLater(function() { scrollingFromSelection = false })
+    }
+
+    function findCenteredSection() {
+        var viewCenter = (editorScrollView.contentItem as Flickable).contentY + editorScrollView.height / 2
+        var sections = [
+            { name: "preinfusion", item: preinfusionSection },
+            { name: "hold", item: holdSection },
+            { name: "decline", item: declineSection }
+        ]
+        var closest = "hold"
+        var closestDist = 999999
+        for (let i = 0; i < sections.length; i++) {
+            let s = sections[i]
+            if (!s.item.visible || s.item.height === 0) continue
+            let sectionCenter = s.item.y + s.item.height / 2
+            let dist = Math.abs(viewCenter - sectionCenter)
+            if (dist < closestDist) {
+                closestDist = dist
+                closest = s.name
+            }
+        }
+        return closest
+    }
+
+    function sectionToFrame(sectionName) {
+        if (!profile || !profile.steps) return -1
+        for (let i = 0; i < profile.steps.length; i++) {
+            if (frameToSection(i) === sectionName) return i
+        }
+        return -1
+    }
+
+
+    function updateGraph() {
+        profileGraph.frames = profile && profile.steps ? profile.steps.slice() : []
+    }
+
+    function loadCurrentProfile() {
+        if (profile || detailRequestId) return
+        profile = null
+        sourceRouteFilename = editorEntryFilename || ""
+        if (editorEntryIsNew) {
+            const type = editorEntryType || (isFlow ? "flow" : "pressure")
+            const title = editorEntryTitle || (isFlow
+                ? TranslationManager.translate("simpleProfileEditor.newFlowProfile", "New Flow Profile")
+                : TranslationManager.translate("simpleProfileEditor.newPressureProfile", "New Pressure Profile"))
+            editorDraft.createNewProfile(type, title)
+            profile = editorDraft.profile
+            params = editorDraft.getOrConvertProfileParams()
+            updateGraph()
+            return
+        }
+        detailRequestId = sourceRouteFilename
+            ? ProfileService.requestProfileDetail(sourceRouteFilename)
+            : ProfileService.requestCurrentProfile()
+    }
+
+    function handleProfileDetail(requestId, filename, detail, reason) {
+        if (requestId !== detailRequestId) return
+        detailRequestId = ""
+        if (reason || !detail || !detail.steps) {
+            saveErrorDetail = reason || ""
+            saveErrorDialog.open()
+            return
+        }
+        sourceRouteFilename = filename
+        const sourceName = detail._sourceFilename || ""
+        const revision = detail._sourceRevision || ""
+        const expectedType = editorEntryType || (isFlow ? "flow" : "pressure")
+        if (detail.editorType !== expectedType) {
+            const title = detail.title || editorPage.editorTitle
+            editorDraft.createNewProfile(expectedType, title)
+            editorDraft.load(editorDraft.profile, sourceName, revision)
+        } else if (!editorDraft.load(detail, sourceName, revision)) {
+            saveErrorDetail = "invalidProfile"
+            saveErrorDialog.open()
+            return
+        }
+        profile = editorDraft.profile
+        params = editorDraft.getOrConvertProfileParams()
+        updateGraph()
+    }
+
+    function updateParam(key, value) {
+        var newParams = Object.assign({}, params)
+        newParams[key] = value
+        params = newParams
+        editorDraft.applyParams(params)
+        profile = editorDraft.profile
+        updateGraph()
+    }
+
+    // Update profile temp — sets all 4 step temps at once
+    function updateProfileTemp(newTemp) {
+        var newParams = Object.assign({}, params)
+        newParams.pourTemperature = newTemp
+        newParams.tempStart = newTemp
+        newParams.tempPreinfuse = newTemp
+        newParams.tempHold = newTemp
+        newParams.tempDecline = newTemp
+        params = newParams
+        editorDraft.applyParams(params)
+        profile = editorDraft.profile
+        updateGraph()
+    }
+
+    function uploadProfile() {
+        if (!profile) return
+        editorDraft.setProfile(profile)
+        profile = editorDraft.profile
+    }
+
+    function beginWrite(kind, title, overwriteRevision) {
+        if (!profile || pendingWriteRequestId) return false
+        flushPendingEdits()
+        uploadProfile()
+        pendingWriteKind = kind
+        pendingSaveAsTitle = title
+        pendingWriteRequestId = kind === "try"
+            ? ProfileService.tryDraft(sourceRouteFilename, editorDraft.profile, editorDraft.sourceRevision)
+            : ProfileService.saveDraft(sourceRouteFilename, editorDraft.profile, editorDraft.sourceRevision,
+                                       title, overwriteRevision || "")
+        if (pendingWriteRequestId) return true
+        pendingWriteKind = ""
+        saveErrorDetail = ProfileService.operationError || ""
+        saveErrorDialog.open()
+        return false
+    }
+
+    function handleProfileOperation(requestId, operation, filename, success, reason, result) {
+        if (requestId !== pendingWriteRequestId) return
+        pendingWriteRequestId = ""
+        if (!success) {
+            reopenExitAfterError = pendingWriteKind !== "saveAs"
+            if (reason === "alreadyExists" && pendingWriteKind === "saveAs") {
+                pendingOverwriteRevision = result ? result.overwriteRevision || "" : ""
+                overwriteDialog.open()
+                pendingWriteKind = ""
+                return
+            }
+            pendingWriteKind = ""
+            saveErrorDetail = reason || ""
+            saveErrorDialog.open()
+            return
+        }
+        if (result && result.detail) {
+            sourceRouteFilename = result.filename || sourceRouteFilename
+            editorDraft.load(result.detail, result.detail._sourceFilename || "", result.sourceRevision || "")
+            profile = editorDraft.profile
+            params = editorDraft.getOrConvertProfileParams()
+            updateGraph()
+        } else {
+            editorDraft.markClean()
+        }
+        if (pendingWriteKind === "saveAs") saveAsDialog.close()
+        pendingWriteKind = ""
+        pendingOverwriteRevision = ""
+        saveErrorDetail = ""
+        AppShell.backRequested()
+    }
+
+    Connections {
+        target: ProfileService
+        function onProfileDetailReady(requestId, filename, detail, reason) {
+            editorPage.handleProfileDetail(requestId, filename, detail, reason)
+        }
+        function onOperationCompleted(requestId, operation, filename, success, reason, result) {
+            if (operation === "saveDraft" || operation === "tryDraft")
+                editorPage.handleProfileOperation(requestId, operation, filename, success, reason, result)
+        }
+    }
+
+    KeyboardAwareContainer {
+        id: keyboardContainer
+        anchors.fill: parent
+        textFields: [notesField.textField, saveAsTitleField]
+
+    // Editor mode header
+    Rectangle {
+        id: editorModeHeader
+        anchors.top: parent.top
+        anchors.topMargin: Theme.pageTopMargin
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: Theme.standardMargin
+        anchors.rightMargin: Theme.standardMargin
+        height: Theme.scaled(50)
+        color: Theme.primaryColor
+        radius: Theme.cardRadius
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Theme.scaled(15)
+            anchors.rightMargin: Theme.scaled(15)
+
+            Text {
+                text: editorPage.isFlow ? editorPage.tr("title", "Flow Profile Editor") : editorPage.tr("title", "Pressure Profile Editor")
+                font.family: Theme.titleFont.family
+                font.pixelSize: Theme.titleFont.pixelSize
+                font.bold: true
+                color: Theme.primaryContrastColor
+                Accessible.role: Accessible.Heading
+                Accessible.name: text
+                Accessible.focusable: true
+            }
+
+            Item { Layout.fillWidth: true }
+        }
+    }
+
+    // Main content area
+    Item {
+        anchors.top: editorModeHeader.bottom
+        anchors.topMargin: Theme.scaled(10)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: bottomBar.top
+        anchors.leftMargin: Theme.standardMargin
+        anchors.rightMargin: Theme.standardMargin
+
+        RowLayout {
+            anchors.fill: parent
+            spacing: Theme.scaled(15)
+
+            // Left side: Profile graph + Description
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                spacing: Theme.scaled(8)
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: Theme.scaled(120)
+                    color: Theme.cardBackgroundColor
+                    radius: Theme.cardRadius
+
+                    ProfileGraph {
+                        id: profileGraph
+                        anchors.fill: parent
+                        anchors.margins: Theme.scaled(10)
+                        frames: []
+                        selectedFrameIndex: editorPage.selectedFrameIndex
+                        targetWeight: editorPage.profile ? (editorPage.profile.target_weight || 0) : 0
+                        targetVolume: editorPage.profile ? (editorPage.profile.target_volume || 0) : 0
+
+                        onFrameSelected: function(index) {
+                            editorPage.selectedFrameIndex = index
+                            var section = editorPage.frameToSection(index)
+                            editorPage.scrollToSection(section)
+                        }
+                    }
+                }
+
+                ExpandableTextArea {
+                    id: notesField
+                    Layout.fillWidth: true
+                    accessibleName: TranslationManager.translate("profileEditor.accessible.profileDescription", "Profile description")
+                    text: editorPage.profile ? (editorPage.profile.profile_notes || "") : ""
+                    textFont: Theme.labelFont
+                    onEditingFinished: {
+                        if (editorPage.profile) {
+                            editorPage.profile.profile_notes = text
+                            editorPage.uploadProfile()
+                        }
+                    }
+                }
+            }
+
+            // Right side: Editor controls (de1app style)
+            Rectangle {
+                Layout.preferredWidth: Theme.scaled(320)
+                Layout.fillHeight: true
+                color: Theme.cardBackgroundColor
+                radius: Theme.cardRadius
+
+                ScrollView {
+                    id: editorScrollView
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(15)
+                    clip: true
+                    contentWidth: availableWidth
+
+                    // Use onMovingChanged instead of onMovementEnded because
+                    // movementEnded does not fire for mouse wheel scrolling on desktop
+                    Connections {
+                        target: editorScrollView.contentItem
+                        function onMovingChanged() {
+                            if (!(editorScrollView.contentItem as Flickable).moving && !editorPage.scrollingFromSelection) {
+                                let section = editorPage.findCenteredSection()
+                                let frameIdx = editorPage.sectionToFrame(section)
+                                if (frameIdx >= 0 && frameIdx !== editorPage.selectedFrameIndex) {
+                                    editorPage.selectedFrameIndex = frameIdx
+                                }
+                            }
+                        }
+                        function onDraggingChanged() {
+                            if ((editorScrollView.contentItem as Flickable).dragging) {
+                                editorPage.scrollingFromSelection = false
+                            }
+                        }
+                    }
+
+                    ColumnLayout {
+                        width: editorScrollView.width - Math.max(Theme.scaled(14), editorScrollView.effectiveScrollBarWidth)
+                        spacing: Theme.scaled(14)
+
+                        // === Profile Temperature ===
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.scaled(4)
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Theme.scaled(8)
+
+                                Text {
+                                    text: editorPage.tr("profileTemp", "Profile temp")
+                                    font.family: Theme.captionFont.family
+                                    font.pixelSize: Theme.captionFont.pixelSize
+                                    font.bold: true
+                                    color: Theme.textColor
+                                }
+
+                                Item { Layout.fillWidth: true }
+
+                                Text {
+                                    text: Theme.formatTemperature(editorPage.val(editorPage.params.pourTemperature, 90), 1)
+                                    font.family: Theme.bodyFont.family
+                                    font.pixelSize: Theme.bodyFont.pixelSize
+                                    font.bold: true
+                                    color: Theme.temperatureColor
+                                }
+
+                                // Temp Steps button
+                                Rectangle {
+                                    Layout.preferredWidth: tempStepsText.implicitWidth + Theme.scaled(16)
+                                    Layout.preferredHeight: Theme.scaled(28)
+                                    radius: Theme.scaled(6)
+                                    color: Theme.backgroundColor
+                                    border.color: Theme.temperatureColor
+                                    border.width: 1
+                                    Accessible.role: Accessible.Button
+                                    Accessible.name: TranslationManager.translate("simpleProfileEditor.editTemperatureSteps", "Edit temperature steps")
+                                    Accessible.focusable: true
+                                    Accessible.onPressAction: tempStepsArea.clicked(null)
+
+                                    Text {
+                                        id: tempStepsText
+                                        anchors.centerIn: parent
+                                        text: editorPage.tr("tempSteps", "Steps")
+                                        font.family: Theme.captionFont.family
+                                        font.pixelSize: Theme.captionFont.pixelSize
+                                        color: Theme.temperatureColor
+                                        Accessible.ignored: true
+                                    }
+
+                                    MouseArea {
+                                        id: tempStepsArea
+                                        anchors.fill: parent
+                                        onClicked: tempStepsDialog.open()
+                                    }
+                                }
+                            }
+
+                            ValueInput {
+                                id: profileTempSlider
+                                Layout.fillWidth: true; valueColor: Theme.temperatureColor
+                                accessibleName: TranslationManager.translate("simpleProfileEditor.profileTemperature", "Profile temperature")
+                                from: Theme.cToDisplay(70); to: Theme.cToDisplay(100); stepSize: 0.1; suffix: Theme.tempUnitSuffix()
+                                // Stored in Celsius; shown and entered in the user's unit.
+                                value: Theme.cToDisplay(editorPage.val(editorPage.params.pourTemperature, 90))
+                                onValueModified: function(newValue) { editorPage.updateProfileTemp(Math.round(Theme.displayToC(newValue) * 10) / 10) }
+                            }
+
+                            // Dose
+                            Text { text: TranslationManager.translate("simpleProfile.dose", "Dose"); font: Theme.captionFont; color: Theme.weightColor }
+                            ValueInput { Layout.fillWidth: true; valueColor: Theme.weightColor; accessibleName: TranslationManager.translate("simpleProfileEditor.dose", "Dose"); from: 3; to: 40; stepSize: 0.1; suffix: " g"; value: (editorPage.profile ? (editorPage.profile.recommended_dose || 0) : 0); onValueModified: function(newValue) { if (editorPage.profile) { editorPage.profile.recommended_dose = Math.round(newValue * 10) / 10; editorPage.profile.has_recommended_dose = true; editorPage.uploadProfile() } } }
+                        }
+
+                        // Separator
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            color: Theme.borderColor
+                        }
+
+                        // === 1: Preinfuse ===
+                        Item {
+                            id: preinfusionSection
+                            Layout.fillWidth: true
+                            implicitHeight: preinfuseCol.implicitHeight
+
+                            ColumnLayout {
+                                id: preinfuseCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                spacing: Theme.scaled(4)
+
+                                // Step header with temp badge
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: Theme.scaled(6)
+                                    Text { text: "1:"; font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.primaryColor }
+                                    Text { text: editorPage.tr("preinfuse", "Preinfuse"); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.textColor }
+                                    Item { Layout.fillWidth: true }
+                                    Rectangle {
+                                        Layout.preferredWidth: tempPreinfuseLabel.implicitWidth + Theme.scaled(12); Layout.preferredHeight: Theme.scaled(32)
+                                        radius: Theme.scaled(12); color: Qt.rgba(Theme.temperatureColor.r, Theme.temperatureColor.g, Theme.temperatureColor.b, 0.15)
+                                        Accessible.role: Accessible.Button; Accessible.name: TranslationManager.translate("simpleProfileEditor.editPreinfuseTemperature", "Edit preinfuse temperature"); Accessible.focusable: true
+                                        Accessible.onPressAction: tempPreinfuseArea.clicked(null)
+                                        Text { id: tempPreinfuseLabel; anchors.centerIn: parent; text: Theme.cToDisplay(editorPage.stepTemp("tempStart")).toFixed(1) + "/" + Theme.formatTemperature(editorPage.stepTemp("tempPreinfuse"), 1); font.family: Theme.captionFont.family; font.pixelSize: Theme.captionFont.pixelSize; color: Theme.temperatureColor; Accessible.ignored: true }
+                                        MouseArea { id: tempPreinfuseArea; anchors.fill: parent; onClicked: tempStepsDialog.open() }
+                                    }
+                                }
+
+                                // Max duration
+                                Text { text: TranslationManager.translate("simpleProfile.maxDuration", "Max duration"); font: Theme.captionFont; color: Theme.textSecondaryColor }
+                                ValueInput { Layout.fillWidth: true; accessibleName: TranslationManager.translate("simpleProfileEditor.preinfusionMaxDuration", "Preinfusion max duration"); from: 0; to: 60; stepSize: 1; suffix: " s"; displayText: editorPage.val(editorPage.params.preinfusionTime, 20) === 0 ? TranslationManager.translate("profileEditor.off", "off") : ""; value: editorPage.val(editorPage.params.preinfusionTime, 20); onValueModified: function(newValue) { editorPage.updateParam("preinfusionTime", Math.round(newValue)) } }
+
+                                // Flow rate (hidden when preinfusion is off)
+                                Text { text: TranslationManager.translate("simpleProfile.flowRate", "Flow rate"); font: Theme.captionFont; color: Theme.flowColor; visible: editorPage.val(editorPage.params.preinfusionTime, 20) > 0 }
+                                ValueInput { Layout.fillWidth: true; valueColor: Theme.flowColor; accessibleName: TranslationManager.translate("simpleProfileEditor.preinfusionFlowRate", "Preinfusion flow rate"); from: 1; to: editorDraft.maxSettableFlow; stepSize: 0.01; suffix: " mL/s"; value: editorPage.val(editorPage.params.preinfusionFlowRate, 8.0); onValueModified: function(newValue) { editorPage.updateParam("preinfusionFlowRate", Math.round(newValue * 100) / 100) }; visible: editorPage.val(editorPage.params.preinfusionTime, 20) > 0 }
+
+                                // Exit pressure (hidden when preinfusion is off)
+                                Text { text: TranslationManager.translate("simpleProfile.exitPressure", "Exit pressure"); font: Theme.captionFont; color: Theme.pressureColor; visible: editorPage.val(editorPage.params.preinfusionTime, 20) > 0 }
+                                ValueInput { Layout.fillWidth: true; valueColor: Theme.pressureColor; accessibleName: TranslationManager.translate("simpleProfileEditor.preinfusionExitPressure", "Preinfusion exit pressure"); from: 0.5; to: 8; stepSize: 0.01; suffix: " bar"; value: editorPage.val(editorPage.params.preinfusionStopPressure, 4.0); onValueModified: function(newValue) { editorPage.updateParam("preinfusionStopPressure", Math.round(newValue * 100) / 100) }; visible: editorPage.val(editorPage.params.preinfusionTime, 20) > 0 }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.borderColor }
+
+                        // === 2: Hold (flow) / Rise and Hold (pressure) ===
+                        Item {
+                            id: holdSection
+                            Layout.fillWidth: true
+                            implicitHeight: holdCol.implicitHeight
+
+                            ColumnLayout {
+                                id: holdCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                spacing: Theme.scaled(4)
+
+                                // Step header with temp badge
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: Theme.scaled(6)
+                                    Text { text: "2:"; font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.primaryColor }
+                                    Text { text: editorPage.isFlow ? editorPage.tr("hold", "Hold") : editorPage.tr("riseAndHold", "Rise and Hold"); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.textColor }
+                                    Item { Layout.fillWidth: true }
+                                    Rectangle {
+                                        Layout.preferredWidth: tempHoldLabel.implicitWidth + Theme.scaled(12); Layout.preferredHeight: Theme.scaled(32)
+                                        radius: Theme.scaled(12); color: Qt.rgba(Theme.temperatureColor.r, Theme.temperatureColor.g, Theme.temperatureColor.b, 0.15)
+                                        Accessible.role: Accessible.Button; Accessible.name: TranslationManager.translate("simpleProfileEditor.editHoldTemperature", "Edit hold temperature"); Accessible.focusable: true
+                                        Accessible.onPressAction: tempHoldArea.clicked(null)
+                                        Text { id: tempHoldLabel; anchors.centerIn: parent; text: Theme.formatTemperature(editorPage.stepTemp("tempHold"), 1); font.family: Theme.captionFont.family; font.pixelSize: Theme.captionFont.pixelSize; color: Theme.temperatureColor; Accessible.ignored: true }
+                                        MouseArea { id: tempHoldArea; anchors.fill: parent; onClicked: tempStepsDialog.open() }
+                                    }
+                                }
+
+                                // Time
+                                Text { text: TranslationManager.translate("simpleProfile.holdTime", "Time"); font: Theme.captionFont; color: Theme.textSecondaryColor }
+                                ValueInput { Layout.fillWidth: true; accessibleName: TranslationManager.translate("simpleProfileEditor.holdTime", "Hold time"); from: 0; to: 60; stepSize: 1; suffix: " s"; displayText: editorPage.val(editorPage.params.holdTime, 10) === 0 ? TranslationManager.translate("profileEditor.off", "off") : ""; value: editorPage.val(editorPage.params.holdTime, 10); onValueModified: function(newValue) { editorPage.updateParam("holdTime", Math.round(newValue)) } }
+
+                                // Flow: holdFlow + pressure limit
+                                // Pressure: flow limit + espressoPressure
+                                // First slider: flow has holdFlow (primary, hide when off), pressure has limiterValue (limiter, always show)
+                                Text { text: editorPage.isFlow ? TranslationManager.translate("simpleProfile.flow", "Flow") : TranslationManager.translate("simpleProfile.flowLimit", "Flow limit"); font: Theme.captionFont; color: Theme.flowColor; visible: editorPage.isFlow ? editorPage.val(editorPage.params.holdTime, 10) > 0 : true }
+                                ValueInput {
+                                    Layout.fillWidth: true; valueColor: Theme.flowColor
+                                    visible: editorPage.isFlow ? editorPage.val(editorPage.params.holdTime, 10) > 0 : true
+                                    accessibleName: editorPage.isFlow ? TranslationManager.translate("simpleProfileEditor.holdFlow", "Hold flow") : TranslationManager.translate("simpleProfileEditor.flowLimit", "Flow limit")
+                                    // Pressure profile: the flow LIMIT, which can no longer be
+                                    // off. Flow profile: still the flow goal (its ceiling rises
+                                    // with maxSettableFlow).
+                                    from: 0.1; to: editorDraft.maxSettableFlow; stepSize: 0.01; suffix: " mL/s"
+                                    snapZeroTo: editorPage.isFlow ? 0 : editorDraft.defaultPressureFlowLimit
+                                    value: editorPage.isFlow ? editorPage.val(editorPage.params.holdFlow, 2.2) : editorPage.val(editorPage.params.limiterValue, 3.5)
+                                    onValueModified: function(newValue) { editorPage.isFlow
+                                        ? editorPage.updateParam("holdFlow", Math.round(newValue * 100) / 100)
+                                        : editorPage.updateParam("limiterValue", Math.round(newValue * 100) / 100) }
+                                }
+
+                                // Second slider: flow has limiterValue (pressure limit, always show), pressure has espressoPressure (primary, hide when off)
+                                Text { text: editorPage.isFlow ? TranslationManager.translate("simpleProfile.pressureLimit", "Pressure limit") : TranslationManager.translate("simpleProfile.pressure2", "Pressure"); font: Theme.captionFont; color: Theme.pressureColor; visible: editorPage.isFlow ? true : editorPage.val(editorPage.params.holdTime, 10) > 0 }
+                                ValueInput {
+                                    Layout.fillWidth: true; valueColor: Theme.pressureColor
+                                    visible: editorPage.isFlow ? true : editorPage.val(editorPage.params.holdTime, 10) > 0
+                                    accessibleName: editorPage.isFlow ? TranslationManager.translate("simpleProfileEditor.pressureLimit", "Pressure limit") : TranslationManager.translate("simpleProfileEditor.holdPressure", "Hold pressure")
+                                    from: editorPage.isFlow ? 0 : 1; to: 12; stepSize: 0.01; suffix: " bar"
+                                    displayText: editorPage.isFlow && editorPage.val(editorPage.params.limiterValue, 3.5) === 0 ? TranslationManager.translate("profileEditor.off", "off") : ""
+                                    value: editorPage.isFlow ? editorPage.val(editorPage.params.limiterValue, 3.5) : editorPage.val(editorPage.params.espressoPressure, 8.4)
+                                    onValueModified: function(newValue) { editorPage.isFlow
+                                        ? editorPage.updateParam("limiterValue", Math.round(newValue * 100) / 100)
+                                        : editorPage.updateParam("espressoPressure", Math.round(newValue * 100) / 100) }
+                                }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.borderColor }
+
+                        // === 3: Decline ===
+                        Item {
+                            id: declineSection
+                            Layout.fillWidth: true
+                            implicitHeight: declineCol.implicitHeight
+
+                            ColumnLayout {
+                                id: declineCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                spacing: Theme.scaled(4)
+
+                                // Step header with temp badge
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: Theme.scaled(6)
+                                    Text { text: "3:"; font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.primaryColor }
+                                    Text { text: editorPage.tr("decline", "Decline"); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.textColor }
+                                    Item { Layout.fillWidth: true }
+                                    Rectangle {
+                                        Layout.preferredWidth: tempDeclineLabel.implicitWidth + Theme.scaled(12); Layout.preferredHeight: Theme.scaled(32)
+                                        radius: Theme.scaled(12); color: Qt.rgba(Theme.temperatureColor.r, Theme.temperatureColor.g, Theme.temperatureColor.b, 0.15)
+                                        Accessible.role: Accessible.Button; Accessible.name: TranslationManager.translate("simpleProfileEditor.editDeclineTemperature", "Edit decline temperature"); Accessible.focusable: true
+                                        Accessible.onPressAction: tempDeclineArea.clicked(null)
+                                        Text { id: tempDeclineLabel; anchors.centerIn: parent; text: Theme.formatTemperature(editorPage.stepTemp("tempDecline"), 1); font.family: Theme.captionFont.family; font.pixelSize: Theme.captionFont.pixelSize; color: Theme.temperatureColor; Accessible.ignored: true }
+                                        MouseArea { id: tempDeclineArea; anchors.fill: parent; onClicked: tempStepsDialog.open() }
+                                    }
+                                }
+
+                                // Time
+                                Text { text: TranslationManager.translate("simpleProfile.declineTime", "Time"); font: Theme.captionFont; color: Theme.textSecondaryColor }
+                                ValueInput { Layout.fillWidth: true; accessibleName: TranslationManager.translate("simpleProfileEditor.declineTime", "Decline time"); from: 0; to: 60; stepSize: 1; suffix: " s"; displayText: editorPage.val(editorPage.params.simpleDeclineTime, 30) === 0 ? TranslationManager.translate("profileEditor.off", "off") : ""; value: editorPage.val(editorPage.params.simpleDeclineTime, 30); onValueModified: function(newValue) { editorPage.updateParam("simpleDeclineTime", Math.round(newValue)) } }
+
+                                // End value: flow has flowEnd (mL/s), pressure has pressureEnd (bar)
+                                // Hidden when decline is off
+                                Text { text: editorPage.isFlow ? TranslationManager.translate("simpleProfile.endFlow", "Flow") : TranslationManager.translate("simpleProfile.endPressure", "Pressure"); font: Theme.captionFont; color: editorPage.isFlow ? Theme.flowColor : Theme.pressureColor; visible: editorPage.val(editorPage.params.simpleDeclineTime, 30) > 0 }
+                                ValueInput {
+                                    Layout.fillWidth: true; valueColor: editorPage.isFlow ? Theme.flowColor : Theme.pressureColor
+                                    visible: editorPage.val(editorPage.params.simpleDeclineTime, 30) > 0
+                                    accessibleName: editorPage.isFlow ? TranslationManager.translate("simpleProfileEditor.declineEndFlow", "Decline end flow") : TranslationManager.translate("simpleProfileEditor.declinePressure", "Decline pressure")
+                                    from: 0; to: editorPage.isFlow ? editorDraft.maxSettableFlow : 12; stepSize: 0.01; suffix: editorPage.isFlow ? " mL/s" : " bar"
+                                    value: editorPage.isFlow ? editorPage.val(editorPage.params.flowEnd, 1.8) : editorPage.val(editorPage.params.pressureEnd, 6.0)
+                                    onValueModified: function(newValue) { editorPage.isFlow
+                                        ? editorPage.updateParam("flowEnd", Math.round(newValue * 100) / 100)
+                                        : editorPage.updateParam("pressureEnd", Math.round(newValue * 100) / 100) }
+                                }
+                            }
+                        }
+
+                        // Separator
+                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.borderColor }
+
+                        // === 4: Stop at Weight ===
+                        Item {
+                            Layout.fillWidth: true
+                            implicitHeight: stopCol.implicitHeight
+
+                            ColumnLayout {
+                                id: stopCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                spacing: Theme.scaled(4)
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: Theme.scaled(6)
+                                    Text { text: "4:"; font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.primaryColor }
+                                    Text { text: editorPage.tr("stopAtWeight", "Stop at Weight"); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.textColor }
+                                }
+
+                                // Weight
+                                Text { text: TranslationManager.translate("simpleProfile.weight", "Weight"); font: Theme.captionFont; color: Theme.weightColor }
+                                ValueInput { Layout.fillWidth: true; valueColor: Theme.weightColor; accessibleName: TranslationManager.translate("simpleProfileEditor.targetWeight", "Target weight"); from: 0; to: 500; stepSize: 0.1; suffix: " g"; displayText: editorPage.val(editorPage.params.targetWeight, 36) <= 0 ? TranslationManager.translate("profileEditor.off", "off") : ""; value: editorPage.val(editorPage.params.targetWeight, 36); onValueModified: function(newValue) { editorPage.updateParam("targetWeight", Math.round(newValue * 10) / 10) } }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: { var d = (editorPage.profile ? (editorPage.profile.recommended_dose || 0) : 0); return editorPage.tr("ratio", "Ratio: 1:") + (d > 0 ? (editorPage.val(editorPage.params.targetWeight, 36) / d).toFixed(1) : "--") }
+                                    font: Theme.captionFont
+                                    color: Theme.textSecondaryColor
+                                    horizontalAlignment: Text.AlignRight
+                                }
+                            }
+                        }
+
+                        Item { Layout.fillHeight: true }
+                    }
+                }
+            }
+        }
+    }
+
+    // Bottom bar — counteract keyboard shift so it stays at screen bottom (behind keyboard)
+    BottomBar {
+        id: bottomBar
+        transform: Translate { y: keyboardContainer.keyboardOffset }
+        title: editorPage.profile ? editorPage.profile.title : (editorPage.isFlow ? editorPage.tr("flow", "Flow") : editorPage.tr("pressure", "Pressure"))
+        onBackClicked: editorPage.handleBack()
+
+        // Read-only indicator
+        Text {
+            text: TranslationManager.translate("profileEditor.readOnly", "Read-Only")
+            color: Theme.warningColor
+            font: Theme.bodyFont
+            visible: editorPage.sourceReadOnly
+        }
+
+        Text {
+            text: "\u2022 " + TranslationManager.translate("simpleProfileEditor.modified", "Modified")
+            color: Theme.warningColor
+            font: Theme.bodyFont
+            visible: editorPage.profileModified && !editorPage.sourceReadOnly
+        }
+
+        Rectangle { width: 1; height: Theme.scaled(30); color: bottomBar.contentColor; opacity: 0.3 }
+
+        Text {
+            text: (editorPage.profile && editorPage.profile.steps ? editorPage.profile.steps.length : 0) + " " + editorPage.tr("frames", "frames")
+            color: bottomBar.contentColor
+            font: Theme.bodyFont
+        }
+
+        Rectangle { width: 1; height: Theme.scaled(30); color: bottomBar.contentColor; opacity: 0.3 }
+
+        Text {
+            text: {
+                var w = editorPage.val(editorPage.params.targetWeight, 36)
+                return w > 0 ? w.toFixed(0) + TranslationManager.translate("units.grams", "g") : TranslationManager.translate("profileEditor.off", "off")
+            }
+            color: bottomBar.contentColor
+            font: Theme.bodyFont
+        }
+
+        AccessibleButton {
+            id: accessibleButton
+            text: editorPage.tr("done", "Done")
+            accessibleName: editorPage.isFlow ? editorPage.tr("finishEditing", "Finish editing flow profile") : editorPage.tr("finishEditing", "Finish editing pressure profile")
+            onClicked: {
+                editorPage.flushPendingEdits()
+                if (editorPage.profileModified) {
+                    exitDialog.open()
+                } else {
+                    AppShell.backRequested()
+                }
+            }
+            background: Rectangle {
+                implicitWidth: Math.max(Theme.scaled(80), doneText.implicitWidth + Theme.scaled(32))
+                implicitHeight: Theme.scaled(36)
+                radius: Theme.scaled(6)
+                color: accessibleButton.down || accessibleButton.isPressed ? Qt.darker(Theme.primaryContrastColor, 1.1) : Theme.primaryContrastColor
+            }
+            contentItem: Text {
+                id: doneText
+                text: accessibleButton.text
+                font.pixelSize: Theme.scaled(14)
+                font.family: Theme.bodyFont.family
+                color: Theme.primaryColor
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+        }
+    }
+
+    } // KeyboardAwareContainer
+
+    // === Temperature Steps Dialog ===
+    DecenzaDialog {
+        id: tempStepsDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - Theme.scaled(40), Theme.scaled(400))
+        modal: true
+        padding: 0
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 1
+            border.color: Theme.primaryContrastColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 0
+
+            // Header
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(50)
+                Layout.topMargin: Theme.scaled(10)
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.scaled(20)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: editorPage.tr("tempStepsTitle", "Temperature Steps")
+                    font: Theme.titleFont
+                    color: Theme.textColor
+                }
+
+                Rectangle {
+                    anchors.right: parent.right
+                    anchors.rightMargin: Theme.scaled(12)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Theme.scaled(32); height: Theme.scaled(32)
+                    radius: Theme.scaled(16)
+                    color: tempCloseArea.pressed ? Qt.darker(Theme.surfaceColor, 1.3) : "transparent"
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("simpleProfileEditor.closeTemperatureSteps", "Close temperature steps")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: tempCloseArea.clicked(null)
+
+                    ColoredIcon {
+                        anchors.centerIn: parent
+                        source: "qrc:/icons/cross.svg"
+                        iconWidth: Theme.scaled(14)
+                        iconHeight: Theme.scaled(14)
+                        iconColor: Theme.textSecondaryColor
+                    }
+                    MouseArea {
+                        id: tempCloseArea
+                        anchors.fill: parent
+                        onClicked: tempStepsDialog.close()
+                    }
+                }
+
+                Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: Theme.borderColor
+                }
+            }
+
+            // Content
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.margins: Theme.scaled(20)
+                spacing: Theme.scaled(14)
+
+                // Start
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(2)
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: editorPage.tr("start", "Start"); font: Theme.bodyFont; color: Theme.textColor }
+                        Item { Layout.fillWidth: true }
+                        Text { text: Theme.formatTemperature(editorPage.val(editorPage.params.tempStart, 90), 1); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.temperatureColor }
+                    }
+                    ValueInput { Layout.fillWidth: true; valueColor: Theme.temperatureColor; accessibleName: TranslationManager.translate("simpleProfileEditor.startTemperature", "Start temperature"); from: Theme.cToDisplay(70); to: Theme.cToDisplay(100); stepSize: 0.1; suffix: Theme.tempUnitSuffix(); value: Theme.cToDisplay(editorPage.val(editorPage.params.tempStart, 90)); onValueModified: function(newValue) { editorPage.updateParam("tempStart", Math.round(Theme.displayToC(newValue) * 10) / 10) } }
+                }
+
+                // 1: Preinfuse
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(2)
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: "1: " + editorPage.tr("preinfuse", "Preinfuse"); font: Theme.bodyFont; color: Theme.textColor }
+                        Item { Layout.fillWidth: true }
+                        Text { text: Theme.formatTemperature(editorPage.val(editorPage.params.tempPreinfuse, 90), 1); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.temperatureColor }
+                    }
+                    ValueInput { Layout.fillWidth: true; valueColor: Theme.temperatureColor; accessibleName: TranslationManager.translate("simpleProfileEditor.preinfuseTemperature", "Preinfuse temperature"); from: Theme.cToDisplay(70); to: Theme.cToDisplay(100); stepSize: 0.1; suffix: Theme.tempUnitSuffix(); value: Theme.cToDisplay(editorPage.val(editorPage.params.tempPreinfuse, 90)); onValueModified: function(newValue) { editorPage.updateParam("tempPreinfuse", Math.round(Theme.displayToC(newValue) * 10) / 10) } }
+                }
+
+                // 2: Hold / Rise and Hold
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(2)
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: editorPage.isFlow ? ("2: " + editorPage.tr("hold", "Hold")) : ("2: " + editorPage.tr("riseAndHold", "Rise and Hold")); font: Theme.bodyFont; color: Theme.textColor }
+                        Item { Layout.fillWidth: true }
+                        Text { text: Theme.formatTemperature(editorPage.val(editorPage.params.tempHold, 90), 1); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.temperatureColor }
+                    }
+                    ValueInput { Layout.fillWidth: true; valueColor: Theme.temperatureColor; accessibleName: editorPage.isFlow ? TranslationManager.translate("simpleProfileEditor.holdTemperature", "Hold temperature") : TranslationManager.translate("simpleProfileEditor.riseAndHoldTemperature", "Rise and hold temperature"); from: Theme.cToDisplay(70); to: Theme.cToDisplay(100); stepSize: 0.1; suffix: Theme.tempUnitSuffix(); value: Theme.cToDisplay(editorPage.val(editorPage.params.tempHold, 90)); onValueModified: function(newValue) { editorPage.updateParam("tempHold", Math.round(Theme.displayToC(newValue) * 10) / 10) } }
+                }
+
+                // 3: Decline
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(2)
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: "3: " + editorPage.tr("decline", "Decline"); font: Theme.bodyFont; color: Theme.textColor }
+                        Item { Layout.fillWidth: true }
+                        Text { text: Theme.formatTemperature(editorPage.val(editorPage.params.tempDecline, 90), 1); font.family: Theme.bodyFont.family; font.pixelSize: Theme.bodyFont.pixelSize; font.bold: true; color: Theme.temperatureColor }
+                    }
+                    ValueInput { Layout.fillWidth: true; valueColor: Theme.temperatureColor; accessibleName: TranslationManager.translate("simpleProfileEditor.declineTemperature", "Decline temperature"); from: Theme.cToDisplay(70); to: Theme.cToDisplay(100); stepSize: 0.1; suffix: Theme.tempUnitSuffix(); value: Theme.cToDisplay(editorPage.val(editorPage.params.tempDecline, 90)); onValueModified: function(newValue) { editorPage.updateParam("tempDecline", Math.round(Theme.displayToC(newValue) * 10) / 10) } }
+                }
+
+                AccessibleButton {
+                    id: doneButton
+                    Layout.fillWidth: true
+                    Layout.topMargin: Theme.scaled(6)
+                    text: TranslationManager.translate("common.done", "Done")
+                    accessibleName: TranslationManager.translate("common.done", "Done")
+                    onClicked: tempStepsDialog.close()
+                    background: Rectangle {
+                        implicitHeight: Theme.scaled(44)
+                        radius: Theme.buttonRadius
+                        color: doneButton.down || doneButton.isPressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                    }
+                    contentItem: Text {
+                        text: doneButton.text
+                        font: Theme.bodyFont
+                        color: Theme.primaryContrastColor
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+        }
+    }
+
+    // Save error dialog
+    DecenzaDialog {
+        id: saveErrorDialog
+        anchors.centerIn: parent
+        width: Theme.scaled(350)
+        modal: true
+        padding: 0
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 1
+            border.color: Theme.primaryContrastColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 0
+
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(50)
+                Layout.topMargin: Theme.scaled(10)
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.scaled(20)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: editorPage.tr("saveError", "Save Failed")
+                    font: Theme.titleFont
+                    color: Theme.textColor
+                }
+
+                Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: Theme.borderColor
+                }
+            }
+
+            Text {
+                text: editorPage.tr("saveErrorMessage", "Could not save the profile. Please try again or use Save As with a different name.")
+                    + (editorPage.saveErrorDetail ? "\n" + editorPage.saveErrorDetail : "")
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.margins: Theme.scaled(20)
+            }
+
+            AccessibleButton {
+                id: okButton
+                Layout.fillWidth: true
+                Layout.leftMargin: Theme.scaled(20)
+                Layout.rightMargin: Theme.scaled(20)
+                Layout.bottomMargin: Theme.scaled(20)
+                text: TranslationManager.translate("common.button.ok", "OK")
+                accessibleName: TranslationManager.translate("common.button.ok", "OK")
+                onClicked: saveErrorDialog.close()
+                background: Rectangle {
+                    implicitHeight: Theme.scaled(44)
+                    radius: Theme.buttonRadius
+                    color: okButton.down || okButton.isPressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                }
+                contentItem: Text {
+                    text: okButton.text
+                    font: Theme.bodyFont
+                    color: Theme.primaryContrastColor
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+        }
+        onClosed: {
+            if (editorPage.reopenExitAfterError && editorPage.profileModified) {
+                editorPage.reopenExitAfterError = false
+                exitDialog.open()
+            }
+        }
+    }
+
+    // Exit dialog for unsaved changes
+    UnsavedChangesDialog {
+        id: exitDialog
+        itemType: "profile"
+        canSave: editorPage.originalProfileName !== "" && !editorPage.sourceReadOnly
+        showTry: true
+        onLeaveCancelled: AppShell.browserBackCancelled()
+        onDiscardClicked: AppShell.backRequested()
+        onTryClicked: editorPage.beginWrite("try", "")
+        onSaveAsClicked: saveAsDialog.open()
+        onSaveClicked: editorPage.beginWrite("save", "")
+    }
+
+    // Save As dialog
+    DecenzaDialog {
+        id: saveAsDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - Theme.scaled(40), Theme.scaled(400))
+        modal: true
+        padding: 0
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 1
+            border.color: Theme.primaryContrastColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 0
+
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(50)
+                Layout.topMargin: Theme.scaled(10)
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.scaled(20)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: editorPage.tr("saveAs", "Save Profile As")
+                    font: Theme.titleFont
+                    color: Theme.textColor
+                }
+
+                Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    height: 1
+                    color: Theme.borderColor
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.margins: Theme.scaled(20)
+                spacing: Theme.scaled(10)
+
+                Text {
+                    text: editorPage.tr("profileTitle", "Profile Title")
+                    font: Theme.captionFont
+                    color: Theme.textSecondaryColor
+                }
+
+                StyledTextField {
+                    id: saveAsTitleField
+                    Accessible.name: TranslationManager.translate("simpleProfileEditor.profileName", "Profile name")
+                    Layout.fillWidth: true
+                    text: editorPage.isFlow ? TranslationManager.translate("simpleProfileEditor.newFlowProfile", "New Flow Profile") : TranslationManager.translate("simpleProfileEditor.newPressureProfile", "New Pressure Profile")
+                    font: Theme.bodyFont
+                    color: Theme.textColor
+                    placeholder: editorPage.tr("namePlaceholder", "Enter profile name")
+                    leftPadding: Theme.scaled(12)
+                    rightPadding: Theme.scaled(12)
+                    topPadding: Theme.scaled(12)
+                    bottomPadding: Theme.scaled(12)
+                    background: Rectangle {
+                        color: Theme.backgroundColor
+                        radius: Theme.scaled(4)
+                        border.color: saveAsTitleField.activeFocus ? Theme.primaryColor : Theme.borderColor
+                        border.width: 1
+                    }
+                    onAccepted: saveAsDialog.doSave()
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(10)
+
+                    AccessibleButton {
+                        id: cancelButton
+                        Layout.fillWidth: true
+                        text: TranslationManager.translate("common.cancel", "Cancel")
+                        accessibleName: TranslationManager.translate("common.cancel", "Cancel")
+                        onClicked: saveAsDialog.close()
+                        background: Rectangle {
+                            implicitHeight: Theme.scaled(44)
+                            radius: Theme.buttonRadius
+                            color: "transparent"
+                            border.width: 1
+                            border.color: Theme.textSecondaryColor
+                        }
+                        contentItem: Text {
+                            text: cancelButton.text
+                            font: Theme.bodyFont
+                            color: Theme.textColor
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+
+                    AccessibleButton {
+                        id: saveButton
+                        Layout.fillWidth: true
+                        text: TranslationManager.translate("common.save", "Save")
+                        accessibleName: TranslationManager.translate("common.save", "Save")
+                        onClicked: saveAsDialog.doSave()
+                        background: Rectangle {
+                            implicitHeight: Theme.scaled(44)
+                            radius: Theme.buttonRadius
+                            color: saveButton.down || saveButton.isPressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                        }
+                        contentItem: Text {
+                            text: saveButton.text
+                            font: Theme.bodyFont
+                            color: Theme.primaryContrastColor
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+                }
+            }
+        }
+
+        function doSave() {
+            Keyboard.commit()
+            const title = saveAsTitleField.text.trim()
+            if (!title || editorPage.pendingWriteRequestId) return
+            editorPage.beginWrite("saveAs", title)
+        }
+
+        onOpened: {
+            var defaultName = editorPage.isFlow ? TranslationManager.translate("simpleProfileEditor.newFlowProfile", "New Flow Profile") : TranslationManager.translate("simpleProfileEditor.newPressureProfile", "New Pressure Profile")
+            saveAsTitleField.text = editorPage.profile ? editorPage.profile.title : defaultName
+            saveAsTitleField.forceActiveFocus()
+        }
+    }
+
+    DecenzaDialog {
+        id: overwriteDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - Theme.scaled(40), Theme.scaled(400))
+        modal: true
+        title: editorPage.tr("profileExists", "Profile Exists")
+        standardButtons: Dialog.NoButton
+        contentItem: ColumnLayout {
+            spacing: Theme.scaled(12)
+            Text {
+                text: editorPage.tr("overwriteConfirm", "A profile with this name already exists.\nDo you want to overwrite it?")
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                AccessibleButton {
+                    text: TranslationManager.translate("common.no", "No")
+                    accessibleName: text
+                    Layout.fillWidth: true
+                    onClicked: overwriteDialog.close()
+                }
+                AccessibleButton {
+                    text: TranslationManager.translate("common.yes", "Yes")
+                    accessibleName: text
+                    destructive: true
+                    Layout.fillWidth: true
+                    onClicked: {
+                        overwriteDialog.close()
+                        editorPage.beginWrite("saveAs", editorPage.pendingSaveAsTitle,
+                                              editorPage.pendingOverwriteRevision)
+                    }
+                }
+            }
+        }
+    }
+
+    StackView.onActivated: {
+        loadCurrentProfile()
+        Qt.callLater(function() { editorPage.updateGraph() })
+    }
+}

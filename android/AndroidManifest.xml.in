@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Auto-generated from AndroidManifest.xml.in - do not edit directly -->
+<!-- Edit this template, then rebuild. Version comes from CMakeLists.txt + versioncode.txt -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:versionCode="@CURRENT_VERSION_CODE@"
+    android:versionName="@VERSION_STRING@">
+
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lets Qt's QNetworkInformation report real reachability instead of
+         "Unknown". Without this, QtAndroidNetworkInformation.registerReceiver()
+         throws a SecurityException at every cold start (issue #1124) and any
+         reachability-driven code (Visualizer retry, ShotServer wifi-loss
+         handling, UpdateChecker reconnect retry) sees stale state forever.
+         Normal protection level — granted at install time, no runtime
+         prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Allows us to hold a WifiManager.MulticastLock so incoming UDP broadcast
+         discovery datagrams aren't filtered by the OS on Wi-Fi. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Android 17 blocks all LAN traffic for apps targeting API 37 until the user grants this
+         runtime permission. Requested by LocalNetworkAccess. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Storage permissions -->
+    <!-- Android 9 (SDK 28): needs WRITE_EXTERNAL_STORAGE -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Android 11+ (SDK 30+): needs MANAGE_EXTERNAL_STORAGE for profile backup to Documents -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- Foreground service for BLE keep-alive (prevents Samsung/OEM app killing) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Wake lock keeps CPU alive while screen is off so BLE timers keep firing -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- APK installation permission for remote updates -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!--
+        Special permission ("Display over other apps") used here as the
+        documented Background Activity Launch exemption (#13 in
+        https://developer.android.com/guide/components/activities/background-starts).
+        Lets UpdateRelaunchReceiver call startActivity() after a self-update
+        even though the new process has no visible window at that moment.
+
+        Required because prior empirical work on Samsung SM-X210 / Android 16
+        (commits a5a7ef6a / 0db30f00 / 208655c8 / 5e19c785, 2026-04-19) confirmed
+        that neither a plain MY_PACKAGE_REPLACED receiver nor a PendingIntent
+        with full setPendingIntent{Creator,}BackgroundActivityStartMode
+        opt-in can bypass BAL — the creator opt-in is silently dropped because
+        the receiver's process is in RECEIVER state with no foreground privilege
+        to delegate. SAW grants the receiver's own process BAL privileges
+        directly, which is the only remaining documented path.
+
+        Declared in manifest but NOT auto-granted (Android 6.0+); the user must
+        toggle the permission ON via Settings → Apps → Decenza → Display over
+        other apps. The app surfaces an opt-in prompt at runtime.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <!--
+        gwpAsanMode="always" (Android 11+; older devices ignore it): a small
+        random sample of native heap allocations is guarded, so a use-after-free
+        or overflow on one of them crashes at the bad access, and the tombstone
+        names where it was allocated (and, for a use-after-free, freed). It can
+        name the culprit of a crash like #1927/#1937 only when the corrupted
+        allocation was sampled; the ART heap (#1963) is not covered.
+    -->
+    <application
+        android:name="org.qtproject.qt.android.bindings.QtApplication"
+        android:label="Lab"
+        android:icon="@mipmap/icon"
+        android:theme="@style/AppTheme"
+        android:allowBackup="true"
+        android:gwpAsanMode="always"
+        android:enableOnBackInvokedCallback="true">
+
+        @ANDROID_PROFILEABLE_ELEMENT@
+
+        <!-- configChanges is Qt's own template list (qtbase/src/android/templates/AndroidManifest.xml:22).
+             Anything missing makes Android recreate the activity (font size, display size, split screen),
+             which Qt does not support: a recreated QtActivityBase restarts the whole app
+             (QtActivityBase.java:114-119), and a retained destroy does not exit (:223). Each QtWindow's
+             QtEditText is bound to the activity that created it (QtWindow.java:65), so a cursor-handle
+             popup posted in that gap hits a dead window token (CursorHandle.java:172). That gap is our
+             reading of #2086's log, not a reproduction. -->
+        <activity
+            android:name="io.github.kulitorum.decenza_de1.DecenzaActivity"
+            android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density"
+            android:launchMode="singleTop"
+            android:screenOrientation="sensorLandscape"
+            android:windowSoftInputMode="adjustPan"
+            android:exported="true">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+
+            <meta-data android:name="android.app.lib_name" android:value="Decenza" />
+            <!-- Keep Qt event loop running when app is backgrounded. Without this,
+                 Qt freezes the event loop when the activity is suspended (no EGL surface),
+                 which kills the HTTP/MCP server. Users switch to Claude for remote control
+                 and need the server to stay responsive.
+                 Safety requires the QAccessible::setActive(false) call in main.cpp's
+                 ApplicationSuspended handler — it disables the accessibility bridge
+                 before the EGL surface is destroyed, preventing a SIGABRT deadlock
+                 between QtAndroidAccessibility and the render thread's eglSurface()
+                 swap. With that guard in place, the "makeCurrent: no EGLSurface"
+                 warnings from the render thread are non-fatal. Do NOT remove this
+                 flag without also reconsidering that guard, and vice versa. -->
+            <!-- Also load-bearing for MainController::drainDbWork() on the
+                 ApplicationSuspended path: "true" sets
+                 QT_BLOCK_EVENT_LOOPS_WHEN_SUSPENDED=0, which stops Qt's Android
+                 dispatcher suppressing timer activation while suspended. Set this
+                 to "false" and that drain's timers never fire, so it blocks the
+                 UI thread until resume — an ANR. See the comment at its call site
+                 in src/main.cpp. -->
+            <meta-data android:name="android.app.background_running" android:value="true"/>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
+
+        <!-- Launcher/kiosk mode: disabled by default, enabled at runtime via Settings -->
+        <activity-alias
+            android:name="io.github.kulitorum.decenza_de1.LauncherAlias"
+            android:targetActivity="io.github.kulitorum.decenza_de1.DecenzaActivity"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data android:name="android.app.lib_name" android:value="Decenza" />
+        </activity-alias>
+
+        <!-- Service for handling device shutdown when app is swiped away -->
+        <service
+            android:name="io.github.kulitorum.decenza_de1.DeviceShutdownService"
+            android:stopWithTask="false"
+            android:exported="false" />
+
+        <!-- Foreground service for BLE keep-alive -->
+        <service
+            android:name="io.github.kulitorum.decenza_de1.BleConnectionService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <!-- FileProvider for APK installation -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!--
+            Auto-relaunch after a self-update. The receiver is fired in the
+            NEW process by the system on ACTION_MY_PACKAGE_REPLACED and tries
+            to launch the main activity. The startActivity() call is BAL-
+            blocked on modern Android UNLESS the user has granted
+            SYSTEM_ALERT_WINDOW (see uses-permission above). If permission
+            is not granted, the receiver still fires but startActivity()
+            silently fails — graceful degradation to pre-existing behavior.
+
+            Marked exported="false" because MY_PACKAGE_REPLACED is delivered
+            only to this app's own package; no third party should be able to
+            trigger this receiver.
+        -->
+        <receiver
+            android:name="io.github.kulitorum.decenza_de1.UpdateRelaunchReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Machine-status Home Screen widget. exported="true" so the
+             launcher (a separate process) can bind it; it only handles the
+             system APPWIDGET_UPDATE broadcast and reads the app's own
+             SharedPreferences snapshot — no exported control surface. -->
+        <receiver
+            android:name="io.github.kulitorum.decenza_de1.MachineStatusWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/machine_status_widget_info" />
+        </receiver>
+    </application>
+
+</manifest>

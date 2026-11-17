@@ -1,0 +1,252 @@
+// The new-profile type tiles' delegate reads `newTypeTile`'s own modelData
+// only (no outer-file id lookups needed there), but the dialogs below use
+// nested Components (layer.effect-free here) — Bound is kept for consistency
+// with every other page in this app and because the picker it hosts requires it.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import QtQuick.Layouts
+import Decenza
+
+// rebuild-profile-picker: this page is now a thin host around the shared
+// ProfilePicker component (profile-picker spec). It supplies the current DYE
+// bean for tiers, opens with the Favorites chip on, and a card tap LOADS the
+// profile — the choice that makes this host the "selector" rather than the
+// wizard's "chooser". Everything the old six-way combo / favorites panel /
+// checkbox column did now lives in ProfilePicker or its dialogs.
+T.Page {
+    id: profileSelectorPage
+    readonly property string pageTitle: TranslationManager.translate("profileselector.title", "Profiles")
+
+    objectName: "profileSelectorPage"
+    background: ThemedPageBackground {}
+    property string loadRequestId: ""
+    property var initialPickerContext: null
+    readonly property var navigationContext: ({pickerContext: picker.navigationContext})
+    StatusToast { id: actionError; error: true }
+    Connections {
+        target: ProfileService
+        function onOperationCompleted(requestId, operation, filename, success, reason, result) {
+            if (requestId !== profileSelectorPage.loadRequestId) return
+            profileSelectorPage.loadRequestId = ""
+            if (!success) actionError.show(reason)
+        }
+    }
+
+    KeyboardAwareContainer {
+        anchors.fill: parent
+        textFields: [picker.searchInput]
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: Theme.standardMargin
+            anchors.topMargin: Theme.pageTopMargin
+            anchors.bottomMargin: Theme.pageTopMargin
+            spacing: Theme.scaled(10)
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                color: Theme.cardBackgroundColor
+                radius: Theme.cardRadius
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(15)
+
+                    ProfilePicker {
+                        id: picker
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+
+                        // Bean tiers from the current DYE bean + its roast level
+                        // (task 3.3) — vanish automatically with no bean set.
+                        beanBrand: RecipeContext.preferences.dyeBeanBrand ?? ""
+                        beanType: RecipeContext.preferences.dyeBeanType ?? ""
+                        roastLevel: RecipeContext.preferences.dyeRoastLevel ?? ""
+
+                        // Selector opens on Favorites, nothing else (profile-picker spec).
+                        initialChips: ({ favorites: true })
+                        initialNavigationContext: profileSelectorPage.initialPickerContext
+                        showAutoLoadStrip: true
+                        // Settings search reaches the auto-load strip here, outside the settings tabs.
+                        SettingsSearch.route: "profileSelector"
+                        SettingsSearch.title: TranslationManager.translate("settings.search.autoLoadProfileTitle", "Auto-Load Profile")
+                        SettingsSearch.description: TranslationManager.translate("settings.search.autoLoadProfileDesc", "Pin a profile to auto-load on app start, wake, or after idle")
+                        SettingsSearch.keywords: ["auto-load", "auto load", "automatic profile", "pin", "default", "revert", "home"]
+                        showAddButton: true
+                        onAddRequested: addMenuDialog.open()
+
+                        onProfileChosen: function(filename, title) {
+                            if (profileSelectorPage.loadRequestId.length === 0)
+                                profileSelectorPage.loadRequestId = ProfileService.loadProfile(filename)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== "+" menu dialog (design D9) =====
+    DecenzaDialog {
+        id: addMenuDialog
+        x: (parent.width - width) / 2
+        y: (parent.height - height) / 2
+        padding: 20
+        modal: true
+        closePolicy: Dialog.CloseOnEscape | Dialog.CloseOnPressOutside
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.color: Theme.textSecondaryColor
+            border.width: 1
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Theme.scaled(12)
+
+            Accessible.role: Accessible.Dialog
+            Accessible.name: TranslationManager.translate("profilepicker.addMenu.title", "Add a profile")
+
+            AccessibleButton {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(40)
+                text: TranslationManager.translate("profileselector.button.import_visualizer_short", "Visualizer")
+                accessibleName: TranslationManager.translate("profileSelector.importFromVisualizer", "Import profiles from Visualizer website")
+                onClicked: {
+                    addMenuDialog.close()
+                    AppShell.visualizerBrowserRequested()
+                }
+            }
+
+            AccessibleButton {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(40)
+                text: Qt.platform.os === "ios"
+                      ? TranslationManager.translate("profileselector.button.import_file_short", "File")
+                      : TranslationManager.translate("profileselector.button.import_tablet_short", "Tablet")
+                accessibleName: Qt.platform.os === "ios"
+                      ? TranslationManager.translate("profileSelector.importFromFiles", "Import a profile file from Files app")
+                      : TranslationManager.translate("profileSelector.importFromTablet", "Import profiles from Decent tablet")
+                onClicked: {
+                    addMenuDialog.close()
+                    AppShell.profileImportRequested()
+                }
+            }
+
+            AccessibleButton {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(40)
+                text: TranslationManager.translate("profileselector.newProfile.title", "New Profile")
+                accessibleName: TranslationManager.translate("profileSelector.createNewProfile", "Create new profile")
+                onClicked: {
+                    addMenuDialog.close()
+                    newProfileDialog.open()
+                }
+            }
+        }
+    }
+
+    // ===== New profile type picker dialog =====
+    DecenzaDialog {
+        id: newProfileDialog
+        anchors.centerIn: parent
+        width: Theme.scaled(350)
+        padding: 0
+        modal: true
+
+        header: Item {
+            implicitHeight: Theme.scaled(50)
+
+            Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.scaled(20)
+                anchors.verticalCenter: parent.verticalCenter
+                text: TranslationManager.translate("profileselector.newProfile.title", "New Profile")
+                font: Theme.titleFont
+                color: Theme.textColor
+            }
+
+            Rectangle {
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 1
+                color: Theme.borderColor
+            }
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Theme.scaled(8)
+
+            Repeater {
+                model: [
+                    { label: TranslationManager.translate("profileselector.newProfile.pressure", "Pressure Profile"), type: "pressure", title: "New Pressure Profile" },
+                    { label: TranslationManager.translate("profileselector.newProfile.flow", "Flow Profile"), type: "flow", title: "New Flow Profile" },
+                    { label: TranslationManager.translate("profileselector.newProfile.dflow", "D-Flow"), type: "dflow", title: "D-Flow / New Profile" },
+                    { label: TranslationManager.translate("profileselector.newProfile.aflow", "A-Flow"), type: "aflow", title: "A-Flow / New Profile" },
+                    { label: TranslationManager.translate("profileselector.newProfile.advanced", "Advanced"), type: "advanced", title: "New Profile" }
+                ]
+
+                delegate: Rectangle {
+                    id: newTypeTile
+                    required property var modelData
+
+                    Layout.fillWidth: true
+                    Layout.leftMargin: Theme.scaled(12)
+                    Layout.rightMargin: Theme.scaled(12)
+                    Layout.preferredHeight: Theme.scaled(48)
+                    radius: Theme.scaled(6)
+                    color: typeMouseArea.containsMouse ? Qt.rgba(Theme.primaryColor.r, Theme.primaryColor.g, Theme.primaryColor.b, 0.2) : Theme.insetBackgroundColor
+                    Accessible.role: Accessible.Button
+                    Accessible.name: newTypeTile.modelData.label
+                    Accessible.focusable: true
+                    Accessible.onPressAction: typeMouseArea.clicked(null)
+                    activeFocusOnTab: true
+                    Keys.onReturnPressed: typeMouseArea.clicked(null)
+                    Keys.onSpacePressed: typeMouseArea.clicked(null)
+
+                    Text {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.scaled(16)
+                        text: newTypeTile.modelData.label
+                        color: Theme.textColor
+                        font: Theme.bodyFont
+                        verticalAlignment: Text.AlignVCenter
+                        Accessible.ignored: true
+                    }
+
+                    MouseArea {
+                        id: typeMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        Accessible.ignored: true
+                        onClicked: {
+                            newProfileDialog.close()
+                            AppShell.newProfileDraftRequested(
+                                newTypeTile.modelData.type, newTypeTile.modelData.title)
+                        }
+                    }
+                }
+            }
+
+            Item { Layout.preferredHeight: Theme.scaled(4) }
+        }
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.scaled(8)
+            border.color: Theme.borderColor
+        }
+    }
+
+    // Bottom bar
+    BottomBar {
+        title: TranslationManager.translate("profileselector.title", "Profiles")
+        rightText: TranslationManager.translate("profileselector.current_prefix", "Current:") + " " + ProfileService.currentProfileSummary.name
+        onBackClicked: AppShell.backRequested()
+    }
+}

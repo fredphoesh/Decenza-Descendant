@@ -1,0 +1,106 @@
+import QtQuick
+import Decenza
+
+// The steam analogue of ShotPlanText: a one-line sentence summarising what the
+// next steam will do — "Steam 300g of milk, using the Large pitcher for 30s" — with the live
+// values bolded and a leading steam icon. Display-only (no tap target). Renders
+// milk weight / pitcher / duration only (no temperature — the app steams by weight
+// + duration; the only steam temperature is the boiler setpoint, not a milk target).
+Item {
+    id: root
+
+    // The currently selected steam pitcher preset. getSteamPitcherPreset() is Q_INVOKABLE, so the
+    // binding must ALSO read steamPitcherPresets to re-run when the selected pitcher is renamed,
+    // disabled, or recalibrated without the selection index itself changing.
+    readonly property var _preset: {
+        void(SteamService.state.steamPitcherPresets)
+        return SteamService.getSteamPitcherPreset(SteamService.state.selectedSteamPitcher)
+    }
+    readonly property bool _presetOff: !!(_preset && _preset.disabled)
+    readonly property string _pitcherName: (_preset && _preset.name) ? String(_preset.name) : ""
+
+    // The milk captured this session, else the last steam's.
+    readonly property real _targetMilk:
+        !SteamService.ready ? 0
+            : PreparationService.state.sessionMeasuredMilkG > 0
+                ? PreparationService.state.sessionMeasuredMilkG : (SteamService.state.lastSteamMilkG || 0)
+    // Preparation owns the time: only captured milk scales it, while manual time and
+    // an active steam keep the actual timeout. The last steam's milk never does.
+    readonly property int _duration:
+        SteamService.ready ? SteamService.state.plannedSteamDurationSec : 0
+
+    readonly property string _milkStr: _targetMilk > 0 ? (_targetMilk.toFixed(0) + "g") : ""
+    readonly property string _durStr: _duration > 0 ? (_duration + "s") : ""
+
+    // Break a "%N" token in a user value so QString.arg can't substitute a later arg into it (a pitcher
+    // literally named e.g. "50% off"). The zero-width space is invisible.
+    function _argSafe(v) { return String(v).replace(/%(\d)/g, "%\u200B$1") }
+
+    // ONE renderer for both the plain `text` (a11y label + `visible: text !== ""`) and the bolded `_rich`
+    // (display), so they can't drift. fmt(value, live) formats one value: plain %-escapes, rich HTML-escapes
+    // and bolds live values. Disabled ("Off") preset ⇒ "" ⇒ hidden.
+    function _build(fmt, sep) {
+        var _ = TranslationManager.translationVersion
+        if (_presetOff) return ""
+        if (_milkStr !== "" && _pitcherName !== "" && _durStr !== "") {
+            // Pills display presets as "Small Pitcher" etc., so users name them that way —
+            // don't render "…the Large Pitcher pitcher". Separate full template (not string
+            // surgery) so translators control word order in both forms.
+            let tpl = _pitcherName.toLowerCase().indexOf("pitcher") >= 0
+                ? TranslationManager.translate("steamplan.sentenceNamedPitcher", "Steam %1 of milk, using the %2 for %3")
+                : TranslationManager.translate("steamplan.sentence", "Steam %1 of milk, using the %2 pitcher for %3")
+            return tpl.arg(fmt(_milkStr, true)).arg(fmt(_pitcherName, true)).arg(fmt(_durStr, true))
+        }
+        // Degrade gracefully when a piece is missing.
+        var parts = []
+        if (_milkStr !== "") parts.push(fmt(_milkStr, true))
+        if (_pitcherName !== "") parts.push(fmt(_pitcherName, true))
+        if (_durStr !== "") parts.push(fmt(_durStr, true))
+        if (parts.length === 0) return ""
+        return fmt(TranslationManager.translate("steamplan.prefix", "Steam"), false) + " " + parts.join(sep)
+    }
+
+    // Plain: for the accessibility label + `visible: text !== ""`.
+    readonly property string text: _build(function(v, live) { return _argSafe(v) }, "  ·  ")
+    // Rich: same content, live values bolded, all HTML-escaped; styled bold safe-dot · separator.
+    // Same treatment as ShotPlanText: escaping makes user text safe as markup but leaves emoji
+    // as raw codepoints for the text renderer. Pitcher names are user-supplied.
+    readonly property string _rich: Theme.replaceEmojiWithImg(_build(function(v, live) {
+        var e = Theme.escapeHtml(_argSafe(v))
+        return live ? ("<b>" + e + "</b>") : e
+    }, Theme.bulletSep), Theme.bodyFont.pixelSize, true)
+
+    implicitWidth: row.implicitWidth
+    implicitHeight: row.implicitHeight
+
+    // Always wrapped by ShotPlanItem, which already exposes the a11y node for the plan.
+    // Role-less Items are skipped by the a11y tree anyway (which is why ShotPlanText's
+    // root needs no flag); this is deliberate belt-and-braces so adding a role here
+    // later can't silently create a duplicate nested announcement.
+    Accessible.ignored: true
+
+    Row {
+        id: row
+        anchors.centerIn: parent
+        spacing: Theme.spacingSmall
+
+        ColoredIcon {
+            anchors.verticalCenter: parent.verticalCenter
+            source: "qrc:/icons/steam.svg"
+            iconWidth: Theme.scaled(20)
+            iconHeight: Theme.scaled(20)
+            iconColor: Theme.textColor
+            Accessible.ignored: true
+        }
+
+        Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: root._rich
+            textFormat: Text.StyledText
+            font: Theme.bodyFont
+            color: Theme.textColor
+            elide: Text.ElideRight
+            Accessible.ignored: true
+        }
+    }
+}

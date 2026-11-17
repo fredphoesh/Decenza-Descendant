@@ -1,0 +1,1501 @@
+#include <QtTest>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QTemporaryDir>
+#include <limits>
+
+#include "mocks/McpTestFixture.h"
+#include "ble/protocol/de1characteristics.h"
+#include "core/dbutils.h"
+#include "core/settings_visualizer.h"
+#include "history/shothistorystorage.h"
+#include "history/coffeebagstorage.h"
+#include "history/equipmentstorage.h"
+#include "history/recipestorage.h"
+#include "core/settings_app.h"
+#include "core/settings_dye.h"
+#include "core/settings_mqtt.h"
+#include "core/settings_brew.h"
+#include "core/brewbaseline.h"
+#include "profile/profileparams.h"
+#include "ai/aimanager.h"
+
+using namespace DE1::Characteristic;
+
+// Stub for AIManager::availableModels — mcptools_write.cpp references it for
+// aiModel validation, but this test passes a null AIManager (no aiModel paths
+// under test) and does not link aimanager.cpp (which would drag in the whole
+// AI subsystem). Defining it here satisfies the linker; it is never called.
+QVariantList AIManager::availableModels(const QString&) const { return {}; }
+
+// Forward declarations — implemented in mcptools_write.cpp
+class ProfileManager;
+class McpToolRegistry;
+class ShotHistoryStorage;
+class Settings;
+class VisualizerUploader;
+class AccessibilityManager;
+class ScreensaverVideoManager;
+class BeanBaseClient;
+class TranslationManager;
+class BatteryManager;
+class CoffeeBagStorage;
+class MainController;
+void registerWriteTools(McpToolRegistry* registry, ProfileManager* profileManager,
+                        ShotHistoryStorage* shotHistory, Settings* settings,
+                        CoffeeBagStorage* bagStorage,
+                        AccessibilityManager* accessibility,
+                        ScreensaverVideoManager* screensaver,
+                        TranslationManager* translation,
+                        BatteryManager* battery,
+                        AIManager* aiManager,
+                        BeanBaseClient* beanbase,
+                        MainController* mainController);
+
+// Test MCP write tools (settings_set, profiles_set_active) against ProfileManager + MockTransport.
+// settings_set brew keys arm overrides (never a profile edit); temperature must re-upload.
+
+class tst_McpToolsWrite : public QObject {
+    Q_OBJECT
+
+private:
+    // The merged tools take their verb in `action` (and `auto_load` also takes a
+    // `target`). These two keep the argument-building out of every call site.
+    static QJsonObject withAction(const QString& action, QJsonObject args)
+    {
+        args["action"] = action;
+        return args;
+    }
+    static QJsonObject withRecipeAutoLoad(const QString& action, QJsonObject args)
+    {
+        args["action"] = action;
+        args["target"] = QStringLiteral("recipe");
+        return args;
+    }
+
+    // Wait for a storage's background DB work to actually finish, before letting it
+    // go out of scope.
+    //
+    // This replaced five copies of `for (i < 20) { processEvents(); msleep(25); }`
+    // — a fixed 500 ms guess at how long a background write takes. That is the
+    // "timers as guards" anti-pattern CLAUDE.md forbids by name, and it behaved
+    // exactly as that rule predicts: fine when run alone, fine on retry, and
+    // intermittently NOT fine in the full parallel suite, where every binary is
+    // ASan- and UBSan-instrumented and competing for cores. A duration cannot be
+    // long enough, because the thing it is standing in for has no bound.
+    //
+    // Waiting matters rather than just being tidy: ~SerialDbWorker quit()s, which
+    // DISCARDS queued-but-unstarted tasks, and close() calls
+    // QSqlDatabase::removeDatabase(), which qWarns if a connection is still in use
+    // — and init()'s failOnWarning turns that into a failure. So a task still in
+    // flight at scope exit is either silently dropped or a warning, depending on
+    // timing. QTRY_VERIFY spins the event loop (which is what delivers the result
+    // callbacks) and fails loudly if the work never completes, instead of
+    // continuing regardless the way the sleep did.
+    // Drain, THEN close -- in that order, and only if the drain succeeded.
+    //
+    // The two were previously written as a `drainDbWork(storage); storage.close();` pair at
+    // all 12 call sites. That is a drift opportunity (nothing enforces the order, or that
+    // both are present), and it also mishandles failure: QTRY_VERIFY inside a non-slot
+    // helper returns from the HELPER, so a timed-out drain fell straight through to the
+    // close() it exists to protect, whose warning then became a second, louder failure that
+    // buried the first. Returning early here instead leaves the close to
+    // ~ShotHistoryStorage, which resets the worker (and WAITS) before closing -- so the
+    // teardown is safe even on the failure path.
+    static void drainDbWorkAndClose(ShotHistoryStorage& storage) {
+        QTRY_VERIFY(storage.isDbWorkIdle());
+        // One more pass for anything the final callback itself posted.
+        QCoreApplication::processEvents();
+        storage.close();
+    }
+
+    // CoffeeBagStorage runs its OWN SerialDbWorker against the same database file,
+    // so draining the ShotHistoryStorage says nothing about it. Missing this is a
+    // real intermittent, not tidiness: bagCreateKindAndGating passed only when its
+    // two queued bag writes happened to land before the stack object went out of
+    // scope, and failed as
+    //   "CoffeeBagStorageWorker" destroyed with 2 DB task(s) still queued
+    //     — those writes are being discarded.        (dbutils.h:245)
+    // Drain the bag storage BEFORE drainDbWorkAndClose(), because that close()
+    // removes the shared connection this worker is still using.
+    static void drainBagDbWork(CoffeeBagStorage& bagStorage) {
+        QTRY_VERIFY(bagStorage.isDbWorkIdle());
+        QCoreApplication::processEvents();
+    }
+
+    // Seed one row so an update/delete has something real to affect. The real
+    // schema, not the minimal one the storage tests build: uuid, timestamp,
+    // profile_name and duration_seconds are NOT NULL. Returns the new id, or -1.
+    static qint64 insertMinimalShot(ShotHistoryStorage& storage) {
+        qint64 id = -1;
+        withTempDb(storage.databasePath(), "tst_seed", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds) "
+                      "VALUES ('outcome-seed-shot', 1000, 'P', 25.0)");
+            if (q.exec())
+                id = q.lastInsertId().toLongLong();
+        });
+        return id;
+    }
+
+    // Load a minimal D-Flow profile
+    static void loadDFlowProfile(McpTestFixture& f, const QString& title = "D-Flow / Test") {
+        QJsonObject json;
+        json["title"] = title;
+        json["author"] = "test";
+        json["notes"] = "";
+        json["beverage_type"] = "espresso";
+        json["version"] = "2";
+        json["legacy_profile_type"] = "settings_2c";
+        json["target_weight"] = 36.0;
+        json["target_volume"] = 0.0;
+        json["espresso_temperature"] = 93.0;
+        json["maximum_pressure"] = 12.0;
+        json["maximum_flow"] = 6.0;
+        json["minimum_pressure"] = 0.0;
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.targetWeight = 36.0;
+        params.fillTemperature = 93.0;
+        params.pourTemperature = 93.0;
+        params.pourFlow = 2.0;
+        json["recipe"] = params.toJson();
+
+        QJsonArray steps;
+        QJsonObject frame1;
+        frame1["name"] = "fill";
+        frame1["temperature"] = 93.0;
+        frame1["sensor"] = "coffee";
+        frame1["pump"] = "flow";
+        frame1["transition"] = "fast";
+        frame1["pressure"] = 6.0;
+        frame1["flow"] = 4.0;
+        frame1["seconds"] = 25.0;
+        frame1["volume"] = 0.0;
+        frame1["exit"] = QJsonObject{{"type", "pressure"}, {"condition", "over"}, {"value", 4.0}};
+        frame1["limiter"] = QJsonObject{{"value", 0.0}, {"range", 0.6}};
+        steps.append(frame1);
+
+        // A D-Flow profile is ALWAYS three frames — Filling / Infusing / Pouring —
+        // because that is what the plugin's `prep` indexes (0/1/2, no pattern
+        // matching). A two-frame fixture is not a D-Flow profile, and since
+        // parameters are now derived from the frames it has no pour frame to
+        // read from.
+        QJsonObject frameSoak;
+        frameSoak["name"] = "infuse";
+        frameSoak["temperature"] = 93.0;
+        frameSoak["sensor"] = "coffee";
+        frameSoak["pump"] = "pressure";
+        frameSoak["transition"] = "fast";
+        frameSoak["pressure"] = 3.0;
+        frameSoak["flow"] = 8.0;
+        frameSoak["seconds"] = 20.0;
+        frameSoak["volume"] = 100.0;
+        frameSoak["weight"] = 4.0;
+        frameSoak["exit"] = QJsonObject{{"type", "pressure"}, {"condition", "over"}, {"value", 3.0}};
+        frameSoak["limiter"] = QJsonObject{{"value", 0.0}, {"range", 0.6}};
+        steps.append(frameSoak);
+
+        QJsonObject frame2;
+        frame2["name"] = "pour";
+        frame2["temperature"] = 93.0;
+        frame2["sensor"] = "coffee";
+        frame2["pump"] = "flow";
+        frame2["transition"] = "smooth";
+        frame2["pressure"] = 6.0;
+        frame2["flow"] = 2.0;
+        frame2["seconds"] = 60.0;
+        frame2["volume"] = 0.0;
+        frame2["exit"] = QJsonObject{{"type", "pressure"}, {"condition", "over"}, {"value", 11.0}};
+        frame2["limiter"] = QJsonObject{{"value", 0.0}, {"range", 0.6}};
+        steps.append(frame2);
+
+        json["steps"] = steps;
+        json["number_of_preinfuse_frames"] = 1;
+
+        QString jsonStr = QJsonDocument(json).toJson(QJsonDocument::Compact);
+        f.profileManager.loadProfileFromJson(jsonStr);
+        emit f.device.profileUploaded(true, QString());
+    }
+
+    // Load a minimal advanced profile
+    static void loadAdvancedProfile(McpTestFixture& f) {
+        QJsonObject json;
+        json["title"] = "Test Advanced";
+        json["author"] = "test";
+        json["notes"] = "";
+        json["beverage_type"] = "espresso";
+        json["version"] = "2";
+        json["legacy_profile_type"] = "settings_2c";
+        json["target_weight"] = 36.0;
+        json["target_volume"] = 0.0;
+        json["espresso_temperature"] = 93.0;
+        json["maximum_pressure"] = 12.0;
+        json["maximum_flow"] = 6.0;
+        json["minimum_pressure"] = 0.0;
+        json["number_of_preinfuse_frames"] = 1;
+
+        QJsonObject frame;
+        frame["name"] = "preinfusion";
+        frame["temperature"] = 93.0;
+        frame["sensor"] = "coffee";
+        frame["pump"] = "flow";
+        frame["transition"] = "fast";
+        frame["pressure"] = 1.0;
+        frame["flow"] = 4.0;
+        frame["seconds"] = 20.0;
+        frame["volume"] = 0.0;
+        frame["exit"] = QJsonObject{{"type", "pressure"}, {"condition", "over"}, {"value", 4.0}};
+        frame["limiter"] = QJsonObject{{"value", 0.0}, {"range", 0.6}};
+        json["steps"] = QJsonArray{frame};
+
+        QString jsonStr = QJsonDocument(json).toJson(QJsonDocument::Compact);
+        f.profileManager.loadProfileFromJson(jsonStr);
+        emit f.device.profileUploaded(true, QString());
+    }
+
+    void registerTools(McpTestFixture& f)
+    {
+        // Pass nullptr for dependencies not needed by the profile paths under test
+        // (bagStorage, accessibility, screensaver, translation, battery, aiManager,
+        // beanbase, mainController).
+        registerWriteTools(&f.registry, &f.profileManager, nullptr, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+
+    // ===== settings_set temperature: a brew override, re-uploaded =====
+
+    void settingsSetTemperatureDFlowTriggersBleUpload()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        loadDFlowProfile(f);
+        const double profileTemp = f.profileManager.profileTargetTemperature();
+        f.settings.brew()->setBrewRatioAnchor(2.0);
+        f.transport.clearWrites();
+
+        QJsonObject args;
+        args["espressoTemperature"] = 95.0;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY(result.contains("updated"));
+
+        // Verify BLE writes occurred
+        auto headerWrites = f.writesTo(HEADER_WRITE);
+        auto frameWrites = f.writesTo(FRAME_WRITE);
+        QVERIFY2(!headerWrites.isEmpty(), "settings_set temperature must write shot header to BLE");
+        QVERIFY2(!frameWrites.isEmpty(), "settings_set temperature must write shot frames to BLE");
+
+        // Brew Settings semantics: an override, not a profile edit.
+        QVERIFY(f.settings.brew()->hasTemperatureOverride());
+        QCOMPARE(f.settings.brew()->temperatureOverride(), 95.0);
+        // An unsent yield keeps its live anchor rather than flattening to grams.
+        QCOMPARE(f.settings.brew()->brewYieldMode(), QStringLiteral("ratio"));
+        QCOMPARE(f.profileManager.profileTargetTemperature(), profileTemp);
+        QVERIFY(!f.profileManager.isProfileModified());
+    }
+
+    void settingsSetTemperatureAdvancedTriggersBleUpload()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        loadAdvancedProfile(f);
+        f.transport.clearWrites();
+
+        QJsonObject args;
+        args["espressoTemperature"] = 95.0;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY(result.contains("updated"));
+
+        auto headerWrites = f.writesTo(HEADER_WRITE);
+        QVERIFY2(!headerWrites.isEmpty(), "settings_set temperature (advanced) must write to BLE");
+    }
+
+    // ===== settings_set targetWeight: a stop-at override, not a profile edit =====
+
+    void settingsSetTargetWeightArmsYieldOverride()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        loadDFlowProfile(f);
+        const double profileTarget = f.profileManager.profileTargetWeight();
+
+        QJsonObject args;
+        args["targetWeight"] = profileTarget + 4.0;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(f.settings.brew()->brewYieldMode(), QStringLiteral("absolute"));
+        QCOMPARE(f.profileManager.targetWeight(), profileTarget + 4.0);
+        QCOMPARE(f.profileManager.profileTargetWeight(), profileTarget);
+        QVERIFY(!f.profileManager.isProfileModified());
+    }
+
+    // The ratio Brew Settings dials. A dose in the same call must land before
+    // the ratio resolves against it.
+    void settingsSetYieldRatioResolvesAgainstSameCallDose()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        loadDFlowProfile(f);
+        f.settings.dye()->setDyeBeanWeight(18.0);
+
+        QJsonObject args;
+        args["dyeBeanWeight"] = 20.0;
+        args["yieldRatio"] = 2.5;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(f.settings.brew()->brewYieldMode(), QStringLiteral("ratio"));
+        QCOMPARE(f.settings.brew()->brewYieldOverride(), 2.5);
+        QCOMPARE(f.profileManager.targetWeight(), 50.0);
+        QVERIFY(!f.profileManager.isProfileModified());
+        // The reply reports what took effect, read after the setters ran.
+        QCOMPARE(result["brew"].toObject()["targetWeightG"].toDouble(), 50.0);
+
+        // 0 clears; it must not clamp up to the minimum ratio.
+        QJsonObject clear;
+        clear["yieldRatio"] = 0.0;
+        f.callAsyncTool("settings_set", clear);
+        QCOMPARE(f.settings.brew()->brewYieldMode(), QStringLiteral("none"));
+    }
+
+    void settingsSetRejectsBothYieldKeys()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        loadDFlowProfile(f);
+        f.settings.brew()->setBrewYieldOverride(0);  // stored settings outlive a fixture
+        f.settings.brew()->clearTemperatureOverride();
+
+        QJsonObject args;
+        args["targetWeight"] = 40.0;
+        args["yieldRatio"] = 2.0;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY(result.contains("error"));
+        QCOMPARE(f.settings.brew()->brewYieldMode(), QStringLiteral("none"));
+
+        // A value toDouble() would read as 0 ("clear") is refused, not coerced.
+        QJsonObject notNumber;
+        notNumber["targetWeight"] = "heavy";
+        QVERIFY(f.callAsyncTool("settings_set", notNumber).contains("error"));
+
+        // 0 clears a yield, but a 0 °C temperature override is refused.
+        QJsonObject coldTemp;
+        coldTemp["espressoTemperature"] = 0.0;
+        QVERIFY(f.callAsyncTool("settings_set", coldTemp).contains("error"));
+        QVERIFY(!f.settings.brew()->hasTemperatureOverride());
+    }
+
+    // Clear goes back to the store that designs the yield, mode included, and
+    // to the baseline temperature.
+    void settingsSetClearBrewOverridesRestoresBeanRatio()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        loadDFlowProfile(f);
+        f.settings.dye()->setDyeBeanWeight(18.0);
+        f.settings.dye()->persistYieldSpecToBag(2.0, QStringLiteral("ratio"));
+        f.settings.brew()->setBrewYieldOverride(40.0);
+        f.settings.brew()->setTemperatureOverride(90.0);
+
+        QJsonObject args;
+        args["clearBrewOverrides"] = true;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(f.settings.brew()->brewYieldMode(), QStringLiteral("ratio"));
+        QCOMPARE(f.profileManager.targetWeight(), 36.0);
+        QVERIFY(!f.settings.brew()->hasTemperatureOverride());
+
+        // Stored settings outlive the fixture; don't leave a ratio for later tests.
+        f.settings.brew()->clearAllBrewOverrides();
+        f.settings.dye()->persistYieldSpecToBag(0, QStringLiteral("none"));
+    }
+
+    // The ladder Brew Settings, MainController and settings_set share. The
+    // recipe rung is only reachable here: these tool tests run without
+    // MainController.
+    void brewBaselineLadderPicksOneRung()
+    {
+        const QVariantMap recipe{{"yieldMode", "ratio"}, {"yieldValue", 2.2}, {"tempOffsetC", -3.0}};
+        BrewBaseline::Yield y = BrewBaseline::resolveYield(recipe, QStringLiteral("absolute"), 40.0, 36.0);
+        QCOMPARE(y.source, BrewBaseline::sourceRecipe());
+        QCOMPARE(y.mode, QStringLiteral("ratio"));
+        QCOMPARE(y.value, 2.2);
+        QCOMPARE(BrewBaseline::temperatureC(recipe, 93.0), 90.0);
+        QCOMPARE(BrewBaseline::persistTarget(y, true, true), BrewBaseline::sourceRecipe());
+        QCOMPARE(BrewBaseline::anchorToRestore(y, 36.0).value, 2.2);
+
+        // A mode with no value does not claim the rung: the shown and the
+        // written store stay the bag.
+        const QVariantMap unset{{"yieldMode", "ratio"}, {"yieldValue", 0.0}};
+        y = BrewBaseline::resolveYield(unset, QStringLiteral("absolute"), 40.0, 36.0);
+        QCOMPARE(y.source, BrewBaseline::sourceBag());
+        QCOMPARE(y.value, 40.0);
+        QCOMPARE(BrewBaseline::persistTarget(y, true, true), BrewBaseline::sourceBag());
+
+        y = BrewBaseline::resolveYield(QVariantMap(), QStringLiteral("none"), 0.0, 36.0);
+        QCOMPARE(y.source, BrewBaseline::sourceProfile());
+        QCOMPARE(y.mode, QStringLiteral("absolute"));
+        QCOMPARE(y.value, 36.0);
+        QVERIFY(!y.isStoreAnchor());
+        QCOMPARE(BrewBaseline::persistTarget(y, true, true), BrewBaseline::sourceBag());
+        QCOMPARE(BrewBaseline::persistTarget(y, true, false), BrewBaseline::sourceRecipe());
+        QCOMPARE(BrewBaseline::persistTarget(y, false, false), QString());
+        QVERIFY(!YieldSpec::isSet(BrewBaseline::anchorToRestore(y, 36.0).mode));
+
+        // A recipe gram yield equal to the profile's own target is not restored.
+        const QVariantMap sameGrams{{"yieldMode", "absolute"}, {"yieldValue", 36.0}};
+        y = BrewBaseline::resolveYield(sameGrams, QStringLiteral("none"), 0.0, 36.0);
+        QVERIFY(!YieldSpec::isSet(BrewBaseline::anchorToRestore(y, 36.0).mode));
+    }
+
+    // ===== settings_set non-profile settings don't require profile =====
+
+    void settingsSetSteamNoProfileNeeded()
+    {
+        McpTestFixture f;
+        registerTools(f);
+
+        QJsonObject args;
+        args["steamTemperature"] = 155.0;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY(result.contains("updated"));
+        QJsonArray updated = result["updated"].toArray();
+        bool found = false;
+        for (const auto& v : updated) {
+            if (v.toString() == "steamTemperature") found = true;
+        }
+        QVERIFY2(found, "steamTemperature should be in updated list");
+    }
+
+    // The grinder is the equipment package's, not a setting. These keys were once
+    // accepted, reported as updated, and changed nothing; re-adding one to the
+    // schema must fail here rather than silently succeed again.
+    void settingsSetRejectsGrinderIdentityKeys()
+    {
+        McpTestFixture f;
+        registerTools(f);
+
+        const QString before = f.settings.dye()->dyeGrinderModel();
+        QJsonObject args;
+        args["dyeGrinderModel"] = "Not A Grinder";
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY(result.contains("error"));
+        QVERIFY(!result.contains("updated"));
+        QVERIFY(result["unknownKeys"].toArray().contains(QJsonValue("dyeGrinderModel")));
+        QVERIFY(result["hint"].toString().contains("equipment"));
+        QCOMPARE(f.settings.dye()->dyeGrinderModel(), before);
+    }
+
+    // The spec's own scenario: an assistant must not be able to send the stored MQTT
+    // password elsewhere, and a refused request changes nothing at all.
+    void settingsSetRefusesChangesThatWouldExposeTheMqttPassword()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        auto* mqtt = f.settings.mqtt();
+        const QString password = mqtt->mqttPassword();
+        const bool tls = mqtt->mqttUseTls();
+        const QString base = mqtt->mqttBaseTopic();
+        const auto restore = qScopeGuard([&] {
+            mqtt->setMqttPassword(password);
+            mqtt->setMqttUseTls(tls);
+            mqtt->setMqttBaseTopic(base);
+        });
+        mqtt->setMqttPassword(QStringLiteral("secret"));
+        mqtt->setMqttUseTls(true);
+        mqtt->setMqttBaseTopic(QStringLiteral("decenza"));
+
+        QJsonObject args;
+        args["mqttUseTls"] = false;
+        args["mqttBaseTopic"] = QStringLiteral("elsewhere");
+        const QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        QVERIFY(result["error"].toString().contains("mqttUseTls"));
+        QVERIFY(mqtt->mqttUseTls());
+        QCOMPARE(mqtt->mqttBaseTopic(), QStringLiteral("decenza"));
+    }
+
+    // settings_set reaches the shared upload settings and the per-destination
+    // switches under their destination-neutral names. When an edit is sent is
+    // ShotUploads, tested in tst_decentshotupload.
+    void settingsSetUploadSettingsRoundTrip()
+    {
+        McpTestFixture f;
+        registerTools(f);
+
+        const bool origUpdate = f.settings.upload()->autoUpdate();
+        const bool origDecent = f.settings.decent()->enabled();
+        QJsonObject args;
+        args["updateAutomatically"] = !origUpdate;
+        args["decentEnabled"] = !origDecent;
+        QJsonObject result = f.callAsyncTool("settings_set", args);
+
+        const QJsonArray updated = result["updated"].toArray();
+        QVERIFY(updated.contains(QJsonValue("updateAutomatically")));
+        QVERIFY(updated.contains(QJsonValue("decentEnabled")));
+        QCOMPARE(f.settings.upload()->autoUpdate(), !origUpdate);
+        QCOMPARE(f.settings.decent()->enabled(), !origDecent);
+
+        f.settings.upload()->setAutoUpdate(origUpdate);
+        f.settings.decent()->setEnabled(origDecent);
+    }
+
+    // shots_upload's input guards. The dispatch itself is ShotUploads, tested in
+    // tst_decentshotupload.
+    void shotsUploadRejectsInvalidShotId()
+    {
+        McpTestFixture f;
+        registerTools(f);
+
+        QJsonObject args;
+        args["shotId"] = 0;
+        QJsonObject result = f.callAsyncTool("shots_upload", args);
+
+        QVERIFY2(result.contains("error"), "expected error for shotId <= 0");
+        QCOMPARE(result["error"].toString(), QString("Valid shotId is required"));
+    }
+
+    void shotsUploadRejectsMissingShotHistory()
+    {
+        McpTestFixture f;
+        registerTools(f);
+
+        QJsonObject args;
+        args["shotId"] = 42;
+        QJsonObject result = f.callAsyncTool("shots_upload", args);
+
+        QVERIFY2(result.contains("error"), "expected error when shotHistory is null");
+        QCOMPARE(result["error"].toString(), QString("Shot history not available"));
+    }
+
+    // ===== bag_update bean-detail fields (add-bag-detail-editing) =====
+    // Detail params merge into the beanBaseData blob via the shared
+    // BeanBaseBlob helper (merge semantics themselves are unit-tested in
+    // tst_beanbaseclient); this covers the MCP arg mapping, the clear-on-empty
+    // contract, the identity mirror into the blob's working keys, and the
+    // beanBase echo in the response. No CoffeeBagStorage instance is passed,
+    // so the fallback static-write path runs (headless, no signals).
+    void bagUpdateMergesDetailFieldsIntoBlob()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("bagupd.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        qint64 bagId = -1;
+        withTempDb(storage.databasePath(), "bagupd_seed", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Prodigal";
+            bag.coffeeName = "First Batch";
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QVERIFY(bagId > 0);
+
+        // Details on a manual bag: keys land in the blob, echoed as beanBase.
+        QJsonObject args;
+        args["bagId"] = bagId;
+        args["origin"] = "Ethiopia";
+        args["tastingNotes"] = "floral, bergamot";
+        args["link"] = "https://example.com/bag";
+        QJsonObject result = f.callAsyncTool("bag", withAction("update", args));
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QJsonObject beanBase = result["bag"].toObject()["beanBase"].toObject();
+        QCOMPARE(beanBase["origin"].toString(), QString("Ethiopia"));
+        QCOMPARE(beanBase["tastingNotes"].toString(), QString("floral, bergamot"));
+        QCOMPARE(beanBase["link"].toString(), QString("https://example.com/bag"));
+        // Manual bag: no canonical id was conjured.
+        QVERIFY(!beanBase.contains("id"));
+
+        // Empty string clears a key; identity edits mirror into the working
+        // keys of the (now-existing) blob.
+        QJsonObject args2;
+        args2["bagId"] = bagId;
+        args2["origin"] = "";
+        args2["coffeeName"] = "First Batch 2026";
+        QJsonObject result2 = f.callAsyncTool("bag", withAction("update", args2));
+        QVERIFY(result2["success"].toBool());
+        QJsonObject bag2 = result2["bag"].toObject();
+        QCOMPARE(bag2["coffeeName"].toString(), QString("First Batch 2026"));
+        QJsonObject beanBase2 = bag2["beanBase"].toObject();
+        QVERIFY(!beanBase2.contains("origin"));
+        QCOMPARE(beanBase2["roastName"].toString(), QString("First Batch 2026"));
+        QCOMPARE(beanBase2["tastingNotes"].toString(), QString("floral, bergamot"));
+
+        // A column-only edit on a detail-less bag must NOT conjure a blob.
+        qint64 plainBagId = -1;
+        withTempDb(storage.databasePath(), "bagupd_seed2", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Other";
+            bag.coffeeName = "Roast";
+            plainBagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QJsonObject args3;
+        args3["bagId"] = plainBagId;
+        args3["coffeeName"] = "Renamed";
+        QJsonObject result3 = f.callAsyncTool("bag", withAction("update", args3));
+        QVERIFY(result3["success"].toBool());
+        QVERIFY(!result3["bag"].toObject().contains("beanBase"));
+
+        // Drain BEFORE close(). close() calls QSqlDatabase::removeDatabase(), which
+        // qWarns "connection is still in use" if background work still holds one —
+        // and failOnWarning makes that a failure. Closing first was the original
+        // order, with the sleep afterwards hoping the work had already finished.
+        drainDbWorkAndClose(storage);
+    }
+
+    // equipment_update: a name-only rename must be REPORTED as a success, not
+    // merely performed as one.
+    //
+    // The regression this pins: the success flag used to be set by
+    // `ok = updatePackageFieldsStatic(...) || ok`. Removing that expression to
+    // stop a successful identity edit masking a failed rename also removed the
+    // only place `ok` was set for a rename — so a call carrying just a name
+    // committed the rename and then answered "Package not found or update
+    // failed". Nothing else in the suite inspects this tool's response shape.
+    void equipmentUpdateNameOnlyReportsSuccess()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("equpd.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        qint64 packageId = -1;
+        withTempDb(storage.databasePath(), "equpd_seed", [&](QSqlDatabase& db) {
+            EquipmentPackage pkg;
+            pkg.name = QStringLiteral("Bench Grinder");
+            packageId = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, QStringLiteral("Niche"), QStringLiteral("Zero"),
+                QStringLiteral("63mm conical"), QString(), QString(), QString());
+        });
+        QVERIFY2(packageId > 0, "seed package should be created");
+
+        // Name only: no grinder/basket/puckPrep keys at all.
+        QJsonObject args;
+        args["packageId"] = packageId;
+        args["name"] = "Bench Grinder (renamed)";
+        QJsonObject result = f.callAsyncTool("equipment", withAction("update", args));
+
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(result["package"].toObject()["name"].toString(),
+                 QString("Bench Grinder (renamed)"));
+
+        // And the rename really is on disk, so a green assertion above cannot
+        // mean "reported success without writing".
+        QString stored;
+        withTempDb(storage.databasePath(), "equpd_check", [&](QSqlDatabase& db) {
+            stored = EquipmentStorage::loadPackageStatic(db, packageId).name;
+        });
+        QCOMPARE(stored, QString("Bench Grinder (renamed)"));
+
+        // Drain BEFORE close(). close() calls QSqlDatabase::removeDatabase(), which
+        // qWarns "connection is still in use" if background work still holds one —
+        // and failOnWarning makes that a failure. Closing first was the original
+        // order, with the sleep afterwards hoping the work had already finished.
+        drainDbWorkAndClose(storage);
+    }
+
+    // equipment_merge: the repair path for a grinder that got split in two
+    // (#1713). Pinned at the tool layer because the destructive part — the source
+    // package really is deleted and its shots really do move — is what an AI will
+    // be asked to run on a user's live history, and the only signal it has that
+    // the merge happened is this response.
+    void equipmentMergeMovesHistoryAndDeletesSource()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("eqmerge.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        qint64 source = -1, target = -1, movedShot = -1;
+        withTempDb(storage.databasePath(), "eqmerge_seed", [&](QSqlDatabase& db) {
+            EquipmentPackage a;
+            a.name = QStringLiteral("Eureka (with burrs)");
+            source = EquipmentStorage::createPackageWithGrinderStatic(
+                db, a, QStringLiteral("Eureka"), QStringLiteral("Mignon Single Dose"),
+                QStringLiteral("Lebrew Sweet"), QString(), QString(), QString());
+            EquipmentPackage b;
+            b.name = QStringLiteral("Eureka");
+            target = EquipmentStorage::createPackageWithGrinderStatic(
+                db, b, QStringLiteral("Eureka"), QStringLiteral("Mignon Single Dose"),
+                QString(), QString(), QString(), QString());
+            // The real schema, not the minimal one the storage tests build: uuid,
+            // timestamp, profile_name and duration_seconds are NOT NULL.
+            QSqlQuery q(db);
+            q.prepare("INSERT INTO shots (uuid, timestamp, profile_name, duration_seconds, equipment_id) "
+                      "VALUES ('eqmerge-shot-1', 1000, 'P', 25.0, ?)");
+            q.addBindValue(source);
+            QVERIFY2(q.exec(), qPrintable(q.lastError().text()));
+            movedShot = q.lastInsertId().toLongLong();
+        });
+        QVERIFY2(source > 0 && target > 0, "seed packages should be created");
+
+        QJsonObject args;
+        args["sourcePackageId"] = source;
+        args["targetPackageId"] = target;
+        const QJsonObject result = f.callAsyncTool("equipment", withAction("merge", args));
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(result["shotsMoved"].toInteger(), (qint64)1);
+        QCOMPARE(result["package"].toObject()["id"].toInteger(), target);
+        // The survivor now HOLDS that shot, so the response must say so. Reporting
+        // shotCount 0 here would tell an assistant the package it just moved history
+        // onto is disposable — the same defect equipment_update was fixed for.
+        QCOMPARE(result["package"].toObject()["shotCount"].toInteger(), (qint64)1);
+
+        // On disk, not just in the response.
+        qint64 shotEquipment = -1, sourceRows = -1;
+        withTempDb(storage.databasePath(), "eqmerge_check", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            q.prepare("SELECT equipment_id FROM shots WHERE id = ?");
+            q.addBindValue(movedShot);
+            if (q.exec() && q.next()) shotEquipment = q.value(0).toLongLong();
+            QSqlQuery c(db);
+            c.prepare("SELECT COUNT(*) FROM equipment_packages WHERE id = ?");
+            c.addBindValue(source);
+            if (c.exec() && c.next()) sourceRows = c.value(0).toLongLong();
+        });
+        QCOMPARE(shotEquipment, target);
+        QCOMPARE(sourceRows, (qint64)0);
+
+        // Two ids that name one package is a refusal, not a self-merge that
+        // deletes the package it was asked to keep.
+        QJsonObject same;
+        same["sourcePackageId"] = target;
+        same["targetPackageId"] = target;
+        const QJsonObject refused = f.callAsyncTool("equipment", withAction("merge", same));
+        QVERIFY(!refused["success"].toBool());
+        QVERIFY(refused.contains("error"));
+
+        drainDbWorkAndClose(storage);
+    }
+
+    // bag_create (add-recipe-wizard-tea): kind stamped at creation, gated in
+    // both directions. Needs a real CoffeeBagStorage (the tool creates via the
+    // async instance — there is no static fallback like bag_update).
+    void bagCreateKindAndGating()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("bagcreate.db")));
+        CoffeeBagStorage bagStorage;
+        bagStorage.initialize(storage.databasePath());
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          &bagStorage, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        // Tea bag with brewing data: kind + tea vocabulary round-trip.
+        QJsonObject tea;
+        tea["kind"] = "tea";
+        tea["roasterName"] = "Harney & Sons";
+        tea["coffeeName"] = "Decaf Ceylon";
+        tea["teaType"] = "black";
+        tea["brewTempC"] = 100;
+        QJsonObject r = f.callAsyncTool("bag", withAction("create", tea));
+        QVERIFY2(r["success"].toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QJsonObject bag = r["bag"].toObject();
+        QCOMPARE(bag["kind"].toString(), QString("tea"));
+        QCOMPARE(bag["teaType"].toString(), QString("black"));
+        QCOMPARE(bag["brewTemperatureC"].toDouble(), 100.0);
+
+        // kind=coffee + a tea field: rejected (synchronous, before storage).
+        QJsonObject bad1;
+        bad1["kind"] = "coffee"; bad1["roasterName"] = "X"; bad1["teaType"] = "black";
+        QVERIFY(f.callAsyncTool("bag", withAction("create", bad1)).contains("error"));
+
+        // kind=tea + a coffee-only field: rejected.
+        QJsonObject bad2;
+        bad2["kind"] = "tea"; bad2["roasterName"] = "X"; bad2["roastLevel"] = "Light";
+        QVERIFY(f.callAsyncTool("bag", withAction("create", bad2)).contains("error"));
+
+        // Omitted kind defaults to coffee.
+        QJsonObject def;
+        def["roasterName"] = "Onyx"; def["coffeeName"] = "Geometry";
+        QJsonObject dr = f.callAsyncTool("bag", withAction("create", def));
+        QVERIFY2(dr["success"].toBool(), qPrintable(QJsonDocument(dr).toJson()));
+        QCOMPARE(dr["bag"].toObject()["kind"].toString(), QString("coffee"));
+        const qint64 bagId = dr["bag"].toObject()["bagId"].toInteger();
+        QVERIFY(bagId > 0);
+        for (const auto& field : {QStringLiteral("grinderSetting"), QStringLiteral("rpm"),
+                                  QStringLiteral("equipmentId")}) {
+            QJsonObject oldCreate = def;
+            oldCreate[field] = field == QLatin1String("grinderSetting") ? QJsonValue("8") : QJsonValue(100);
+            QVERIFY(f.callAsyncTool("bag", withAction("create", oldCreate)).contains("error"));
+            QJsonObject oldUpdate{{"bagId", bagId}, {field, oldCreate[field]}};
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("update refused: " + field));
+            QVERIFY(f.callAsyncTool("bag", withAction("update", oldUpdate)).contains("error"));
+            oldUpdate[field] = field == QLatin1String("grinderSetting") ? QJsonValue("") : QJsonValue(0);
+            const QJsonObject cleared = f.callAsyncTool("bag", withAction("update", oldUpdate));
+            QVERIFY2(cleared["success"].toBool(), qPrintable(QJsonDocument(cleared).toJson()));
+        }
+
+        // Neither roaster nor coffee name: rejected.
+        QJsonObject empty; empty["kind"] = "tea";
+        QVERIFY(f.callAsyncTool("bag", withAction("create", empty)).contains("error"));
+
+        // Drain BEFORE close(). close() calls QSqlDatabase::removeDatabase(), which
+        // qWarns "connection is still in use" if background work still holds one —
+        // and failOnWarning makes that a failure. Closing first was the original
+        // order, with the sleep afterwards hoping the work had already finished.
+        drainBagDbWork(bagStorage);
+        drainDbWorkAndClose(storage);
+    }
+
+    // bag_update kind gate runs on the static path (nullptr bagStorage): tea
+    // vocabulary is rejected on a coffee bag and coffee-only columns on a tea
+    // bag; both accepted on the matching kind.
+    void bagUpdateKindGating()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("bagkind.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        qint64 coffeeId = -1, teaId = -1;
+        withTempDb(storage.databasePath(), "bagkind_seed", [&](QSqlDatabase& db) {
+            CoffeeBag c; c.roasterName = "Onyx"; c.coffeeName = "Geometry";
+            coffeeId = CoffeeBagStorage::insertBagStatic(db, c);
+            CoffeeBag t; t.roasterName = "Harney"; t.coffeeName = "Ceylon"; t.kind = "tea";
+            teaId = CoffeeBagStorage::insertBagStatic(db, t);
+        });
+        QVERIFY(coffeeId > 0 && teaId > 0);
+
+        // teaType on a coffee bag: rejected.
+        QJsonObject t1; t1["bagId"] = coffeeId; t1["teaType"] = "black";
+        QVERIFY(f.callAsyncTool("bag", withAction("update", t1)).contains("error"));
+
+        // roastLevel/grinderSetting/rpm on a tea bag: refused in storage.
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("update refused: roastLevel"));
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("update refused: grinderSetting"));
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("update refused: rpm"));
+        QJsonObject t2; t2["bagId"] = teaId; t2["roastLevel"] = "Light";
+        QVERIFY(f.callAsyncTool("bag", withAction("update", t2)).contains("error"));
+        QJsonObject t3; t3["bagId"] = teaId; t3["grinderSetting"] = "12";
+        QVERIFY(f.callAsyncTool("bag", withAction("update", t3)).contains("error"));
+        QJsonObject t4; t4["bagId"] = teaId; t4["rpm"] = 800;
+        QVERIFY(f.callAsyncTool("bag", withAction("update", t4)).contains("error"));
+
+        // teaType on the tea bag: accepted.
+        QJsonObject ok; ok["bagId"] = teaId; ok["teaType"] = "black";
+        QJsonObject r = f.callAsyncTool("bag", withAction("update", ok));
+        QVERIFY2(r["success"].toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QCOMPARE(r["bag"].toObject()["teaType"].toString(), QString("black"));
+
+        // Drain BEFORE close(). close() calls QSqlDatabase::removeDatabase(), which
+        // qWarns "connection is still in use" if background work still holds one —
+        // and failOnWarning makes that a failure. Closing first was the original
+        // order, with the sleep afterwards hoping the work had already finished.
+        drainDbWorkAndClose(storage);
+    }
+
+    // The linked-bag case is where the MCP wiring does real work: the tool
+    // description promises "Bean-detail edits keep a canonical Bean Base link
+    // intact", the identity mirror rewrites the blob working keys, and the
+    // first edit captures the pristine `canonical` snapshot.
+    void bagUpdatePreservesCanonicalLinkAndCapturesSnapshot()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("bagupd_linked.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        qint64 bagId = -1;
+        withTempDb(storage.databasePath(), "bagupd_seed3", [&](QSqlDatabase& db) {
+            CoffeeBag bag;
+            bag.roasterName = "Prodigal";
+            bag.coffeeName = "First Batch";
+            bag.beanBaseId = "uuid-1";
+            bag.beanBaseData = QStringLiteral(
+                "{\"id\":\"uuid-1\",\"visualizerCanonicalId\":\"uuid-1\","
+                "\"canonicalRoasterId\":\"roaster-uuid\",\"roasterName\":\"Prodigal\","
+                "\"roastName\":\"First Batch\",\"origin\":\"Colombia\"}");
+            bagId = CoffeeBagStorage::insertBagStatic(db, bag);
+        });
+        QVERIFY(bagId > 0);
+
+        QJsonObject args;
+        args["bagId"] = bagId;
+        args["tastingNotes"] = "plum";
+        QJsonObject result = f.callAsyncTool("bag", withAction("update", args));
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        const QJsonObject beanBase = result["bag"].toObject()["beanBase"].toObject();
+        // A DETAIL edit leaves the link intact: identity mirror applied, snapshot
+        // = pre-edit values.
+        QCOMPARE(beanBase["id"].toString(), QString("uuid-1"));
+        QCOMPARE(beanBase["canonicalRoasterId"].toString(), QString("roaster-uuid"));
+        QCOMPARE(beanBase["roastName"].toString(), QString("First Batch"));
+        QCOMPARE(beanBase["tastingNotes"].toString(), QString("plum"));
+        const QJsonObject canonical = beanBase["canonical"].toObject();
+        QCOMPARE(canonical["roastName"].toString(), QString("First Batch"));
+        QCOMPARE(canonical["origin"].toString(), QString("Colombia"));
+        QVERIFY(!canonical.contains("tastingNotes"));  // canonical had none
+
+        // Idempotent re-apply: same value again is a success, not an error.
+        QJsonObject again;
+        again["bagId"] = bagId;
+        again["tastingNotes"] = "plum";
+        QJsonObject result2 = f.callAsyncTool("bag", withAction("update", again));
+        QVERIFY2(result2["success"].toBool(), qPrintable(QJsonDocument(result2).toJson()));
+        // And the snapshot is untouched by the second edit.
+        QCOMPARE(result2["bag"].toObject()["beanBase"].toObject()
+                     ["canonical"].toObject()["origin"].toString(), QString("Colombia"));
+
+        // An IDENTITY edit is different in kind: the canonical record names a
+        // roaster's product, and visualizer.coffee rewrites a shot's bean fields
+        // from it, so a bag that no longer calls itself what the record calls it
+        // must stop claiming that record. The descriptive fields the user
+        // linked FOR are kept.
+        QJsonObject renamed;
+        renamed["bagId"] = bagId;
+        renamed["coffeeName"] = "Second Batch";
+        QJsonObject result3 = f.callAsyncTool("bag", withAction("update", renamed));
+        QVERIFY2(result3["success"].toBool(), qPrintable(QJsonDocument(result3).toJson()));
+        const QJsonObject unlinked = result3["bag"].toObject()["beanBase"].toObject();
+        QVERIFY(!unlinked.contains("id"));
+        QVERIFY(!unlinked.contains("visualizerCanonicalId"));
+        QVERIFY(!unlinked.contains("canonicalRoasterId"));
+        QVERIFY(!unlinked.contains("canonical"));
+        QCOMPARE(unlinked["origin"].toString(), QString("Colombia"));
+        QCOMPARE(unlinked["tastingNotes"].toString(), QString("plum"));
+
+        // Drain BEFORE close(). close() calls QSqlDatabase::removeDatabase(), which
+        // qWarns "connection is still in use" if background work still holds one —
+        // and failOnWarning makes that a failure. Closing first was the original
+        // order, with the sleep afterwards hoping the work had already finished.
+        drainDbWorkAndClose(storage);
+    }
+
+    // ===== recipe_get/set/clear_auto_load (recipe-auto-load) =====
+    // These three tools were relocated here from mcptools_recipes.cpp
+    // specifically so they could be tested without a real MainController —
+    // see the note above their registration in mcptools_write.cpp.
+
+    static qint64 seedRecipe(ShotHistoryStorage& storage, const QString& name, bool archived = false) {
+        qint64 id = -1;
+        withTempDb(storage.databasePath(), "recipe_autoload_seed", [&](QSqlDatabase& db) {
+            Recipe r;
+            r.name = name;
+            r.profileTitle = "Test Profile";
+            r.profileJson = "{\"title\":\"Test Profile\"}";
+            r.archived = archived;
+            id = RecipeStorage::insertRecipeStatic(db, r);
+        });
+        return id;
+    }
+
+    void recipeGetAutoLoadUnconfiguredReturnsNull()
+    {
+        McpTestFixture f;
+        f.settings.dye()->setAutoLoadRecipeId(-1);
+        f.settings.app()->setAutoLoadRevertMinutes(9);
+        registerTools(f);
+
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("get", {}));
+        QVERIFY(result["recipeId"].isNull());
+        QCOMPARE(result["revertMinutes"].toInt(), 9);
+        QVERIFY(!result.contains("name"));
+    }
+
+    void recipeGetAutoLoadConfiguredReturnsNameAndId()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("recipe_get.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        const qint64 recipeId = seedRecipe(storage, "Morning Latte");
+        QVERIFY(recipeId > 0);
+        f.settings.dye()->setAutoLoadRecipeId(static_cast<int>(recipeId));
+        f.settings.app()->setAutoLoadRevertMinutes(15);
+
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("get", {}));
+        QCOMPARE(result["recipeId"].toInteger(), recipeId);
+        QCOMPARE(result["name"].toString(), QString("Morning Latte"));
+        QCOMPARE(result["revertMinutes"].toInt(), 15);
+        drainDbWorkAndClose(storage);
+    }
+
+    void recipeGetAutoLoadStaleIdReturnsNullNotError()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("recipe_get_stale.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        // A stale reference (the recipe row no longer exists) is a snapshot,
+        // not an error — the next auto-load trigger discovers and clears it.
+        f.settings.dye()->setAutoLoadRecipeId(99999);
+
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("get", {}));
+        QVERIFY(result["recipeId"].isNull());
+        QVERIFY(!result.contains("error"));
+        drainDbWorkAndClose(storage);
+    }
+
+    void recipeGetAutoLoadConfiguredButStorageUnavailableIsError()
+    {
+        // A recipe IS pinned, but the tool can't verify it right now (no
+        // ShotHistoryStorage wired up here) — this must be reported as an
+        // error, not collapsed into the same {"recipeId": null} shape as
+        // "nothing is pinned" (which would misinform a caller).
+        McpTestFixture f;
+        const int before = f.settings.dye()->autoLoadRecipeId();  // shared PID-scoped store
+        f.settings.dye()->setAutoLoadRecipeId(42);
+        registerTools(f);  // shotHistory is nullptr here
+
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("get", {}));
+        QCOMPARE(result["error"].toString(), QString("Storage not available"));
+        QVERIFY(!result.contains("recipeId"));
+
+        f.settings.dye()->setAutoLoadRecipeId(before);
+    }
+
+    void recipeSetAutoLoadSuccessSetsSettingsAndClearsProfile()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("recipe_set.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        const qint64 recipeId = seedRecipe(storage, "Afternoon Cortado");
+        QVERIFY(recipeId > 0);
+        f.settings.app()->setAutoLoadProfileFilename("some-profile");  // must be cleared
+
+        QJsonObject args;
+        args["recipeId"] = recipeId;
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("set", args));
+
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(result["recipeId"].toInteger(), recipeId);
+        QCOMPARE(result["name"].toString(), QString("Afternoon Cortado"));
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), static_cast<int>(recipeId));
+        // Mutual exclusion: setting a recipe auto-load clears the profile side.
+        QCOMPARE(f.settings.app()->autoLoadProfileFilename(), QString());
+        drainDbWorkAndClose(storage);
+    }
+
+    void recipeSetAutoLoadMissingRecipeIdIsError()
+    {
+        McpTestFixture f;
+        registerTools(f);
+
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("set", {}));
+        QCOMPARE(result["error"].toString(), QString("recipeId is required"));
+    }
+
+    void recipeSetAutoLoadInvalidRecipeIdIsDistinctFromMissing()
+    {
+        // recipeId WAS supplied here, just with an invalid value — the error
+        // must say so rather than repeat the "is required" message used for
+        // the genuinely-absent case above (that message would misleadingly
+        // suggest the field was never sent).
+        McpTestFixture f;
+        registerTools(f);
+
+        QJsonObject zero;
+        zero["recipeId"] = 0;
+        QCOMPARE(f.callAsyncTool("auto_load", withRecipeAutoLoad("set", zero))["error"].toString(),
+                 QString("recipeId must be a positive integer"));
+
+        QJsonObject negative;
+        negative["recipeId"] = -5;
+        QCOMPARE(f.callAsyncTool("auto_load", withRecipeAutoLoad("set", negative))["error"].toString(),
+                 QString("recipeId must be a positive integer"));
+    }
+
+    void recipeSetAutoLoadOutOfRangeRecipeIdIsError()
+    {
+        // recipeId is stored as a plain `int` (SettingsDye::autoLoadRecipeId),
+        // so a value past INT_MAX must be rejected before the later
+        // static_cast<int>() truncates it into a bogus, silently-wrong id.
+        McpTestFixture f;
+        registerTools(f);
+
+        QJsonObject args;
+        args["recipeId"] = static_cast<qint64>(std::numeric_limits<int>::max()) + 1;
+        QCOMPARE(f.callAsyncTool("auto_load", withRecipeAutoLoad("set", args))["error"].toString(),
+                 QString("recipeId is out of range"));
+    }
+
+    void recipeSetAutoLoadNotFoundIsError()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("recipe_set_notfound.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        // Settings::testQSettingsPath() is a single PID-scoped store shared by
+        // every McpTestFixture in this process, so a prior test's write can
+        // still be sitting there — capture the baseline rather than assume -1.
+        const int before = f.settings.dye()->autoLoadRecipeId();
+
+        QJsonObject args;
+        args["recipeId"] = 99999;
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("set", args));
+        QCOMPARE(result["error"].toString(), QString("Recipe not found: 99999"));
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), before);
+        drainDbWorkAndClose(storage);
+    }
+
+    void recipeSetAutoLoadArchivedIsError()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("recipe_set_archived.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        const int before = f.settings.dye()->autoLoadRecipeId();  // see note above
+
+        const qint64 recipeId = seedRecipe(storage, "Retired Recipe", /*archived=*/true);
+        QVERIFY(recipeId > 0);
+
+        QJsonObject args;
+        args["recipeId"] = recipeId;
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("set", args));
+        QCOMPARE(result["error"].toString(), QString("Recipe is archived"));
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), before);
+        drainDbWorkAndClose(storage);
+    }
+
+    void recipeSetAutoLoadOverwritesExistingPin()
+    {
+        // Pinning a second recipe while one is already pinned must silently
+        // replace it — no error, no double-pin state, no need to clear the
+        // first pin first.
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("recipe_set_overwrite.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        const qint64 first = seedRecipe(storage, "First Pin");
+        const qint64 second = seedRecipe(storage, "Second Pin");
+        QVERIFY(first > 0 && second > 0 && first != second);
+
+        QJsonObject argsFirst;
+        argsFirst["recipeId"] = first;
+        QJsonObject resultFirst = f.callAsyncTool("auto_load", withRecipeAutoLoad("set", argsFirst));
+        QVERIFY2(resultFirst["success"].toBool(), qPrintable(QJsonDocument(resultFirst).toJson()));
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), static_cast<int>(first));
+
+        QJsonObject argsSecond;
+        argsSecond["recipeId"] = second;
+        QJsonObject resultSecond = f.callAsyncTool("auto_load", withRecipeAutoLoad("set", argsSecond));
+        QVERIFY2(resultSecond["success"].toBool(), qPrintable(QJsonDocument(resultSecond).toJson()));
+        QCOMPARE(resultSecond["recipeId"].toInteger(), second);
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), static_cast<int>(second));
+        drainDbWorkAndClose(storage);
+    }
+
+    void recipeSetAutoLoadOptionalRevertMinutesUpdatesSharedSetting()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("recipe_set_revert.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        const qint64 recipeId = seedRecipe(storage, "Evening Decaf");
+        QVERIFY(recipeId > 0);
+
+        QJsonObject args;
+        args["recipeId"] = recipeId;
+        args["revertMinutes"] = 33;
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("set", args));
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(result["revertMinutes"].toInt(), 33);
+        // Shared with the profile side.
+        QCOMPARE(f.settings.app()->autoLoadRevertMinutes(), 33);
+        drainDbWorkAndClose(storage);
+    }
+
+    void recipeClearAutoLoadSuccessPreservesRevertMinutes()
+    {
+        McpTestFixture f;
+        f.settings.dye()->setAutoLoadRecipeId(42);
+        f.settings.app()->setAutoLoadRevertMinutes(27);
+        registerTools(f);
+
+        QJsonObject result = f.callAsyncTool("auto_load", withRecipeAutoLoad("clear", {}));
+        QVERIFY2(result["success"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), -1);
+        // Timeout is untouched — preserved across enable/disable cycles.
+        QCOMPARE(f.settings.app()->autoLoadRevertMinutes(), 27);
+    }
+
+    // ===== Outcome reporting: success must mean the operation happened =====
+    //
+    // Each of these covers a tool that used to report success for an operation
+    // that did not take place. PR Kulitorum/Decenza#1754 made a tool's `error` key reach the wire as
+    // `isError`; it cannot reach these, because no `error` key was written at
+    // all — the tool believed it had succeeded.
+
+    // shots_delete waited on `shotDeleted`, which fires only on success, so a
+    // delete that failed produced NO RESPONSE — the client hung with no error
+    // and no timeout anywhere in the deferred path. The assertion that matters
+    // is that a response arrives at all; `callAsyncTool` gives up after 5 s and
+    // warns, so a regression here shows up as both a failed compare and that
+    // warning.
+    // `target` is required, and the reason is destructive: with a default, "clear the
+    // auto-load" would clear whichever pin the default named while the other stayed
+    // set, and the caller would be told it succeeded. The state assertion is the
+    // load-bearing half — an error message alone passes even if something was cleared
+    // on the way to producing it.
+    void autoLoadWithoutTargetChangesNothing()
+    {
+        McpTestFixture f;
+        f.settings.dye()->setAutoLoadRecipeId(4242);
+        registerTools(f);
+
+        const QJsonObject result = f.callAsyncTool("auto_load", {{"action", "clear"}});
+        QVERIFY2(result["error"].toString().contains("profile"), qPrintable(result["error"].toString()));
+        QVERIFY2(result["error"].toString().contains("recipe"), qPrintable(result["error"].toString()));
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), 4242);
+    }
+
+    void autoLoadWithUnknownTargetChangesNothing()
+    {
+        McpTestFixture f;
+        f.settings.dye()->setAutoLoadRecipeId(4242);
+        registerTools(f);
+
+        const QJsonObject result =
+            f.callAsyncTool("auto_load", {{"action", "clear"}, {"target", "recipes"}});
+        QVERIFY2(result["error"].toString().contains("recipes"), qPrintable(result["error"].toString()));
+        QCOMPARE(f.settings.dye()->autoLoadRecipeId(), 4242);
+    }
+
+    // equipment action=merge is destructive and irreversible, and its confirmation is
+    // now a string at its registration site rather than a name in McpServer's list —
+    // delete the string and the prompt disappears with no other signal.
+    void equipmentMergeStillRequiresConfirmation()
+    {
+        McpTestFixture f;
+        registerTools(f);
+        QVERIFY(f.registry.confirmationFor("equipment", {{"action", "merge"}}).required);
+        QVERIFY(!f.registry.confirmationFor("equipment", {{"action", "list"}}).required);
+    }
+
+    void shotsDeleteNonexistentShotAnswersInsteadOfHanging()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("del.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        // The storage layer logs the failed delete; that is the point, not a fault.
+        ScopedWarningFilter deleteFilter("Failed to async delete shot");
+
+        QJsonObject args;
+        args["shotId"] = 99999;
+        QJsonObject result = f.callAsyncTool("shots_delete", args);
+
+        QVERIFY2(!result.isEmpty(), "shots_delete must respond even when the delete fails");
+        QVERIFY2(result.contains("error"),
+                 "deleting a shot that does not exist is a failure, not a success");
+        QVERIFY2(!result.contains("success"), "a failed delete must not also report success");
+
+        drainDbWorkAndClose(storage);
+    }
+
+    void shotsDeleteExistingShotStillReportsSuccess()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("del2.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        const qint64 shotId = insertMinimalShot(storage);
+        QVERIFY(shotId > 0);
+
+        QJsonObject args;
+        args["shotId"] = shotId;
+        QJsonObject result = f.callAsyncTool("shots_delete", args);
+
+        QVERIFY2(result["success"].toBool(),
+                 "a delete that removed a row must still report success");
+        QVERIFY(!result.contains("error"));
+
+        drainDbWorkAndClose(storage);
+    }
+
+    // `query.exec()` succeeding means the statement RAN. An UPDATE whose WHERE
+    // matches nothing is a perfectly successful statement, and shots_update
+    // reported it as an updated shot.
+    void shotsUpdateNonexistentShotReportsError()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("upd.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        ScopedWarningFilter updateFilter("No shot with id");
+
+        QJsonObject args;
+        args["shotId"] = 99999;
+        args["enjoyment"] = 80;
+        QJsonObject result = f.callAsyncTool("shots_update", args);
+
+        QVERIFY2(result.contains("error"),
+                 "updating a shot that does not exist is a failure, not a success");
+        QVERIFY(!result.contains("success"));
+
+        drainDbWorkAndClose(storage);
+    }
+
+    void shotsUpdateExistingShotStillReportsSuccess()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("upd2.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        const qint64 shotId = insertMinimalShot(storage);
+        QVERIFY(shotId > 0);
+
+        QJsonObject args;
+        args["shotId"] = static_cast<qint64>(shotId);
+        args["enjoyment"] = 80;
+        QJsonObject result = f.callAsyncTool("shots_update", args);
+
+        QVERIFY2(result["success"].toBool(),
+                 "an update that changed a row must still report success");
+
+        drainDbWorkAndClose(storage);
+    }
+
+    // shots_update reaches what the app and web shot pages set: a bag pick
+    // (snapshot from the bag), storage dates under the bag rules, taste, the
+    // equipment package, and the indexed bean id alongside beanBase.
+    void shotsUpdateReachesShotPageFields()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("updfields.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        ScopedWarningFilter refusedFilter("update refused");
+
+        const qint64 shotId = insertMinimalShot(storage);
+        QVERIFY(shotId > 0);
+        qint64 bagId = -1;
+        withTempDb(storage.databasePath(), "updfields_seed", [&](QSqlDatabase& db) {
+            CoffeeBag b; b.roasterName = "Hometown"; b.coffeeName = "Hometown";
+            b.roastDate = "2026-09-01"; b.frozenDate = "2026-09-03"; b.storageHint = "vacuum-sealed";
+            bagId = CoffeeBagStorage::insertBagStatic(db, b);
+        });
+        QVERIFY(bagId > 0);
+        auto update = [&](QJsonObject args) {
+            args["shotId"] = shotId;
+            return f.callAsyncTool("shots_update", args);
+        };
+        auto column = [&](const char* col) {
+            QString v;
+            withTempDb(storage.databasePath(), "updfields_read", [&](QSqlDatabase& db) {
+                QSqlQuery q(db);
+                q.exec(QStringLiteral("SELECT %1 FROM shots WHERE id = %2").arg(QLatin1String(col)).arg(shotId));
+                if (q.next()) v = q.value(0).toString();
+            });
+            return v;
+        };
+
+        // A bag pick copies the bag's snapshot, and refuses fields it would overwrite.
+        QVERIFY(update({{"bagId", bagId}})["success"].toBool());
+        QCOMPARE(column("bean_brand"), QString("Hometown"));
+        QCOMPARE(column("frozen_date"), QString("2026-09-03"));
+        QVERIFY(update({{"bagId", bagId}, {"beanBrand", "x"}}).contains("error"));
+        QVERIFY(update({{"bagId", 99999}}).contains("error"));
+        // -1 unlinks, keeping the bean fields sent with it (a bean not in the inventory).
+        QVERIFY(update({{"bagId", -1}, {"beanBrand", "Elsewhere"}})["success"].toBool());
+        QCOMPARE(column("bag_id"), QString("-1"));
+        QCOMPARE(column("bean_brand"), QString("Elsewhere"));
+
+        // Storage dates, checked by the bag rules against the shot's own dates.
+        QJsonObject dates{{"defrostDate", "2026-09-09"}, {"openedDate", "2026-09-10"}, {"storageHint", "vacuum-sealed"}};
+        QVERIFY(update(dates)["success"].toBool());
+        QCOMPARE(column("defrost_date"), QString("2026-09-09"));
+        QCOMPARE(column("opened_date"), QString("2026-09-10"));
+        QVERIFY(update({{"defrostDate", "2026-09-02"}}).contains("error"));   // before the freeze
+        QVERIFY(update({{"openedDate", "2999-01-01"}}).contains("error"));    // future
+        QVERIFY(update({{"storageHint", "jar"}}).contains("error"));
+
+        // Taste is refused, not dropped, when off the list.
+        QVERIFY(update({{"tasteBalance", "sweet"}}).contains("error"));
+        QVERIFY(update({{"tasteBalance", "Balanced"}})["success"].toBool());
+        QCOMPARE(column("taste_balance"), QString("balanced"));
+
+        QVERIFY(update({{"equipmentId", 99999}}).contains("error"));
+
+        QVERIFY(update({{"beanBase", QJsonObject{{"id", "canon-7"}}}})["success"].toBool());
+        QCOMPARE(column("beanbase_id"), QString("canon-7"));
+
+        drainDbWorkAndClose(storage);
+    }
+
+    // profiles_set_active's own refusal path — loadProfile returning false — is
+    // covered in tst_profilemanager (loadProfileReportsRefusalAndKeepsTheActive-
+    // Profile). It needs a deliberately-broken profile ON DISK, and the only safe
+    // place to write one is the QStandardPaths test store, which that file
+    // already sets up and sweeps. Enabling test mode here instead turned every
+    // other test in this file red: an empty profile store makes ProfileManager
+    // warn at construction, and init()'s failOnWarning converts that to a
+    // failure of the whole file. What is NOT covered by a test either way is the
+    // one line in the tool that consults the return value.
+
+    // equipment create shares the Switch Equipment dialog's storage rule: the
+    // same gear is the same package, and a taken name is refused.
+    void equipmentCreateAddsOnceAndRefusesTakenName()
+    {
+        McpTestFixture f;
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(f.tempDir.filePath("eqcreate.db")));
+        registerWriteTools(&f.registry, &f.profileManager, &storage, &f.settings,
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        QJsonObject args;
+        args["grinderBrand"] = "Niche";
+        args["grinderModel"] = "Zero";
+        args["name"] = "Bench";
+        const QJsonObject first = f.callAsyncTool("equipment", withAction("create", args));
+        QVERIFY2(first["success"].toBool(), qPrintable(QJsonDocument(first).toJson()));
+        const qint64 id = first["package"].toObject()["id"].toInteger();
+        QVERIFY(id > 0);
+        QVERIFY(first["created"].toBool());
+
+        const QJsonObject again = f.callAsyncTool("equipment", withAction("create", args));
+        QCOMPARE(again["package"].toObject()["id"].toInteger(), id);
+        QVERIFY(!again["created"].toBool());
+
+        QJsonObject clash;
+        clash["grinderBrand"] = "DF64";
+        clash["grinderModel"] = "Gen 2";
+        clash["name"] = "Bench";
+        const QJsonObject refused = f.callAsyncTool("equipment", withAction("create", clash));
+        QVERIFY(refused.contains("error"));
+
+        drainDbWorkAndClose(storage);
+    }
+};
+
+QTEST_MAIN(tst_McpToolsWrite)
+#include "tst_mcptools_write.moc"

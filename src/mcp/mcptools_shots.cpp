@@ -1,0 +1,774 @@
+#include "mcpserver.h"
+#include "mcptoolregistry.h"
+#include "mcplogging.h"
+#include "mcptools_shots_helpers.h"
+#include "mcplogfilter.h"
+#include "../history/shotcomparison.h"
+#include "../history/shothistorystorage.h"
+#include "../ai/shotsummarizer.h"
+#include "../core/dbutils.h"
+
+#include <QDateTime>
+#include <algorithm>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QThread>
+#include <QMetaObject>
+#include <QCoreApplication>
+
+
+// Strip per-detector implementation-detail blocks (currently `gates`) from
+// detectorResults so MCP responses only expose the user-facing scalars the
+// detectors commit to externally. Threshold values inside `gates` (e.g.
+// chokedFlowMaxMlPerSec) are scratch input/output for the detector and
+// invite the LLM to reason about them as if they were dialing parameters.
+static void stripDetectorInternals(QJsonObject& obj)
+{
+    if (!obj.contains("detectorResults"))
+        return;
+    QJsonObject detectorResults = obj.value("detectorResults").toObject();
+    static const char* detectorKeys[] = {
+        "grind", "channeling", "flowTrend", "preinfusion"
+    };
+    for (const char* key : detectorKeys) {
+        const QString k = QString::fromLatin1(key);
+        if (!detectorResults.contains(k))
+            continue;
+        QJsonObject d = detectorResults.value(k).toObject();
+        d.remove(QStringLiteral("gates"));
+        detectorResults[k] = d;
+    }
+    obj["detectorResults"] = detectorResults;
+}
+
+using McpShotsHelpers::reshapeDetectorEnvelopes;
+using McpShotsHelpers::stripTimeSeriesFields;
+
+// Resolve the detail argument. Default "summary" — drops time-series, debugLog,
+// profileJson. "full" — return the complete projection. Unknown values fall
+// back to summary so the LLM gets a usable response rather than the 200K-char
+// firehose.
+static bool wantsFullDetail(const QJsonObject& args)
+{
+    return args.value("detail").toString() == QStringLiteral("full");
+}
+
+// Replace 0 with null for enjoyment0to100/drinkTdsPct/drinkEyPct so MCP
+// consumers can distinguish unrated shots (and shots without TDS/EY
+// measurements) from a deliberate zero. The QML UI already does this
+// implicitly with `(value || 0) > 0 ? value : "-"` on display; this gives
+// the LLM the same signal.
+static void nullifyUnratedFields(QJsonObject& obj)
+{
+    static const char* ratingFields[] = {
+        "enjoyment0to100", "drinkTdsPct", "drinkEyPct"
+    };
+    for (const char* key : ratingFields) {
+        const QString k = QString::fromLatin1(key);
+        if (!obj.contains(k))
+            continue;
+        const double v = obj.value(k).toDouble();
+        if (v <= 0.0)
+            obj[k] = QJsonValue(QJsonValue::Null);
+    }
+}
+
+// MCP consumers get the Bean Base snapshot as a parsed `beanBase` object —
+// LLMs cannot reliably read a double-encoded JSON string. Absent/unparseable
+// snapshots are simply omitted (sparse, like the projection's own emit).
+static void reshapeBeanBase(QJsonObject& obj)
+{
+    if (!obj.contains("beanBaseJson"))
+        return;
+    const QString raw = obj.take("beanBaseJson").toString();
+    const QJsonDocument doc = QJsonDocument::fromJson(raw.toUtf8());
+    if (doc.isObject() && !doc.object().isEmpty())
+        obj["beanBase"] = doc.object();
+    else if (!raw.isEmpty())
+        // Corruption tripwire — sparse-emit makes a bad blob look "unlinked"
+        // at every consumer; leave one trace.
+        MCP_WARN_TAGGED("shots", QStringLiteral("corrupt beanBaseJson on shot %1")
+                                    .arg(obj.value("id").toVariant().toString()));
+}
+
+// MCP and the in-app advisor read PORTAL data in one format, described once by the shared prompt.
+static void reshapePortal(QJsonObject& obj)
+{
+    const QJsonValue raw = obj.take(QStringLiteral("portalAnalysis"));
+    if (raw.isObject())
+        obj[QStringLiteral("portal")] = ShotSummarizer::buildPortalBlock(raw.toObject().toVariantMap());
+}
+
+void registerShotTools(McpToolRegistry* registry, ShotHistoryStorage* shotHistory)
+{
+    // shots_list
+    registry->registerAsyncTool(
+        "shots_list",
+        "List recent shots with optional filters. Returns summary data (no time-series).",
+        QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"limit", QJsonObject{{"type", "integer"}, {"description", "Max shots to return (default 20, max 100)"}}},
+                {"offset", QJsonObject{{"type", "integer"}, {"description", "Offset for pagination"}}},
+                {"profileName", QJsonObject{{"type", "string"}, {"description", "Filter by profile name (substring match)"}}},
+                {"beanBrand", QJsonObject{{"type", "string"}, {"description", "Filter by bean brand"}}},
+                {"minEnjoyment", QJsonObject{{"type", "integer"}, {"description", "Minimum enjoyment rating (1-100, 0 or omit means no filter)"}}},
+                {"hasRating", QJsonObject{{"type", "boolean"}, {"description", "Only shots with an enjoyment score (>0). Composable with other filters; equivalent to minEnjoyment: 1."}}},
+                {"hasNotes", QJsonObject{{"type", "boolean"}, {"description", "Only shots with non-empty espresso notes."}}},
+                {"hasTds", QJsonObject{{"type", "boolean"}, {"description", "Only shots with a refractometer reading (drinkTdsPct > 0)."}}},
+                {"after", QJsonObject{{"type", "string"}, {"description", "Only shots after this ISO timestamp (e.g. 2026-03-15T00:00:00)"}}},
+                {"before", QJsonObject{{"type", "string"}, {"description", "Only shots before this ISO timestamp (e.g. 2026-03-21T23:59:59)"}}}
+            }}
+        },
+        [shotHistory](const QJsonObject& args, std::function<void(QJsonObject)> respond) {
+            if (!shotHistory || !shotHistory->isReady()) {
+                respond(QJsonObject{{"error", "Shot history not available"}});
+                return;
+            }
+
+            // Capture current time on the main thread before spawning background work
+            auto now = QDateTime::currentDateTime();
+            QString currentDateTime = now.toOffsetFromUtc(now.offsetFromUtc()).toString(Qt::ISODate);
+
+            int limit = qBound(1, args["limit"].toInt(20), 100);
+            int offset = qMax(0, args["offset"].toInt(0));
+            QString profileFilter = args["profileName"].toString();
+            QString beanFilter = args["beanBrand"].toString();
+            int minEnjoyment = args["minEnjoyment"].toInt(-1);
+            const bool hasRating = args.value("hasRating").toBool();
+            const bool hasNotes = args.value("hasNotes").toBool();
+            const bool hasTds = args.value("hasTds").toBool();
+            qint64 afterEpoch = 0, beforeEpoch = 0;
+            if (args.contains("after")) {
+                QDateTime dt = QDateTime::fromString(args["after"].toString(), Qt::ISODate);
+                if (dt.isValid()) afterEpoch = dt.toSecsSinceEpoch();
+            }
+            if (args.contains("before")) {
+                QDateTime dt = QDateTime::fromString(args["before"].toString(), Qt::ISODate);
+                if (dt.isValid()) beforeEpoch = dt.toSecsSinceEpoch();
+            }
+
+            const QString dbPath = shotHistory->databasePath();
+
+            QThread* thread = QThread::create(
+                [dbPath, limit, offset, profileFilter, beanFilter,
+                 minEnjoyment, hasRating, hasNotes, hasTds,
+                 afterEpoch, beforeEpoch, currentDateTime, respond]() {
+                QJsonObject result;
+                QJsonArray shots;
+                qint64 totalCount = 0;
+
+                if (!withTempDb(dbPath, "mcp_shots_list", [&](QSqlDatabase& db) {
+                    // Grinder model resolves through the equipment_id pointer
+                    // (the per-shot grinder_model column is dropped in migration
+                    // 23, add-equipment-packages task 4.1).
+                    // Recipe identity resolves through s.recipe_id the same way
+                    // (history-recipe-identity): live from `recipes`, so a rename
+                    // is reflected here too. A shot-linked recipe can only be
+                    // archived, never deleted, so the row always resolves.
+                    // EVERY shots column is qualified `s.`: joining `recipes` makes
+                    // ten names ambiguous (bag_id, beanbase_id, created_at,
+                    // equipment_id, hot_water_json, id, profile_json, steam_json,
+                    // updated_at, yield_mode), and SQLite rejects the whole
+                    // statement on any one of them. Do not hand-maintain that list
+                    // — recompute it from the two CREATE TABLEs plus their
+                    // ALTER TABLE ADD COLUMN migrations if you need it. Qualifying
+                    // unconditionally is what makes the list not matter.
+                    QString sql = "SELECT s.id, s.timestamp, s.profile_name, s.dose_weight, s.final_weight, "
+                                  "s.duration_seconds, s.enjoyment, "
+                                  "s.grinder_setting, s.rpm, eg.model AS grinder_model, "
+                                  "s.espresso_notes, s.bean_brand, s.bean_type, s.yield_override, s.profile_json, "
+                                  "s.stopped_by, s.recipe_id, r.name AS recipe_name "
+                                  "FROM shots s "
+                                  "LEFT JOIN equipment_items eg ON eg.package_id = s.equipment_id AND eg.kind = 'grinder' "
+                                  "LEFT JOIN recipes r ON r.id = s.recipe_id "
+                                  "WHERE 1=1 ";
+                    // Aliased `s` as well, though it does NOT join: it lets the shared
+                    // WHERE fragments below carry one qualified spelling instead of
+                    // two that can drift apart.
+                    QString countSql = "SELECT COUNT(*) FROM shots s WHERE 1=1 ";
+
+                    if (!profileFilter.isEmpty()) {
+                        sql += " AND s.profile_name LIKE :profileFilter";
+                        countSql += " AND s.profile_name LIKE :profileFilter";
+                    }
+                    if (!beanFilter.isEmpty()) {
+                        sql += " AND s.bean_brand LIKE :beanFilter";
+                        countSql += " AND s.bean_brand LIKE :beanFilter";
+                    }
+                    if (minEnjoyment > 0) {
+                        sql += " AND s.enjoyment >= :minEnjoyment";
+                        countSql += " AND s.enjoyment >= :minEnjoyment";
+                    }
+                    if (hasRating) {
+                        sql += " AND s.enjoyment > 0";
+                        countSql += " AND s.enjoyment > 0";
+                    }
+                    if (hasNotes) {
+                        sql += " AND TRIM(COALESCE(s.espresso_notes, '')) <> ''";
+                        countSql += " AND TRIM(COALESCE(s.espresso_notes, '')) <> ''";
+                    }
+                    if (hasTds) {
+                        sql += " AND s.drink_tds > 0";
+                        countSql += " AND s.drink_tds > 0";
+                    }
+                    if (afterEpoch > 0) {
+                        sql += " AND s.timestamp >= :after";
+                        countSql += " AND s.timestamp >= :after";
+                    }
+                    if (beforeEpoch > 0) {
+                        sql += " AND s.timestamp <= :before";
+                        countSql += " AND s.timestamp <= :before";
+                    }
+                    sql += " ORDER BY s.timestamp DESC LIMIT " + QString::number(limit) + " OFFSET " + QString::number(offset);
+
+                    QSqlQuery query(db);
+                    // prepare() checked with || so it SHORT-CIRCUITS. Calling
+                    // exec() after a failed prepare clears lastError and then
+                    // reports whatever the finalized statement produces —
+                    // "Parameter count mismatch" with any filter bound — which
+                    // sends the reader hunting a bind bug instead of the real
+                    // "ambiguous column name". (qsqlquery.cpp clears the error
+                    // before delegating; qsql_sqlite.cpp clears it again.)
+                    const bool prepared = query.prepare(sql);
+                    if (!prepared)
+                        MCP_WARN_TAGGED("shots_list", QStringLiteral("prepare failed - %1").arg(query.lastError().text()));
+                    if (!profileFilter.isEmpty())
+                        query.bindValue(":profileFilter", "%" + profileFilter + "%");
+                    if (!beanFilter.isEmpty())
+                        query.bindValue(":beanFilter", "%" + beanFilter + "%");
+                    if (minEnjoyment > 0)
+                        query.bindValue(":minEnjoyment", minEnjoyment);
+                    if (afterEpoch > 0)
+                        query.bindValue(":after", afterEpoch);
+                    if (beforeEpoch > 0)
+                        query.bindValue(":before", beforeEpoch);
+
+                    if (prepared && query.exec()) {
+                        while (query.next()) {
+                            QJsonObject shot;
+                            shot["id"] = query.value("id").toLongLong();
+                            auto dt = QDateTime::fromSecsSinceEpoch(query.value("timestamp").toLongLong());
+                            shot["timestamp"] = dt.toOffsetFromUtc(dt.offsetFromUtc()).toString(Qt::ISODate);
+                            shot["profileName"] = query.value("profile_name").toString();
+                            shot["doseG"] = query.value("dose_weight").toDouble();
+                            shot["yieldG"] = query.value("final_weight").toDouble();
+                            shot["durationSec"] = query.value("duration_seconds").toDouble();
+                            const int enjoyment = query.value("enjoyment").toInt();
+                            shot["enjoyment0to100"] = enjoyment > 0 ? QJsonValue(enjoyment) : QJsonValue(QJsonValue::Null);
+                            shot["grinderSetting"] = query.value("grinder_setting").toString();
+                            const qint64 rpm = query.value("rpm").toLongLong();
+                            if (rpm > 0)
+                                shot["rpm"] = rpm;  // RPM half of the dial-in (sparse)
+                            shot["grinderModel"] = query.value("grinder_model").toString();
+                            // Sparse: both omitted when the shot used no recipe,
+                            // so their presence alone answers "was this a recipe
+                            // drink?" without a sentinel value to interpret.
+                            // Both or neither. Emitting an id beside an empty name
+                            // would defeat the sparse convention's whole point —
+                            // presence answers "was this a recipe drink?" — and an
+                            // LLM client renders the empty string literally.
+                            const qint64 recipeId = query.value("recipe_id").toLongLong();
+                            const QString recipeName = query.value("recipe_name").toString();
+                            if (recipeId > 0 && !recipeName.isEmpty()) {
+                                shot["recipeId"] = recipeId;
+                                shot["recipeName"] = recipeName;
+                            }
+                            shot["notes"] = query.value("espresso_notes").toString();
+                            shot["beanBrand"] = query.value("bean_brand").toString();
+                            shot["beanType"] = query.value("bean_type").toString();
+                            // #1161: why the shot ended. Sparse-emit the
+                            // meaningful values; omit "profileEnd"/"" (the
+                            // AI falls back to yield-vs-targetWeightG).
+                            {
+                                const QString sb = query.value("stopped_by").toString();
+                                if (sb == QStringLiteral("manual")
+                                    || sb == QStringLiteral("weight")
+                                    || sb == QStringLiteral("volume"))
+                                    shot["stoppedBy"] = sb;
+                            }
+                            // Use the saved target weight (from yield_override column) if set,
+                            // else fall back to the profile snapshot's target_weight.
+                            double targetWeight = query.value("yield_override").toDouble();
+                            if (targetWeight > 0) {
+                                shot["targetWeightG"] = targetWeight;
+                            } else {
+                                QString profileJson = query.value("profile_json").toString();
+                                if (!profileJson.isEmpty()) {
+                                    QJsonObject profileObj = QJsonDocument::fromJson(profileJson.toUtf8()).object();
+                                    QJsonValue tw = profileObj["target_weight"];
+                                    double twVal = tw.isString() ? tw.toString().toDouble() : tw.toDouble();
+                                    if (twVal > 0)
+                                        shot["targetWeightG"] = twVal;
+                                }
+                            }
+                            shots.append(shot);
+                        }
+                    } else {
+                        // A bare `if (exec())` with no else is how a broken query
+                        // here reaches a user: the loop is skipped, the count query
+                        // still succeeds because it does not join, and the tool
+                        // answers `shots: []` beside a non-zero `total` — forever,
+                        // with no log line and no error field. That is exactly what
+                        // an unqualified `profile_json` did once the recipes join
+                        // landed. Report it instead.
+                        const QString why = prepared ? query.lastError().text()
+                                                     : QStringLiteral("statement did not prepare");
+                        MCP_WARN_TAGGED("shots_list", QStringLiteral("query failed - %1").arg(why));
+                        result["error"] = QStringLiteral("Shot list query failed: ") + why;
+                    }
+
+                    QSqlQuery countQuery(db);
+                    if (!countQuery.prepare(countSql))
+                        MCP_WARN_TAGGED("shots_list",
+                                        QStringLiteral("count prepare failed - %1")
+                                            .arg(countQuery.lastError().text()));
+                    if (!profileFilter.isEmpty())
+                        countQuery.bindValue(":profileFilter", "%" + profileFilter + "%");
+                    if (!beanFilter.isEmpty())
+                        countQuery.bindValue(":beanFilter", "%" + beanFilter + "%");
+                    if (minEnjoyment > 0)
+                        countQuery.bindValue(":minEnjoyment", minEnjoyment);
+                    if (afterEpoch > 0)
+                        countQuery.bindValue(":after", afterEpoch);
+                    if (beforeEpoch > 0)
+                        countQuery.bindValue(":before", beforeEpoch);
+                    // The count query needs the same treatment as the data query
+                    // above: swallowed here, totalCount stays 0, which makes
+                    // hasMore false and nextOffset null — a client paginating gets
+                    // a truncated result set and no error.
+                    if (!countQuery.exec()) {
+                        MCP_WARN_TAGGED("shots_list",
+                                        QStringLiteral("count query failed - %1")
+                                            .arg(countQuery.lastError().text()));
+                        if (!result.contains("error"))
+                            result["error"] = QStringLiteral("Shot count query failed: ")
+                                              + countQuery.lastError().text();
+                    } else if (countQuery.next()) {
+                        totalCount = countQuery.value(0).toLongLong();
+                    }
+                })) {
+                    result["error"] = "Failed to open shot database";
+                }
+
+                if (!result.contains("error")) {
+                    result["currentDateTime"] = currentDateTime;
+                    result["shots"] = shots;
+                    result["count"] = shots.size();
+                    result["total"] = totalCount;
+                    result["offset"] = offset;
+                    const qint64 returned = shots.size();
+                    const bool hasMore = (static_cast<qint64>(offset) + returned) < totalCount;
+                    result["hasMore"] = hasMore;
+                    result["nextOffset"] = hasMore
+                        ? QJsonValue(static_cast<qint64>(offset) + returned)
+                        : QJsonValue(QJsonValue::Null);
+
+                    // Per MCP 2025-06-18: emit a resource_link block per shot
+                    // pointing at decenza://shots/{id} so subscribing clients
+                    // can correlate the result with future resource updates.
+                    QJsonArray links;
+                    for (const QJsonValue& v : std::as_const(shots)) {
+                        const QJsonObject s = v.toObject();
+                        QJsonObject link;
+                        link["uri"] = QStringLiteral("decenza://shots/")
+                            + QString::number(s.value("id").toVariant().toLongLong());
+                        link["title"] = QStringLiteral("Shot #%1 — %2")
+                            .arg(s.value("id").toVariant().toLongLong())
+                            .arg(s.value("profileName").toString(QStringLiteral("(unknown profile)")));
+                        link["mimeType"] = "application/json";
+                        links.append(link);
+                    }
+                    result["_resourceLinks"] = links;
+                }
+
+                QMetaObject::invokeMethod(qApp, [respond, result]() {
+                    respond(result);
+                }, Qt::QueuedConnection);
+            });
+
+            QObject::connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+            thread->start();
+        },
+        "read", McpTierCore);
+
+    // shots_get_detail
+    registry->registerAsyncTool(
+        "shots_get_detail",
+        "Get a shot record. Default detail='summary' returns scalars, phase summaries, "
+        "summary lines, detector results (every detector wrapped in its own envelope object: "
+        "grind / channeling / flowTrend / preinfusion / pour / skipFirstFrame / "
+        "verdict), and ratings (~3K chars). Pass detail='full' to include time-series curves "
+        "(pressure, flow, temperature, weight), debug log, and embedded profile JSON (~85K chars "
+        "— only useful for curve-aware analysis).",
+        QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"shotId", QJsonObject{{"type", "integer"}, {"description", "Shot ID"}}},
+                {"detail", QJsonObject{
+                    {"type", "string"},
+                    {"enum", QJsonArray{"summary", "full"}},
+                    {"description", "summary (default): omit time-series, debugLog, profileJson. full: include everything."}
+                }}
+            }},
+            {"required", QJsonArray{"shotId"}}
+        },
+        [shotHistory](const QJsonObject& args, std::function<void(QJsonObject)> respond) {
+            if (!shotHistory || !shotHistory->isReady()) {
+                respond(QJsonObject{{"error", "Shot history not available"}});
+                return;
+            }
+
+            qint64 shotId = args["shotId"].toInteger();
+            if (shotId <= 0) {
+                respond(QJsonObject{{"error", "Valid shotId is required"}});
+                return;
+            }
+
+            const bool fullDetail = wantsFullDetail(args);
+            const QString dbPath = shotHistory->databasePath();
+
+            QThread* thread = QThread::create([dbPath, shotId, fullDetail, respond]() {
+                QJsonObject result;
+
+                if (!withTempDb(dbPath, "mcp_shot_detail", [&](QSqlDatabase& db) {
+                    ShotRecord record = ShotHistoryStorage::loadShotRecordStatic(db, shotId, nullptr, Q_FUNC_INFO);
+                    ShotProjection shot = ShotHistoryStorage::convertShotRecord(record);
+                    if (shot.isValid()) {
+                        result = shot.toJsonObject();
+                        if (!fullDetail)
+                            stripTimeSeriesFields(result);
+                        stripDetectorInternals(result);
+                        reshapeDetectorEnvelopes(result);
+                        nullifyUnratedFields(result);
+                        reshapeBeanBase(result);
+                        reshapePortal(result);
+                    } else {
+                        result["error"] = "Shot not found: " + QString::number(shotId);
+                    }
+                })) {
+                    result["error"] = "Failed to open shot database";
+                }
+
+                if (!result.contains("error")) {
+                    QJsonObject link;
+                    link["uri"] = QStringLiteral("decenza://shots/") + QString::number(shotId);
+                    link["title"] = QStringLiteral("Shot #%1").arg(shotId);
+                    link["mimeType"] = "application/json";
+                    result["_resourceLinks"] = QJsonArray{ link };
+                }
+
+                QMetaObject::invokeMethod(qApp, [respond, result]() {
+                    respond(result);
+                }, Qt::QueuedConnection);
+            });
+
+            QObject::connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+            thread->start();
+        },
+        "read", McpTierCore);
+
+    // shots_compare
+    registry->registerAsyncTool(
+        "shots_compare",
+        "Compare 2 or more shots against the OLDEST one (the base). `comparison` lists, per "
+        "other shot, the inputs it changed and its outcome deltas ({from,to,delta}), whether "
+        "the profile version changed, and measured metrics per shot. Default detail='summary' "
+        "also returns scalars + phase summaries per shot (~3K chars/shot); detail='full' adds "
+        "time-series and debug logs (~85K chars/shot). A profile shared by all shots is "
+        "hoisted to `sharedProfile`.",
+        QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"shotIds", QJsonObject{
+                    {"type", "array"},
+                    {"items", QJsonObject{{"type", "integer"}}},
+                    {"description", "Array of shot IDs to compare (2-10)"}
+                }},
+                {"detail", QJsonObject{
+                    {"type", "string"},
+                    {"enum", QJsonArray{"summary", "full"}},
+                    {"description", "summary (default): omit time-series, debugLog, profileJson per shot. full: include everything."}
+                }}
+            }},
+            {"required", QJsonArray{"shotIds"}}
+        },
+        [shotHistory](const QJsonObject& args, std::function<void(QJsonObject)> respond) {
+            if (!shotHistory || !shotHistory->isReady()) {
+                respond(QJsonObject{{"error", "Shot history not available"}});
+                return;
+            }
+
+            QJsonArray idArray = args["shotIds"].toArray();
+            if (idArray.size() < 2 || idArray.size() > 10) {
+                respond(QJsonObject{{"error", "Provide 2-10 shot IDs for comparison"}});
+                return;
+            }
+
+            const bool fullDetail = wantsFullDetail(args);
+            const QString dbPath = shotHistory->databasePath();
+
+            QThread* thread = QThread::create([dbPath, idArray, fullDetail, respond]() {
+                QJsonObject result;
+                QJsonArray shots;
+                QJsonArray unresolved;
+                QList<ShotProjection> projections;
+
+                if (!withTempDb(dbPath, "mcp_compare", [&](QSqlDatabase& db) {
+                    for (const auto& idVal : idArray) {
+                        qint64 shotId = idVal.toInteger();
+                        ShotRecord record = ShotHistoryStorage::loadShotRecordStatic(db, shotId, nullptr, Q_FUNC_INFO);
+                        ShotProjection shot = ShotHistoryStorage::convertShotRecord(record);
+                        if (!shot.isValid()) {
+                            // Dropped IDs used to vanish: the caller got a shorter
+                            // array and could only detect the loss by comparing
+                            // counts, with no way to learn WHICH id was bad.
+                            unresolved.append(shotId);
+                            continue;
+                        }
+                        {
+                            QJsonObject shotJson = shot.toJsonObject();
+                            if (!fullDetail)
+                                stripTimeSeriesFields(shotJson);
+                            stripDetectorInternals(shotJson);
+                            reshapeDetectorEnvelopes(shotJson);
+                            nullifyUnratedFields(shotJson);
+                            reshapeBeanBase(shotJson);
+                            reshapePortal(shotJson);
+                            shots.append(shotJson);
+                            projections.append(std::move(shot));
+                        }
+                    }
+                })) {
+                    result["error"] = "Failed to open shot database";
+                } else if (shots.isEmpty()) {
+                    // Nothing resolved, so there is nothing to compare — a result
+                    // with an empty `shots` array and a `count` of 0 would read as
+                    // a successful comparison of nothing.
+                    QStringList ids;
+                    for (const QJsonValue& v : std::as_const(unresolved))
+                        ids << QString::number(v.toInteger());
+                    result["error"] = "No shots found for any of the requested ids: "
+                                      + ids.join(QStringLiteral(", "));
+                }
+
+                if (!result.contains("error")) {
+                    if (!unresolved.isEmpty())
+                        result["unresolvedShotIds"] = unresolved;
+                    // Dedupe shared profile metadata. Comparing dial-in
+                    // iterations on a single profile is the common case, and
+                    // profileNotes is ~700 chars per shot — hoisting it to
+                    // sharedProfile saves ~20% of payload at N=2 and scales
+                    // with N. When shots span multiple profiles, leave the
+                    // per-shot fields in place.
+                    if (shots.size() >= 2) {
+                        const QJsonObject first = shots.first().toObject();
+                        const QString sharedName = first.value("profileName").toString();
+                        const QString sharedKbId = first.value("profileKbId").toString();
+                        const QString sharedNotes = first.value("profileNotes").toString();
+                        bool allShare = !sharedName.isEmpty();
+                        for (const QJsonValue& v : std::as_const(shots)) {
+                            const QJsonObject s = v.toObject();
+                            if (s.value("profileName").toString() != sharedName ||
+                                s.value("profileKbId").toString() != sharedKbId ||
+                                s.value("profileNotes").toString() != sharedNotes) {
+                                allShare = false;
+                                break;
+                            }
+                        }
+                        if (allShare) {
+                            QJsonArray dedupedShots;
+                            for (const QJsonValue& v : std::as_const(shots)) {
+                                QJsonObject s = v.toObject();
+                                s.remove("profileNotes");
+                                s.remove("profileKbId");
+                                dedupedShots.append(s);
+                            }
+                            shots = dedupedShots;
+                            QJsonObject sharedProfile;
+                            sharedProfile["profileName"] = sharedName;
+                            if (!sharedKbId.isEmpty())
+                                sharedProfile["profileKbId"] = sharedKbId;
+                            if (!sharedNotes.isEmpty())
+                                sharedProfile["profileNotes"] = sharedNotes;
+                            result["sharedProfile"] = sharedProfile;
+                        }
+                    }
+                    result["shots"] = shots;
+                    result["count"] = shots.size();
+                }
+
+                // Against the oldest shot, the same comparison the Compare page shows.
+                if (projections.size() >= 2) {
+                    std::stable_sort(projections.begin(), projections.end(),
+                                     [](const ShotProjection& x, const ShotProjection& y) {
+                                         return x.timestamp < y.timestamp;
+                                     });
+                    result["comparison"] = ShotComparison::compare(projections, 0);
+                }
+
+                QMetaObject::invokeMethod(qApp, [respond, result]() {
+                    respond(result);
+                }, Qt::QueuedConnection);
+            });
+
+            QObject::connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+            thread->start();
+        },
+        "read", McpTierCore);
+
+    // shots_get_debug_log — read the per-shot debug log with pagination
+    registry->registerAsyncTool(
+        "shots_get_debug_log",
+        "Read the debug log captured during one shot: BLE frames, phase transitions, stop-at-weight "
+        "events, flow calibration, and every qDebug line from the shot. `filter` (substring, or "
+        "regex when `regex` is true) narrows before pagination, `dedupe` collapses consecutive "
+        "repeats, and `tail` beats `offset` when both are given. `minLevel` is accepted but has no "
+        "effect — these lines are not level-tagged. Details: get_agent_file topic "
+        "\"shots_get_debug_log\".",
+        QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"shotId", QJsonObject{{"type", "integer"}, {"description", "Shot ID"}}},
+                {"offset", QJsonObject{{"type", "integer"}, {"description", "Line number to start from (0-based). Default: 0. Ignored when tail is set."}}},
+                {"limit", QJsonObject{{"type", "integer"}, {"description", "Maximum lines to return (1-2000). Default: 500"}}},
+                {"filter", QJsonObject{
+                    {"type", "string"},
+                    {"description", "Only return lines containing this text (case-insensitive substring, or regex when `regex` is true)"}
+                }},
+                {"regex", QJsonObject{
+                    {"type", "boolean"},
+                    {"description", "Treat `filter` as a case-insensitive regular expression instead of a literal substring"}
+                }},
+                {"minLevel", QJsonObject{
+                    {"type", "string"},
+                    {"enum", QJsonArray{"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}},
+                    {"description", "Accepted but ignored — shot debug log lines carry no severity level"}
+                }},
+                {"tail", QJsonObject{
+                    {"type", "integer"},
+                    {"description", "Return the last N qualifying lines. Takes precedence over offset when both are set"}
+                }},
+                {"dedupe", QJsonObject{
+                    {"type", "boolean"},
+                    {"description", "Collapse CONSECUTIVE identical lines (ignoring timestamps) into one carrying count/lastLine"}
+                }}
+            }},
+            {"required", QJsonArray{"shotId"}}
+        },
+        [shotHistory](const QJsonObject& args, std::function<void(QJsonObject)> respond) {
+            if (!shotHistory || !shotHistory->isReady()) {
+                respond(QJsonObject{{"error", "Shot history not available"}});
+                return;
+            }
+
+            qint64 shotId = args["shotId"].toInteger();
+            if (shotId <= 0) {
+                respond(QJsonObject{{"error", "Valid shotId is required"}});
+                return;
+            }
+
+            qsizetype offset = qMax(qsizetype(0), static_cast<qsizetype>(args["offset"].toInt(0)));
+            qsizetype limit = qBound(qsizetype(1), static_cast<qsizetype>(args["limit"].toInt(500)), qsizetype(2000));
+            const QString filter = args["filter"].toString();
+            const bool regexMode = args["regex"].toBool(false);
+            // tail:0 (or a negative value, clamped to 0) means "no tail" — must NOT be
+            // treated the same as a real tail request below, or hasMore gets forced to
+            // false on an ordinary paginated page that may have more lines beyond it.
+            const qsizetype tail = args.contains("tail")
+                ? qMax(qsizetype(0), static_cast<qsizetype>(args["tail"].toInt(0))) : 0;
+            const bool tailActive = tail > 0;
+            const bool dedupe = args["dedupe"].toBool(false);
+
+            const QString dbPath = shotHistory->databasePath();
+
+            QThread* thread = QThread::create([dbPath, shotId, offset, limit, filter, regexMode, tailActive, tail, dedupe, respond]() {
+                QJsonObject result;
+
+                if (!withTempDb(dbPath, "mcp_shot_debug", [&](QSqlDatabase& db) {
+                    QSqlQuery query(db);
+                    query.prepare("SELECT debug_log FROM shots WHERE id = ?");
+                    query.addBindValue(shotId);
+                    if (query.exec() && query.next()) {
+                        QString debugLog = query.value(0).toString();
+                        if (debugLog.isEmpty()) {
+                            result["error"] = "No debug log for shot " + QString::number(shotId);
+                        } else if (filter.isEmpty() && !tailActive && !dedupe) {
+                            // Unnarrowed — original chunk behavior/shape, unchanged.
+                            const QStringList allLines = debugLog.split('\n');
+                            const qsizetype totalLines = allLines.size();
+
+                            QStringList chunk;
+                            for (qsizetype i = offset; i < qMin(offset + limit, totalLines); ++i)
+                                chunk.append(allLines[i]);
+
+                            result["shotId"] = shotId;
+                            result["offsetLines"] = static_cast<int>(offset);
+                            result["limitLines"] = static_cast<int>(limit);
+                            result["totalLines"] = static_cast<int>(totalLines);
+                            result["returnedLines"] = static_cast<int>(chunk.size());
+                            result["hasMore"] = (offset + chunk.size()) < totalLines;
+                            result["log"] = chunk.join('\n');
+                        } else {
+                            const QStringList allLines = debugLog.split('\n');
+                            const qsizetype totalLines = allLines.size();
+
+                            QString filterError;
+                            QList<McpLogFilter::LineMatch> qualifying =
+                                McpLogFilter::filterLines(allLines, 0, filter, regexMode, QString(), &filterError);
+                            if (!filterError.isEmpty()) {
+                                result["error"] = filterError;
+                                return;
+                            }
+                            if (dedupe)
+                                qualifying = McpLogFilter::dedupeConsecutive(qualifying);
+                            const QList<McpLogFilter::LineMatch> page =
+                                McpLogFilter::paginate(qualifying, offset, limit, tail);
+
+                            result["shotId"] = shotId;
+                            result["offsetLines"] = static_cast<int>(offset);
+                            result["limitLines"] = static_cast<int>(limit);
+                            result["totalLines"] = static_cast<int>(totalLines);
+                            result["qualifyingLines"] = static_cast<int>(qualifying.size());
+                            result["returnedLines"] = static_cast<int>(page.size());
+                            result["hasMore"] = tailActive ? false : ((offset + page.size()) < qualifying.size());
+
+                            QStringList texts;
+                            QJsonArray lineArray;
+                            texts.reserve(page.size());
+                            for (const auto& m : page) {
+                                QJsonObject entry{{"line", static_cast<qint64>(m.line)}, {"text", m.text}};
+                                if (dedupe) {
+                                    texts.append(m.count > 1 ? m.text + QStringLiteral(" (x%1)").arg(m.count) : m.text);
+                                    entry["count"] = static_cast<qint64>(m.count);
+                                    entry["lastLine"] = static_cast<qint64>(m.lastLine);
+                                } else {
+                                    texts.append(m.text);
+                                }
+                                lineArray.append(entry);
+                            }
+                            result["log"] = texts.join('\n');
+                            result["lines"] = lineArray;
+                        }
+                    } else {
+                        result["error"] = "Shot not found: " + QString::number(shotId);
+                    }
+                })) {
+                    if (!result.contains("error"))
+                        result["error"] = "Failed to open shot database";
+                }
+
+                QMetaObject::invokeMethod(qApp, [respond, result]() {
+                    respond(result);
+                }, Qt::QueuedConnection);
+            });
+
+            QObject::connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+            thread->start();
+        },
+        "read");
+}

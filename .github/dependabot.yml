@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # Scans .github/workflows/ only. It does NOT descend into composite actions,
+  # which is why the second entry exists — see the note there before adding a
+  # composite action of your own.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+
+  # Composite actions keep their own `uses:` pins, and the "/" entry above does
+  # not cover them: for the github-actions ecosystem, `directory` names the
+  # folder holding the manifest, and each composite action is its own folder.
+  #
+  # This is not hypothetical. hendrikmuhs/ccache-action was pinned in six
+  # workflow files and Dependabot updated it twice on its own (PRs #578, #816).
+  # Consolidating those six copies into .github/actions/setup-compiler-cache/
+  # was a real improvement that also, silently, moved the pin somewhere nobody
+  # was watching — the kind of regression that only shows up as an old version
+  # a year later.
+  #
+  # A new composite action needs its own entry here. There is no glob.
+  - package-ecosystem: "github-actions"
+    directory: "/.github/actions/setup-compiler-cache"
+    schedule:
+      interval: "daily"
+
+  # obsidian-plugin/ is the repo's only npm manifest, and nothing here watched
+  # it until an esbuild advisory (arbitrary file read via the dev server on
+  # Windows, low) surfaced as a Dependabot *alert* with no PR behind it. Alerts
+  # do not open pull requests — they sit in the Security tab until someone
+  # looks. Only an entry here, or the repo's separate security-updates toggle,
+  # produces one.
+  #
+  # Same rule as the composite actions above: `directory` names the folder
+  # holding the manifest, and there is no glob. A second npm package would need
+  # its own entry.
+  #
+  # Weekly rather than daily: this is build-only tooling for a plugin that
+  # changes rarely, so a daily cadence would be noise without being safer.
+  - package-ecosystem: "npm"
+    directory: "/obsidian-plugin"
+    schedule:
+      interval: "weekly"

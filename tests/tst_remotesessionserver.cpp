@@ -1,0 +1,679 @@
+#include <QtTest>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QHostAddress>
+#include <QIODevice>
+#include <QUrl>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QWebSocket>
+#include <QSignalSpy>
+
+#include <utility>
+
+#ifdef DECENZA_TEST_OPENSSL_PEM
+#include "network/tlspemwriter.h"
+#include <QTemporaryDir>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#endif
+
+#include "network/remotesessionserver.h"
+#include "network/shotservertls.h"
+#include "remote/qtrowebsocketdevice.h"
+
+namespace {
+using Disposition = RemoteSessionServer::UpgradeDisposition;
+using Inspection = RemoteSessionServer::UpgradeInspection;
+
+constexpr qint64 kMaximumHeaderSize = 64 * 1024;
+
+QString testPackageId() { return QString(64, QLatin1Char('a')); }
+QString testHostId() { return QStringLiteral("01234567-89ab-cdef-0123-456789abcdef"); }
+
+QByteArray remoteObjectsTarget(const QString& packageId = testPackageId(),
+                               const QString& hostId = testHostId(),
+                               const QString& clientId = QStringLiteral("12345678-1234-1234-1234-123456789abc"))
+{
+    return QByteArrayLiteral("/api/session/objects?packageId=") + packageId.toLatin1()
+        + QByteArrayLiteral("&hostId=") + hostId.toLatin1()
+        + QByteArrayLiteral("&clientId=") + clientId.toLatin1();
+}
+
+
+QByteArray validRequest(const QByteArray& extraHeaders = {},
+                        const QByteArray& target = remoteObjectsTarget())
+{
+    QByteArray request = QByteArrayLiteral("GET ") + target
+        + QByteArrayLiteral(" HTTP/1.1\r\nHost: espresso.local:8080\r\n"
+                            "Origin: http://espresso.local:8080\r\n");
+    request += extraHeaders;
+    request += QByteArrayLiteral("\r\n");
+    return request;
+}
+
+Inspection inspect(const QByteArray& bytes, qint64 available = -1,
+                   bool secure = false, bool requireSession = false,
+                   const RemoteSessionServer::SessionValidator& validator = {},
+                   const QString& expectedPackageId = testPackageId(), const QString& expectedHostId = testHostId())
+{
+    if (available < 0)
+        available = bytes.size();
+    return RemoteSessionServer::inspectUpgradeBuffer(
+        bytes, available, kMaximumHeaderSize, secure, requireSession, validator,
+        expectedPackageId, expectedHostId);
+}
+
+class SessionHarness
+{
+public:
+    explicit SessionHarness(RemoteSessionServer::SessionValidator validator = {})
+        : helper(std::move(validator), false)
+    {
+        QObject::connect(&listener, &QTcpServer::newConnection, &listener, [this] {
+            while (listener.hasPendingConnections())
+                helper.adoptConnection(listener.nextPendingConnection());
+        });
+    }
+
+    bool start() { return listener.listen(QHostAddress::LocalHost, 0); }
+
+    QTcpServer listener;
+    RemoteSessionServer helper;
+};
+} // namespace
+
+class TestRemoteSessionServer : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void initTestCase() { qRegisterMetaType<QTcpSocket*>(); }
+    void init() { QTest::failOnWarning(); }
+
+#ifdef DECENZA_TEST_OPENSSL_PEM
+    void pemFilesRoundTrip_data()
+    {
+        QTest::addColumn<bool>("privateKey");
+        QTest::addColumn<bool>("replace");
+        QTest::newRow("new-certificate") << false << false;
+        QTest::newRow("replace-certificate") << false << true;
+        QTest::newRow("new-private-key") << true << false;
+        QTest::newRow("replace-private-key") << true << true;
+    }
+
+    void pemFilesRoundTrip()
+    {
+        QFETCH(bool, privateKey);
+        QFETCH(bool, replace);
+        const std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> context(
+            EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr), EVP_PKEY_CTX_free);
+        QVERIFY(context);
+        QVERIFY(EVP_PKEY_keygen_init(context.get()) > 0);
+        QVERIFY(EVP_PKEY_CTX_set_ec_paramgen_curve_nid(context.get(), NID_X9_62_prime256v1) > 0);
+        EVP_PKEY* rawKey = nullptr;
+        const int generated = EVP_PKEY_keygen(context.get(), &rawKey);
+        const std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(rawKey, EVP_PKEY_free);
+        QVERIFY(generated > 0);
+        QVERIFY(key);
+        const std::unique_ptr<X509, decltype(&X509_free)> certificate(X509_new(), X509_free);
+        QVERIFY(certificate);
+        QCOMPARE(X509_set_version(certificate.get(), 2), 1);
+        QCOMPARE(ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1), 1);
+        QVERIFY(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), 0));
+        QVERIFY(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600));
+        QCOMPARE(X509_set_pubkey(certificate.get(), key.get()), 1);
+        const std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> subject(X509_NAME_new(), X509_NAME_free);
+        QVERIFY(subject);
+        QCOMPARE(X509_NAME_add_entry_by_txt(subject.get(), "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("Decenza test"), -1, -1, 0), 1);
+        QCOMPARE(X509_set_subject_name(certificate.get(), subject.get()), 1);
+        QCOMPARE(X509_set_issuer_name(certificate.get(), subject.get()), 1);
+        QVERIFY(X509_sign(certificate.get(), key.get(), EVP_sha256()) > 0);
+
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = directory.filePath(QStringLiteral("réseau-咖啡.pem"));
+        if (replace) {
+            QFile old(path);
+            QVERIFY(old.open(QIODevice::WriteOnly));
+            QCOMPARE(old.write("invalid old PEM"), 15);
+        }
+        QString error;
+        QVERIFY2(TlsPemWriter::write(path, [&](BIO* buffer) {
+            return privateKey
+                ? PEM_write_bio_PrivateKey(buffer, key.get(), nullptr, nullptr, 0, nullptr, nullptr)
+                : PEM_write_bio_X509(buffer, certificate.get());
+        }, &error), qPrintable(error));
+        QVERIFY(error.isEmpty());
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray pem = file.readAll();
+        const std::unique_ptr<BIO, decltype(&BIO_free)> input(
+            BIO_new_mem_buf(pem.constData(), int(pem.size())), BIO_free);
+        QVERIFY(input);
+        if (privateKey) {
+            const std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> decoded(
+                PEM_read_bio_PrivateKey(input.get(), nullptr, nullptr, nullptr), EVP_PKEY_free);
+            QVERIFY(decoded);
+            QCOMPARE(EVP_PKEY_eq(key.get(), decoded.get()), 1);
+        } else {
+            const std::unique_ptr<X509, decltype(&X509_free)> decoded(
+                PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr), X509_free);
+            QVERIFY(decoded);
+            QCOMPARE(X509_check_private_key(decoded.get(), key.get()), 1);
+            QCOMPARE(X509_verify(decoded.get(), key.get()), 1);
+        }
+    }
+#endif
+
+    void certificateMustCoverNewNetworkAddresses()
+    {
+        QMultiMap<QSsl::AlternativeNameEntryType, QString> names{
+            {QSsl::DnsEntry, QStringLiteral("localhost")},
+            {QSsl::IpAddressEntry, QStringLiteral("127.0.0.1")},
+            {QSsl::IpAddressEntry, QStringLiteral("192.168.1.10")}};
+        const QList<QHostAddress> oldAddresses{QHostAddress::LocalHost, QHostAddress("192.168.1.10")};
+        const QList<QHostAddress> newAddresses{QHostAddress::LocalHost, QHostAddress("192.168.1.11")};
+        QVERIFY(ShotServerTls::coversAddresses(names, oldAddresses));
+        QVERIFY(!ShotServerTls::coversAddresses(names, newAddresses));
+        names.insert(QSsl::IpAddressEntry, QStringLiteral("192.168.1.11"));
+        QVERIFY(ShotServerTls::coversAddresses(names, newAddresses));
+    }
+
+    void redirectWaitsForFragmentedHeadersAndDrainsLateBody()
+    {
+        HttpRedirectSslServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QTcpSocket client;
+        client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+        QTRY_COMPARE(client.state(), QAbstractSocket::ConnectedState);
+        client.write("POST /legacy/?q=latte%20shot");
+        client.flush();
+        QTest::qWait(20);
+        QCOMPARE(client.bytesAvailable(), 0);
+        client.write(" HTTP/1.1\r\nhOsT: espresso.local:8888\r\nContent-Length: 4\r\n");
+        client.flush();
+        QTest::qWait(20);
+        QCOMPARE(client.bytesAvailable(), 0);
+        client.write("\r\n");
+        QTRY_VERIFY(client.bytesAvailable() > 0);
+        const auto response = client.readAll();
+        QVERIFY(response.startsWith("HTTP/1.1 307"));
+        QVERIFY(response.contains("Location: https://espresso.local:" + QByteArray::number(server.serverPort())
+                                  + "/legacy/?q=latte%20shot\r\n"));
+        client.write("body");
+        client.flush();
+        QTest::qWait(20);
+        QCOMPARE(client.state(), QAbstractSocket::ConnectedState);
+        client.disconnectFromHost();
+    }
+
+    void plaintextMcpEndpointIsServedButItsPagesStillRedirect()
+    {
+        HttpRedirectSslServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QByteArray received;
+        bool restrictedToMcp = false;
+        QObject::connect(&server, &QTcpServer::pendingConnectionAvailable, &server, [&] {
+            QTcpSocket* accepted = server.nextPendingConnection();
+            restrictedToMcp = accepted->property(ShotServerTls::kPlaintextMcpProperty).toBool();
+            QObject::connect(accepted, &QTcpSocket::readyRead, accepted,
+                             [&received, accepted] { received += accepted->readAll(); });
+        });
+        const QByteArray request = QByteArrayLiteral(
+            "POST /mcp?probe=1 HTTP/1.1\r\nHost: localhost:8888\r\nContent-Length: 4\r\n\r\nping");
+        QTcpSocket client;
+        client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+        QTRY_COMPARE(client.state(), QAbstractSocket::ConnectedState);
+        client.write(request);
+        QTRY_COMPARE(received, request);
+        QCOMPARE(client.bytesAvailable(), 0);
+        QVERIFY(restrictedToMcp);
+
+        QTcpSocket page;
+        page.connectToHost(QHostAddress::LocalHost, server.serverPort());
+        QTRY_COMPARE(page.state(), QAbstractSocket::ConnectedState);
+        page.write("GET /mcp/setup HTTP/1.1\r\nHost: localhost:8888\r\n\r\n");
+        QTRY_VERIFY(page.bytesAvailable() > 0);
+        QVERIFY(page.readAll().startsWith("HTTP/1.1 307"));
+
+        // The rule ShotServer applies to later keep-alive requests on that connection.
+        QObject plaintext;
+        plaintext.setProperty(ShotServerTls::kPlaintextMcpProperty, true);
+        QObject encrypted;
+        for (const char* target : {"/mcp", "/mcp?probe=1"})
+            QVERIFY(!ShotServerTls::refusesPlaintextRequest(&plaintext, target));
+        for (const char* target : {"/", "/api/session/ws", "/mcp/setup", "/mcpx"}) {
+            QVERIFY2(ShotServerTls::refusesPlaintextRequest(&plaintext, target), target);
+            QVERIFY(!ShotServerTls::refusesPlaintextRequest(&encrypted, target));
+        }
+    }
+
+    void redirectRejectsOversizedUnterminatedHeaders()
+    {
+        HttpRedirectSslServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QTcpSocket client;
+        client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+        QTRY_COMPARE(client.state(), QAbstractSocket::ConnectedState);
+        client.write(QByteArray(17 * 1024, 'G'));
+        QTRY_COMPARE(client.state(), QAbstractSocket::UnconnectedState);
+        QCOMPARE(client.readAll(), QByteArray());
+    }
+
+    void certificateRefreshRunsBeforeTlsHandshake()
+    {
+        int refreshes = 0;
+        HttpRedirectSslServer server([&](QSslServer*) { ++refreshes; return false; });
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        QTcpSocket client;
+        client.connectToHost(QHostAddress::LocalHost, server.serverPort());
+        QTRY_COMPARE(client.state(), QAbstractSocket::ConnectedState);
+        client.write(QByteArray(1, '\x16'));
+        QTRY_COMPARE(refreshes, 1);
+        QTRY_COMPARE(client.state(), QAbstractSocket::UnconnectedState);
+    }
+
+    void fragmentedRequestLineWaitsWithoutConsuming()
+    {
+        const QByteArray prefix = QByteArrayLiteral("GET /api/session/");
+        const Inspection result = inspect(prefix, prefix.size());
+        QCOMPARE(result.disposition, Disposition::NeedMore);
+    }
+
+    void fragmentedHeaderWaitsWithoutConsuming()
+    {
+        const QByteArray complete = validRequest();
+        const QByteArray partial = complete.left(complete.size() - 2);
+        const Inspection result = inspect(partial, partial.size());
+        QCOMPARE(result.disposition, Disposition::NeedMore);
+    }
+
+    void validUpgradePreservesEntireHeader()
+    {
+        const QByteArray request = validRequest(
+            QByteArrayLiteral("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
+        const Inspection result = inspect(request);
+        QCOMPARE(result.disposition, Disposition::Accepted);
+        QCOMPARE(result.requestHeaders, request);
+    }
+
+    void authIsConditionalAndUsesValidatedRequest()
+    {
+        const QByteArray request = validRequest(QByteArrayLiteral("Cookie: session=abc\r\n"));
+        QByteArray seenByValidator;
+        const auto validator = [&seenByValidator](const QByteArray& raw) {
+            seenByValidator = raw;
+            return raw.contains("Cookie: session=abc\r\n");
+        };
+        QCOMPARE(inspect(request, -1, false, true, validator).disposition, Disposition::Accepted);
+        QCOMPARE(seenByValidator, request);
+
+        const auto reject = [](const QByteArray&) { return false; };
+        const Inspection denied = inspect(request, -1, false, true, reject);
+        QCOMPARE(denied.disposition, Disposition::Rejected);
+        QCOMPARE(denied.statusCode, 401);
+
+        // The app's existing security-off mode allows the same-origin route
+        // without requiring a session cookie.
+        QCOMPARE(inspect(validRequest(), -1, false, false, {}).disposition,
+                 Disposition::Accepted);
+    }
+
+    void remoteObjectsRequireConfiguredMatchingIdentity()
+    {
+        const QByteArray request = validRequest(
+            QByteArrayLiteral("Cookie: session=abc\r\n"), remoteObjectsTarget());
+        const auto validator = [](const QByteArray& raw) {
+            return raw.contains("Cookie: session=abc\r\n");
+        };
+        QCOMPARE(inspect(request, -1, false, true, validator, {}, {}).disposition,
+                 Disposition::Rejected);
+        QCOMPARE(inspect(request, -1, false, true, validator, {}, {}).statusCode, 503);
+
+        Inspection result = inspect(request, -1, false, true, validator,
+                                    testPackageId(), testHostId());
+        QCOMPARE(result.disposition, Disposition::Accepted);
+        QCOMPARE(result.requestHeaders, request);
+
+        result = inspect(request, -1, false, true, validator,
+                         testPackageId(), QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 409);
+    }
+
+    void remoteObjectsKeepOriginAndCookieChecks()
+    {
+        QByteArray request = validRequest({}, remoteObjectsTarget());
+        request.replace("Origin: http://espresso.local:8080",
+                        "Origin: http://attacker.example");
+        Inspection result = inspect(request, -1, false, false, {},
+                                     testPackageId(), testHostId());
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 403);
+
+        result = inspect(validRequest({}, remoteObjectsTarget()), -1, false, true, {},
+                         testPackageId(), testHostId());
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 401);
+    }
+
+    void remoteObjectsRejectMalformedIdentityQuery()
+    {
+        const QList<QByteArray> targets{
+            QByteArrayLiteral("/api/session/objects"),
+            QByteArrayLiteral("/api/session/objects?packageId=") + testPackageId().toLatin1(),
+            remoteObjectsTarget() + QByteArrayLiteral("&hostId=") + testHostId().toLatin1(),
+            remoteObjectsTarget() + QByteArrayLiteral("&clientId=12345678-1234-1234-1234-123456789abc"),
+            remoteObjectsTarget(testPackageId(), testHostId(), QStringLiteral("00000000-0000-0000-0000-000000000000")),
+            QByteArrayLiteral("/api/session/objects?packageId=") + testPackageId().toLatin1()
+                + QByteArrayLiteral("&hostId=") + testHostId().toLatin1()
+                + QByteArrayLiteral("&extra=1")
+        };
+        for (const QByteArray& target : targets) {
+            const Inspection result = inspect(validRequest({}, target), -1, false, false, {},
+                                              testPackageId(), testHostId());
+            QCOMPARE(result.disposition, Disposition::Rejected);
+            QCOMPARE(result.statusCode, 400);
+        }
+    }
+
+    void missingOriginIsRejected()
+    {
+        QByteArray request = validRequest();
+        request.replace("Origin: http://espresso.local:8080\r\n", "");
+        const Inspection result = inspect(request);
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 403);
+    }
+
+    void httpsUpgradeDoesNotRequireAuthenticationWhenDisabled()
+    {
+        for (const auto& target : {remoteObjectsTarget()}) {
+            QByteArray request = validRequest({}, target);
+            request.replace("http://espresso.local:8080", "https://espresso.local:8080");
+            const auto result = inspect(request, -1, true, false,
+                [](const QByteArray&) { return false; }, testPackageId(), testHostId());
+            QCOMPARE(result.disposition, Disposition::Accepted);
+        }
+    }
+
+    void crossOriginAndSchemeMismatchAreRejected()
+    {
+        QByteArray crossOrigin = validRequest();
+        crossOrigin.replace("http://espresso.local:8080", "http://attacker.example");
+        Inspection result = inspect(crossOrigin);
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 403);
+
+        QByteArray changedScheme = validRequest();
+        changedScheme.replace("http://espresso.local:8080", "https://espresso.local:8080");
+        result = inspect(changedScheme);
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 403);
+    }
+
+    void queryAndWrongMethodAreRejected()
+    {
+        Inspection result = inspect(validRequest({}, QByteArrayLiteral("/api/session/objects?x=1")));
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 400);
+
+        QByteArray wrongMethod = validRequest();
+        wrongMethod.replace(0, 3, "PUT");
+        result = inspect(wrongMethod);
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 405);
+    }
+
+    void duplicatesAndHttpBodiesAreRejected()
+    {
+        Inspection result = inspect(validRequest(QByteArrayLiteral(
+            "Origin: http://espresso.local:8080\r\n")));
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 400);
+
+        result = inspect(validRequest(QByteArrayLiteral("Content-Length: 0\r\n")));
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 400);
+
+        result = inspect(validRequest(QByteArrayLiteral("Transfer-Encoding: chunked\r\n")));
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 400);
+
+        QByteArray pipelined = validRequest();
+        pipelined += QByteArrayLiteral("GET /api/state HTTP/1.1\r\n\r\n");
+        result = inspect(pipelined);
+        QCOMPARE(result.disposition, Disposition::Rejected);
+        QCOMPARE(result.statusCode, 400);
+    }
+
+    void malformedHeadersAndOversizedUnterminatedLineAreRejected()
+    {
+        const Inspection malformed = inspect(QByteArrayLiteral(
+            "GET /api/session/objects HTTP/1.1\r\nHost espresso.local:8080\r\n\r\n"));
+        QCOMPARE(malformed.disposition, Disposition::Rejected);
+        QCOMPARE(malformed.statusCode, 400);
+
+        const QByteArray huge = QByteArrayLiteral("GET /api/session/objects")
+            + QByteArray(kMaximumHeaderSize, 'X');
+        const Inspection oversized = inspect(huge, huge.size());
+        QCOMPARE(oversized.disposition, Disposition::Rejected);
+        QCOMPARE(oversized.statusCode, 413);
+    }
+
+    void unrelatedRequestIsLeftToHttpParser()
+    {
+        const Inspection result = inspect(QByteArrayLiteral(
+            "GET /api/state HTTP/1.1\r\nHost: espresso.local:8080\r\n\r\n"));
+        QCOMPARE(result.disposition, Disposition::NotTarget);
+    }
+
+    void remoteObjectClientLifetimesEndExactlyOnce()
+    {
+        SessionHarness harness;
+        harness.helper.setRemoteObjectHandler(testPackageId(), testHostId(), [](QIODevice*) {});
+        QSignalSpy opened(&harness.helper, &RemoteSessionServer::remoteObjectClientOpened);
+        QSignalSpy closed(&harness.helper, &RemoteSessionServer::remoteObjectClientClosed);
+        QVERIFY(harness.start());
+        const auto url = [&harness](const QString& clientId) {
+            return QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+                .arg(harness.listener.serverPort())
+                .arg(QString::fromLatin1(remoteObjectsTarget(testPackageId(), testHostId(), clientId))));
+        };
+        const QString a = QStringLiteral("12345678-1234-1234-1234-123456789abc");
+        const QString b = QStringLiteral("12345678-1234-1234-1234-123456789abd");
+        QWebSocket first;
+        first.open(url(a));
+        QTRY_COMPARE(opened.count(), 1);
+        QCOMPARE(opened.first().first().toString(), a);
+        QWebSocket duplicate;
+        duplicate.open(url(a));
+        QSignalSpy rejected(&duplicate, &QWebSocket::disconnected);
+        QTRY_COMPARE(rejected.count(), 1);
+        QCOMPARE(opened.count(), 1);
+        QCOMPARE(closed.count(), 0);
+        QCOMPARE(first.state(), QAbstractSocket::ConnectedState);
+        QWebSocket second;
+        second.open(url(b));
+        QTRY_COMPARE(opened.count(), 2);
+        first.close();
+        QTRY_COMPARE(closed.count(), 1);
+        QCOMPARE(closed.first().first().toString(), a);
+        harness.helper.closeAll();
+        QTRY_COMPARE(closed.count(), 2);
+        QCOMPARE(closed.last().first().toString(), b);
+        QTRY_COMPARE(second.state(), QAbstractSocket::UnconnectedState);
+        QCOMPARE(closed.count(), 2);
+    }
+
+    void remoteObjectsTransportHandsOffBoundedBinaryData()
+    {
+        SessionHarness harness;
+        QPointer<QIODevice> remoteDevice;
+        harness.helper.setRemoteObjectHandler(
+            testPackageId(), testHostId(), [&remoteDevice](QIODevice* device) {
+                remoteDevice = device;
+            });
+        QVERIFY(harness.start());
+
+        QWebSocket client;
+        QSignalSpy textMessages(&client, &QWebSocket::textMessageReceived);
+        client.open(QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+                             .arg(harness.listener.serverPort())
+                             .arg(QString::fromLatin1(remoteObjectsTarget()))));
+        QTRY_VERIFY_WITH_TIMEOUT(remoteDevice, 5000);
+        QCOMPARE(textMessages.size(), 0);
+
+        QSignalSpy readyRead(remoteDevice, &QIODevice::readyRead);
+        QVERIFY(readyRead.isValid());
+        QSignalSpy disconnected(remoteDevice, SIGNAL(disconnected()));
+        QVERIFY(disconnected.isValid());
+        QSignalSpy binaryMessages(&client, &QWebSocket::binaryMessageReceived);
+        QVERIFY(binaryMessages.isValid());
+        const QByteArray payload = QByteArrayLiteral("qtro-binary-frame");
+        QCOMPARE(client.sendBinaryMessage(payload), qint64(payload.size()));
+        QTRY_COMPARE_WITH_TIMEOUT(readyRead.size(), 1, 5000);
+        QCOMPARE(remoteDevice->readAll(), payload);
+
+        const QByteArray response = QByteArrayLiteral("qtro-reply-frame");
+        QCOMPARE(remoteDevice->write(response), qint64(response.size()));
+        QTRY_COMPARE_WITH_TIMEOUT(binaryMessages.size(), 1, 5000);
+        QCOMPARE(binaryMessages.takeFirst().at(0).toByteArray(), response);
+        client.close();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == QAbstractSocket::UnconnectedState, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(disconnected.size(), 1, 5000);
+    }
+
+    void remoteObjectsTransportStreamsLargePacketsInBoundedChunks()
+    {
+        SessionHarness harness;
+        QPointer<QIODevice> hostDevice;
+        harness.helper.setRemoteObjectHandler(testPackageId(), testHostId(),
+            [&hostDevice](QIODevice* device) { hostDevice = device; });
+        QVERIFY(harness.start());
+        QWebSocket socket;
+        QtRoWebSocketDevice clientDevice(&socket, [] { return true; });
+        QSignalSpy chunks(&socket, &QWebSocket::binaryMessageReceived);
+        socket.open(QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+            .arg(harness.listener.serverPort())
+            .arg(QString::fromLatin1(remoteObjectsTarget()))));
+        QTRY_VERIFY_WITH_TIMEOUT(hostDevice, 5000);
+
+        // Exceeds both the old client write cap and old host accumulation cap,
+        // and leaves room for the envelope of a maximum-size service request.
+        QByteArray packet(2 * 1024 * 1024 + 4096, 'p');
+        packet[0] = 'a';
+        packet[128 * 1024] = 'b';
+        packet[packet.size() - 1] = 'z';
+        QCOMPARE(clientDevice.write(packet), qint64(packet.size()));
+        QTRY_COMPARE_WITH_TIMEOUT(hostDevice->bytesAvailable(), qint64(packet.size()), 5000);
+        QCOMPARE(hostDevice->readAll(), packet);
+        QCOMPARE(hostDevice->write(packet), qint64(packet.size()));
+        QTRY_COMPARE_WITH_TIMEOUT(clientDevice.bytesAvailable(), qint64(packet.size()), 5000);
+        QCOMPARE(clientDevice.readAll(), packet);
+        QVERIFY(chunks.size() > 1);
+        for (const auto& chunk : chunks)
+            QVERIFY(chunk.at(0).toByteArray().size() <= QtRoWebSocketDevice::MaximumIncomingMessageBytes);
+        socket.close();
+        QTRY_COMPARE_WITH_TIMEOUT(socket.state(), QAbstractSocket::UnconnectedState, 5000);
+    }
+
+    void remoteObjectsOversizedWriteClosesInsteadOfSilentlyDropping()
+    {
+        SessionHarness harness;
+        QPointer<QIODevice> hostDevice;
+        harness.helper.setRemoteObjectHandler(testPackageId(), testHostId(),
+            [&hostDevice](QIODevice* device) { hostDevice = device; });
+        QVERIFY(harness.start());
+        QWebSocket socket;
+        QtRoWebSocketDevice clientDevice(&socket, [] { return true; });
+        QSignalSpy closed(&clientDevice, &QtRoWebSocketDevice::transportClosed);
+        socket.open(QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+            .arg(harness.listener.serverPort())
+            .arg(QString::fromLatin1(remoteObjectsTarget()))));
+        QTRY_VERIFY_WITH_TIMEOUT(hostDevice, 5000);
+        QCOMPARE(clientDevice.write(QByteArray(QtRoWebSocketDevice::MaximumPacketBytes + 1, 'x')),
+                 qint64(-1));
+        QTRY_COMPARE_WITH_TIMEOUT(closed.size(), 1, 5000);
+        QCOMPARE(socket.state(), QAbstractSocket::UnconnectedState);
+    }
+
+    void remoteObjectsTransportRevalidatesEveryIncomingFrame()
+    {
+        bool validSession = true;
+        int validationCount = 0;
+        SessionHarness harness([&](const QByteArray&) {
+            ++validationCount;
+            return validSession;
+        });
+        QPointer<QIODevice> remoteDevice;
+        harness.helper.setRemoteObjectHandler(
+            testPackageId(), testHostId(), [&remoteDevice](QIODevice* device) {
+                remoteDevice = device;
+            });
+        QVERIFY(harness.start());
+
+        QWebSocket client;
+        client.open(QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+                             .arg(harness.listener.serverPort())
+                             .arg(QString::fromLatin1(remoteObjectsTarget()))));
+        QTRY_VERIFY_WITH_TIMEOUT(remoteDevice, 5000);
+        QSignalSpy readyRead(remoteDevice, &QIODevice::readyRead);
+        QVERIFY(readyRead.isValid());
+        const int validationsAfterAccept = validationCount;
+        validSession = false;
+        client.sendBinaryMessage(QByteArrayLiteral("must-not-reach-qtro"));
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == QAbstractSocket::UnconnectedState, 5000);
+        QVERIFY(validationCount > validationsAfterAccept);
+        QCOMPARE(readyRead.size(), 0);
+    }
+
+    void remoteObjectsTransportPeriodicallyRevalidatesIdleSession()
+    {
+        bool validSession = true;
+        SessionHarness harness([&](const QByteArray&) { return validSession; });
+        harness.helper.setRemoteObjectHandler(testPackageId(), testHostId(), [](QIODevice*) {});
+        QVERIFY(harness.start());
+
+        QWebSocket client;
+        client.open(QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+                             .arg(harness.listener.serverPort())
+                             .arg(QString::fromLatin1(remoteObjectsTarget()))));
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == QAbstractSocket::ConnectedState, 5000);
+        validSession = false;
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == QAbstractSocket::UnconnectedState, 5000);
+    }
+
+    void remoteObjectsTransportRejectsTextAndUnconfiguredRoute()
+    {
+        SessionHarness harness;
+        QVERIFY(harness.start());
+
+        QWebSocket client;
+        client.open(QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+                             .arg(harness.listener.serverPort())
+                             .arg(QString::fromLatin1(remoteObjectsTarget()))));
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == QAbstractSocket::UnconnectedState, 5000);
+
+        QPointer<QIODevice> remoteDevice;
+        harness.helper.setRemoteObjectHandler(
+            testPackageId(), testHostId(), [&remoteDevice](QIODevice* device) {
+                remoteDevice = device;
+            });
+        QWebSocket textClient;
+        textClient.open(QUrl(QStringLiteral("ws://127.0.0.1:%1%2")
+                                 .arg(harness.listener.serverPort())
+                                 .arg(QString::fromLatin1(remoteObjectsTarget()))));
+        QTRY_VERIFY_WITH_TIMEOUT(remoteDevice, 5000);
+        textClient.sendTextMessage(QStringLiteral("not a QtRO frame"));
+        QTRY_VERIFY_WITH_TIMEOUT(textClient.state() == QAbstractSocket::UnconnectedState, 5000);
+    }
+
+
+};
+
+QTEST_GUILESS_MAIN(TestRemoteSessionServer)
+#include "tst_remotesessionserver.moc"

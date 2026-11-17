@@ -1,0 +1,4162 @@
+#include "core/diagnosticlogging.h"
+#include <QJSEngine>
+#include "translationmanager.h"
+#include "translationcatalog.h"
+#include "settings.h"
+#include "settings_ai.h"
+#include "settings_network.h"
+#include "logpaths.h"
+// Header-only, no AI-stack dependency — see the note in airequestshape.h about
+// why this file must not include aiprovider.h.
+#include "../ai/airequestshape.h"
+#include <QStandardPaths>
+#include <QDir>
+#include <QDirIterator>
+#include <QFile>
+#include <QTextStream>
+#include <QSaveFile>
+#include <QTemporaryDir>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <algorithm>
+#include <QJsonArray>
+#include <QDebug>
+#include <QDesktopServices>
+#include <QUrl>
+#include <QUrlQuery>
+#include <QTimer>
+#include <QNetworkInformation>
+#include <QSet>
+#include <QRegularExpression>
+#include <QThread>
+#include <functional>
+#include <memory>
+#include <limits>
+#include <utility>
+
+TranslationManager::TranslationManager(QNetworkAccessManager* networkManager, Settings* settings, QObject* parent)
+    : QObject(parent)
+    , m_settings(settings)
+    , m_networkManager(networkManager)
+{
+    Q_ASSERT(networkManager);
+    connect(this, &TranslationManager::translationsChanged, this, [this]() {
+        advanceCatalogRevision();
+    });
+    // Ensure translations directory exists
+    QDir dir(translationsDir());
+    if (!dir.exists()) {
+        dir.mkpath(".");
+    }
+
+    // Load saved language from settings
+    m_currentLanguage = m_settings->value("localization/language", "en").toString();
+
+    // Load language metadata (list of available languages)
+    loadLanguageMetadata();
+
+    // Keep the existing "en" identity and file so existing customisations survive.
+    const bool seedLanguageMetadata = !m_languageMetadata.contains("en")
+        || !m_languageMetadata.contains("en-GB");
+    m_languageMetadata["en"] = QVariantMap{
+        {"displayName", "English (US)"}, {"nativeName", "English (US)"}, {"isRtl", false}
+    };
+    if (!m_languageMetadata.contains("en-GB")) {
+        m_languageMetadata["en-GB"] = QVariantMap{
+            {"displayName", "English (UK)"}, {"nativeName", "English (UK)"}, {"isRtl", false}
+        };
+    }
+    if (seedLanguageMetadata)
+        (void)saveLanguageMetadata(); // Re-seeded on the next launch if saving fails.
+
+    // Update available languages list
+    m_availableLanguages = m_languageMetadata.keys();
+    if (!m_availableLanguages.contains("en")) {
+        m_availableLanguages.prepend("en");
+    }
+
+    // Load string registry
+    loadStringRegistry();
+
+    // Clean up any empty/whitespace keys that might have been saved previously
+    QStringList keysToRemove;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        if (it.key().trimmed().isEmpty() || it.value().trimmed().isEmpty()) {
+            keysToRemove.append(it.key());
+        }
+    }
+    if (!keysToRemove.isEmpty()) {
+        for (const QString& key : keysToRemove) {
+            m_stringRegistry.remove(key);
+        }
+        DIAG_DEBUG(APP, "TranslationManager") << "Cleaned up" << keysToRemove.size() << "empty registry entries";
+        // Tolerable discard: this cleanup re-runs on every launch, so a failed write only
+        // defers it. The helper has warned.
+        (void)saveStringRegistry();
+    }
+
+    // Load translations for current language
+    loadTranslations();
+
+    // Load user overrides for current language
+    loadUserOverrides();
+
+    // Load AI translations for current language
+    loadAiTranslations();
+
+    // Calculate initial untranslated count
+    recalculateUntranslatedCount();
+
+    // Timer to batch-save string registry
+    QTimer* registrySaveTimer = new QTimer(this);
+    registrySaveTimer->setInterval(5000);  // Save every 5 seconds if dirty
+    connect(registrySaveTimer, &QTimer::timeout, this, [this]() {
+        if (m_registryDirty) {
+            // Tolerable discard: the registry is rebuilt by rendering — every string
+            // re-registers the next time it is drawn — so a lost batch is rediscovered, not
+            // gone. Clearing the dirty flag regardless is deliberate: retrying a broken disk
+            // every 5 seconds would toast the user at the same cadence.
+            (void)saveStringRegistry();
+            recalculateUntranslatedCount();
+            m_registryDirty = false;
+            emit totalStringCountChanged();
+        }
+    });
+    registrySaveTimer->start();
+
+    DIAG_DEBUG(APP, "TranslationManager") << "TranslationManager initialized. Language:" << m_currentLanguage
+             << "Strings:" << m_stringRegistry.size()
+             << "Translations:" << m_translations.size()
+             << "AI Translations:" << m_aiTranslations.size();
+
+    scheduleLanguageUpdateCheck();
+}
+
+TranslationManager::~TranslationManager()
+{
+    // The string-scan worker posts progress and its results back to this object, so it must not
+    // outlive it. Nothing else waits on it — the scan is pure parsing over compiled-in qrc data,
+    // so the worst case here is the parse of the remaining files, not a blocking I/O wait.
+    //
+    // The bounded wait is not belt-and-braces: wait() returns a bool that Qt does not annotate,
+    // so a dropped `false` would be invisible to -Werror=unused-result while leaving a thread
+    // about to post to an object entering ~QObject — the exact UB this line exists to prevent.
+    if (m_scanThread && m_scanThread->isRunning()) {
+        if (!m_scanThread->wait(10000)) {
+            DIAG_WARN(APP, "TranslationManager") << "the string-scan worker has not exited 10s into"
+                       << "destruction. Waiting on it regardless — the alternative is a thread"
+                       << "posting to a destroyed object.";
+            (void)m_scanThread->wait();
+        }
+    }
+    // Strings registered in the last batch interval. Tolerable discard: rendering
+    // re-registers them next launch. The helper has warned.
+    if (m_registryDirty)
+        (void)saveStringRegistry();
+}
+
+// Merge community translations for the active language, once per launch, as soon as there is
+// a network to do it over.
+//
+// This was `QTimer::singleShot(3000, ...)` — a fixed delay standing in for "wait until the
+// network is up", which is the timer-as-a-guard pattern the project rules out: three seconds
+// is too long on a warm desktop and too short on a tablet still associating with Wi-Fi, and
+// when it is too short the check simply fails and nothing retries until the next launch.
+// QNetworkInformation already reports reachability — main.cpp loads the backend and logs it —
+// so the condition can be waited on directly.
+void TranslationManager::scheduleLanguageUpdateCheck()
+{
+    auto* info = QNetworkInformation::instance();
+    if (!info) {
+        // No backend on this platform, or the manager was constructed before main.cpp loaded
+        // one. Ask immediately; being offline just fails the request, which is already handled.
+        checkForLanguageUpdate();
+        return;
+    }
+
+    // Wait ONLY when the backend positively says there is no network. Everything else —
+    // including Unknown — attempts the request.
+    //
+    // Unknown is not a synonym for offline: it is what the backend reports when it cannot
+    // tell, and macOS reports exactly that at startup on the machine this was tested on, with
+    // no reachabilityChanged ever following. A first version of this waited for Online and so
+    // would have sat there forever, never running a check the old timer always ran. Local and
+    // Site are treated the same way: the API host is on the internet so they will probably
+    // fail, but attempting and failing is what the timer did, and failure is already handled.
+    if (info->reachability() != QNetworkInformation::Reachability::Disconnected) {
+        checkForLanguageUpdate();
+        return;
+    }
+
+    // Genuinely disconnected. Wait for that to stop being true rather than guessing at a
+    // delay — this also covers the case the old timer could not: a device that only gets a
+    // network minutes in now picks up translations without needing a restart.
+    connect(info, &QNetworkInformation::reachabilityChanged, this,
+            [this](QNetworkInformation::Reachability reachability) {
+        if (reachability != QNetworkInformation::Reachability::Disconnected)
+            checkForLanguageUpdate();
+    });
+}
+
+QString TranslationManager::translationsDir() const
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/translations";
+}
+
+QString TranslationManager::languageFilePath(const QString& langCode) const
+{
+    return translationsDir() + "/" + langCode + ".json";
+}
+
+// --- Properties ---
+
+QString TranslationManager::currentLanguage() const
+{
+    return m_currentLanguage;
+}
+
+void TranslationManager::setCurrentLanguage(const QString& lang)
+{
+    if (m_autoTranslating && m_currentLanguage != lang) return;
+    if (m_currentLanguage != lang) {
+        m_currentLanguage = lang;
+        m_settings->setValue("localization/language", lang);
+        loadTranslations();
+        loadUserOverrides();
+        loadAiTranslations();
+        recalculateUntranslatedCount();
+        m_translationVersion++;
+        emit translationsChanged();
+        emit currentLanguageChanged();
+    }
+}
+
+bool TranslationManager::editModeEnabled() const
+{
+    return m_editModeEnabled;
+}
+
+void TranslationManager::setEditModeEnabled(bool enabled)
+{
+    if (m_editModeEnabled != enabled) {
+        m_editModeEnabled = enabled;
+        emit editModeEnabledChanged();
+    }
+}
+
+int TranslationManager::untranslatedCount() const
+{
+    return m_untranslatedCount;
+}
+
+int TranslationManager::totalStringCount() const
+{
+    return static_cast<int>(m_stringRegistry.size());
+}
+
+QStringList TranslationManager::availableLanguages() const
+{
+    return m_availableLanguages;
+}
+
+bool TranslationManager::isDownloading() const
+{
+    return m_downloading;
+}
+
+bool TranslationManager::isUploading() const
+{
+    return m_uploading;
+}
+
+bool TranslationManager::isScanning() const
+{
+    return m_scanning;
+}
+
+int TranslationManager::scanProgress() const
+{
+    return m_scanProgress;
+}
+
+int TranslationManager::scanTotal() const
+{
+    return m_scanTotal;
+}
+
+QString TranslationManager::lastError() const
+{
+    return m_lastError;
+}
+
+// --- Translation lookup ---
+
+void TranslationManager::setJsEngine(QJSEngine* engine)
+{
+    if (m_jsEngine && m_jsEngine != engine) {
+        // Bindings that already read `translate` hold a callable bound to the PREVIOUS
+        // engine. They keep calling into it, and if that engine is destroyed the value is
+        // invalid — materially worse than undefined. There is no migration path, so fail
+        // loudly at the wiring mistake rather than mysteriously later.
+        DIAG_FATAL(APP, "TranslationManager") << QString::asprintf("setJsEngine() called twice with different engines — 3,248 bindings "
+               "hold a callable from the first one and cannot be migrated.");
+    }
+
+    m_jsEngine = engine;
+    m_translateFn = QJSValue();  // rebuild against this engine on next read
+
+    if (!engine)
+        return;
+
+    // Build eagerly so a wiring fault surfaces here, at the call site that got it wrong,
+    // instead of 3,248 times over from the property getter.
+    (void)translateFn();
+
+    // The property name below is a STRING coupled to a C++ method with no compile-time
+    // link: an IDE rename of translateString() compiles clean, yields undefined, and turns
+    // every translated string in the app into a TypeError. tst_translationreactivity's
+    // indexOfMethod check catches removal, not a consistent rename.
+    Q_ASSERT_X(m_translateFn.isCallable(), "TranslationManager",
+               "translateString not found on the QJSEngine wrapper — was it renamed?");
+
+    // Anything that already evaluated (before wiring, or against the old engine) is stale
+    // and will never re-run on its own, because nothing else fires for this transition.
+    emit translationsChanged();
+}
+
+QJSValue TranslationManager::translateFn()
+{
+    if (!m_jsEngine) {
+        // Nobody called setJsEngine(). Every translated binding in the app evaluates to
+        // undefined — a startup wiring fault, not a content problem.
+        //
+        // Warn ONCE. This is a Q_PROPERTY read accessor behind ~3,248 bindings; warning per
+        // read would emit thousands of identical lines on startup and again on every
+        // translationsChanged, burying the one message that explains the blank UI. Debug logs
+        // here are read by users' AI assistants via MCP, so a flooded log is actively harmful.
+        if (!m_warnedNoEngine) {
+            m_warnedNoEngine = true;
+            DIAG_ERROR(APP, "TranslationManager") << "TranslationManager has no QJSEngine — EVERY translated "
+                           "string in the app will be undefined. main.cpp must call "
+                           "translationManager.setJsEngine(&engine) before engine.load(). "
+                           "This message is logged once.";
+        }
+        return QJSValue();
+    }
+
+    if (m_translateFn.isUndefined() || m_translateFn.isNull()) {
+        // Built once and cached. Bindings re-evaluate on every translationsChanged, and
+        // rebuilding the wrapper each time would allocate on every language change.
+        //
+        // CppOwnership is required, not defensive: newQObject() hands the object to the JS
+        // engine's GC by default, and TranslationManager is a stack object in main() that
+        // outlives nothing. Without this the engine could collect it out from under the
+        // callable held by 3,248 live bindings.
+        QJSEngine::setObjectOwnership(this, QJSEngine::CppOwnership);
+        QJSValue wrapper = m_jsEngine->newQObject(this);
+        m_translateFn = wrapper.property(QStringLiteral("translateString"));
+    }
+    return m_translateFn;
+}
+
+QString TranslationManager::translateString(const QString& key, const QString& fallback)
+{
+    // Skip empty/whitespace keys or fallbacks
+    if (key.trimmed().isEmpty() || fallback.trimmed().isEmpty()) {
+        return fallback;
+    }
+
+    // Auto-register the string, or update it if the English changed under this key.
+    if (noteSourceString(key, fallback)) {
+        // Don't save on every call - batch save periodically
+        m_registryDirty = true;
+
+        // Propagate existing translation from other keys with the same fallback
+        // This ensures new keys get translations that were applied before they were registered.
+        // It also runs for a key whose English was REWORDED, where it can fill in a translation
+        // for free if the new wording matches a string already translated elsewhere.
+        //
+        // It does NOT run because the old translation was dropped: noteSourceString deliberately
+        // leaves the translation alone on a reword — see the long note there, and the 26 keys
+        // that legitimately carry two fallbacks in one build. This comment used to assert the
+        // opposite, which matters because "a reword loses its translation" is exactly the
+        // premise that decides whether reworded UI text needs a NEW key. It does: the old
+        // translation is kept and would keep rendering the old meaning.
+        if (m_currentLanguage != "en") {
+            QString normalizedFallback = fallback.trimmed();
+            for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+                if (it.key() != key && it.value().trimmed() == normalizedFallback) {
+                    QString existingTranslation = m_translations.value(it.key());
+                    if (!existingTranslation.isEmpty()) {
+                        m_translations[key] = existingTranslation;
+                        if (m_aiGenerated.contains(it.key())) {
+                            m_aiGenerated.insert(key);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Match the same read-only resolution rule exposed to remote clients. Registry discovery
+    // above remains native-only and retains its existing side effects.
+    return TranslationCatalog::resolve(fallback, m_translations.value(key));
+}
+
+QJsonObject TranslationManager::exportTranslationCatalog(QString* error) const
+{
+    const TranslationCatalog::ExportResult result = TranslationCatalog::exportSnapshot(
+        m_currentLanguage, m_catalogRevision, m_stringRegistry, m_translations);
+    if (error)
+        *error = result.error;
+    return result.payload;
+}
+
+void TranslationManager::advanceCatalogRevision()
+{
+    constexpr quint64 kMaximumExactJsonInteger = 9007199254740991ULL;
+    if (m_catalogRevision < kMaximumExactJsonInteger)
+        ++m_catalogRevision;
+    emit catalogRevisionChanged();
+}
+
+bool TranslationManager::hasTranslation(const QString& key) const
+{
+    return m_translations.contains(key) && !m_translations.value(key).isEmpty();
+}
+
+// --- Translation editing ---
+
+void TranslationManager::setTranslation(const QString& key, const QString& translation)
+{
+    // Same rollback contract as setGroupTranslation: an edit that cannot be persisted must not
+    // be left on screen looking applied. Note m_userOverrides in particular — recording a key as
+    // "user customised" while the text it refers to was never written is worse than doing
+    // nothing, because the override then protects a string that does not exist.
+    const bool hadPrevious = m_translations.contains(key);
+    const QString previous = m_translations.value(key);
+    const bool wasAiGenerated = m_aiGenerated.contains(key);
+    const bool wasOverride = m_userOverrides.contains(key);
+
+    m_translations[key] = translation;
+    m_aiGenerated.remove(key);  // User edited, no longer AI-generated
+    m_userOverrides.insert(key);  // Track as user override (preserved during updates)
+
+    if (!saveTranslations()) {
+        if (hadPrevious) m_translations[key] = previous; else m_translations.remove(key);
+        if (wasAiGenerated) m_aiGenerated.insert(key);
+        if (!wasOverride) m_userOverrides.remove(key);
+        DIAG_WARN(APP, "TranslationManager") << "Edit of" << key << "was NOT saved and has been rolled back";
+        emit translationsChanged();
+        emit translationChanged(key);
+        return;
+    }
+
+    // The override marker matters as much as the text: it is the only thing stopping the next
+    // community update from overwriting this edit. Persisting the translation but not the marker
+    // means the edit silently reverts on the next Update — the exact failure m_userOverrides
+    // exists to prevent, arrived at from the success path.
+    if (!saveUserOverrides()) {
+        DIAG_WARN(APP, "TranslationManager") << "Translation for" << key << "was saved but its user-override marker was"
+                   << "NOT — a community update could overwrite this edit";
+    }
+    recalculateUntranslatedCount();
+    m_translationVersion++;
+    emit translationsChanged();
+    emit translationChanged(key);
+}
+
+void TranslationManager::deleteTranslation(const QString& key)
+{
+    if (m_translations.contains(key)) {
+        const QString previous = m_translations.value(key);
+        m_translations.remove(key);
+        if (!saveTranslations()) {
+            m_translations[key] = previous;   // deletion not persisted; do not show it as gone
+            DIAG_WARN(APP, "TranslationManager") << "Deletion of" << key << "was NOT saved and has been rolled back";
+            emit translationsChanged();
+            emit translationChanged(key);
+            return;
+        }
+        recalculateUntranslatedCount();
+        m_translationVersion++;
+        emit translationsChanged();
+        emit translationChanged(key);
+    }
+}
+
+// --- Language management ---
+
+bool TranslationManager::addLanguage(const QString& langCode, const QString& displayName, const QString& nativeName)
+{
+    if (langCode.isEmpty() || m_languageMetadata.contains(langCode)) {
+        return false;
+    }
+
+    // Determine RTL based on language code
+    static const QStringList rtlLanguages = {"ar", "he", "fa", "ur"};
+    bool isRtl = rtlLanguages.contains(langCode);
+
+    m_languageMetadata[langCode] = QVariantMap{
+        {"displayName", displayName},
+        {"nativeName", nativeName.isEmpty() ? displayName : nativeName},
+        {"isRtl", isRtl}
+    };
+
+    // Honour the verdict: a language that exists only in memory shows in the picker today and
+    // vanishes at restart, which reads as data loss. Refuse the add instead — the helper has
+    // already warned and set lastError.
+    if (!saveLanguageMetadata()) {
+        m_languageMetadata.remove(langCode);
+        DIAG_WARN(APP, "TranslationManager") << "Language" << langCode << "was NOT added - its metadata could not be saved";
+        return false;
+    }
+
+    // Create an empty translation file ONLY if there is not one already.
+    //
+    // This opened WriteOnly unconditionally, which truncates. The guard above is only
+    // `m_languageMetadata.contains(langCode)`, so if the metadata file was ever lost the
+    // language vanishes from the picker while its .json sits on disk — and the obvious recovery,
+    // adding the language back, destroyed exactly the file the user was trying to recover.
+    // The action a person takes to fix the problem must not be the one that makes it permanent.
+    const QString newLangPath = languageFilePath(langCode);
+    if (QFile::exists(newLangPath)) {
+        DIAG_WARN(APP, "TranslationManager") << "Language" << langCode << "was missing from the metadata but its file"
+                   << "exists — keeping the existing translations rather than overwriting them";
+    } else {
+        QJsonObject root;
+        root["language"] = langCode;
+        root["displayName"] = displayName;
+        root["nativeName"] = nativeName.isEmpty() ? displayName : nativeName;
+        root["translations"] = QJsonObject();
+        // Tolerable discard: this file is an empty scaffold, and the first real save of a
+        // translation writes the same path in full. The helper has warned.
+        (void)writeJsonFile(newLangPath, QJsonDocument(root), tr("the new %1 language file").arg(langCode));
+    }
+
+    m_availableLanguages = m_languageMetadata.keys();
+    emit availableLanguagesChanged();
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Added language:" << langCode << displayName;
+    return true;
+}
+
+bool TranslationManager::deleteLanguage(const QString& langCode)
+{
+    if (langCode == "en" || langCode == "en-GB" || !m_languageMetadata.contains(langCode)) {
+        return false;  // Built-in languages are always available.
+    }
+
+    const QVariantMap removed = m_languageMetadata.take(langCode);
+
+    // Honour the verdict BEFORE deleting the translation file. With the old order a failed
+    // metadata save left the language listed on disk while its file was already gone — at the
+    // next launch it reappears in the picker holding nothing, which reads as corruption.
+    if (!saveLanguageMetadata()) {
+        m_languageMetadata[langCode] = removed;
+        DIAG_WARN(APP, "TranslationManager") << "Language" << langCode << "was NOT deleted - the metadata could not be saved,"
+                   << "so its translation file has been left in place";
+        return false;
+    }
+
+    // Delete translation file
+    QFile::remove(languageFilePath(langCode));
+
+    m_availableLanguages = m_languageMetadata.keys();
+    emit availableLanguagesChanged();
+
+    // Switch to English if current language was deleted
+    if (m_currentLanguage == langCode) {
+        setCurrentLanguage("en");
+    }
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Deleted language:" << langCode;
+    return true;
+}
+
+QString TranslationManager::getLanguageDisplayName(const QString& langCode) const
+{
+    if (langCode == QLatin1String("en")) return QStringLiteral("English (US)");
+    if (langCode == QLatin1String("en-GB")) return QStringLiteral("English (UK)");
+    if (m_languageMetadata.contains(langCode)) {
+        return m_languageMetadata[langCode]["displayName"].toString();
+    }
+    return langCode;
+}
+
+QString TranslationManager::getLanguageNativeName(const QString& langCode) const
+{
+    if (langCode == QLatin1String("en")) return QStringLiteral("English (US)");
+    if (langCode == QLatin1String("en-GB")) return QStringLiteral("English (UK)");
+    if (m_languageMetadata.contains(langCode)) {
+        return m_languageMetadata[langCode]["nativeName"].toString();
+    }
+    return langCode;
+}
+
+// --- String registry ---
+
+void TranslationManager::registerString(const QString& key, const QString& fallback)
+{
+    // Skip empty/whitespace keys or fallbacks
+    if (key.trimmed().isEmpty() || fallback.trimmed().isEmpty()) {
+        return;
+    }
+
+    if (noteSourceString(key, fallback)) {
+        // Batched like translateString(): every Tr calls this from Component.onCompleted, so a
+        // synchronous write here ran once per new key on the main thread. The batch also
+        // recounts and emits.
+        m_registryDirty = true;
+    }
+}
+
+// Scan all QML source files to discover every translatable string in the app.
+//
+// Why this is needed:
+// - Strings are normally registered when translate() is called at runtime
+// - This means strings on screens the user hasn't visited aren't in the registry
+// - AI translation and community sharing need the complete list of strings
+// - By scanning QML files, we find ALL translate("key", "fallback") calls
+//
+// This runs when entering the Language settings page.
+void TranslationManager::scanAllStrings()
+{
+    // Not a refusal: the in-flight scan will emit scanFinished(), and that IS this caller's
+    // answer. The contract is that a caller connects BEFORE calling, never after — see
+    // translateAndUploadAllLanguages(), which parks on the signal first and only then asks for a
+    // scan. A caller that connects afterwards waits forever whenever it lost the race.
+    if (m_scanning) {
+        DIAG_DEBUG(APP, "TranslationManager") << "string scan already running; joining the in-flight scan.";
+        return;
+    }
+
+    m_scanning = true;
+    m_scanProgress = 0;
+    emit scanningChanged();
+
+    // Collect all QML files from the Qt resource system.
+    //
+    // The root is ":/qt/qml/Decenza/qml" — where qt_add_qml_module actually publishes, and what
+    // main.cpp loads ("qrc:/qt/qml/Decenza/qml/main.qml"). This used to iterate ":/qml", which
+    // does not exist in a Qt 6 module build, so the scan silently walked an empty tree and
+    // registered nothing. Every key in the registry got there by being RENDERED at runtime, so
+    // the registry has never been the app's string set — it is "strings this device happened to
+    // display". That is why machineStatus.idle and four siblings are absent while their
+    // rendered neighbours are present, why 446 keys have German translations the registry has
+    // never heard of, and why the translation percentage's denominator was wrong. It also
+    // means AI translation and community upload have never been offered the full string list.
+    QStringList qmlFiles;
+    QDirIterator it(QStringLiteral(":/qt/qml/Decenza/qml"), QStringList() << "*.qml",
+                    QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        qmlFiles.append(it.next());
+    }
+
+    m_scanTotal = static_cast<int>(qmlFiles.size());
+    emit scanProgressChanged();
+
+    // A scan that finds no files is always a bug, never a valid state — the QML is compiled
+    // into the binary. Say so loudly; the silent zero is what let this sit unnoticed.
+    if (m_scanTotal == 0) {
+        DIAG_WARN(APP, "TranslationManager") << "string scan found NO QML files under"
+                   << ":/qt/qml/Decenza/qml — the resource root is wrong, so the registry will"
+                   << "only ever contain strings this device has rendered. AI translation and"
+                   << "community upload will be working from an incomplete list.";
+    }
+    DIAG_DEBUG(APP, "TranslationManager") << "Scanning" << m_scanTotal << "QML files for translatable strings...";
+
+    // Parse off the main thread. The registry is NOT touched here — the worker only reads the
+    // (read-only, compiled-in) qrc files and returns pairs; noteSourceString() and everything
+    // else that mutates state runs in applyScanResults() back on the main thread.
+    QThread* worker = QThread::create([this, qmlFiles]() {
+        QList<ScannedString> found;
+        QSet<QString> seenInQml;
+        QStringList unreadable;
+        int filesDone = 0;
+
+        for (const QString& filePath : qmlFiles) {
+            QFile file(filePath);
+            if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                const QString content = QString::fromUtf8(file.readAll());
+                file.close();
+
+                const QList<ScannedString> inFile = parseTranslatableStrings(content);
+                for (const ScannedString& s : inFile) {
+                    seenInQml.insert(s.key);
+                    found.append(s);
+                }
+            } else {
+                // A file we cannot read contributes nothing and would otherwise be indistinguishable
+                // from one that legitimately holds no strings — the scan would reach 100% and
+                // report success over a short registry, which is then AI-translated and uploaded.
+                unreadable << QStringLiteral("%1 (%2)").arg(filePath, file.errorString());
+            }
+
+            ++filesDone;
+            QMetaObject::invokeMethod(this, [this, filesDone]() {
+                m_scanProgress = filesDone;
+                emit scanProgressChanged();
+            }, Qt::QueuedConnection);
+        }
+
+        QMetaObject::invokeMethod(this, [this, found, seenInQml, unreadable]() {
+            applyScanResults(found, seenInQml, unreadable);
+        }, Qt::QueuedConnection);
+    });
+
+    m_scanThread = worker;
+
+    // The results are posted before run() returns, so they are queued AHEAD of finished() on the
+    // main thread: reaching this slot with m_scanning still set means the worker died — or never
+    // started — without posting. Without it, m_scanning would stay true forever, the Language
+    // page's modal scanning overlay would never clear, every later scanAllStrings() would
+    // early-return, and anything parked on scanFinished() would wait for a signal that is not
+    // coming. QThread::start() can itself fail and only warns.
+    connect(worker, &QThread::finished, this, [this]() {
+        if (!m_scanning)
+            return;   // normal path: applyScanResults already ran
+        DIAG_WARN(APP, "TranslationManager") << "the string-scan worker exited without posting a result."
+                   << "The registry was not updated, so AI translation and community upload will"
+                   << "be working from an incomplete list.";
+        m_scanning = false;
+        emit scanningChanged();
+        emit scanFinished(0);   // release anything parked on it rather than hang
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
+}
+
+// Runs on the scan's worker thread. Touches no member, emits no signal, does no I/O — keep it
+// that way, or the crash this split was made to fix comes back by another route.
+QList<TranslationManager::ScannedString> TranslationManager::parseTranslatableStrings(const QString& content)
+{
+    QList<ScannedString> found;
+
+    // Built per call, not kept static: QRegularExpression is documented reentrant, not
+    // thread-safe (qtbase/src/corelib/text/qregularexpression.cpp:34), so a shared instance is a
+    // promise Qt does not make. A few microseconds of PCRE compile per file is not measurable
+    // against regexing the file itself.
+    //
+    // One QML string literal's body: no raw newline, and `\"` does not end it. A capture that
+    // stopped at the escaped quote registered `Profile "%1" is missing` as `Profile \`, which the
+    // runtime then overwrote and the next scan wrote back, and whose missing %1 made the
+    // community translation be rejected.
+    //
+    // The newline exclusion is load-bearing too. AISettingsPage has `fallback: "How to get an API
+    // key:"`, whose TEXT ends in `key:`, so `\bkey\s*:\s*"` matched at `key:"`; with no newline
+    // guard the capture ran to the next quote in the file and registered 249 characters of QML
+    // source as a key, which was then AI-translated and uploaded to the community server.
+    const QString body = QStringLiteral(R"(((?:[^"\\\n]|\\.)+))");
+    const auto literal = [&body](const char* prefix) {
+        return QRegularExpression(QLatin1String(prefix) + QStringLiteral("\"") + body + QStringLiteral("\""));
+    };
+
+    // Pattern 1: Direct translate() calls - translate("key", "fallback")
+    const QRegularExpression directCallRegex(QStringLiteral(R"(translate\s*\(\s*")") + body
+        + QStringLiteral(R"("\s*,\s*")") + body + QStringLiteral(R"("\s*\))"));
+
+    // Pattern 2: ActionButton's translationKey/translationFallback properties
+    const QRegularExpression propKeyRegex = literal(R"(translationKey\s*:\s*)");
+    const QRegularExpression propFallbackRegex = literal(R"(translationFallback\s*:\s*)");
+
+    // Pattern 3: Tr component's key/fallback properties - Tr { key: "..."; fallback: "..." }
+    const QRegularExpression trKeyRegex = literal(R"(\bkey\s*:\s*)");
+    const QRegularExpression trFallbackRegex = literal(R"(\bfallback\s*:\s*)");
+
+    // Pattern 1: Direct translate() calls
+    QRegularExpressionMatchIterator matchIt = directCallRegex.globalMatch(content);
+    while (matchIt.hasNext()) {
+        QRegularExpressionMatch match = matchIt.next();
+        QString key = match.captured(1);
+        QString fallback = match.captured(2);
+
+        // Unescape common escape sequences
+        key = unescapeQmlLiteral(key);
+        fallback = unescapeQmlLiteral(fallback);
+
+        if (!key.trimmed().isEmpty() && !fallback.trimmed().isEmpty()) {
+            found.append({key, fallback});
+        }
+    }
+
+    // Pattern 2: Property-based translations (translationKey + translationFallback pairs)
+    // Collect all keys and fallbacks, then match them by proximity in the file
+    QMap<qsizetype, QString> keyPositions;  // position -> key
+    QMap<qsizetype, QString> fallbackPositions;  // position -> fallback
+
+    QRegularExpressionMatchIterator keyIt = propKeyRegex.globalMatch(content);
+    while (keyIt.hasNext()) {
+        QRegularExpressionMatch match = keyIt.next();
+        keyPositions[match.capturedStart()] = match.captured(1);
+    }
+
+    QRegularExpressionMatchIterator fallbackIt = propFallbackRegex.globalMatch(content);
+    while (fallbackIt.hasNext()) {
+        QRegularExpressionMatch match = fallbackIt.next();
+        fallbackPositions[match.capturedStart()] = match.captured(1);
+    }
+
+    // Match keys with their nearest following fallback
+    for (auto posIt = keyPositions.constBegin(); posIt != keyPositions.constEnd(); ++posIt) {
+        qsizetype keyPos = posIt.key();
+        QString key = posIt.value();
+
+        // Find the nearest fallback after this key (within 200 chars)
+        for (auto fbIt = fallbackPositions.constBegin(); fbIt != fallbackPositions.constEnd(); ++fbIt) {
+            qsizetype fbPos = fbIt.key();
+            if (fbPos > keyPos && fbPos - keyPos < 200) {
+                QString fallback = fbIt.value();
+
+                // Unescape
+                key = unescapeQmlLiteral(key);
+                fallback = unescapeQmlLiteral(fallback);
+
+                if (!key.trimmed().isEmpty() && !fallback.trimmed().isEmpty()) {
+                    found.append({key, fallback});
+                }
+                break;  // Found the matching fallback
+            }
+        }
+    }
+
+    // Pattern 3: Tr component's key/fallback properties
+    QMap<qsizetype, QString> trKeyPositions;
+    QMap<qsizetype, QString> trFallbackPositions;
+
+    QRegularExpressionMatchIterator trKeyIt = trKeyRegex.globalMatch(content);
+    while (trKeyIt.hasNext()) {
+        QRegularExpressionMatch match = trKeyIt.next();
+        trKeyPositions[match.capturedStart()] = match.captured(1);
+    }
+
+    QRegularExpressionMatchIterator trFallbackIt = trFallbackRegex.globalMatch(content);
+    while (trFallbackIt.hasNext()) {
+        QRegularExpressionMatch match = trFallbackIt.next();
+        trFallbackPositions[match.capturedStart()] = match.captured(1);
+    }
+
+    // Match keys with their nearest fallback (within 200 chars, in either direction)
+    for (auto posIt = trKeyPositions.constBegin(); posIt != trKeyPositions.constEnd(); ++posIt) {
+        qsizetype keyPos = posIt.key();
+        QString key = posIt.value();
+
+        // Find the nearest fallback (can be before or after the key)
+        QString fallback;
+        qsizetype minDistance = 200;
+
+        for (auto fbIt = trFallbackPositions.constBegin(); fbIt != trFallbackPositions.constEnd(); ++fbIt) {
+            qsizetype fbPos = fbIt.key();
+            qsizetype distance = qAbs(fbPos - keyPos);
+            if (distance < minDistance) {
+                minDistance = distance;
+                fallback = fbIt.value();
+            }
+        }
+
+        if (!fallback.trimmed().isEmpty()) {
+            // Unescape
+            QString keyClean = key;
+            QString fallbackClean = fallback;
+            keyClean = unescapeQmlLiteral(keyClean);
+            fallbackClean = unescapeQmlLiteral(fallbackClean);
+
+            if (!keyClean.trimmed().isEmpty() && !fallbackClean.trimmed().isEmpty()) {
+                found.append({keyClean, fallbackClean});
+            }
+        }
+    }
+
+    return found;
+}
+
+void TranslationManager::applyScanResults(const QList<ScannedString>& found, const QSet<QString>& seenInQml,
+                                          const QStringList& unreadableFiles)
+{
+    int stringsFound = 0;
+    const qsizetype initialCount = m_stringRegistry.size();
+
+    // In scan order (per file, then pattern 1, 2, 3), so a key used with two different fallbacks
+    // resolves the same way it did when this loop was interleaved with the parsing.
+    for (const ScannedString& s : found) {
+        if (noteSourceString(s.key, s.fallback)) {
+            stringsFound++;
+        }
+    }
+
+    // Strings declared in C++ TABLES rather than in QML. The scan above walks QML source, so it
+    // cannot see them, and the registry's other filler — translate() running — only fires if the
+    // user opens the screen that renders them. Anything not registered by the time a bulk AI
+    // translation or a community upload runs is published missing, and stays English in every
+    // locale with nothing reporting it. That was already true of the widget catalog's palette,
+    // chip and category labels; the Custom-widget action catalog joined them when it moved out of
+    // CustomEditorPopup.qml. Declared here so neither depends on having been looked at.
+    //
+    // If a SECOND C++ file grows translatable string tables, aggregate them into
+    // layoutCatalogTranslationStrings()'s neighbourhood and keep ONE loop here —
+    // a second loop beside this one is the copy that drifts.
+    for (const auto& s : SettingsNetwork::layoutCatalogTranslationStrings()) {
+        if (noteSourceString(s.first, s.second)) {
+            stringsFound++;
+        }
+    }
+
+    // Save the updated registry
+    if (stringsFound > 0) {
+        // Tolerable discard: the scan can simply be run again, and rendering re-registers
+        // strings anyway. The helper has warned.
+        (void)saveStringRegistry();
+        recalculateUntranslatedCount();
+        emit totalStringCountChanged();
+    }
+
+    // A file the scan could not read is not a cosmetic loss: the registry it feeds is what the AI
+    // translator is prompted with and what a community upload publishes, so a short scan spreads
+    // outward exactly the way the ":/qml" wrong-root bug did.
+    if (!unreadableFiles.isEmpty()) {
+        DIAG_WARN(APP, "TranslationManager").noquote() << "string scan could not read"
+                             << unreadableFiles.size() << "of" << m_scanTotal << "QML files. The"
+                             << "registry is INCOMPLETE — AI translation and community upload will"
+                             << "be working from a short list:"
+                             << "\n    " + unreadableFiles.join(QStringLiteral("\n    "));
+    }
+
+    // Both flags settle BEFORE the signal. translateAndUploadAllLanguages() re-enters from inside
+    // this emit and re-tests m_scanCompleted; set it afterwards and the batch re-parks, rescans,
+    // and loops scan -> translate -> scan forever. tst_translationscan pins the order.
+    m_scanning = false;
+    m_scanCompleted = true;
+    emit scanningChanged();
+    emit scanFinished(static_cast<int>(m_stringRegistry.size() - initialCount));
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Scan complete. Found" << stringsFound << "new strings. Total:" << m_stringRegistry.size();
+
+    // Keys held in the registry that this scan did not find in any QML file. Reported, never
+    // removed: plenty of live strings are registered from C++ (blemanager, aimanager,
+    // updatechecker, visualizer*, and main.cpp's per-provider model hints all call
+    // translateString directly), and those legitimately appear nowhere in the QML tree. So this
+    // list is CANDIDATES, not garbage — the registry does accumulate keys for UI that has since
+    // been deleted (settings.ai.remoteMcp.adminFunnel/.adminHttps are two), but telling those
+    // apart from a C++-registered key needs a human, and deleting a live one silently
+    // untranslates it in every language.
+    QStringList notInQml;
+    for (auto regIt = m_stringRegistry.constBegin(); regIt != m_stringRegistry.constEnd(); ++regIt) {
+        if (!seenInQml.contains(regIt.key()))
+            notInQml << regIt.key();
+    }
+    if (!notInQml.isEmpty()) {
+        notInQml.sort();
+
+        // The COUNT goes to the log; the LIST goes to a file beside it.
+        //
+        // This used to join all 560 keys into this one qDebug() with embedded
+        // newlines. That is a single call emitting 561 physical lines, and only
+        // the first carries a timestamp and a level — the rest are unattributable
+        // to any subsystem, defeat line-based parsing, and on their own exceed the
+        // whole 500-line in-memory ring. It fires for any user who opens the
+        // Language settings tab, so a log submitted about a Bluetooth fault
+        // arrived carrying 560 lines of translation keys.
+        //
+        // Nothing was gained by that. The audience for the list is a developer
+        // pruning the registry, at a desk, with the source open — and the comment
+        // above already says the list cannot be acted on without cross-checking
+        // C++ registration by hand. Everyone else reading this log is diagnosing
+        // hardware. The list is also regenerable at will: open the tab again.
+        //
+        // So the signal a reader can actually use ("560 of 3,858") stays inline,
+        // and the payload moves to a file that is named in the line, which keeps
+        // the maintenance use exactly and costs the log one line instead of 561.
+        // BESIDE debug.log, not in AppDataLocation.
+        //
+        // Those are the same directory on desktop and NOT on Android, where
+        // WebDebugLogger asks StorageHelper.getLogsPath() for external storage
+        // precisely so a user can retrieve the file. A dump written to internal
+        // app data on Android is unreachable without adb — it would exist, be
+        // named in the log, and be impossible for the person reading that log to
+        // open. DecenzaPaths::logsDirectory() is the single resolver this and
+        // WebDebugLogger share, rather than a second copy of the Android branch.
+        const QString dumpPath = DecenzaPaths::logsDirectory()
+                                 + QStringLiteral("/translation-keys-not-in-qml.txt");
+
+        // QSaveFile, so a failed write leaves the PREVIOUS dump intact. With
+        // Truncate a full disk or a revoked permission destroys the good copy and
+        // replaces it with nothing, at the exact moment someone is trying to read
+        // it. commit() is also the honest success signal: QFile::flush() only
+        // pushes QFile's own buffer, and QTextStream has a separate one on top of
+        // it, so flushing the file while the stream still holds the payload
+        // returns true having written nothing.
+        QString written;
+        QString failure;
+        QSaveFile dump(dumpPath);
+        if (dump.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            {
+                QTextStream out(&dump);
+                out << notInQml.join(QLatin1Char('\n')) << '\n';
+            }  // stream destroyed -> its buffer is in the file's
+            if (dump.commit())
+                written = dumpPath;
+            else
+                failure = dump.errorString();
+        } else {
+            failure = dump.errorString();
+        }
+
+        // Name the path and the reason on failure. "could not be written" with
+        // neither is unactionable: the reader cannot tell a missing directory from
+        // a permission denial from a full disk, and cannot even look for the file.
+        const QString where = written.isEmpty()
+            ? QStringLiteral("could not be written to %1 - %2").arg(dumpPath, failure)
+            : written;
+        DIAG_DEBUG(APP, "TranslationManager").noquote()
+            << notInQml.size() << "of" << m_stringRegistry.size()
+            << "registry keys were not found in any QML file. Live C++-registered strings look"
+            << "like this too, so this is a candidate list and not garbage — verify before"
+            << "removing any. Full list:" << where;
+    }
+}
+
+// --- Community translations ---
+
+void TranslationManager::downloadLanguageList()
+{
+    if (m_downloading) {
+        return;
+    }
+
+    // Reset retry counter for new download
+    m_downloadRetryCount = 0;
+
+    m_downloading = true;
+    emit downloadingChanged();
+
+    QString url = QString("%1/v1/translations/languages").arg(TRANSLATION_API_BASE);
+    DIAG_DEBUG(APP, "TranslationManager") << "Fetching language list from:" << url;
+
+    QNetworkRequest request{QUrl(url)};
+    QNetworkReply* reply = m_networkManager->get(request);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        onLanguageListFetched(reply);
+    });
+}
+
+void TranslationManager::downloadLanguage(const QString& langCode)
+{
+    if (m_downloading || langCode == "en") {
+        return;
+    }
+
+    // Reset retry counter for new download
+    m_downloadRetryCount = 0;
+
+    m_downloading = true;
+    m_downloadingLangCode = langCode;
+    emit downloadingChanged();
+
+    QString url = QString("%1/v1/translations/languages/%2").arg(TRANSLATION_API_BASE, langCode);
+    DIAG_DEBUG(APP, "TranslationManager") << "Fetching language file from:" << url;
+
+    QNetworkRequest request{QUrl(url)};
+    QNetworkReply* reply = m_networkManager->get(request);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        onLanguageFileFetched(reply);
+    });
+}
+
+void TranslationManager::onLanguageListFetched(QNetworkReply* reply)
+{
+    reply->deleteLater();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        // Check for 429 Too Many Requests - retry after delay
+        int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (statusCode == 429 && m_downloadRetryCount < MAX_RETRIES) {
+            m_downloadRetryCount++;
+            DIAG_DEBUG(APP, "TranslationManager") << "Language list rate limited (429), retrying in" << (RETRY_DELAY_MS / 1000)
+                     << "seconds... (attempt" << m_downloadRetryCount << "of" << MAX_RETRIES << ")";
+
+            // Show retry status to user
+            m_retryStatus = QString("Server busy, retrying download %1/%2...").arg(m_downloadRetryCount).arg(MAX_RETRIES);
+            emit retryStatusChanged();
+
+            // Schedule retry after delay
+            QTimer::singleShot(RETRY_DELAY_MS, this, [this]() {
+                QString url = QString("%1/v1/translations/languages").arg(TRANSLATION_API_BASE);
+                DIAG_DEBUG(APP, "TranslationManager") << "Retrying language list from:" << url;
+
+                QNetworkRequest request{QUrl(url)};
+                QNetworkReply* retryReply = m_networkManager->get(request);
+
+                connect(retryReply, &QNetworkReply::finished, this, [this, retryReply]() {
+                    onLanguageListFetched(retryReply);
+                });
+            });
+            return;
+        }
+
+        m_downloading = false;
+        m_downloadRetryCount = 0;
+        m_retryStatus.clear();
+        emit retryStatusChanged();
+        emit downloadingChanged();
+
+        m_lastError = QString("Failed to fetch language list: %1").arg(reply->errorString());
+        emit lastErrorChanged();
+        emit languageListDownloaded(false);
+        DIAG_WARN(APP, "TranslationManager") << m_lastError;
+        return;
+    }
+
+    // Success - reset state
+    m_downloading = false;
+    m_downloadRetryCount = 0;
+    if (!m_retryStatus.isEmpty()) {
+        m_retryStatus.clear();
+        emit retryStatusChanged();
+    }
+    emit downloadingChanged();
+
+    QByteArray data = reply->readAll();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+
+    if (!doc.isObject()) {
+        m_lastError = "Invalid language list format";
+        emit lastErrorChanged();
+        emit languageListDownloaded(false);
+        return;
+    }
+
+    QJsonObject root = doc.object();
+    if (!root.value(QStringLiteral("languages")).isArray()) {
+        m_lastError = QStringLiteral("Invalid language list format");
+        emit lastErrorChanged();
+        emit languageListDownloaded(false);
+        return;
+    }
+    QJsonArray languages = root["languages"].toArray();
+    QSet<QString> communityLanguages;
+
+    for (const QJsonValue& val : languages) {
+        QJsonObject lang = val.toObject();
+        QString code = lang["code"].toString();
+        QString displayName = lang["name"].toString();
+        QString nativeName = lang["nativeName"].toString();
+        bool isRtl = lang["isRtl"].toBool(false);
+
+        if (!code.isEmpty()) communityLanguages.insert(code);
+
+        if (!code.isEmpty() && !m_languageMetadata.contains(code)) {
+            m_languageMetadata[code] = QVariantMap{
+                {"displayName", displayName},
+                {"nativeName", nativeName.isEmpty() ? displayName : nativeName},
+                {"isRtl", isRtl},
+                {"isRemote", true}  // Mark as available for download
+            };
+        }
+    }
+
+    m_communityLanguages = std::move(communityLanguages);
+    m_communityCatalogKnown = true;
+
+    // Tolerable discard: this is a cache of the server's language list, refetched on the next
+    // visit to the language page. The helper has warned.
+    (void)saveLanguageMetadata();
+    m_availableLanguages = m_languageMetadata.keys();
+    emit availableLanguagesChanged();
+    emit languageListDownloaded(true);
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Language list updated. Available:" << m_availableLanguages;
+}
+
+// Merge a downloaded language into the on-disk file for a language that is NOT loaded.
+//
+// Returns false if the merge was refused or the write failed, in which case it has already
+// warned and emitted languageDownloaded(..., false, reason) — the caller must simply return.
+//
+// Extracted from onLanguageFileFetched so a test can reach it. The bug this guards against
+// (a local file that exists but cannot be read being replaced wholesale by the server's copy)
+// lived in a network-reply slot, which is untestable, and was found by review rather than by
+// the suite for exactly that reason.
+bool TranslationManager::mergeDownloadedLanguageFile(const QString& langCode, const QJsonObject& root)
+{
+    // Not the active language, so it is not in memory. Merge on the file instead, keeping
+    // any local translation that the download does not carry.
+    // "No local file yet" and "local file exists but I could not read it" must be handled
+    // differently, and conflating them is how a merge turns back into the replace it was
+    // written to stop. If the file is there but locked, permission-denied, or corrupt, an
+    // empty `merged` is not the truth — it is a failure to read the truth, and writing the
+    // server's copy on top of it destroys exactly what this branch exists to protect.
+    const QString path = languageFilePath(langCode);
+    QJsonObject merged;
+    QFile existing(path);
+    if (existing.exists()) {
+        if (!existing.open(QIODevice::ReadOnly)) {
+            DIAG_WARN(APP, "TranslationManager") << "Language merge ABORTED for" << langCode << "- cannot read"
+                       << path << ":" << existing.errorString()
+                       << "- refusing to overwrite it with the server copy";
+            m_lastError = tr("Could not read the existing %1 file, so the update was not applied "
+                             "(your local translations are untouched).").arg(langCode);
+            emit lastErrorChanged();
+            emit languageDownloaded(langCode, false, m_lastError);
+            return false;
+        }
+        QJsonParseError parseError;
+        const QJsonDocument localDoc = QJsonDocument::fromJson(existing.readAll(), &parseError);
+        existing.close();
+        if (parseError.error != QJsonParseError::NoError) {
+            DIAG_WARN(APP, "TranslationManager") << "Language merge ABORTED for" << langCode << "- local file is not"
+                       << "valid JSON:" << parseError.errorString()
+                       << "- refusing to overwrite it";
+            m_lastError = tr("The existing %1 file could not be parsed, so the update was not "
+                             "applied.").arg(langCode);
+            emit lastErrorChanged();
+            emit languageDownloaded(langCode, false, m_lastError);
+            return false;
+        }
+        merged = localDoc.object().value(QStringLiteral("translations")).toObject();
+    }
+
+    // Same translationDefect rule as mergeLanguageUpdate. Narrow — reached only when the language
+    // changes while a download is in flight — but checked like its twin.
+    const QJsonObject incoming = root["translations"].toObject();
+    int skippedBroken = 0;
+    for (auto it = incoming.constBegin(); it != incoming.constEnd(); ++it) {
+        // An empty incoming value is no translation; it never replaces one.
+        if (it.value().toString().isEmpty())
+            continue;
+        const QString sourceEnglish = m_stringRegistry.value(it.key());
+        if (const QString defect = translationDefect(sourceEnglish, it.value().toString());
+            !defect.isEmpty()) {
+            DIAG_WARN(APP, "TranslationManager").noquote() << "Skipping community translation for" << it.key()
+                                 << "-" << defect << ". source=" << sourceEnglish
+                                 << "incoming=" << it.value().toString();
+            skippedBroken++;
+            continue;
+        }
+        merged[it.key()] = it.value();
+    }
+    if (skippedBroken > 0)
+        DIAG_WARN(APP, "TranslationManager") << "Language file merge for" << langCode << "skipped"
+                   << skippedBroken << "broken string(s)";
+
+    QJsonObject out = root;
+    out["translations"] = merged;
+
+    // QSaveFile, not QFile: it writes to a temporary and renames on commit(), so a failure
+    // leaves the original file exactly as it was.
+    //
+    // With plain QFile this had a hole that defeated the point of the whole function.
+    // QIODevice::WriteOnly TRUNCATES on open, so the moment the open succeeded the user's
+    // translations were already gone — a full disk, a crash, or a short write between there and
+    // the end left them with an empty or half-written file. The previous version checked the
+    // write length and reported a loss it had no way to reverse. Detecting destruction is not
+    // the same as preventing it, and this function exists to prevent it.
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        DIAG_WARN(APP, "TranslationManager") << "Failed to write merged language file" << path << ":" << file.errorString();
+        m_lastError = tr("Could not save the updated %1 file.").arg(langCode);
+        emit lastErrorChanged();
+        emit languageDownloaded(langCode, false, m_lastError);
+        return false;
+    }
+    const QByteArray payload = QJsonDocument(out).toJson();
+    file.write(payload);
+    if (!file.commit()) {   // commit() reports short writes and rename failures alike
+        DIAG_WARN(APP, "TranslationManager") << "Failed to commit merged language file" << path << ":" << file.errorString()
+                   << "- the existing file is unchanged";
+        m_lastError = tr("Could not save the updated %1 file (your existing translations are "
+                         "unchanged).").arg(langCode);
+        emit lastErrorChanged();
+        emit languageDownloaded(langCode, false, m_lastError);
+        return false;
+    }
+
+    return true;
+}
+
+// Apply a fetched language document. Split out of the network slot so it is reachable from a
+// test AT THE CALLER FRAME.
+//
+// That framing is deliberate. Two separate guards in this area were added, tested, and
+// negative-controlled while the frame ABOVE them undid the guard — first by never running it,
+// then by emitting success straight after its refusal. Both times the test was green and the
+// bug shipped. Testing the helper proves the helper; only this level proves the outcome.
+void TranslationManager::applyFetchedLanguage(const QString& langCode, const QJsonObject& root)
+{
+    // MERGE the download into what is already here — do not replace it.
+    //
+    // This used to write `data` straight over the language file. That made the Update button
+    // destructive: the server's copy is whatever was last submitted by someone, and a machine
+    // that has since AI-translated the gaps holds far more than that. One click replaced 3429
+    // German strings with the server's 1515 and silently discarded the difference, twice, on
+    // this machine. Nothing uploads automatically, so a richer local set is the NORMAL state,
+    // not an edge case.
+    //
+    // The automatic check at launch has always merged (mergeLanguageUpdate) and preserved user
+    // overrides. That the manual button did the opposite was the whole bug — the same action,
+    // by two paths, with opposite outcomes.
+    //
+    // Merging is also what makes the overrides file meaningful: it stores only KEY NAMES, and
+    // the text they refer to lives in this file. Replacing the file therefore threw away the
+    // user's own wording while leaving the key still marked as customised.
+    if (langCode == m_currentLanguage) {
+        // Loaded language: merge in memory, which preserves overrides, then persist that.
+        //
+        // The return value MUST be honoured. It used to be void, so a refusal here fell through
+        // to the success emit at the end of this function: the user got languageDownloaded(false)
+        // immediately followed by languageDownloaded(true), and both QML handlers act on the
+        // second. The Update button reported success having applied nothing — and worse, the
+        // success branch then offers to AI-translate, which writes the file and destroys exactly
+        // what the refusal had just protected. The guard was defeated by its own caller.
+        if (!mergeLanguageUpdate(root["translations"].toObject())) {
+            emit languageDownloaded(langCode, false, m_lastError);
+            return;
+        }
+    } else {
+        // Not the active language, so it is not in memory: merge on the FILE instead. Split out
+        // so it can be tested — the destructive-replace bug lived in exactly this branch, and a
+        // network-reply slot is not reachable from a test.
+        if (!mergeDownloadedLanguageFile(langCode, root))
+            return;   // helper has already warned and emitted languageDownloaded(false, ...)
+    }
+
+    // Update metadata
+    m_languageMetadata[langCode] = QVariantMap{
+        {"displayName", root["displayName"].toString(langCode)},
+        {"nativeName", root["nativeName"].toString(langCode)},
+        {"isRtl", root["isRtl"].toBool(false)},
+        {"isRemote", false}  // Now downloaded locally
+    };
+    // Warn-and-continue, not refuse: the translations themselves persisted above, so the
+    // download genuinely succeeded. A lost metadata write can hide the language from the picker
+    // after a restart, but addLanguage() now preserves an orphaned file, so re-adding recovers
+    // it. The helper has set lastError, which the toast surfaces.
+    if (!saveLanguageMetadata()) {
+        DIAG_WARN(APP, "TranslationManager") << "Downloaded" << langCode << "but its metadata could not be saved -"
+                   << "the language may be missing from the picker after a restart";
+    }
+
+    // Update available languages list (overwrites, no duplicates)
+    m_availableLanguages = m_languageMetadata.keys();
+    emit availableLanguagesChanged();
+
+    // No reload for the current language: mergeLanguageUpdate() above already folded the
+    // download into the in-memory map, saved it, and refreshed the counts. Re-reading the file
+    // here would be harmless but pointless — and reloading BEFORE that merge existed is
+    // precisely how the replaced file became the live state.
+    if (langCode != m_currentLanguage) {
+        recalculateUntranslatedCount();
+    }
+
+    // Always increment version to refresh UI (language list colors/percentages)
+    m_translationVersion++;
+    emit translationsChanged();
+
+    emit languageDownloaded(langCode, true, QString());
+    DIAG_DEBUG(APP, "TranslationManager") << "Downloaded language:" << langCode;
+}
+
+void TranslationManager::onLanguageFileFetched(QNetworkReply* reply)
+{
+    reply->deleteLater();
+    QString langCode = m_downloadingLangCode;
+
+    if (reply->error() != QNetworkReply::NoError) {
+        // Check for 429 Too Many Requests - retry after delay
+        int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (statusCode == 429 && m_downloadRetryCount < MAX_RETRIES) {
+            m_downloadRetryCount++;
+            DIAG_DEBUG(APP, "TranslationManager") << "Download rate limited (429), retrying in" << (RETRY_DELAY_MS / 1000)
+                     << "seconds... (attempt" << m_downloadRetryCount << "of" << MAX_RETRIES << ")";
+
+            // Show retry status to user
+            m_retryStatus = QString("Server busy, retrying download %1/%2...").arg(m_downloadRetryCount).arg(MAX_RETRIES);
+            emit retryStatusChanged();
+
+            // Schedule retry after delay (keep m_downloading true and m_downloadingLangCode set)
+            QTimer::singleShot(RETRY_DELAY_MS, this, [this, langCode]() {
+                QString url = QString("%1/v1/translations/languages/%2").arg(TRANSLATION_API_BASE, langCode);
+                DIAG_DEBUG(APP, "TranslationManager") << "Retrying download from:" << url;
+
+                QNetworkRequest request{QUrl(url)};
+                QNetworkReply* retryReply = m_networkManager->get(request);
+
+                connect(retryReply, &QNetworkReply::finished, this, [this, retryReply]() {
+                    onLanguageFileFetched(retryReply);
+                });
+            });
+            return;
+        }
+
+        m_downloading = false;
+        m_downloadingLangCode.clear();
+        m_downloadRetryCount = 0;
+        m_retryStatus.clear();
+        emit retryStatusChanged();
+        emit downloadingChanged();
+
+        m_lastError = QString("Failed to download %1: %2").arg(langCode, reply->errorString());
+        emit lastErrorChanged();
+        emit languageDownloaded(langCode, false, m_lastError);
+        DIAG_WARN(APP, "TranslationManager") << m_lastError;
+        return;
+    }
+
+    // Success - reset state
+    m_downloading = false;
+    m_downloadingLangCode.clear();
+    m_downloadRetryCount = 0;
+    if (!m_retryStatus.isEmpty()) {
+        m_retryStatus.clear();
+        emit retryStatusChanged();
+    }
+    emit downloadingChanged();
+
+    QByteArray data = reply->readAll();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+
+    if (!doc.isObject()) {
+        m_lastError = "Invalid translation file format";
+        emit lastErrorChanged();
+        emit languageDownloaded(langCode, false, m_lastError);
+        return;
+    }
+
+    const QJsonObject root = doc.object();
+
+    applyFetchedLanguage(langCode, root);
+}
+
+namespace {
+int propagateTranslationValues(const QMap<QString, QString>& registry,
+                               QMap<QString, QString>& translations, QSet<QString>& aiGenerated)
+{
+    // Build map of normalized fallback -> first found translation
+    QMap<QString, QPair<QString, bool>> fallbackToTranslation;  // normalized fallback -> (translation, isAiGenerated)
+
+    for (auto it = registry.constBegin(); it != registry.constEnd(); ++it) {
+        QString normalizedFallback = it.value().trimmed();
+        if (normalizedFallback.isEmpty()) continue;  // Skip empty fallbacks
+        if (!fallbackToTranslation.contains(normalizedFallback)) {
+            QString translation = translations.value(it.key());
+            if (!translation.isEmpty()) {
+                bool isAiGen = aiGenerated.contains(it.key());
+                fallbackToTranslation[normalizedFallback] = qMakePair(translation, isAiGen);
+            }
+        }
+    }
+
+    // Now propagate to all keys that don't have translations
+    int propagated = 0;
+    for (auto it = registry.constBegin(); it != registry.constEnd(); ++it) {
+        QString normalizedFallback = it.value().trimmed();
+        if (normalizedFallback.isEmpty()) continue;  // Skip empty fallbacks
+        if (translations.value(it.key()).isEmpty()) {
+            if (fallbackToTranslation.contains(normalizedFallback)) {
+                auto& pair = fallbackToTranslation[normalizedFallback];
+                translations[it.key()] = pair.first;
+                if (pair.second) {
+                    aiGenerated.insert(it.key());
+                }
+                propagated++;
+            }
+        }
+    }
+
+    return propagated;
+}
+
+QString writeTranslationPayload(const QString& path, const QByteArray& payload)
+{
+    QSaveFile file(path);
+    file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly) || file.write(payload) != payload.size() || !file.commit())
+        return QStringLiteral("writeFailed");
+    return {};
+}
+
+QString validateTranslationFile(const QJsonObject& root)
+{
+    static const QSet<QString> fields{QStringLiteral("language"), QStringLiteral("displayName"),
+        QStringLiteral("nativeName"), QStringLiteral("isRtl"), QStringLiteral("translations")};
+    for (auto it = root.begin(); it != root.end(); ++it)
+        if (!fields.contains(it.key())) return QStringLiteral("invalidSchema");
+    if (!root.value(QStringLiteral("language")).isString()
+        || !TranslationManager::isValidLanguageCode(root.value(QStringLiteral("language")).toString()))
+        return QStringLiteral("invalidLanguage");
+    for (const QString& field : {QStringLiteral("displayName"), QStringLiteral("nativeName")}) {
+        const QJsonValue value = root.value(field);
+        if (!value.isUndefined() && (!value.isString() || value.toString().isEmpty()
+            || value.toString().size() > 128 || value.toString().contains(QChar::Null)))
+            return QStringLiteral("invalidSchema");
+    }
+    if ((root.contains(QStringLiteral("isRtl")) && !root.value(QStringLiteral("isRtl")).isBool())
+        || !root.value(QStringLiteral("translations")).isObject())
+        return QStringLiteral("invalidSchema");
+    const QJsonObject translations = root.value(QStringLiteral("translations")).toObject();
+    if (translations.size() > TranslationCatalog::MaximumEntries)
+        return QStringLiteral("sizeLimit");
+    qsizetype textUnits = 0;
+    for (auto it = translations.begin(); it != translations.end(); ++it) {
+        if (it.key().isEmpty() || it.key().size() > TranslationCatalog::MaximumKeyLength
+            || it.key().contains(QChar::Null) || !it.value().isString()
+            || it.value().toString().size() > TranslationCatalog::MaximumTextLength)
+            return QStringLiteral("invalidSchema");
+        textUnits += it.key().size() + it.value().toString().size();
+        if (textUnits > TranslationCatalog::MaximumCombinedTextUnits)
+            return QStringLiteral("sizeLimit");
+    }
+    return {};
+}
+}
+
+bool TranslationManager::isValidLanguageCode(const QString& code)
+{
+    static const QRegularExpression pattern(QStringLiteral("^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$"));
+    return code.size() <= TranslationCatalog::MaximumLanguageLength && pattern.match(code).hasMatch();
+}
+
+TranslationManager::FileSnapshot TranslationManager::captureFileSnapshot() const
+{
+    return {m_currentLanguage, m_catalogRevision, translationsDir(), m_stringRegistry, m_translations,
+        m_aiGenerated, m_userOverrides, {{QStringLiteral("displayName"), getLanguageDisplayName(m_currentLanguage)},
+                       {QStringLiteral("nativeName"), getLanguageNativeName(m_currentLanguage)},
+                       {QStringLiteral("isRtl"), isRtlLanguage(m_currentLanguage)}}, m_translationsLoadFailed};
+}
+
+bool TranslationManager::applyTransferredOverrides(const QStringList& keys, bool replace)
+{
+    if (m_autoTranslating) return false;
+    if (m_currentLanguage == QLatin1String("en")) return true;
+    const QSet<QString> previous = m_userOverrides;
+    const QSet<QString> previousGenerated = m_aiGenerated;
+    const auto previousAiTranslations = m_aiTranslations;
+    if (replace) {
+        m_userOverrides.clear();
+        m_aiGenerated.clear();
+        m_aiTranslations.clear();
+    }
+    for (const QString& key : keys) {
+        if (m_translations.contains(key)) {
+            m_userOverrides.insert(key);
+            m_aiGenerated.remove(key);
+        }
+    }
+    if (saveUserOverrides() && saveAiTranslations()) {
+        ++m_translationVersion;
+        emit translationsChanged();
+        return true;
+    }
+    m_userOverrides = previous;
+    m_aiGenerated = previousGenerated;
+    m_aiTranslations = previousAiTranslations;
+    return false;
+}
+
+QString TranslationManager::writeTranslationExport(const FileSnapshot& snapshot, const QString& filePath)
+{
+    if (snapshot.loadFailed) return QStringLiteral("failedLoad");
+    QJsonObject translations;
+    for (auto it = snapshot.translations.constBegin(); it != snapshot.translations.constEnd(); ++it)
+        translations.insert(it.key(), it.value());
+    QJsonObject root = QJsonObject::fromVariantMap(snapshot.metadata);
+    root.insert(QStringLiteral("language"), snapshot.currentLanguage);
+    root.insert(QStringLiteral("translations"), translations);
+    const QString error = validateTranslationFile(root);
+    if (!error.isEmpty()) return error;
+    const QByteArray payload = QJsonDocument(root).toJson();
+    if (payload.size() > TranslationCatalog::MaximumPayloadBytes) return QStringLiteral("sizeLimit");
+    return writeTranslationPayload(filePath, payload);
+}
+
+void TranslationManager::addLanguageToBackup(QJsonObject& backup, const FileSnapshot& snapshot)
+{
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("language.json"));
+    const QString error = directory.isValid() ? writeTranslationExport(snapshot, path)
+                                               : QStringLiteral("writeFailed");
+    QFile file(path);
+    if (error.isEmpty() && file.open(QIODevice::ReadOnly)) {
+        const QJsonDocument language = QJsonDocument::fromJson(file.readAll());
+        if (language.isObject()) {
+            QJsonArray overrides;
+            for (const QString& key : snapshot.userOverrides)
+                if (snapshot.translations.contains(key)) overrides.append(key);
+            backup.insert(QStringLiteral("language"), snapshot.currentLanguage);
+            backup.insert(QStringLiteral("languageTranslation"), language.object());
+            backup.insert(QStringLiteral("languageOverrides"), overrides);
+        }
+    }
+    if (!backup.contains(QStringLiteral("languageTranslation")))
+        backup.insert(QStringLiteral("languageTranslationError"), true);
+}
+
+bool TranslationManager::readBackupOverrides(const QJsonObject& language, const QJsonValue& value,
+                                             QStringList* keys)
+{
+    if (!keys || !value.isArray()) return false;
+    const QJsonArray array = value.toArray();
+    const QJsonObject translations = language.value(QStringLiteral("translations")).toObject();
+    if (array.size() > TranslationCatalog::MaximumEntries) return false;
+    for (const QJsonValue& item : array) {
+        if (!item.isString() || item.toString().size() > TranslationCatalog::MaximumKeyLength
+            || !translations.contains(item.toString())) return false;
+        keys->append(item.toString());
+    }
+    return true;
+}
+
+bool TranslationManager::exportTranslation(const QString& filePath)
+{
+    const QString error = writeTranslationExport(captureFileSnapshot(), filePath);
+    if (error.isEmpty()) return true;
+    m_lastError = tr("The translations could not be exported. Check the language file and destination.");
+    emit lastErrorChanged();
+    return false;
+}
+
+TranslationManager::PreparedImport TranslationManager::prepareTranslationImport(
+    const FileSnapshot& snapshot, const QString& filePath, const QString& expectedLanguage, bool replace)
+{
+    PreparedImport prepared;
+    prepared.baseLanguage = snapshot.currentLanguage;
+    prepared.baseRevision = snapshot.revision;
+    const auto refuse = [&prepared](const QString& reason) {
+        prepared.reason = reason;
+        return prepared;
+    };
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly) || file.size() <= 0
+        || file.size() > TranslationCatalog::MaximumPayloadBytes)
+        return refuse(QStringLiteral("readFailed"));
+    const QByteArray data = file.read(TranslationCatalog::MaximumPayloadBytes + 1);
+    const bool inputRead = file.error() == QFileDevice::NoError
+        && data.size() <= TranslationCatalog::MaximumPayloadBytes && data.size() == file.size();
+    file.close();
+    if (!inputRead)
+        return refuse(QStringLiteral("readFailed"));
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(data, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject())
+        return refuse(QStringLiteral("invalidSchema"));
+    const QJsonObject root = document.object();
+    const QString schemaError = validateTranslationFile(root);
+    if (!schemaError.isEmpty())
+        return refuse(schemaError);
+    const QString langCode = root.value(QStringLiteral("language")).toString();
+    prepared.language = langCode;
+    if (!expectedLanguage.isEmpty() && langCode != expectedLanguage)
+        return refuse(QStringLiteral("languageMismatch"));
+    const QJsonObject incoming = root.value(QStringLiteral("translations")).toObject();
+    for (auto it = incoming.begin(); it != incoming.end(); ++it) {
+        const QString source = snapshot.registry.value(it.key());
+        const QString text = it.value().toString();
+        // Placeholders only: a symbols-only value may be the user's own choice, and refusing
+        // here fails a whole backup restore.
+        if (!source.isEmpty() && !text.isEmpty() && placeholderSet(source) != placeholderSet(text))
+            return refuse(QStringLiteral("invalidPlaceholders"));
+    }
+    const QString destPath = snapshot.directory + QLatin1Char('/') + langCode + QStringLiteral(".json");
+    QJsonObject merged;
+    QFile existing(destPath);
+    if (!replace && existing.exists()) {
+        if (!existing.open(QIODevice::ReadOnly) || existing.size() <= 0
+            || existing.size() > TranslationCatalog::MaximumPayloadBytes)
+            return refuse(QStringLiteral("existingFileInvalid"));
+        const QByteArray localData = existing.read(TranslationCatalog::MaximumPayloadBytes + 1);
+        const bool localRead = existing.error() == QFileDevice::NoError
+            && localData.size() <= TranslationCatalog::MaximumPayloadBytes && localData.size() == existing.size();
+        existing.close();
+        const QJsonDocument localDocument = QJsonDocument::fromJson(localData, &parseError);
+        if (!localRead || parseError.error != QJsonParseError::NoError || !localDocument.isObject()
+            || !validateTranslationFile(localDocument.object()).isEmpty()
+            || localDocument.object().value(QStringLiteral("language")).toString() != langCode)
+            return refuse(QStringLiteral("existingFileInvalid"));
+        merged = localDocument.object().value(QStringLiteral("translations")).toObject();
+    }
+    // Missing keys remain local; importing an older backup never deletes later work.
+    for (auto it = incoming.begin(); it != incoming.end(); ++it)
+        merged.insert(it.key(), it.value());
+    prepared.destination = destPath;
+    prepared.importedEntries = static_cast<int>(incoming.size());
+    prepared.aiGenerated = replace ? QSet<QString>{} : snapshot.aiGenerated;
+    prepared.metadata = {{QStringLiteral("displayName"), root.value(QStringLiteral("displayName")).toString(langCode)},
+        {QStringLiteral("nativeName"), root.value(QStringLiteral("nativeName")).toString(langCode)},
+        {QStringLiteral("isRtl"), root.value(QStringLiteral("isRtl")).toBool(false)},
+        {QStringLiteral("isRemote"), false}};
+    for (auto it = merged.constBegin(); it != merged.constEnd(); ++it)
+        prepared.translations.insert(it.key(), it.value().toString());
+    if (langCode == snapshot.currentLanguage && langCode != QLatin1String("en"))
+        propagateTranslationValues(snapshot.registry, prepared.translations, prepared.aiGenerated);
+    QMap<QString, bool> unique;
+    for (auto it = snapshot.registry.constBegin(); it != snapshot.registry.constEnd(); ++it) {
+        const bool translated = !prepared.translations.value(it.key()).isEmpty();
+        if (!it.value().trimmed().isEmpty() && !translated) ++prepared.untranslatedCount;
+        unique[it.value()] = unique.value(it.value(), false) || translated;
+    }
+    prepared.uniqueStringCount = static_cast<int>(unique.size());
+    for (bool translated : std::as_const(unique))
+        if (!translated) ++prepared.uniqueUntranslatedCount;
+    QJsonObject output = root;
+    merged = {};
+    for (auto it = prepared.translations.constBegin(); it != prepared.translations.constEnd(); ++it)
+        merged.insert(it.key(), it.value());
+    output.insert(QStringLiteral("translations"), merged);
+    const QString mergedError = validateTranslationFile(output);
+    if (!mergedError.isEmpty()) return refuse(mergedError);
+    prepared.payload = QJsonDocument(output).toJson();
+    if (prepared.payload.size() > TranslationCatalog::MaximumPayloadBytes)
+        return refuse(QStringLiteral("sizeLimit"));
+    return prepared;
+}
+
+QVariantMap TranslationManager::commitTranslationImport(const PreparedImport& prepared)
+{
+    QVariantMap result{{QStringLiteral("success"), false}, {QStringLiteral("reason"), QString()},
+        {QStringLiteral("language"), prepared.language}, {QStringLiteral("translationsSaved"), false},
+        {QStringLiteral("metadataSaved"), false}, {QStringLiteral("importedEntries"), 0}};
+    QString error = prepared.reason;
+    if (m_autoTranslating)
+        error = QStringLiteral("busy");
+    if (prepared.baseLanguage != m_currentLanguage || prepared.baseRevision != m_catalogRevision)
+        error = QStringLiteral("staleContext");
+    // Discrete guarded commit only; parsing/merging/serialization run off-thread.
+    // Mac populated-registry fixture, 4k/10k entries: median/worst core commit
+    // 3.360/3.907 ms and 8.069/8.989 ms (tst_translationsourcedrift, 2026-10-23).
+    if (error.isEmpty()) error = writeTranslationPayload(prepared.destination, prepared.payload);
+    if (!error.isEmpty()) {
+        result.insert(QStringLiteral("reason"), error);
+        m_lastError = tr("The translation file could not be imported. The language data is unchanged.");
+        emit lastErrorChanged();
+        return result;
+    }
+    result.insert(QStringLiteral("translationsSaved"), true);
+    result.insert(QStringLiteral("importedEntries"), prepared.importedEntries);
+    m_languageMetadata[prepared.language] = prepared.metadata;
+    const bool metadataSaved = saveLanguageMetadata();
+    result.insert(QStringLiteral("metadataSaved"), metadataSaved);
+    result.insert(QStringLiteral("success"), metadataSaved);
+    result.insert(QStringLiteral("reason"), metadataSaved ? QString() : QStringLiteral("metadataWriteFailed"));
+    m_availableLanguages = m_languageMetadata.keys();
+    if (prepared.language == m_currentLanguage) {
+        m_translations = prepared.translations;
+        m_aiGenerated = prepared.aiGenerated;
+        m_translationsLoadFailed = false;
+        m_untranslatedCount = prepared.untranslatedCount;
+        ++m_translationVersion;
+        emit untranslatedCountChanged();
+        emit translationsChanged();
+    }
+    emit availableLanguagesChanged();
+    return result;
+}
+
+QVariantMap TranslationManager::importTranslation(const QString& filePath, const QString& expectedLanguage)
+{
+    return commitTranslationImport(prepareTranslationImport(captureFileSnapshot(), filePath, expectedLanguage));
+}
+
+QJsonObject TranslationManager::currentLanguageDocument(const QJsonObject& translations) const
+{
+    QJsonObject root;
+    root["language"] = m_currentLanguage;
+    root["displayName"] = getLanguageDisplayName(m_currentLanguage);
+    root["nativeName"] = getLanguageNativeName(m_currentLanguage);
+    root["isRtl"] = isRtlLanguage(m_currentLanguage);
+    root["translations"] = translations;
+    return root;
+}
+
+void TranslationManager::submitTranslation()
+{
+    if (m_uploading) {
+        // Silent no-op, and the batch has no other way to advance: if this is ever reached from
+        // the batch it stalls with m_batchProcessing stuck true, which then blocks every future
+        // batch for the life of the process. Say so rather than returning quietly.
+        DIAG_WARN(APP, "TranslationManager") << "submitTranslation ignored - an upload is already in progress for"
+                   << m_currentLanguage;
+        emit translationSubmitted(false, tr("An upload is already in progress."));
+        return;
+    }
+
+    // Never publish a map that is empty by failure. This is the same ambiguity as the save and
+    // merge guards, but with the widest blast radius: the upload replaces the SERVER's copy for
+    // every user of this language, not just this machine's file. Reachable from the same
+    // corrupt-file-shows-0% state, and from the batch, which uploads without asking.
+    if (m_translationsLoadFailed) {
+        DIAG_WARN(APP, "TranslationManager") << "Refusing to upload" << m_currentLanguage
+                   << "- its local file could not be read, so the in-memory map is empty by"
+                   << "failure. Publishing it would overwrite the community copy with nothing.";
+        m_lastError = tr("The %1 file could not be read, so nothing was uploaded.")
+                          .arg(m_currentLanguage);
+        emit lastErrorChanged();
+        emit translationSubmitted(false, m_lastError);
+        return;
+    }
+
+    // Reset retry counter for new upload
+    m_uploadRetryCount = 0;
+
+    if (m_currentLanguage == "en") {
+        m_lastError = "Cannot submit English - it's the base language";
+        emit lastErrorChanged();
+        emit translationSubmitted(false, m_lastError);
+        return;
+    }
+
+    // The upload replaces the server copy for every user of this language, so a value the merge
+    // would refuse is not sent: a stale local one would otherwise outlive any server repair.
+    QJsonObject translations;
+    int withheld = 0;
+    for (auto it = m_translations.constBegin(); it != m_translations.constEnd(); ++it) {
+        if (const QString defect = translationDefect(m_stringRegistry.value(it.key()), it.value());
+            !defect.isEmpty()) {
+            DIAG_WARN(APP, "TranslationManager").noquote() << "Not uploading translation for" << it.key()
+                                 << "-" << defect << ". source=" << m_stringRegistry.value(it.key())
+                                 << "value=" << it.value();
+            ++withheld;
+            continue;
+        }
+        translations[it.key()] = it.value();
+    }
+    if (withheld > 0)
+        DIAG_WARN(APP, "TranslationManager") << "Upload of" << m_currentLanguage << "withheld"
+                                             << withheld << "broken string(s)";
+    if (translations.isEmpty() && withheld > 0) {
+        m_lastError = tr("None of the %1 translations fit the English text, so nothing was uploaded.")
+                          .arg(m_currentLanguage);
+        emit lastErrorChanged();
+        emit translationSubmitted(false, m_lastError);
+        return;
+    }
+    m_uploadWithheld = withheld;
+    const QJsonObject root = currentLanguageDocument(translations);
+
+    // Store the data for upload after we get the pre-signed URL
+    m_pendingUploadData = QJsonDocument(root).toJson();
+    m_uploadingLangCode = m_currentLanguage;   // pin: the retry must not re-derive this later
+
+    m_uploading = true;
+    emit uploadingChanged();
+
+    // Request a pre-signed URL from the backend, passing the language code
+    QString uploadUrlEndpoint = QString("%1/v1/translations/upload-url?lang=%2").arg(TRANSLATION_API_BASE, m_currentLanguage);
+    QNetworkRequest request{QUrl(uploadUrlEndpoint)};
+    QNetworkReply* reply = m_networkManager->get(request);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        onUploadUrlReceived(reply);
+    });
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Requesting upload URL from:" << uploadUrlEndpoint;
+}
+
+void TranslationManager::onUploadUrlReceived(QNetworkReply* reply)
+{
+    reply->deleteLater();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        // Check for 429 Too Many Requests - retry after delay
+        int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (statusCode == 429 && m_uploadRetryCount < MAX_RETRIES) {
+            m_uploadRetryCount++;
+            DIAG_DEBUG(APP, "TranslationManager") << "Upload rate limited (429), retrying in" << (RETRY_DELAY_MS / 1000)
+                     << "seconds... (attempt" << m_uploadRetryCount << "of" << MAX_RETRIES << ")";
+
+            // Show retry status to user
+            m_retryStatus = QString("Upload rate limited, retrying %1/%2...")
+                                .arg(m_uploadRetryCount).arg(MAX_RETRIES);
+            emit retryStatusChanged();
+
+            // Schedule retry after delay.
+            //
+            // Capture the language this upload is FOR. Reading m_currentLanguage inside the
+            // lambda meant the retry asked for an upload URL for whatever language was selected
+            // 30 seconds later, while m_pendingUploadData still held the payload captured for
+            // the original one. Nothing stops the user switching language while a rate-limited
+            // upload waits — m_uploading gates submitTranslation(), not setCurrentLanguage() —
+            // so uploading French, hitting 429, and switching to German published the French
+            // strings as the German community copy, then reported "Translation for German
+            // submitted successfully! Thank you for contributing."
+            //
+            // Up to MAX_RETRIES chances per upload, on the status this file documents as the
+            // ordinary one. The blast radius is every user of that language, not this machine.
+            const QString uploadLang = m_uploadingLangCode.isEmpty() ? m_currentLanguage
+                                                                     : m_uploadingLangCode;
+            QTimer::singleShot(RETRY_DELAY_MS, this, [this, uploadLang]() {
+                if (uploadLang != m_uploadingLangCode) {
+                    DIAG_WARN(APP, "TranslationManager") << "Abandoning upload retry for" << uploadLang
+                               << "- the pending upload is now for" << m_uploadingLangCode;
+                    return;
+                }
+                // Re-request the upload URL
+                QString uploadUrlEndpoint = QString("%1/v1/translations/upload-url?lang=%2")
+                    .arg(TRANSLATION_API_BASE)
+                    .arg(uploadLang);
+
+                QNetworkRequest request{QUrl(uploadUrlEndpoint)};
+                QNetworkReply* retryReply = m_networkManager->get(request);
+
+                connect(retryReply, &QNetworkReply::finished, this, [this, retryReply]() {
+                    onUploadUrlReceived(retryReply);
+                });
+
+                DIAG_DEBUG(APP, "TranslationManager") << "Retrying upload URL request...";
+            });
+            return;
+        }
+
+        m_uploading = false;
+        m_uploadRetryCount = 0;  // Reset for next upload
+        m_retryStatus.clear();
+        emit retryStatusChanged();
+        const int statusCodeFinal = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        m_lastError = statusCodeFinal == 429
+            ? QString("Upload limit reached. The server allows a limited number of translation "
+                      "uploads per hour — try again in up to %1 minutes.")
+                  .arg(RATE_LIMIT_WINDOW_MINUTES)
+            : QString("Failed to get upload URL: %1").arg(reply->errorString());
+        emit uploadingChanged();
+        emit lastErrorChanged();
+        emit translationSubmitted(false, m_lastError);
+        DIAG_WARN(APP, "TranslationManager") << m_lastError;
+        return;
+    }
+
+    // Success - reset retry counter and clear status
+    m_uploadRetryCount = 0;
+    if (!m_retryStatus.isEmpty()) {
+        m_retryStatus.clear();
+        emit retryStatusChanged();
+    }
+
+    QByteArray data = reply->readAll();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+
+    if (!doc.isObject()) {
+        m_uploading = false;
+        m_lastError = "Invalid response from upload server";
+        emit uploadingChanged();
+        emit lastErrorChanged();
+        emit translationSubmitted(false, m_lastError);
+        return;
+    }
+
+    QJsonObject root = doc.object();
+    QString uploadUrl = root["url"].toString();
+
+    if (uploadUrl.isEmpty()) {
+        m_uploading = false;
+        m_lastError = "No upload URL in response";
+        emit uploadingChanged();
+        emit lastErrorChanged();
+        emit translationSubmitted(false, m_lastError);
+        return;
+    }
+
+    // Now upload the translation file to S3 using the pre-signed URL
+    QNetworkRequest uploadRequest{QUrl(uploadUrl)};
+    uploadRequest.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+
+    QNetworkReply* uploadReply = m_networkManager->put(uploadRequest, m_pendingUploadData);
+
+    connect(uploadReply, &QNetworkReply::finished, this, [this, uploadReply]() {
+        onTranslationUploaded(uploadReply);
+    });
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Uploading translation to S3...";
+}
+
+void TranslationManager::onTranslationUploaded(QNetworkReply* reply)
+{
+    reply->deleteLater();
+    m_uploading = false;
+    m_pendingUploadData.clear();
+    emit uploadingChanged();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        m_lastError = QString("Failed to upload translation: %1").arg(reply->errorString());
+        emit lastErrorChanged();
+        emit translationSubmitted(false, m_lastError);
+        DIAG_WARN(APP, "TranslationManager") << m_lastError;
+        return;
+    }
+
+    // Name the language that was actually uploaded. The retry fix pinned the URL to
+    // m_uploadingLangCode but left this reading m_currentLanguage, so a rate-limited French
+    // upload completing after a switch to German still announced a successful GERMAN
+    // contribution — the exact wrong report the fix's own comment quotes.
+    QString message = tr("Translation for %1 submitted successfully! Thank you for contributing.")
+                          .arg(getLanguageDisplayName(m_uploadingLangCode.isEmpty() ? m_currentLanguage : m_uploadingLangCode));
+    if (m_uploadWithheld > 0)
+        message += QLatin1Char(' ') + tr("%1 string(s) were not uploaded because they do not fit the English text.")
+                                          .arg(m_uploadWithheld);
+    emit translationSubmitted(true, message);
+    DIAG_DEBUG(APP, "TranslationManager") << message;
+}
+
+// --- Utility ---
+
+QVariantList TranslationManager::getUntranslatedStrings() const
+{
+    QVariantList result;
+
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        if (!m_translations.contains(it.key()) || m_translations.value(it.key()).isEmpty()) {
+            result.append(QVariantMap{
+                {"key", it.key()},
+                {"fallback", it.value()}
+            });
+        }
+    }
+
+    return result;
+}
+
+QVariantList TranslationManager::getAllStrings() const
+{
+    QVariantList result;
+
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        QString fallback = it.value();
+        QString translation = m_translations.value(it.key());
+        QString aiTranslation = m_aiTranslations.value(fallback);
+        bool isTranslated = !translation.isEmpty();
+        bool isAiGen = m_aiGenerated.contains(it.key());
+
+        result.append(QVariantMap{
+            {"key", it.key()},
+            {"fallback", fallback},
+            {"translation", translation},
+            {"isTranslated", isTranslated},
+            {"aiTranslation", aiTranslation},
+            {"isAiGenerated", isAiGen}
+        });
+    }
+
+    return result;
+}
+
+bool TranslationManager::isRtlLanguage(const QString& langCode) const
+{
+    if (m_languageMetadata.contains(langCode)) {
+        return m_languageMetadata[langCode]["isRtl"].toBool();
+    }
+
+    // Common RTL languages
+    static const QStringList rtlLanguages = {"ar", "he", "fa", "ur"};
+    return rtlLanguages.contains(langCode);
+}
+
+bool TranslationManager::isRemoteLanguage(const QString& langCode) const
+{
+    if (m_languageMetadata.contains(langCode)) {
+        return m_languageMetadata[langCode]["isRemote"].toBool();
+    }
+    return false;
+}
+
+bool TranslationManager::communityLanguageAvailable(const QString& langCode) const
+{
+    return !m_communityCatalogKnown || m_communityLanguages.contains(langCode);
+}
+
+bool TranslationManager::needsCommunityDownload(const QString& langCode) const
+{
+    if (langCode == QLatin1String("en")) return false;
+    return isRemoteLanguage(langCode)
+        || (m_communityCatalogKnown && m_communityLanguages.contains(langCode)
+            && !QFile::exists(languageFilePath(langCode)));
+}
+
+int TranslationManager::getTranslationPercent(const QString& langCode) const
+{
+    if (langCode == "en") {
+        return 100;  // English is always complete
+    }
+
+    // Count total strings (excluding empty fallbacks)
+    int total = 0;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        if (!it.value().trimmed().isEmpty()) {
+            total++;
+        }
+    }
+    if (total == 0) return 0;
+
+    // For current language, use cached untranslated count
+    if (langCode == m_currentLanguage) {
+        int translated = total - m_untranslatedCount;
+        return (translated * 100) / total;
+    }
+
+    // For other languages, read from file
+    QFile file(languageFilePath(langCode));
+    if (!file.open(QIODevice::ReadOnly)) {
+        return 0;
+    }
+
+    QByteArray data = file.readAll();
+    file.close();
+
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject()) {
+        return 0;
+    }
+
+    QJsonObject root = doc.object();
+    QJsonObject translations = root["translations"].toObject();
+
+    // Count keys that have translations (excluding empty fallbacks)
+    int translated = 0;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        if (it.value().trimmed().isEmpty()) continue;  // Skip empty fallbacks
+        if (translations.contains(it.key()) && !translations.value(it.key()).toString().isEmpty()) {
+            translated++;
+        }
+    }
+
+    return (translated * 100) / total;
+}
+
+QVariantList TranslationManager::getGroupedStrings() const
+{
+    return getGroupedStringsPage(0, std::numeric_limits<int>::max());
+}
+
+QVariantList TranslationManager::getGroupedStringsPage(int offset, int limit) const
+{
+    QVariantList result;
+    if (offset < 0 || limit <= 0)
+        return result;
+    int eligibleIndex = 0;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        QString key = it.key();
+        QString fallback = it.value();
+
+        // Skip empty fallbacks - they're not real translatable strings
+        if (fallback.trimmed().isEmpty()) continue;
+        if (eligibleIndex++ < offset) continue;
+        if (result.size() >= limit) break;
+
+        QString translation = m_translations.value(key);
+        bool isAiGen = m_aiGenerated.contains(key);
+
+        // Look up AI translation by normalized fallback
+        QString aiTranslation = m_aiTranslations.value(fallback.trimmed());
+        if (aiTranslation.isEmpty()) {
+            aiTranslation = m_aiTranslations.value(fallback);  // Try exact match too
+        }
+
+        result.append(QVariantMap{
+            {"key", key},
+            {"fallback", fallback},
+            {"translation", translation},
+            {"aiTranslation", aiTranslation},
+            {"isTranslated", !translation.isEmpty()},
+            {"isAiGenerated", isAiGen},
+            // Keep these for compatibility with QML that might use them
+            {"keyCount", 1},
+            {"isSplit", false}
+        });
+    }
+
+    return result;
+}
+
+int TranslationManager::groupedStringCount() const
+{
+    int count = 0;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        if (!it.value().trimmed().isEmpty())
+            ++count;
+    }
+    return count;
+}
+
+QStringList TranslationManager::getKeysForFallback(const QString& fallback) const
+{
+    QStringList keys;
+    QString normalizedFallback = fallback.trimmed();
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        // Use trimmed comparison for robustness against whitespace differences
+        if (it.value().trimmed() == normalizedFallback) {
+            keys.append(it.key());
+        }
+    }
+    return keys;
+}
+
+bool TranslationManager::setGroupTranslation(const QString& fallback, const QString& translation)
+{
+    QStringList keys = getKeysForFallback(fallback);
+    if (keys.isEmpty())
+        return false;
+
+    // Snapshot so the edit can be rolled back if it cannot be persisted. Showing the user an
+    // edit that did not reach disk is the failure this whole area is about: they see it applied,
+    // close the app, and it is gone — with nothing having said so at any point.
+    QMap<QString, QString> previous;
+    QSet<QString> previouslyAiGenerated;
+    for (const QString& key : keys) {
+        if (m_translations.contains(key))
+            previous[key] = m_translations.value(key);
+        if (m_aiGenerated.contains(key))
+            previouslyAiGenerated.insert(key);
+    }
+
+    for (const QString& key : keys) {
+        if (translation.isEmpty()) {
+            m_translations.remove(key);
+        } else {
+            m_translations[key] = translation;
+        }
+        m_aiGenerated.remove(key);  // User edited, no longer AI-generated
+    }
+
+    if (!saveTranslations()) {
+        // Roll back rather than display an edit that was not kept. m_lastError is already set.
+        for (const QString& key : keys) {
+            if (previous.contains(key))
+                m_translations[key] = previous.value(key);
+            else
+                m_translations.remove(key);
+            if (previouslyAiGenerated.contains(key))
+                m_aiGenerated.insert(key);
+        }
+        DIAG_WARN(APP, "TranslationManager") << "Edit of" << fallback.left(40) << "was NOT saved and has been rolled back";
+        emit translationsChanged();   // repaint the reverted state, not the phantom edit
+        return false;
+    }
+
+    // Clear the AI translation here rather than leaving it to the caller.
+    //
+    // StringBrowserPage used to do this in the two lines AFTER calling this function, and those
+    // lines could not run: emit translationsChanged() below is synchronous, the page's handler
+    // calls stringModel.refresh(), and the ListView delegate whose function is mid-execution is
+    // destroyed underneath it. The result was a ReferenceError — "TranslationManager is not
+    // defined" — because the delegate's context had gone, so a manual edit never cleared the
+    // stale AI value. The setEditing() call after it was failing silently for the same reason.
+    //
+    // Doing it here also fixes a correctness bug the QML version had: it cleared the AI
+    // translation whether or not the edit was actually saved. Now it only happens on the path
+    // where the save succeeded, because the refusal above returns before reaching this.
+    if (!translation.isEmpty() && m_currentLanguage != QLatin1String("en"))
+        clearAiTranslation(fallback);
+
+    recalculateUntranslatedCount();
+    m_translationVersion++;
+    emit translationsChanged();
+    return true;
+}
+
+bool TranslationManager::isGroupSplit(const QString& fallback) const
+{
+    QStringList keys = getKeysForFallback(fallback);
+    if (keys.size() <= 1) return false;
+
+    QString firstTranslation;
+    bool hasFirst = false;
+
+    for (const QString& key : keys) {
+        QString translation = m_translations.value(key);
+        if (!translation.isEmpty()) {
+            if (!hasFirst) {
+                firstTranslation = translation;
+                hasFirst = true;
+            } else if (translation != firstTranslation) {
+                return true;  // Different translations found
+            }
+        }
+    }
+
+    return false;
+}
+
+void TranslationManager::mergeGroupTranslation(const QString& key)
+{
+    // Find the fallback for this key
+    QString fallback = m_stringRegistry.value(key);
+    if (fallback.isEmpty()) return;
+
+    // Find the most common translation among keys with this fallback
+    QStringList keys = getKeysForFallback(fallback);
+    QMap<QString, int> translationCounts;
+
+    for (const QString& k : keys) {
+        QString translation = m_translations.value(k);
+        if (!translation.isEmpty()) {
+            translationCounts[translation]++;
+        }
+    }
+
+    // Find the most common translation
+    QString mostCommon;
+    int maxCount = 0;
+    for (auto it = translationCounts.constBegin(); it != translationCounts.constEnd(); ++it) {
+        if (it.value() > maxCount) {
+            maxCount = it.value();
+            mostCommon = it.key();
+        }
+    }
+
+    // Set this key to use the most common translation
+    if (!mostCommon.isEmpty()) {
+        // Rollback on a refused save, like every other edit path: no QML calls this today, but
+        // it is a Q_INVOKABLE — one line of QML away from reachable — and an exposed mutator
+        // that displays a change it could not persist is the exact bug this file kept growing.
+        const bool hadPrevious = m_translations.contains(key);
+        const QString previous = m_translations.value(key);
+        m_translations[key] = mostCommon;
+        if (!saveTranslations()) {
+            if (hadPrevious) m_translations[key] = previous;
+            else m_translations.remove(key);
+            DIAG_WARN(APP, "TranslationManager") << "Group merge for" << key << "was NOT saved and has been rolled back";
+            return;
+        }
+        m_translationVersion++;
+        emit translationsChanged();
+    }
+}
+
+int TranslationManager::uniqueStringCount() const
+{
+    QSet<QString> uniqueFallbacks;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        uniqueFallbacks.insert(it.value());
+    }
+    return static_cast<int>(uniqueFallbacks.size());
+}
+
+int TranslationManager::uniqueUntranslatedCount() const
+{
+    // Count unique fallback texts that have NO translation for ANY of their keys
+    QMap<QString, bool> fallbackTranslated;
+
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        QString fallback = it.value();
+        QString translation = m_translations.value(it.key());
+
+        if (!fallbackTranslated.contains(fallback)) {
+            fallbackTranslated[fallback] = !translation.isEmpty();
+        } else if (!translation.isEmpty()) {
+            fallbackTranslated[fallback] = true;
+        }
+    }
+
+    int untranslated = 0;
+    for (auto it = fallbackTranslated.constBegin(); it != fallbackTranslated.constEnd(); ++it) {
+        if (!it.value()) {
+            untranslated++;
+        }
+    }
+
+    return untranslated;
+}
+
+// --- Private helpers ---
+
+void TranslationManager::loadTranslations()
+{
+    m_translations.clear();
+
+    // "No file yet" and "there is a file but I could not read it" both used to leave
+    // m_translations empty and indistinguishable, and that ambiguity is a data-loss bug rather
+    // than an untidiness: mergeLanguageUpdate() folds a download into this map and saves the
+    // result, so merging into a wrongly-empty map REPLACES the user's file with the server's
+    // copy. The likely sequence is bleak — a corrupt file shows the language at 0% translated,
+    // the user presses Update precisely because it says 0%, and that click destroys the strings
+    // the corrupt file still held.
+    m_translationsLoadFailed = false;
+
+    // Load translations for any language (including English customizations)
+    QFile file(languageFilePath(m_currentLanguage));
+    if (!file.exists()) {
+        DIAG_DEBUG(APP, "TranslationManager") << "No translation file for:" << m_currentLanguage;
+        return;   // genuinely absent: an empty map is the truth
+    }
+    if (!file.open(QIODevice::ReadOnly)) {
+        DIAG_WARN(APP, "TranslationManager") << "Translation file for" << m_currentLanguage << "exists but cannot be read:"
+                   << file.errorString() << "- refusing to treat it as empty";
+        m_translationsLoadFailed = true;
+        return;
+    }
+
+    QByteArray data = file.readAll();
+    file.close();
+
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject()) {
+        DIAG_WARN(APP, "TranslationManager") << "Invalid translation file for:" << m_currentLanguage
+                   << "- refusing to treat it as empty";
+        m_translationsLoadFailed = true;
+        return;
+    }
+
+    QJsonObject root = doc.object();
+    QJsonObject translations = root["translations"].toObject();
+
+    // Simple key -> translation format
+    for (auto it = translations.constBegin(); it != translations.constEnd(); ++it) {
+        m_translations[it.key()] = it.value().toString();
+    }
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Loaded" << m_translations.size() << "translations for:" << m_currentLanguage;
+}
+
+// Write a JSON document to `path` atomically, or report why not.
+//
+// Every persistence helper in this file used to be the same four lines — QFile, if(open),
+// write, close — with no else, no check of write()'s return, and a void signature. That shape
+// is what made a full disk or a read-only profile directory indistinguishable from success at
+// every call site, and it is why four review rounds each found another caller reporting work
+// it had not done.
+//
+// QSaveFile writes a temporary and renames on commit, so a failure leaves the previous file
+// exactly as it was. QIODevice::WriteOnly on a plain QFile truncates at open, which means the
+// old content is destroyed before the first byte of the new content is written — the very way
+// the corrupt files this class now has to guard against get made.
+bool TranslationManager::writeJsonFile(const QString& path, const QJsonDocument& doc,
+                                       const QString& what)
+{
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        DIAG_WARN(APP, "TranslationManager") << "Failed to open" << path << "for writing:" << file.errorString()
+                   << "-" << what << "NOT saved";
+        m_lastError = tr("Could not save %1.").arg(what);
+        emit lastErrorChanged();
+        return false;
+    }
+    file.write(doc.toJson());
+    if (!file.commit()) {
+        DIAG_WARN(APP, "TranslationManager") << "Failed to commit" << path << ":" << file.errorString()
+                   << "-" << what << "NOT saved; the previous file is intact";
+        m_lastError = tr("Could not save %1 (the previous file is unchanged).").arg(what);
+        emit lastErrorChanged();
+        return false;
+    }
+    return true;
+}
+
+bool TranslationManager::saveTranslations()
+{
+    // Refuse when the local file failed to LOAD, for the same reason mergeLanguageUpdate does:
+    // m_translations is empty by failure, not by fact, and writing it out replaces the user's
+    // file with that emptiness.
+    //
+    // This guard was originally put only on the download/merge path, which was the wrong half.
+    // A user whose file is corrupt sees the language at 0% translated, and the two things the
+    // UI invites at 0% are editing a string and running AI Translate — both of which land here
+    // via setTranslation() and the auto-translate pass, neither of which went anywhere near the
+    // guarded path. The guarded door was the one least likely to be used, and the AI route
+    // costs money before it destroys anything.
+    if (m_translationsLoadFailed) {
+        DIAG_WARN(APP, "TranslationManager") << "Refusing to save" << m_currentLanguage
+                   << "- its local file could not be read, so the in-memory map is empty by"
+                   << "failure rather than by fact. Writing it would replace the file with"
+                   << "nothing. Repair or delete" << languageFilePath(m_currentLanguage);
+        m_lastError = tr("The %1 file could not be read earlier, so nothing was saved over it. "
+                         "Repair or delete that file, then restart.").arg(m_currentLanguage);
+        emit lastErrorChanged();
+        return false;
+    }
+
+    // Save translations for any language (including English customizations)
+    QJsonObject translations;
+    for (auto it = m_translations.constBegin(); it != m_translations.constEnd(); ++it) {
+        translations[it.key()] = it.value();
+    }
+    const QJsonObject root = currentLanguageDocument(translations);
+
+    // QSaveFile: temp + atomic rename. This is the writer that RUNS on every string edit and
+    // after every AI pass, so it is the one most likely to produce the truncated file the load
+    // guard above then has to detect. Atomicity was applied first to the rare download-merge
+    // branch and not to this one, which had the priority exactly backwards.
+    const QString path = languageFilePath(m_currentLanguage);
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        DIAG_WARN(APP, "TranslationManager") << "Failed to open" << path << "for writing:" << file.errorString()
+                   << "- translations NOT saved";
+        m_lastError = tr("Could not save translations for %1.").arg(m_currentLanguage);
+        emit lastErrorChanged();
+        return false;
+    }
+    file.write(QJsonDocument(root).toJson());
+    if (!file.commit()) {
+        DIAG_WARN(APP, "TranslationManager") << "Failed to commit" << path << ":" << file.errorString()
+                   << "- the previous file is intact";
+        m_lastError = tr("Could not save translations for %1 (the previous file is unchanged).")
+                          .arg(m_currentLanguage);
+        emit lastErrorChanged();
+        return false;
+    }
+    return true;
+}
+
+void TranslationManager::loadLanguageMetadata()
+{
+    QString metaPath = translationsDir() + "/languages_meta.json";
+    QFile file(metaPath);
+
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    QByteArray data = file.readAll();
+    file.close();
+
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject()) {
+        return;
+    }
+
+    QJsonObject root = doc.object();
+    for (auto it = root.constBegin(); it != root.constEnd(); ++it) {
+        m_languageMetadata[it.key()] = it.value().toObject().toVariantMap();
+    }
+}
+
+bool TranslationManager::saveLanguageMetadata()
+{
+    QJsonObject root;
+    for (auto it = m_languageMetadata.constBegin(); it != m_languageMetadata.constEnd(); ++it) {
+        root[it.key()] = QJsonObject::fromVariantMap(it.value());
+    }
+
+    QString metaPath = translationsDir() + "/languages_meta.json";
+    return writeJsonFile(metaPath, QJsonDocument(root), tr("the language list"));
+}
+
+void TranslationManager::loadStringRegistry()
+{
+    QString regPath = translationsDir() + "/string_registry.json";
+    QFile file(regPath);
+
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    QByteArray data = file.readAll();
+    file.close();
+
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject()) {
+        return;
+    }
+
+    QJsonObject root = doc.object();
+    QJsonObject strings = root["strings"].toObject();
+
+    for (auto it = strings.constBegin(); it != strings.constEnd(); ++it) {
+        QString key = it.key();
+        QString fallback = it.value().toString();
+        // Skip empty/whitespace keys or fallbacks
+        if (key.trimmed().isEmpty() || fallback.trimmed().isEmpty()) {
+            continue;
+        }
+        m_stringRegistry[key] = fallback;
+    }
+}
+
+QString TranslationManager::unescapeQmlLiteral(const QString& literal)
+{
+    QString out;
+    out.reserve(literal.size());
+    for (qsizetype i = 0; i < literal.size(); ++i) {
+        if (literal[i] != u'\\' || i + 1 >= literal.size()) {
+            out += literal[i];
+            continue;
+        }
+        const QChar esc = literal[++i];
+        switch (esc.unicode()) {
+        case u'n':  out += u'\n'; break;
+        case u't':  out += u'\t'; break;
+        case u'r':  out += u'\r'; break;
+        case u'"':  out += u'"';  break;
+        case u'\'': out += u'\''; break;
+        case u'\\': out += u'\\'; break;
+        case u'u': {
+            bool ok = false;
+            const char16_t cp = literal.mid(i + 1, 4).toUShort(&ok, 16);
+            if (ok && i + 4 < literal.size()) {
+                out += QChar(cp);
+                i += 4;
+                break;
+            }
+            out += u'\\';
+            out += esc;
+            break;
+        }
+        default:
+            // An escape this scanner does not model. The engine may well decode it (identity
+            // escapes, \b \f \v \0 \xNN, \u{...}), so leaving it written verbatim is the
+            // deliberate choice: a scanner that guesses can invent a character, one that
+            // declines can only fail to decode. See the header for the full subset.
+            out += u'\\';
+            out += esc;
+            break;
+        }
+    }
+    return out;
+}
+
+bool TranslationManager::noteSourceString(const QString& key, const QString& fallback)
+{
+    const auto existing = m_stringRegistry.constFind(key);
+    if (existing == m_stringRegistry.constEnd()) {
+        m_stringRegistry[key] = fallback;
+        advanceCatalogRevision();
+        return true;
+    }
+
+    // Exact compare first. This is the path taken for every string on every render, and it
+    // allocates nothing; the trimmed() compare below would allocate twice per call if it ran
+    // unconditionally. Trimming is only consulted once the two already differ, so that
+    // re-indenting a multi-line fallback does not count as a rewrite.
+    const QString previous = existing.value();
+    if (previous == fallback || previous.trimmed() == fallback.trimmed())
+        return false;
+
+    m_stringRegistry[key] = fallback;
+    advanceCatalogRevision();
+
+    // No save here: callers mark the registry dirty for the 5 s batch. This runs inside text
+    // bindings, a full registry write measured 14 ms on an M-series Mac debug build, and a
+    // change is not rare: a Tr whose key and fallback switched on one condition passed a
+    // mismatched pair through here on every flip (#1976 follow-up).
+
+    // Report, do NOT touch the translation.
+    //
+    // An earlier version of this dropped the translation on the reasoning that it rendered a
+    // sentence that no longer exists and could be flatly wrong. Running it against the real app
+    // killed that idea: a key having ONE English string is an assumption this codebase does not
+    // hold. 26 keys are used with two different fallbacks in the SAME build — every
+    // beanbase.details.* label ("Elevation" vs "Elevation:" between BeanBaseDetailsPopup and
+    // ChangeBeansDialog), and common.accessibility.dismissDialog across eleven files
+    // ("Close dialog" vs "Dismiss dialog"). Those keys do not drift, they oscillate: whichever
+    // site is scanned or rendered last wins, so dropping would destroy their translations
+    // repeatedly and silently, on every launch, forever. It ate 11 German strings on the first
+    // real run.
+    //
+    // Weighed on measured numbers, the drop cost more than it bought: 52 keys of genuine drift,
+    // mostly cosmetic and partly self-healing through the propagate step below, against 26 keys
+    // of permanent damage. So the honest thing is to say what happened and leave the data alone.
+    // Anyone who wants the translation refreshed can re-translate that key; anyone who sees this
+    // warning repeatedly for one key is looking at a source conflict, not a rewrite.
+    if (m_translations.contains(key)) {
+        DIAG_WARN(APP, "TranslationManager").noquote()
+            << "source text changed for" << key
+            << "— its" << m_currentLanguage << "translation still renders the OLD text."
+            << "Repeats for the same key mean two QML sites disagree about this key's English,"
+            << "not that it was rewritten."
+            << "\n    was:" << previous.left(80)
+            << "\n    now:" << fallback.left(80);
+    }
+    return true;
+}
+
+bool TranslationManager::saveStringRegistry()
+{
+    QJsonObject root;
+    root["version"] = "1.0";
+
+    QJsonObject strings;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        // Skip empty/whitespace keys or fallbacks
+        if (it.key().trimmed().isEmpty() || it.value().trimmed().isEmpty()) {
+            continue;
+        }
+        strings[it.key()] = it.value();
+    }
+    root["strings"] = strings;
+
+    QString regPath = translationsDir() + "/string_registry.json";
+    return writeJsonFile(regPath, QJsonDocument(root), tr("the string registry"));
+}
+
+void TranslationManager::propagateTranslationsToAllKeys()
+{
+    // For each unique fallback (normalized), find if any key has a translation
+    // and propagate it to all other keys with the same fallback
+    if (m_currentLanguage == "en") return;
+
+    const int propagated = propagateTranslationValues(m_stringRegistry, m_translations, m_aiGenerated);
+
+    if (propagated > 0) {
+        // This can run during a registry recount without a translationsChanged emit. The active
+        // catalog must still advance because these copied strings are visible to remote readers.
+        advanceCatalogRevision();
+        DIAG_DEBUG(APP, "TranslationManager") << "Propagated translations to" << propagated << "keys";
+        // Tolerable discard: propagation is deterministic — the same copies are recomputed
+        // from the registry on the next recalculate, which runs at every launch — and the
+        // source translations it copied FROM are already on disk. The helper has warned.
+        (void)saveTranslations();
+    }
+}
+
+void TranslationManager::recalculateUntranslatedCount()
+{
+    // First, propagate any existing translations to keys that are missing them
+    // This handles keys that were registered after AI translation ran
+    propagateTranslationsToAllKeys();
+
+    // For English: count uncustomized strings
+    // For other languages: count untranslated strings
+    int count = 0;
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        // Skip empty fallbacks - they're not real translatable strings
+        if (it.value().trimmed().isEmpty()) continue;
+
+        if (!m_translations.contains(it.key()) || m_translations.value(it.key()).isEmpty()) {
+            count++;
+        }
+    }
+    m_untranslatedCount = count;
+    emit untranslatedCountChanged();
+}
+
+// --- AI Auto-Translation ---
+
+bool TranslationManager::canAutoTranslate() const
+{
+    if (m_currentLanguage == "en") return false;
+    if (m_autoTranslating) return false;
+
+    QString provider = m_settings->ai()->aiProvider();
+    if (provider == "openai" && !m_settings->ai()->openaiApiKey().isEmpty()) return true;
+    if (provider == "anthropic" && !m_settings->ai()->anthropicApiKey().isEmpty()) return true;
+    if (provider == "gemini" && !m_settings->ai()->geminiApiKey().isEmpty()) return true;
+    if (provider == "ollama" && !m_settings->ai()->ollamaEndpoint().isEmpty() && !m_settings->ai()->ollamaModel().isEmpty()) return true;
+
+    return false;
+}
+
+void TranslationManager::autoTranslate()
+{
+    startAutoTranslate(false);
+}
+
+void TranslationManager::retranslateAll()
+{
+    startAutoTranslate(true);
+}
+
+void TranslationManager::startAutoTranslate(bool retranslate)
+{
+    if (!canAutoTranslate()) {
+        m_lastError = "AI provider not configured. Set up an AI provider in Settings.";
+        emit lastErrorChanged();
+        emit autoTranslateFinished(false, m_lastError);
+        return;
+    }
+    m_retranslatingAll = retranslate;
+
+    // Get unique untranslated fallback texts (more efficient - translate once, apply to all keys)
+    // Use trimmed fallbacks for comparison to handle whitespace variations
+    QSet<QString> seenFallbacks;
+    m_stringsToTranslate.clear();
+
+    for (auto it = m_stringRegistry.constBegin(); it != m_stringRegistry.constEnd(); ++it) {
+        QString fallback = it.value();
+        QString normalizedFallback = fallback.trimmed();
+
+        // Skip if already translated (check if ANY key with this fallback is translated)
+        // Use trimmed comparison for robustness
+        bool hasTranslation = false;
+        for (auto keyIt = m_stringRegistry.constBegin(); keyIt != m_stringRegistry.constEnd(); ++keyIt) {
+            if (keyIt.value().trimmed() == normalizedFallback && !m_translations.value(keyIt.key()).isEmpty()) {
+                hasTranslation = true;
+                break;
+            }
+        }
+
+        if ((m_retranslatingAll || !hasTranslation) && !normalizedFallback.isEmpty()
+            && !seenFallbacks.contains(normalizedFallback)) {
+            seenFallbacks.insert(normalizedFallback);
+            // Use normalized fallback to avoid whitespace issues with AI
+            m_stringsToTranslate.append(QVariantMap{
+                {"key", normalizedFallback},  // Use normalized fallback as key for grouped translation
+                {"fallback", normalizedFallback}
+            });
+        }
+    }
+
+    if (m_stringsToTranslate.isEmpty()) {
+        emit autoTranslateFinished(true, "All strings are already translated!");
+        return;
+    }
+
+    m_translationRunId++;  // New run - stale responses from previous run will be ignored
+    m_autoTranslating = true;
+    m_autoTranslateCancelled = false;
+    m_autoTranslateProgress = 0;
+    m_autoTranslateParseFailures = 0;   // per-run, like m_batchFailedUploads
+    m_autoTranslateRejected = 0;
+    m_autoTranslateFatal = false;
+    m_autoTranslateTotal = static_cast<int>(m_stringsToTranslate.size());
+    m_pendingBatchCount = 0;
+    emit autoTranslatingChanged();
+    emit autoTranslateProgressChanged();
+
+    QString provider = getActiveProvider();
+    DIAG_DEBUG(APP, "TranslationManager") << "=== AUTO-TRANSLATE START (run" << m_translationRunId << ") ===";
+    DIAG_DEBUG(APP, "Language") << m_currentLanguage;
+    DIAG_DEBUG(APP, "Provider") << provider << (m_batchProcessing ? "(batch mode)" : "(single mode)");
+    DIAG_DEBUG(APP, "TranslationManager") << "Registry total:" << m_stringRegistry.size() << "keys";
+    DIAG_DEBUG(APP, "TranslationManager") << "Translations loaded:" << m_translations.size();
+    DIAG_DEBUG(APP, "TranslationManager") << "AI cache loaded:" << m_aiTranslations.size();
+    DIAG_DEBUG(APP, "TranslationManager") << "Unique fallbacks:" << uniqueStringCount();
+    DIAG_DEBUG(APP, "TranslationManager") << "Unique untranslated:" << uniqueUntranslatedCount();
+    DIAG_DEBUG(APP, "TranslationManager") << "Strings to translate:" << m_autoTranslateTotal;
+
+    // Fire all batches in parallel for faster translation
+    while (!m_stringsToTranslate.isEmpty() && !m_autoTranslateCancelled) {
+        sendNextAutoTranslateBatch();
+    }
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Fired" << m_pendingBatchCount << "parallel batch requests";
+}
+
+void TranslationManager::cancelAutoTranslate()
+{
+    if (m_autoTranslating) {
+        m_autoTranslateCancelled = true;
+        // Fatal to the whole run, not just this language. The header says this flag covers "a
+        // user cancel" and it did not: the batch's non-fatal branch then recorded the cancel as
+        // one language's failure and called processNext(), so pressing Stop began translating
+        // the NEXT language on the user's paid key. Stop must mean stop.
+        m_autoTranslateFatal = true;
+        m_autoTranslating = false;
+        emit autoTranslatingChanged();
+        emit autoTranslateFinished(false, "Translation cancelled");
+    }
+}
+
+void TranslationManager::sendNextAutoTranslateBatch()
+{
+    if (m_autoTranslateCancelled || m_stringsToTranslate.isEmpty()) {
+        return;
+    }
+
+    // Get next batch
+    QVariantList batch;
+    int batchSize = static_cast<int>(qMin(static_cast<qsizetype>(AUTO_TRANSLATE_BATCH_SIZE), m_stringsToTranslate.size()));
+    for (int i = 0; i < batchSize; i++) {
+        batch.append(m_stringsToTranslate.takeFirst());
+    }
+
+    QString prompt = buildTranslationPrompt(batch);
+    QString provider = getActiveProvider();
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Sending batch of" << batch.size() << "strings to" << provider
+             << "for language" << m_currentLanguage;
+
+    QNetworkRequest request;
+    QByteArray postData;
+
+    if (provider == "openai") {
+        request.setUrl(QUrl("https://api.openai.com/v1/chat/completions"));
+        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        request.setRawHeader("Authorization", ("Bearer " + m_settings->ai()->openaiApiKey()).toUtf8());
+
+        QJsonObject json;
+        const QString openaiModel = translationModelFor(provider, QString());
+        json["model"] = openaiModel;
+        // Sampling parameters are accepted per model, and a rejected one 400s
+        // every batch; see airequestshape.h.
+        AIRequestShape::setOpenAITemperature(json, openaiModel, 0.3);
+        QJsonArray messages;
+        QJsonObject msg;
+        msg["role"] = "user";
+        msg["content"] = prompt;
+        messages.append(msg);
+        json["messages"] = messages;
+        // Same reasoning-off rule the advisor applies. This body is hand-built
+        // rather than routed through OpenAIProvider (decenza_testlib compiles
+        // this file but not the AI stack), which is exactly how it came to be
+        // missing — the model id was kept in step with the catalog by
+        // tst_aiproviders, the request SHAPE was not.
+        AIRequestShape::disableOpenAIReasoning(json, openaiModel);
+        postData = QJsonDocument(json).toJson();
+
+    } else if (provider == "anthropic") {
+        request.setUrl(QUrl("https://api.anthropic.com/v1/messages"));
+        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        request.setRawHeader("x-api-key", m_settings->ai()->anthropicApiKey().toUtf8());
+        request.setRawHeader("anthropic-version", "2023-06-01");
+
+        QJsonObject json;
+        const QString anthropicModel = translationModelFor(provider, QString());
+        json["model"] = anthropicModel;
+        json["max_tokens"] = AIRequestShape::kMaxOutputTokens;
+        QJsonArray messages;
+        QJsonObject msg;
+        msg["role"] = "user";
+        msg["content"] = prompt;
+        messages.append(msg);
+        json["messages"] = messages;
+        // Thinking OFF, explicitly (#1691); see airequestshape.h.
+        AIRequestShape::disableAnthropicThinking(json, anthropicModel);
+        postData = QJsonDocument(json).toJson();
+
+    } else if (provider == "gemini") {
+        QString apiKey = m_settings->ai()->geminiApiKey();
+        // Gemini carries the model in the PATH rather than the body, which is why it was the
+        // easiest one to leave stale — "gemini-2.0-flash" is not in the app's own model list.
+        const QString geminiModel = translationModelFor(provider, QString());
+        request.setUrl(QUrl("https://generativelanguage.googleapis.com/v1beta/models/"
+                            + geminiModel + ":generateContent"));
+        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        request.setRawHeader("x-goog-api-key", apiKey.toUtf8());
+
+        QJsonObject json;
+        QJsonArray contents;
+        QJsonObject content;
+        QJsonArray parts;
+        QJsonObject part;
+        part["text"] = prompt;
+        parts.append(part);
+        content["parts"] = parts;
+        contents.append(content);
+        json["contents"] = contents;
+        // Same as the advisor; without it thinking runs at the model default, billed at the output rate.
+        json["generationConfig"] = AIRequestShape::geminiGenerationConfig(geminiModel);
+        postData = QJsonDocument(json).toJson();
+
+    } else if (provider == "ollama") {
+        QString endpoint = m_settings->ai()->ollamaEndpoint();
+        if (!endpoint.endsWith("/")) endpoint += "/";
+        request.setUrl(QUrl(endpoint + "api/generate"));
+        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+
+        QJsonObject json;
+        json["model"] = m_settings->ai()->ollamaModel();
+        json["prompt"] = prompt;
+        json["stream"] = false;
+        postData = QJsonDocument(json).toJson();
+    }
+
+    m_pendingBatchCount++;
+    int runId = m_translationRunId;  // Capture current run ID
+    QNetworkReply* reply = m_networkManager->post(request, postData);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, runId, batch]() {
+        // Check if this response belongs to the current run
+        if (runId != m_translationRunId) {
+            DIAG_DEBUG(APP, "TranslationManager") << "Stale response from run" << runId
+                     << "(current run:" << m_translationRunId << ") - ignoring";
+            reply->deleteLater();
+            return;
+        }
+        onAutoTranslateBatchReply(reply, batch);
+    });
+}
+
+QString TranslationManager::buildTranslationPrompt(const QVariantList& strings) const
+{
+    QString langName = getLanguageDisplayName(m_currentLanguage);
+    QString nativeName = getLanguageNativeName(m_currentLanguage);
+
+    QString prompt = QString(
+        "Translate the following English strings to %1 (%2).\n"
+        "Return ONLY a JSON object with the translations, no explanation.\n"
+        "The format must be exactly: {\"key\": \"translated text\", ...}\n"
+        "Copy every key exactly as given; translate only the values. Return every key.\n"
+        "Be natural and idiomatic in %1.\n"
+    ).arg(langName, nativeName);
+
+    prompt += QStringLiteral("Keep formatting like %1, %2, \\n exactly as-is.\n");
+
+    if (m_currentLanguage == QLatin1String("en-GB")) {
+        prompt += QStringLiteral("Use British spelling and natural UK terminology in context; "
+                                 "for example, a milk pitcher is a milk jug. Preserve coffee "
+                                 "terms, placeholders and meaning. Keep text unchanged when "
+                                 "it is already natural in UK English.\n\n");
+    }
+
+    prompt += QStringLiteral("\nStrings to translate:\n");
+
+    QJsonObject input;
+    for (const QVariant& v : strings) {
+        QVariantMap item = v.toMap();
+        input.insert(item["key"].toString(), item["fallback"].toString());
+    }
+    prompt += QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Compact));
+
+    return prompt;
+}
+
+void TranslationManager::onAutoTranslateBatchReply(QNetworkReply* reply, const QVariantList& batch)
+{
+    reply->deleteLater();
+    m_pendingBatchCount--;
+
+    QString provider = getActiveProvider();
+    int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Response from" << provider
+             << "HTTP:" << httpStatus
+             << "pending:" << m_pendingBatchCount
+             << "run:" << m_translationRunId;
+
+    // If cancelled mid-run, ignore content but still count down
+    if (m_autoTranslateCancelled) {
+        DIAG_DEBUG(APP, "TranslationManager") << "Response ignored (cancelled), waiting for" << m_pendingBatchCount << "more";
+        // Wait for ALL batches to complete before signaling done
+        if (m_pendingBatchCount == 0) {
+            DIAG_DEBUG(APP, "TranslationManager") << "All batches drained after cancellation";
+            m_autoTranslating = false;
+            emit autoTranslatingChanged();
+
+            // Persist whatever DID apply before the stop. Batches that parsed and applied are
+            // paid for and already in m_translations; this path used to drop them on the floor,
+            // so ten good batches followed by one transport error left the user billed for
+            // eleven and holding none. Only the completion path saved, and the two exits
+            // disagreeing about that is the bug.
+            // Honour the verdict here too. Writing this block while fixing the identical bug on
+            // the completion path ten lines below, and still calling saveTranslations() bare, is
+            // how the message below came to promise "and saved" for work that may never have
+            // reached disk. The two exits disagreeing about the save is the bug this block was
+            // added to fix; it then disagreed in the other direction.
+            bool drainSaved = true;
+            if (m_autoTranslateProgress > 0) {
+                DIAG_DEBUG(APP, "TranslationManager") << "Persisting" << m_autoTranslateProgress << "strings applied before the stop";
+                drainSaved = saveTranslations();
+                if (drainSaved && m_retranslatingAll && !saveUserOverrides())
+                    drainSaved = false;
+                if (!drainSaved)
+                    m_autoTranslateFatal = true;   // a local failure, same as the completion path
+                // Attempt the AI cache EVEN IF the main save failed: _ai.json is then the only
+                // record of the paid AI output, re-applicable via copyAiToFinal after repair.
+                if (!saveAiTranslations() && drainSaved)
+                    // Only the AI-provenance cache failed. Strings keep working but lose their
+                    // "AI generated" marking after a restart.
+                    DIAG_WARN(APP, "TranslationManager") << "Stopped run saved, but the AI cache file did not";
+                recalculateUntranslatedCount();
+                m_translationVersion++;
+                emit translationsChanged();
+            }
+
+            // A user-initiated cancel sets no error, which left this emitting an empty or, worse,
+            // a stale unrelated message. Say which of the two actually happened.
+            QString finishMessage = m_lastError;
+            if (!drainSaved) {
+                // saveTranslations() has already set m_lastError explaining why.
+                DIAG_WARN(APP, "TranslationManager").noquote() << "AI translation stopped and could NOT persist"
+                                     << m_autoTranslateProgress << "applied strings:" << m_lastError;
+            } else if (finishMessage.isEmpty()) {
+                // A clean user stop is an outcome, not an error — the notice channel keeps the
+                // toast from dressing "your work is saved" in error styling.
+                finishMessage = tr("Translation stopped. %1 strings were translated and saved.")
+                                    .arg(m_autoTranslateProgress);
+                emit translationNotice(finishMessage);
+            }
+            emit autoTranslateFinished(false, finishMessage);
+        }
+        return;
+    }
+
+    if (reply->error() != QNetworkReply::NoError) {
+        // Set cancelled flag but DON'T emit autoTranslateFinished yet
+        // Wait for all in-flight responses to complete first
+        m_autoTranslateCancelled = true;
+        m_autoTranslateFatal = true;   // the provider itself is unusable; later languages would fail identically
+        m_lastError = QString("AI request failed (%1): %2").arg(provider, reply->errorString());
+        DIAG_WARN(APP, "TranslationManager") << m_lastError;
+        DIAG_WARN(APP, "TranslationManager") << "Response body:" << reply->readAll().left(500);
+        emit lastErrorChanged();
+
+        // If this was the last batch, we can finish now
+        if (m_pendingBatchCount == 0) {
+            DIAG_DEBUG(APP, "TranslationManager") << "Error on last batch, finishing";
+            if (m_autoTranslateProgress > 0) {
+                const bool saved = saveTranslations();
+                if (saved && m_retranslatingAll)
+                    (void)saveUserOverrides();
+                (void)saveAiTranslations();
+                recalculateUntranslatedCount();
+                ++m_translationVersion;
+                emit translationsChanged();
+            }
+            m_autoTranslating = false;
+            emit autoTranslatingChanged();
+            emit autoTranslateFinished(false, m_lastError);
+        } else {
+            DIAG_DEBUG(APP, "TranslationManager") << "Error occurred, waiting for" << m_pendingBatchCount << "batches to drain";
+        }
+        return;
+    }
+
+    QByteArray data = reply->readAll();
+    if (!parseAutoTranslateResponse(data, batch))
+        m_autoTranslateParseFailures++;
+
+    // Check if all batches are complete
+    if (m_pendingBatchCount == 0) {
+        DIAG_DEBUG(APP, "TranslationManager") << "All batches complete for" << m_currentLanguage;
+        m_autoTranslating = false;
+        emit autoTranslatingChanged();
+        // The verdict MUST be honoured. saveTranslations() returned void, so a refusal here was
+        // invisible and the block below still emitted success: a user whose file was corrupt saw
+        // 0%, pressed AI Translate for that reason, paid for the whole language, watched the
+        // strings appear on screen — and lost every one of them at restart, having been told
+        // "Translated 3429 strings". That is round two's bug reproduced on round three's guard,
+        // on the path this branch itself identified as the one users actually take.
+        bool saved = saveTranslations();
+        if (saved && m_retranslatingAll && !saveUserOverrides())
+            saved = false;
+        // Attempt the AI cache EVEN IF the main save failed: _ai.json is then the only record
+        // of the paid AI output, and copyAiToFinal can re-apply it once the disk is repaired.
+        if (!saveAiTranslations() && saved)
+            // Main file persisted, provenance cache did not: translations survive a restart
+            // but stop being marked "AI generated". Worth a line, not a failed run.
+            DIAG_WARN(APP, "TranslationManager") << "Completed run saved, but the AI cache file did not";
+        recalculateUntranslatedCount();
+        m_translationVersion++;
+        emit translationsChanged();
+        // A batch the provider answered with something unusable is a FAILURE, not zero
+        // translations. This used to be an unconditional `true`: parseAutoTranslateResponse
+        // returned void, so a provider replying 200-with-prose produced
+        // autoTranslateFinished(true, "Translated 0 strings") — and inside the bulk run that
+        // success is what triggers submitTranslation(), publishing an untranslated file over
+        // the community copy. A paid run reported complete, having translated nothing and
+        // uploaded damage. Same "credit for work not done" shape as the upload accounting.
+        //
+        // m_autoTranslateCancelled is belt-and-braces, NOT a fixed defect. The commit that added
+        // it claimed the cancelled drain reported success; that was wrong — the drain above
+        // already emits autoTranslateFinished(false, ...) and always did. The only way to arrive
+        // here with the flag set is a QML handler calling cancelAutoTranslate() re-entrantly
+        // from a progress signal emitted inside the parser. Kept for that narrow case, and
+        // labelled honestly because a false claim of a fixed bug is exactly what this branch
+        // keeps having to correct.
+        if (!saved) {
+            m_autoTranslateFatal = true;   // disk/state problem — every remaining language hits it too
+            // m_lastError is already set by saveTranslations().
+            DIAG_WARN(APP, "TranslationManager").noquote() << "AI translation: applied" << m_autoTranslateProgress
+                                 << "strings but could NOT persist them -" << m_lastError;
+            emit autoTranslateFinished(false, m_lastError);
+        } else if (m_autoTranslateParseFailures > 0) {
+            // A provider returning garbage is a genuine failure — error channel.
+            m_lastError = tr("%1 returned %2 unusable response(s); %3 strings were "
+                             "translated. Nothing was uploaded.")
+                              .arg(selectedProviderLabel())
+                              .arg(m_autoTranslateParseFailures)
+                              .arg(m_autoTranslateProgress);
+            emit lastErrorChanged();
+            DIAG_WARN(APP, "TranslationManager").noquote() << "AI translation:" << m_lastError;
+            emit autoTranslateFinished(false, m_lastError);
+        } else if (m_autoTranslateCancelled) {
+            QString finishMessage = m_lastError;
+            if (finishMessage.isEmpty()) {
+                // A stop the user asked for, with the work saved — an outcome, not an error.
+                finishMessage = tr("Translation stopped early; %1 strings were translated. "
+                                   "Nothing was uploaded.").arg(m_autoTranslateProgress);
+                emit translationNotice(finishMessage);
+            }
+            DIAG_WARN(APP, "TranslationManager").noquote() << "AI translation:" << finishMessage;
+            emit autoTranslateFinished(false, finishMessage);
+        } else {
+            QString okMsg = tr("Translated %1 strings").arg(m_autoTranslateProgress);
+            if (m_autoTranslateRejected > 0) {
+                // Not a failed run — the rest applied — but the user must be told these were
+                // dropped, or they are left looking English with no explanation.
+                okMsg += QLatin1Char(' ') + tr("(%1 rejected: placeholders did not match or no text)")
+                             .arg(m_autoTranslateRejected);
+                DIAG_WARN(APP, "TranslationManager").noquote() << "AI translation:" << m_autoTranslateRejected
+                                     << "string(s) rejected by translationDefect";
+            }
+            emit autoTranslateFinished(true, okMsg);
+        }
+    }
+}
+
+// The set of %N placeholders a string carries.
+//
+// Numbered rather than positional, so a translation is free to REORDER them — that is the whole
+// point of %1/%2 — but it must not lose or invent one. Compared as a set, not a list: QString::arg
+// replaces every occurrence of %1, so repeating or de-duplicating one is harmless.
+//
+// The corpus uses only %1-%9 (no %L, no two-digit escapes).
+// QString::arg reads one OR TWO digits after the % (qstring.cpp:8622-8645, Qt 6.12), so Turkish
+// "%90" (90%) is escape 90, not %9 followed by 0. A two-digit escape is therefore prose, and is
+// not counted; "%15" in place of "%1" still fails, because it is read whole.
+QSet<int> TranslationManager::placeholderSet(const QString& text)
+{
+    static const QRegularExpression re(QStringLiteral("%L?(\\d)(\\d?)"));
+    QSet<int> found;
+    auto it = re.globalMatch(text);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch match = it.next();
+        if (match.capturedLength(2) == 0)
+            found.insert(match.captured(1).toInt());
+    }
+    return found;
+}
+
+QString TranslationManager::translationDefect(const QString& source, const QString& translation)
+{
+    if (source.isEmpty() || translation.isEmpty())
+        return {};
+    if (placeholderSet(translation) != placeholderSet(source))
+        return QStringLiteral("placeholders do not match");
+    // A value with no letter or digit standing in for words: what a source cut off at an
+    // escaped quote translated to ("\\" for a string that starts with a quote).
+    const auto hasText = [](const QString& s) {
+        return std::any_of(s.cbegin(), s.cend(), [](QChar c) { return c.isLetterOrNumber(); });
+    };
+    if (!hasText(translation) && hasText(source))
+        return QStringLiteral("it has no letters or digits");
+    return {};
+}
+
+bool TranslationManager::parseAutoTranslateResponse(const QByteArray& data, const QVariantList& batch)
+{
+    QString provider = getActiveProvider();
+    QString content;
+
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonObject root = doc.object();
+
+    if (provider == "openai") {
+        QJsonArray choices = root["choices"].toArray();
+        if (!choices.isEmpty()) {
+            content = choices[0].toObject()["message"].toObject()["content"].toString();
+        }
+    } else if (provider == "anthropic") {
+        QJsonArray contentArr = root["content"].toArray();
+        if (!contentArr.isEmpty()) {
+            content = contentArr[0].toObject()["text"].toString();
+        }
+    } else if (provider == "gemini") {
+        QJsonArray candidates = root["candidates"].toArray();
+        if (!candidates.isEmpty()) {
+            QJsonArray parts = candidates[0].toObject()["content"].toObject()["parts"].toArray();
+            if (!parts.isEmpty()) {
+                content = parts[0].toObject()["text"].toString();
+            }
+        }
+    } else if (provider == "ollama") {
+        content = root["response"].toString();
+    }
+
+    if (content.isEmpty()) {
+        // HTTP 200 with nothing usable in it. Several providers answer this way for quota and
+        // content-policy conditions, so this is an ordinary failure, not a corrupt-server case.
+        DIAG_WARN(APP, "TranslationManager") << "Empty AI response for provider:" << provider
+                   << "- treating this batch as FAILED, not as zero translations";
+        return false;
+    }
+
+    // Extract JSON from response (AI might include markdown code blocks)
+    qsizetype jsonStart = content.indexOf('{');
+    qsizetype jsonEnd = content.lastIndexOf('}');
+    if (jsonStart >= 0 && jsonEnd > jsonStart) {
+        content = content.mid(jsonStart, jsonEnd - jsonStart + 1);
+    }
+
+    // Parse translations and apply directly to empty keys
+    // Note: The "key" in the response is actually the fallback text (since we translate unique texts)
+    QJsonDocument transDoc = QJsonDocument::fromJson(content.toUtf8());
+    if (transDoc.isObject()) {
+        QJsonObject translations = transDoc.object();
+        QSet<QString> missing;
+        for (const QVariant& item : batch)
+            missing.insert(item.toMap().value(QStringLiteral("key")).toString());
+        int count = 0;
+        int appliedCount = 0;
+        int rejectedHere = 0;
+        for (auto it = translations.constBegin(); it != translations.constEnd(); ++it) {
+            QString fallbackText = it.key();
+            QString translation = it.value().toString().trimmed();
+            if (!batch.isEmpty() && !missing.contains(fallbackText))
+                continue;
+
+            // Reject a translation that dropped or invented a placeholder ("%1 frames" coming
+            // back as "Bilder" leaves QString::arg nowhere to put the number), or has no text.
+            // A swap ("%2 of %1" for "%1 of %2") is indistinguishable from a legitimate reorder
+            // and is not caught.
+            //
+            // Nothing downstream checks this. The string is applied, saved, and then UPLOADED to
+            // the community copy for that language, so one bad completion becomes everyone's
+            // bad completion. Models drop placeholders exactly when the surrounding text is
+            // being restructured, which is most likely in the languages that need it most.
+            if (const QString defect = translationDefect(fallbackText, translation); !defect.isEmpty()) {
+                DIAG_WARN(APP, "TranslationManager").noquote()
+                    << "Rejecting AI translation -" << defect << ". source="
+                    << fallbackText << "translation=" << translation;
+                m_autoTranslateRejected++;
+                // Answered, so the reply is usable: a rejection must not fail the whole batch.
+                missing.remove(fallbackText);
+                rejectedHere++;
+                continue;
+            }
+
+            if (!translation.isEmpty()) {
+                missing.remove(fallbackText);
+                // Store in AI translations (for display in AI column)
+                m_aiTranslations[fallbackText] = translation;
+
+                // Apply to ALL keys with this fallback text that don't have a translation yet
+                // getKeysForFallback uses trimmed comparison for robustness
+                QStringList keys = getKeysForFallback(fallbackText);
+                if (keys.isEmpty()) {
+                    DIAG_DEBUG(APP, "TranslationManager") << "No keys found for fallback:" << fallbackText.left(50);
+                }
+
+                for (const QString& key : keys) {
+                    if (m_retranslatingAll || m_translations.value(key).isEmpty()) {
+                        m_translations[key] = translation;
+                        m_aiGenerated.insert(key);  // Mark as AI-generated
+                        if (m_retranslatingAll)
+                            m_userOverrides.remove(key);
+                        appliedCount++;
+                    }
+                }
+
+                // Update last translated text for UI feedback
+                m_lastTranslatedText = fallbackText + " → " + translation;
+                emit lastTranslatedTextChanged();
+
+                count++;
+            }
+        }
+        // Track actual translations applied, not just AI responses
+        m_autoTranslateProgress += batch.isEmpty() ? count : batch.size() - missing.size() - rejectedHere;
+        emit autoTranslateProgressChanged();
+
+        DIAG_DEBUG(APP, "TranslationManager") << "AI translated" << count << "unique texts," << appliedCount << "keys applied, progress:" << m_autoTranslateProgress << "/" << m_autoTranslateTotal;
+        // A reply whose every answer was rejected did no work: fail it, or the run uploads.
+        return missing.isEmpty() && !(count == 0 && rejectedHere > 0);
+    }
+
+    // The model answered, but not with the JSON object it was asked for — prose, a truncated
+    // reply from hitting max_tokens, or an echo of the prompt. Nothing was applied.
+    DIAG_WARN(APP, "TranslationManager") << "Failed to parse AI translation response:" << content.left(200);
+    return false;
+}
+
+// --- AI Translation Management ---
+
+QString TranslationManager::getAiTranslation(const QString& fallback) const
+{
+    return m_aiTranslations.value(fallback);
+}
+
+bool TranslationManager::isAiGenerated(const QString& key) const
+{
+    return m_aiGenerated.contains(key);
+}
+
+bool TranslationManager::copyAiToFinal(const QString& fallback)
+{
+    QString aiTranslation = m_aiTranslations.value(fallback);
+    if (aiTranslation.isEmpty()) return false;
+
+    QStringList keys = getKeysForFallback(fallback);
+    // The cached value must satisfy translationDefect too.
+    //
+    // m_aiTranslations is filled from two places: parseAutoTranslateResponse, which now checks,
+    // and loadAiTranslations(), which reads a file written before the check existed. So every
+    // _ai.json on disk today may still hold the placeholder-losing strings the rule was added to
+    // stop — and this button pushes them straight into the main file, from where they upload.
+    // That is the propagation loop the check exists to break, entered through a button rather
+    // than a download.
+    const QString sourceEnglish = m_stringRegistry.value(keys.isEmpty() ? QString() : keys.first());
+    if (const QString defect = translationDefect(sourceEnglish, aiTranslation); !defect.isEmpty()) {
+        DIAG_WARN(APP, "TranslationManager").noquote() << "Refusing to copy AI translation for" << fallback
+                             << "-" << defect << ". source=" << sourceEnglish
+                             << "ai=" << aiTranslation;
+        m_lastError = tr("That AI translation does not fit the English text, so it was not used.");
+        emit lastErrorChanged();
+        return false;
+    }
+
+    // Snapshot for rollback: the edit paths were hardened to never display a change that was
+    // not persisted, and this button — "use the AI translation" — is on the same page and just
+    // as reachable. It was skipped in that pass.
+    QMap<QString, QString> previous;
+    QSet<QString> previouslyAi;
+    for (const QString& key : keys) {
+        if (m_translations.contains(key)) previous[key] = m_translations.value(key);
+        if (m_aiGenerated.contains(key)) previouslyAi.insert(key);
+    }
+
+    for (const QString& key : keys) {
+        m_translations[key] = aiTranslation;
+        m_aiGenerated.insert(key);  // Mark as AI-generated
+    }
+
+    if (!saveTranslations()) {
+        for (const QString& key : keys) {
+            if (previous.contains(key)) m_translations[key] = previous.value(key);
+            else m_translations.remove(key);
+            if (!previouslyAi.contains(key)) m_aiGenerated.remove(key);
+        }
+        DIAG_WARN(APP, "TranslationManager") << "Copy of the AI translation was NOT saved and has been rolled back";
+        emit translationsChanged();
+        return false;
+    }
+    recalculateUntranslatedCount();
+    m_translationVersion++;
+    emit translationsChanged();
+    return true;
+}
+
+bool TranslationManager::clearAiTranslation(const QString& fallback)
+{
+    // NOTE: saveAiTranslations() below is checked. setGroupTranslation() calls this on its
+    // SUCCESS path, so a silently failed write leaves the main file saying "not AI generated"
+    // while _ai.json still holds the old value — the two files disagree and nothing says so.
+
+    if (!m_aiTranslations.contains(fallback)) return false;
+
+    const QMap<QString, QString> previousAiTranslations = m_aiTranslations;
+    const QStringList keys = getKeysForFallback(fallback);
+    QSet<QString> previouslyAiGenerated;
+    for (const QString& key : keys) {
+        if (m_aiGenerated.contains(key))
+            previouslyAiGenerated.insert(key);
+    }
+
+    m_aiTranslations.remove(fallback);
+
+    // Also clear the AI-generated flag for all keys using this fallback
+    for (const QString& key : keys) {
+        m_aiGenerated.remove(key);
+    }
+
+    if (!saveAiTranslations()) {
+        m_aiTranslations = previousAiTranslations;
+        for (const QString& key : keys) {
+            if (previouslyAiGenerated.contains(key))
+                m_aiGenerated.insert(key);
+            else
+                m_aiGenerated.remove(key);
+        }
+        DIAG_WARN(APP, "TranslationManager") << "AI translation cleared in memory but the AI file was NOT saved for"
+                   << fallback << "- the previous suggestion remains available";
+        emit translationsChanged();
+        return false;
+    }
+    m_translationVersion++;
+    emit translationsChanged();
+    return true;
+}
+
+bool TranslationManager::clearAllAiTranslations()
+{
+    if (m_currentLanguage == "en") return false;
+
+    qsizetype aiCacheCount = m_aiTranslations.size();
+    int clearedFromMain = 0;
+    int preservedUserEdits = 0;
+
+    // Clear AI-generated translations from main translations map
+    // but preserve user overrides (human edits)
+    QStringList keysToRemove;
+    for (auto it = m_translations.constBegin(); it != m_translations.constEnd(); ++it) {
+        if (m_aiGenerated.contains(it.key()) && !m_userOverrides.contains(it.key())) {
+            keysToRemove.append(it.key());
+        } else if (m_userOverrides.contains(it.key())) {
+            preservedUserEdits++;
+        }
+    }
+
+    for (const QString& key : keysToRemove) {
+        m_translations.remove(key);
+        clearedFromMain++;
+    }
+
+    // Clear AI caches
+    m_aiTranslations.clear();
+    m_aiGenerated.clear();
+
+    // Delete the AI translations file
+    QString aiPath = translationsDir() + "/" + m_currentLanguage + "_ai.json";
+    // Verify the main file can be written BEFORE deleting the AI cache. This removed the file
+    // first and then discarded saveTranslations()' verdict, so with a corrupt language file the
+    // AI cache was destroyed irreversibly while the change it was part of never persisted — the
+    // user saw the clear applied, restarted, and had the old translations back with the AI
+    // column permanently empty.
+    if (!saveTranslations()) {
+        DIAG_WARN(APP, "TranslationManager") << "Refusing to clear AI translations - the main file could not be saved";
+        loadAiTranslations();   // restore the in-memory state we just cleared
+        loadTranslations();
+        emit translationsChanged();
+        return false;
+    }
+    QFile::remove(aiPath);
+    // (No second save here: the guard above already persisted the fully-mutated state — the
+    // map edits all happen before it — so a repeat write was pure redundancy.)
+    recalculateUntranslatedCount();
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Cleared AI translations for" << m_currentLanguage
+             << "- AI cache:" << aiCacheCount
+             << "- Removed from main:" << clearedFromMain
+             << "- Preserved user edits:" << preservedUserEdits;
+
+    m_translationVersion++;
+    emit translationsChanged();
+    return true;
+}
+
+void TranslationManager::loadAiTranslations()
+{
+    m_aiTranslations.clear();
+    m_aiGenerated.clear();
+
+    if (m_currentLanguage == "en") {
+        return;
+    }
+
+    QString aiPath = translationsDir() + "/" + m_currentLanguage + "_ai.json";
+    QFile file(aiPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    QByteArray data = file.readAll();
+    file.close();
+
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject()) {
+        return;
+    }
+
+    QJsonObject root = doc.object();
+
+    // Load AI translations (fallback -> translation)
+    QJsonObject translations = root["translations"].toObject();
+    for (auto it = translations.constBegin(); it != translations.constEnd(); ++it) {
+        m_aiTranslations[it.key()] = it.value().toString();
+    }
+
+    // Load AI-generated flags (list of keys)
+    QJsonArray generated = root["generated"].toArray();
+    for (const QJsonValue& val : generated) {
+        m_aiGenerated.insert(val.toString());
+    }
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Loaded" << m_aiTranslations.size() << "AI translations for:" << m_currentLanguage;
+}
+
+bool TranslationManager::saveAiTranslations()
+{
+    if (m_currentLanguage == "en") {
+        return true;   // nothing to store for the base language; not a failure
+    }
+
+    QString aiPath = translationsDir() + "/" + m_currentLanguage + "_ai.json";
+
+    if (m_aiTranslations.isEmpty()) {
+        QFile::remove(aiPath);   // deliberate: an empty set is represented by absence
+        return true;
+    }
+
+    QJsonObject root;
+    root["language"] = m_currentLanguage;
+
+    // Save AI translations
+    QJsonObject translations;
+    for (auto it = m_aiTranslations.constBegin(); it != m_aiTranslations.constEnd(); ++it) {
+        translations[it.key()] = it.value();
+    }
+    root["translations"] = translations;
+
+    // Save AI-generated flags
+    QJsonArray generated;
+    for (const QString& key : m_aiGenerated) {
+        generated.append(key);
+    }
+    root["generated"] = generated;
+
+    return writeJsonFile(aiPath, QJsonDocument(root), tr("the AI translations"));
+}
+
+// --- User Overrides (preserved during language updates) ---
+
+void TranslationManager::loadUserOverrides()
+{
+    m_userOverrides.clear();
+
+    if (m_currentLanguage == "en") {
+        return;  // English has no remote updates
+    }
+
+    QString overridesPath = translationsDir() + "/" + m_currentLanguage + "_overrides.json";
+    QFile file(overridesPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;  // No overrides file yet
+    }
+
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    file.close();
+
+    if (!doc.isObject()) {
+        return;
+    }
+
+    QJsonArray overrides = doc.object()["overrides"].toArray();
+    for (const QJsonValue& val : overrides) {
+        m_userOverrides.insert(val.toString());
+    }
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Loaded" << m_userOverrides.size() << "user overrides for:" << m_currentLanguage;
+}
+
+bool TranslationManager::saveUserOverrides()
+{
+    if (m_currentLanguage == "en") {
+        return true;   // English has no overrides file; not a failure
+    }
+
+    QString overridesPath = translationsDir() + "/" + m_currentLanguage + "_overrides.json";
+
+    if (m_userOverrides.isEmpty()) {
+        QFile::remove(overridesPath);   // deliberate: an empty set is represented by absence
+        return true;
+    }
+
+    QJsonObject root;
+    QJsonArray overrides;
+    for (const QString& key : m_userOverrides) {
+        overrides.append(key);
+    }
+    root["overrides"] = overrides;
+
+    return writeJsonFile(overridesPath, QJsonDocument(root), tr("your customised strings"));
+}
+
+void TranslationManager::checkForLanguageUpdate()
+{
+    // Once per launch, matching the single-shot this replaced. Set before any early return so
+    // that a connection which drops and comes back does not re-run it — reachabilityChanged
+    // can fire repeatedly on a flapping link, which the fixed delay never had to survive.
+    if (m_launchUpdateCheckDone) {
+        return;
+    }
+    m_launchUpdateCheckDone = true;
+
+    // Only check for non-English languages that were downloaded from the server
+    if (m_currentLanguage == "en") {
+        return;
+    }
+
+    // Check if this language was downloaded (not locally created)
+    if (!m_languageMetadata.contains(m_currentLanguage)) {
+        return;  // Language not in metadata
+    }
+    QVariantMap metadata = m_languageMetadata.value(m_currentLanguage);
+
+    // If it's marked as remote (not yet downloaded), don't auto-update
+    if (metadata.value("isRemote", false).toBool()) {
+        return;  // User hasn't downloaded this language yet
+    }
+
+    // Check if translation file exists locally (indicates it was downloaded at some point)
+    QFile localFile(languageFilePath(m_currentLanguage));
+    if (!localFile.exists()) {
+        return;  // No local file to update
+    }
+
+    DIAG_DEBUG(APP, "TranslationManager") << "Checking for language update:" << m_currentLanguage;
+
+    // Fetch the latest version from server
+    QString url = QString("%1/v1/translations/languages/%2").arg(TRANSLATION_API_BASE, m_currentLanguage);
+    QNetworkRequest request{QUrl(url)};
+    QNetworkReply* reply = m_networkManager->get(request);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            DIAG_DEBUG(APP, "TranslationManager") << "Language update check failed:" << reply->errorString();
+            return;
+        }
+
+        QByteArray data = reply->readAll();
+        QJsonDocument doc = QJsonDocument::fromJson(data);
+
+        if (!doc.isObject()) {
+            DIAG_DEBUG(APP, "TranslationManager") << "Invalid language update response";
+            return;
+        }
+
+        QJsonObject root = doc.object();
+        QJsonObject newTranslations = root["translations"].toObject();
+
+        if (newTranslations.isEmpty()) {
+            return;
+        }
+
+        // Merge new translations, preserving user overrides. Tolerable discard: this is the
+        // silent launch-time check — a refusal has already warned and set lastError, and there
+        // is no operation in flight to abort; the user can Update manually from the language
+        // page, where the refusal IS surfaced.
+        (void)mergeLanguageUpdate(newTranslations);
+    });
+}
+
+bool TranslationManager::mergeLanguageUpdate(const QJsonObject& newTranslations)
+{
+    // Refuse when the local file failed to LOAD. m_translations being empty is ambiguous —
+    // it means either "nothing translated yet" or "I could not read what was there" — and
+    // merging into the second case then saving replaces the user's translations with the
+    // server's copy. That is the destructive replace this whole area exists to prevent, and it
+    // reaches it by a different door than the one that was guarded: the file-level merge got a
+    // read guard, but this in-memory path is the one both UI buttons actually take, because
+    // they set currentLanguage to the language they are about to download.
+    if (m_translationsLoadFailed) {
+        // Retry the load before refusing. The flag is only recomputed inside loadTranslations(),
+        // which runs from the constructor, a genuine language CHANGE, and import — none of which
+        // fire when the user repairs the file and presses Update again, because
+        // setCurrentLanguage(sameLanguage) is a no-op. Without this the refusal told the user to
+        // "fix the file and retry" and then ignored them until an app restart, which is a worse
+        // failure than the one it was guarding: advice that does not work.
+        DIAG_WARN(APP, "TranslationManager") << "Local" << m_currentLanguage << "file previously failed to load - retrying"
+                   << "before deciding whether to merge";
+        loadTranslations();
+    }
+    if (m_translationsLoadFailed) {
+        DIAG_WARN(APP, "TranslationManager") << "Refusing to merge into" << m_currentLanguage
+                   << "- its local file still cannot be read, so an empty in-memory map is not"
+                   << "evidence of an empty language. Repair or delete the file, then retry.";
+        m_lastError = tr("The existing %1 file could not be read, so the update was not applied "
+                         "(your local translations are untouched).").arg(m_currentLanguage);
+        emit lastErrorChanged();
+        return false;
+    }
+
+    int added = 0;
+    int updated = 0;
+    int preserved = 0;
+    int skippedBroken = 0;
+
+    for (auto it = newTranslations.constBegin(); it != newTranslations.constEnd(); ++it) {
+        const QString& key = it.key();
+        const QString& newValue = it.value().toString();
+
+        // Same translationDefect rule as the AI path, for the same reason and with a wider blast
+        // radius: this data comes from the community server, which anyone can upload to
+        // unauthenticated. Without the check a single bad contribution propagates to every user
+        // of that language on their next update.
+        //
+        // Not hypothetical. When this rule was first written it immediately found seven
+        // already-shipped translations that had lost their placeholders, including a screen
+        // reader label — "Background image %1 of %2" translated as just "Hintergrundbild", so a
+        // VoiceOver user in German, French, Arabic or Danish heard no position at all and could
+        // not navigate the list. That damage arrived through exactly this path.
+        // An empty incoming value is no translation; it never replaces one.
+        if (newValue.isEmpty())
+            continue;
+        const QString source = m_stringRegistry.value(key);
+        if (const QString defect = translationDefect(source, newValue); !defect.isEmpty()) {
+            DIAG_WARN(APP, "TranslationManager").noquote() << "Skipping community translation for" << key
+                                 << "-" << defect << ". source=" << source
+                                 << "incoming=" << newValue;
+            skippedBroken++;
+            continue;
+        }
+
+        // Skip if user has customized this translation
+        if (m_userOverrides.contains(key)) {
+            preserved++;
+            continue;
+        }
+
+        if (!m_translations.contains(key)) {
+            // New translation
+            m_translations[key] = newValue;
+            added++;
+        } else if (m_translations[key] != newValue) {
+            // Updated translation
+            m_translations[key] = newValue;
+            updated++;
+        }
+    }
+
+    if (skippedBroken > 0)
+        DIAG_WARN(APP, "TranslationManager") << "Language update for" << m_currentLanguage << "skipped"
+                   << skippedBroken << "broken string(s); the local values were kept";
+    if (added > 0 || updated > 0) {
+        DIAG_DEBUG(APP, "TranslationManager") << "Language update merged:" << added << "new," << updated << "updated,"
+                 << preserved << "preserved user overrides,"
+                 << skippedBroken << "skipped as broken";
+        // Honour the save. Returning true after a refused write defeats this function's own
+        // caller, which was rewritten in this branch specifically to act on the bool — the
+        // caller then writes metadata, emits languageDownloaded(true), and the UI offers to
+        // AI-translate over data that was never persisted.
+        if (!saveTranslations())
+            return false;
+        recalculateUntranslatedCount();
+        m_translationVersion++;
+        emit translationsChanged();
+    } else {
+        DIAG_DEBUG(APP, "TranslationManager") << "Language is up to date";
+    }
+    return true;
+}
+
+// --- Batch Translate and Upload All Languages ---
+
+// The model each provider falls back to when the user has not chosen one. Kept in step with
+// aiprovider.cpp's catalogs by tst_aiproviders, which asserts each of these is that provider's
+// FIRST catalog entry — the codebase's existing definition of "recommended".
+//
+// Deliberately a literal rather than a call into AIProvider: decenza_testlib compiles
+// translationmanager.cpp but not the AI stack, so reaching for the catalog at runtime would
+// drag the provider classes into all 106 test targets that link it, to read one string. The
+// test carries the coupling instead of the link line.
+//
+// This is what had gone stale. All three cloud providers hard-coded a model and ignored both
+// the user's choice and the catalog: Anthropic on claude-3-5-haiku-20241022 (RETIRED
+// 2026-02-19, so every Anthropic translation was 404ing), OpenAI on gpt-4o-mini, Gemini on
+// gemini-2.0-flash — the latter two not even offered by the model picker. Ollama read its
+// setting and never went stale, which is the argument for reading settings.
+QString TranslationManager::fallbackTranslationModel(const QString& providerId)
+{
+    if (providerId == QLatin1String("openai"))    return QStringLiteral("gpt-6.1-sol");
+    if (providerId == QLatin1String("anthropic")) return QStringLiteral("claude-sonnet-5-5");
+    if (providerId == QLatin1String("gemini"))    return QStringLiteral("gemini-3.8-flash");
+    return {};   // ollama has no catalog — its model is user-supplied
+}
+
+// The model to translate with: whatever the user configured for this provider, else the
+// fallback above. Translation is bulk (2400+ strings, 25 to a request), so a configured
+// model can be expensive — that is the user's call to make, and a surprising bill is more
+// visible than a silently wrong model.
+QString TranslationManager::translationModelFor(const QString& provider,
+                                                const QString& fallback) const
+{
+    const QString configured = m_settings->ai()->providerModel(provider).trimmed();
+    if (!configured.isEmpty())
+        return configured;
+    const QString catalogued = fallbackTranslationModel(provider);
+    return catalogued.isEmpty() ? fallback : catalogued;
+}
+
+// Human-readable name of the selected provider, for error text the user actually reads.
+QString TranslationManager::selectedProviderLabel() const
+{
+    const QString id = m_settings->ai()->aiProvider();
+    if (id == QLatin1String("anthropic")) return QStringLiteral("Claude");
+    if (id == QLatin1String("openai"))    return QStringLiteral("OpenAI");
+    if (id == QLatin1String("gemini"))    return QStringLiteral("Gemini");
+    if (id == QLatin1String("ollama"))    return QStringLiteral("Ollama");
+    return id.isEmpty() ? QStringLiteral("No AI provider") : id;
+}
+
+QStringList TranslationManager::getConfiguredProviders() const
+{
+    // ONLY the user's selected provider. No substitution, silent or otherwise.
+    //
+    // This used to hard-order "Claude first (best quality), then OpenAI" and fall through to
+    // whatever else had a key. That fallback is exactly what hid a dead provider for months:
+    // the Anthropic model ID had been retired, every Anthropic request 404'd, and the batch
+    // quietly finished on OpenAI — so the only users who could notice were those with no
+    // second key, who got nothing at all and no reason why.
+    //
+    // Substituting a provider the user did not choose is not resilience when it is silent.
+    // A translation run that cannot use the configured provider now stops and says so.
+    QStringList providers;
+    const QString selected = m_settings->ai()->aiProvider();
+    const bool configured =
+        (selected == QLatin1String("anthropic") && !m_settings->ai()->anthropicApiKey().isEmpty())
+        || (selected == QLatin1String("openai") && !m_settings->ai()->openaiApiKey().isEmpty())
+        || (selected == QLatin1String("gemini") && !m_settings->ai()->geminiApiKey().isEmpty())
+        || (selected == QLatin1String("ollama") && !m_settings->ai()->ollamaEndpoint().isEmpty());
+    if (configured)
+        providers << selected;
+    // Gemini and Ollama are no longer "excluded": nothing is auto-discovered any more, so if
+    // the user selected one, that is what runs.
+    return providers;
+}
+
+QString TranslationManager::getActiveProvider() const
+{
+    // During batch processing, use the override provider (bypasses QSettings cache)
+    if (m_batchProcessing && !m_batchCurrentProvider.isEmpty()) {
+        return m_batchCurrentProvider;
+    }
+    // Otherwise use the normal settings value
+    return m_settings->ai()->aiProvider();
+}
+
+void TranslationManager::translateAndUploadAllLanguages()
+{
+    if (m_batchProcessing || m_autoTranslating || m_uploading) {
+        DIAG_DEBUG(APP, "TranslationManager") << "Batch processing already in progress";
+        return;
+    }
+
+    // Get all configured providers - we'll cycle through them
+    m_batchProviderQueue = getConfiguredProviders();
+    if (m_batchProviderQueue.isEmpty()) {
+        m_lastError = QStringLiteral("%1 is selected as the AI provider but is not configured. "
+                                     "Add its API key in Settings, or select a provider that has one.")
+                          .arg(selectedProviderLabel());
+        emit lastErrorChanged();
+        emit batchTranslateUploadFinished(false, m_lastError);
+        return;
+    }
+
+    // Ensure all strings are scanned first. The scan is asynchronous now (see scanAllStrings),
+    // so park the batch on scanFinished() and restart it from the top rather than proceeding
+    // with whatever the registry happened to hold — the whole point of the scan here is that the
+    // batch translates the COMPLETE string list, not just the screens this device has rendered.
+    if (!m_scanCompleted) {
+        if (!m_batchAwaitingScan) {
+            m_batchAwaitingScan = true;
+            connect(this, &TranslationManager::scanFinished, this, [this](int) {
+                m_batchAwaitingScan = false;
+
+                // The park opens a window the inline scan never had: an AI translation or an
+                // upload can start during it, and the re-entry would then hit the guard at the
+                // top of this function, qDebug, and return — with the single-shot connection
+                // already spent. The button press would evaporate with nothing on screen and no
+                // signal. Say so instead.
+                if (m_batchProcessing || m_autoTranslating || m_uploading) {
+                    m_lastError = QStringLiteral(
+                        "The batch translate and upload was waiting for the QML string scan to "
+                        "finish, but %1 started in the meantime. Wait for that to finish, then "
+                        "press the button again.")
+                        .arg(m_autoTranslating ? QStringLiteral("an AI translation")
+                                               : QStringLiteral("an upload"));
+                    emit lastErrorChanged();
+                    emit batchTranslateUploadFinished(false, m_lastError);
+                    return;
+                }
+                translateAndUploadAllLanguages();
+            }, Qt::SingleShotConnection);
+        }
+        if (!m_scanning) {
+            scanAllStrings();
+        }
+        return;
+    }
+
+    // Save original provider AND language to restore later — the batch switches both.
+    m_originalProvider = m_settings->ai()->aiProvider();
+    m_originalLanguage = m_currentLanguage;
+
+    // Build list of all local (non-remote, non-English) languages
+    QStringList allLanguages;
+    for (const QString& langCode : m_availableLanguages) {
+        if (langCode != "en" && !isRemoteLanguage(langCode)) {
+            allLanguages.append(langCode);
+        }
+    }
+
+    if (allLanguages.isEmpty()) {
+        emit batchTranslateUploadFinished(true, "No local languages to process");
+        return;
+    }
+
+    m_batchProcessing = true;
+    m_batchFailedUploads.clear();   // a previous run's failures must not be reported by this one
+    DIAG_DEBUG(APP, "TranslationManager") << "=== BATCH TRANSLATE+UPLOAD START ===";
+    DIAG_DEBUG(APP, "Languages") << allLanguages.size() << allLanguages;
+    DIAG_DEBUG(APP, "TranslationManager") << "AI Providers:" << m_batchProviderQueue.size() << m_batchProviderQueue;
+
+    // Start with first provider, queue all languages for it
+    QString firstProvider = m_batchProviderQueue.takeFirst();
+    m_batchCurrentProvider = firstProvider;  // Bypass QSettings cache
+    m_settings->ai()->setAiProvider(firstProvider);  // Still set for UI consistency
+    m_batchLanguageQueue = allLanguages;
+
+    DIAG_DEBUG(APP, "Batch") << "Starting with provider:" << firstProvider << "(m_batchCurrentProvider set)";
+
+    // Set up connections for the batch process flow
+    QMetaObject::Connection* autoConn = new QMetaObject::Connection();
+    QMetaObject::Connection* submitConn = new QMetaObject::Connection();
+
+    // Lambda to process next language (using shared_ptr to allow recursion and survive async calls)
+    auto processNext = std::make_shared<std::function<void()>>();
+    *processNext = [this, autoConn, submitConn, processNext]() {
+        if (!m_batchProcessing) return;
+
+        if (!m_batchLanguageQueue.isEmpty()) {
+            // No provider queue to reset: the selected provider is the only one used, and a
+            // failure with it stops the batch rather than moving on.
+            QString nextLang = m_batchLanguageQueue.takeFirst();
+            DIAG_DEBUG(APP, "Batch") << "Processing language:" << nextLang << "with provider:" << m_batchCurrentProvider;
+            setCurrentLanguage(nextLang);
+
+            // Check if translation is needed or just upload
+            int untranslated = uniqueUntranslatedCount();
+            DIAG_DEBUG(APP, "Batch") << "Language status -"
+                     << "Registry:" << m_stringRegistry.size()
+                     << "Translations:" << m_translations.size()
+                     << "Unique untranslated:" << untranslated;
+            if (m_translations.size() < m_stringRegistry.size()) {
+                DIAG_DEBUG(APP, "TranslationManager") << "****************** MISSING TRANSLATIONS:" << (m_stringRegistry.size() - m_translations.size()) << "******************";
+            }
+            if (untranslated == 0) {
+                // Nothing to translate — but that is NOT a reason to skip the upload, which is
+                // what this branch used to do (the comment above it has always promised "or
+                // just upload"; the branch was never written). Being fully translated locally
+                // is exactly the state a language is in AFTER someone runs the AI pass, so the
+                // languages most worth publishing were the ones silently passed over. Observed:
+                // a batch uploaded ar and fr, both of which had gaps, and skipped de at 100%,
+                // leaving the server on a copy 2200 strings poorer.
+                DIAG_DEBUG(APP, "Batch") << nextLang << "is fully translated — uploading as-is";
+                submitTranslation();
+            } else {
+                DIAG_DEBUG(APP, "Batch") << nextLang << "has" << untranslated << "untranslated strings, translating...";
+                autoTranslate();
+            }
+        } else {
+            // All done - restore original provider AND language, then clear batch state.
+            //
+            // The language was missing here: the batch switches currentLanguage per language
+            // and only ever put the PROVIDER back, so it ended wherever the queue finished and
+            // the user's UI silently changed under them. Restoring it is the same courtesy the
+            // provider already got.
+            m_batchCurrentProvider.clear();
+            m_settings->ai()->setAiProvider(m_originalProvider);
+            if (!m_originalLanguage.isEmpty() && m_originalLanguage != m_currentLanguage) {
+                DIAG_DEBUG(APP, "Batch") << "restoring language to" << m_originalLanguage;
+                setCurrentLanguage(m_originalLanguage);
+            }
+            m_batchProcessing = false;
+            disconnect(*autoConn);
+            disconnect(*submitConn);
+            delete autoConn;
+            delete submitConn;
+            DIAG_DEBUG(APP, "TranslationManager") << "=== BATCH TRANSLATE+UPLOAD COMPLETE ===";
+            DIAG_DEBUG(APP, "TranslationManager") << "Restored provider:" << m_originalProvider;
+
+            // Report what actually reached the server, not merely that the queue drained.
+            // Uploads fail for ordinary reasons — the hourly rate limit above all — and this
+            // used to finish "complete" regardless, so a user could publish 10 of 12 languages
+            // and be told all 12 went. Name the ones that did not.
+            if (m_batchFailedUploads.isEmpty()) {
+                emit batchTranslateUploadFinished(true, "Batch processing complete");
+            } else {
+                const QString failed = m_batchFailedUploads.join(QStringLiteral("; "));
+                DIAG_WARN(APP, "Batch") << "uploads FAILED for" << failed;
+                emit batchTranslateUploadFinished(
+                    false, QStringLiteral("Uploaded all but %1 language(s). Failed: %2")
+                               .arg(m_batchFailedUploads.size()).arg(failed));
+            }
+            m_batchFailedUploads.clear();
+        }
+    };
+
+    *autoConn = connect(this, &TranslationManager::autoTranslateFinished, this, [this, processNext, autoConn, submitConn](bool success, const QString& message) {
+        if (!m_batchProcessing) return;
+
+        DIAG_DEBUG(APP, "Batch") << "autoTranslateFinished for" << m_currentLanguage
+                 << "success:" << success << "message:" << message
+                 << "provider:" << m_batchCurrentProvider;
+
+        if (success) {
+            // Check if there were actual translations made (not "all already translated")
+            if (message.contains("already translated")) {
+                // Same reasoning as the untranslated == 0 branch: nothing NEW was translated,
+                // but the local set can still be far ahead of the server's, and this is the
+                // only thing that would ever push it.
+                DIAG_DEBUG(APP, "Batch") << "nothing new for" << m_currentLanguage << "— uploading as-is";
+                submitTranslation();
+            } else {
+                // Translation done with changes, now upload
+                DIAG_DEBUG(APP, "Batch") << "Uploading" << m_currentLanguage << "...";
+                submitTranslation();
+            }
+        } else if (!m_autoTranslateFatal) {
+            // This language failed, but the provider is fine — one reply came back as prose or
+            // truncated JSON. Record it and carry on with the rest.
+            //
+            // Routing parse failures into autoTranslateFinished(false) without this made the
+            // terminal branch below swallow the whole run: one unusable reply out of a
+            // twelve-language batch abandoned the other eleven. The terminal branch was written
+            // for "the provider is unusable and everything after it fails the same way", which
+            // is true of a transport error and false of a bad completion.
+            DIAG_WARN(APP, "Batch").noquote() << "translation of" << m_currentLanguage
+                                 << "failed but the provider is usable — continuing." << message;
+            m_batchFailedUploads << QStringLiteral("%1 (%2)").arg(m_currentLanguage, message);
+            (*processNext)();
+        } else {
+            // Failure is terminal. Previously this walked to the next configured provider and,
+            // once they were exhausted, moved to the next LANGUAGE — so a batch could report
+            // "complete" having translated nothing, on a provider the user never picked.
+            m_batchProcessing = false;
+            m_batchCurrentProvider.clear();
+            m_batchLanguageQueue.clear();
+            m_batchProviderQueue.clear();
+            m_settings->ai()->setAiProvider(m_originalProvider);
+            if (!m_originalLanguage.isEmpty() && m_originalLanguage != m_currentLanguage)
+                setCurrentLanguage(m_originalLanguage);
+            m_lastError = QStringLiteral("Translation failed on %1 for %2: %3")
+                              .arg(selectedProviderLabel(), m_currentLanguage, message);
+
+            // Languages that were translated but never reached the server must still be named.
+            // Reporting only the translation failure repeats, on this branch, exactly the
+            // "credit for work not done" bug the upload accounting was added to fix — and this
+            // is the branch MORE likely to run, since translation and upload draw on the same
+            // hourly quota and fail together.
+            if (!m_batchFailedUploads.isEmpty()) {
+                m_lastError += QStringLiteral(" Uploads had already failed for: %1.")
+                                   .arg(m_batchFailedUploads.join(QStringLiteral("; ")));
+                m_batchFailedUploads.clear();
+            }
+            emit lastErrorChanged();
+            DIAG_WARN(APP, "Batch").noquote() << m_lastError
+                                 << "— stopping. The selected provider is the only one used;"
+                                 << "nothing was silently retried elsewhere.";
+
+            // Tear down the same connections the completion path does. Without this the
+            // lambdas stay attached to `this`: the NEXT batch sets m_batchProcessing back to
+            // true, the stale handlers pass their guard and run alongside the fresh ones, and
+            // processNext() fires twice per completion — taking two languages off the queue
+            // each time and silently skipping about half of them. This terminal branch did not
+            // exist before this change, so the leak is new to it.
+            disconnect(*autoConn);
+            disconnect(*submitConn);
+            delete autoConn;
+            delete submitConn;
+
+            emit batchTranslateUploadFinished(false, m_lastError);
+            return;
+        }
+    });
+
+    *submitConn = connect(this, &TranslationManager::translationSubmitted, this, [this, processNext](bool success, const QString& message) {
+        if (!m_batchProcessing) return;
+
+        DIAG_DEBUG(APP, "Batch") << "Upload" << (success ? "SUCCEEDED" : "FAILED")
+                 << "for" << m_currentLanguage << "-" << message;
+
+        // Record the failure rather than only logging it. A failed upload is not a reason to
+        // abandon the remaining languages — unlike a translation failure, which means the
+        // provider is unusable and everything after it would fail the same way — so the batch
+        // continues, but the final result must name what did not make it.
+        if (!success)
+            m_batchFailedUploads << QStringLiteral("%1 (%2)").arg(m_currentLanguage, message);
+
+        (*processNext)();
+    });
+
+    // Start with first language
+    QString firstLang = m_batchLanguageQueue.takeFirst();
+    DIAG_DEBUG(APP, "Batch") << "Starting with language:" << firstLang;
+    setCurrentLanguage(firstLang);
+
+    // Check if translation is needed or just upload
+    int untranslated = uniqueUntranslatedCount();
+    DIAG_DEBUG(APP, "Batch") << "Language status -"
+             << "Registry:" << m_stringRegistry.size()
+             << "Translations:" << m_translations.size()
+             << "Unique untranslated:" << untranslated;
+    if (m_translations.size() < m_stringRegistry.size()) {
+        DIAG_DEBUG(APP, "TranslationManager") << "****************** MISSING TRANSLATIONS:" << (m_stringRegistry.size() - m_translations.size()) << "******************";
+    }
+    if (untranslated == 0) {
+        DIAG_DEBUG(APP, "Batch") << firstLang << "is fully translated — uploading as-is";
+        submitTranslation();
+    } else {
+        DIAG_DEBUG(APP, "Batch") << firstLang << "has" << untranslated << "untranslated strings, translating...";
+        autoTranslate();
+    }
+}

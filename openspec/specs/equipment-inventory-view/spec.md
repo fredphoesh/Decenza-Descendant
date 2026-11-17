@@ -1,0 +1,100 @@
+# equipment-inventory-view Specification
+
+## Purpose
+Defines the user-facing Equipment window and idle-page entry point for browsing, adding, and removing-from-inventory the equipment packages a user owns, including how each package's basket and puck-prep components are summarized on its card and info dialog. Covers the idempotent layout migration that injects the Equipment button into existing users' saved layouts.
+
+## Requirements
+
+### Requirement: Equipment window
+The system SHALL provide an `EquipmentPage.qml` that lists equipment packages with `inInventory = true` as cards, mirroring `BeanInfoPage.qml`. When no packages exist it SHALL show an empty state plus the "Add [Equipment]" create button. Like the Beans and Recipes pages, the create control is an "Add" label followed by a button naming the kind with its icon, in the same style as those pages.
+
+#### Scenario: Empty inventory
+- **WHEN** the Equipment window is opened with no packages in inventory
+- **THEN** it SHALL show an empty-state message and the "Add [Equipment]" create button only
+
+#### Scenario: Populated inventory
+- **WHEN** the Equipment window is opened with packages in inventory
+- **THEN** it SHALL show a card per package displaying the grinder identity (brand/model, burrs as subtitle)
+- **AND** each card SHALL offer edit and remove-from-inventory actions
+
+#### Scenario: Removing a package from inventory
+- **WHEN** the user removes a package from inventory
+- **THEN** the package SHALL be soft-deleted (`inInventory = 0`) and SHALL disappear from the inventory list
+- **AND** bags and shots pointing at it SHALL continue to resolve to its identity
+
+### Requirement: Idle-page Equipment button
+The system SHALL provide an `EquipmentItem.qml` idle-page layout widget that navigates to the Equipment window, registered in all required places: `CMakeLists.txt` qml module list, `LayoutItemDelegate.qml` (render switch + label map), the layout editor palette (`LayoutCenterZone.qml`/`LayoutEditorZone.qml` widget list + chip label map).
+
+#### Scenario: Default layout placement
+- **WHEN** a fresh install builds the default layout
+- **THEN** the default layout SHALL include an `equipment` item placed immediately after the `beans` item in the same zone
+
+#### Scenario: Tapping the Equipment button
+- **WHEN** the user taps the idle Equipment button
+- **THEN** the Equipment window SHALL open
+
+### Requirement: The equipment card SHALL display the package's basket
+`EquipmentCard` SHALL show the package's basket on its own line (below the grinder
+title / burrs), using the same typography and secondary-color convention as the
+burrs line. When a package has no basket, the basket line SHALL be omitted (not
+shown blank). The grinder SHALL remain the card title; the basket SHALL be a
+subordinate line.
+
+#### Scenario: Card with a basket
+- **WHEN** a package has a basket item
+- **THEN** the card SHALL render a basket line showing the basket brand + model
+
+#### Scenario: Card with no basket
+- **WHEN** a package has no basket item
+- **THEN** the card SHALL omit the basket line entirely
+
+### Requirement: The equipment info dialog SHALL include the basket
+`EquipmentInfoDialog` SHALL add a basket `InfoRow` (label + value) showing the
+basket identity, placed with the other equipment rows. When no basket is set, the
+row SHALL be omitted.
+
+#### Scenario: Info dialog shows the basket
+- **WHEN** the info dialog opens for a package with a basket
+- **THEN** it SHALL include a basket row showing the basket brand + model
+
+### Requirement: The equipment card SHALL display the package's puck prep
+`EquipmentCard` SHALL show the package's puck prep on its own line (a compact
+summary of the set flags, e.g. "WDT · Shaker"), below the existing grinder / basket
+lines. When a package has no puck prep, the line SHALL be omitted (not shown blank).
+
+#### Scenario: Card with puck prep
+- **WHEN** a package has a puck-prep item with flags set
+- **THEN** the card SHALL render a puck-prep line summarizing the set flags
+
+#### Scenario: Card with no puck prep
+- **WHEN** a package has no puck-prep item
+- **THEN** the card SHALL omit the puck-prep line entirely
+
+### Requirement: The equipment info dialog SHALL include the puck prep
+`EquipmentInfoDialog` SHALL include the package's puck prep — the set flags only —
+placed after the grinder / basket / dial rows. The row SHALL self-hide when the
+package has no puck prep. The derived `distribution` rollup SHALL NOT be shown — it
+is an AI-only signal (advisor + MCP) and is kept out of all user-visible surfaces.
+
+#### Scenario: Info dialog shows puck-prep flags, not distribution
+- **WHEN** the info dialog opens for a package with puck prep
+- **THEN** it SHALL show the set flags
+- **AND** it SHALL NOT show the derived distribution
+
+### Requirement: The Equipment page SHALL show archived packages and restore them
+
+The used-package removal action SHALL be labelled **Archive**; delete SHALL remain
+available only for a package no shot references. The Equipment page SHALL offer a
+"Show archived (N)" toggle, shown when archived packages exist, that lists archived
+packages as dimmed cards with a **Restore** action. Forked packages SHALL NOT be listed.
+
+#### Scenario: Restoring an archived package
+
+- **GIVEN** an archived package
+- **WHEN** the user shows archived packages and taps Restore on it
+- **THEN** it returns to the inventory list with its history
+
+#### Scenario: Archived packages stay out of the way
+
+- **WHEN** archived packages are hidden (the default)
+- **THEN** only in-inventory packages are listed and the toggle shows the archived count

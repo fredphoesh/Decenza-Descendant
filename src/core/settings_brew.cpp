@@ -1,0 +1,1442 @@
+#include "core/diagnosticlogging.h"
+#include "settings_brew.h"
+#include "settings.h"
+#include "steamcalculations.h"
+#include "steampitcherselection.h"
+#include "yieldspec.h"
+
+#include <QDebug>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QtMath>
+
+#include <cmath>
+
+static_assert(SettingsBrew::HeaterOffPitcherIndex == SteamPitcherSelection::HeaterOffIndex);
+
+SettingsBrew::SettingsBrew(QObject* parent)
+    : QObject(parent)
+{
+    // The display position is derived from BOTH the stored selection and the
+    // preset count — the built-in's row is one past the last preset, so adding
+    // or deleting one moves it without the selection changing.
+    connect(this, &SettingsBrew::selectedSteamPitcherChanged,
+            this, &SettingsBrew::selectedSteamPitcherDisplayIndexChanged);
+    connect(this, &SettingsBrew::steamPitcherPresetsChanged,
+            this, &SettingsBrew::selectedSteamPitcherDisplayIndexChanged);
+
+    // Seed default steam pitcher presets if none exist
+    if (!m_settings.contains("steam/pitcherPresets")) {
+        QJsonArray defaults;
+        QJsonObject small;
+        small["name"] = "Small";
+        small["duration"] = 30;
+        small["flow"] = 150;  // 1.5 ml/s
+        defaults.append(small);
+
+        QJsonObject large;
+        large["name"] = "Large";
+        large["duration"] = 60;
+        large["flow"] = 150;  // 1.5 ml/s
+        defaults.append(large);
+
+        m_settings.setValue("steam/pitcherPresets", QJsonDocument(defaults).toJson());
+    }
+
+    // Seed default water vessel presets if none exist
+    if (!m_settings.contains("water/vesselPresets")) {
+        QJsonArray defaults;
+        QJsonObject vessel;
+        vessel["name"] = "Cup";
+        vessel["volume"] = 200;
+        defaults.append(vessel);
+
+        QJsonObject mug;
+        mug["name"] = "Mug";
+        mug["volume"] = 350;
+        defaults.append(mug);
+
+        m_settings.setValue("water/vesselPresets", QJsonDocument(defaults).toJson());
+    }
+
+    // Seed default flush presets if none exist
+    if (!m_settings.contains("flush/presets")) {
+        QJsonArray defaults;
+        QJsonObject quick;
+        quick["name"] = "Quick";
+        quick["flow"] = 6.0;
+        quick["seconds"] = 3.0;
+        defaults.append(quick);
+
+        QJsonObject normal;
+        normal["name"] = "Normal";
+        normal["flow"] = 6.0;
+        normal["seconds"] = 5.0;
+        defaults.append(normal);
+
+        QJsonObject thorough;
+        thorough["name"] = "Thorough";
+        thorough["flow"] = 6.0;
+        thorough["seconds"] = 10.0;
+        defaults.append(thorough);
+
+        m_settings.setValue("flush/presets", QJsonDocument(defaults).toJson());
+    }
+
+    // One-time: the steam rate was one global value; copy it into every pitcher.
+    // An unreadable preset list leaves the flag unset, so this retries next launch.
+    if (!m_settings.contains("migration/steamRatePerPitcher")
+        && seedSteamPitcherRates(m_settings.value("steam/steamSecondsPerGram", 0.0).toDouble())) {
+        m_settings.setValue("migration/steamRatePerPitcher", true);
+        DIAG_INFO(APP, "SettingsBrew") << "one-time steam rate copy done; the global rate was"
+            << m_settings.value("steam/steamSecondsPerGram", 0.0).toDouble() << "s/g";
+    }
+
+    // Load persistent brew overrides into the cache (Settings used to do this).
+    m_hasTemperatureOverride = m_settings.value("brew/hasTemperatureOverride", false).toBool();
+    if (m_hasTemperatureOverride) {
+        m_temperatureOverride = m_settings.value("brew/temperatureOverride", 0.0).toDouble();
+    }
+
+    // Session yield anchor (add-yield-ratio-anchor): {value, mode}. An absent
+    // mode key is a pre-anchor install — migrate on read: "absolute" when the
+    // legacy hasBrewYieldOverride flag was set, else "none". No SQL-style
+    // migration step (QSettings).
+    {
+        const QString storedMode = m_settings.value("espresso/brewYieldMode").toString();
+        if (storedMode.isEmpty()) {
+            m_brewYieldMode = m_settings.value("brew/hasBrewYieldOverride", false).toBool()
+                ? YieldSpec::modeAbsolute() : YieldSpec::modeNone();
+        } else {
+            m_brewYieldMode = YieldSpec::normalizedMode(storedMode);
+        }
+        if (YieldSpec::isSet(m_brewYieldMode))
+            m_brewYieldOverride = m_settings.value("brew/brewYieldOverride", 0.0).toDouble();
+        if (m_brewYieldOverride <= 0)
+            m_brewYieldMode = YieldSpec::modeNone();
+    }
+}
+
+// Espresso
+
+double SettingsBrew::espressoTemperature() const {
+    return m_settings.value("espresso/temperature", 93.0).toDouble();
+}
+
+void SettingsBrew::setEspressoTemperature(double temp) {
+    if (espressoTemperature() != temp) {
+        m_settings.setValue("espresso/temperature", temp);
+        emit espressoTemperatureChanged();
+    }
+}
+
+double SettingsBrew::targetWeight() const {
+    return m_settings.value("espresso/targetWeight", 36.0).toDouble();
+}
+
+void SettingsBrew::setTargetWeight(double weight) {
+    if (targetWeight() != weight) {
+        m_settings.setValue("espresso/targetWeight", weight);
+        emit targetWeightChanged();
+    }
+}
+
+double SettingsBrew::lastUsedRatio() const {
+    return m_settings.value("espresso/lastUsedRatio", 2.0).toDouble();
+}
+
+void SettingsBrew::setLastUsedRatio(double ratio) {
+    if (lastUsedRatio() != ratio) {
+        m_settings.setValue("espresso/lastUsedRatio", ratio);
+        emit lastUsedRatioChanged();
+    }
+}
+
+double SettingsBrew::ratioPreset1() const {
+    return m_settings.value("espresso/ratioPreset1", 1.0).toDouble();
+}
+void SettingsBrew::setRatioPreset1(double r) {
+    r = YieldSpec::clampRatio(r);
+    if (ratioPreset1() != r) {
+        m_settings.setValue("espresso/ratioPreset1", r);
+        emit ratioPreset1Changed();
+    }
+}
+
+double SettingsBrew::ratioPreset2() const {
+    return m_settings.value("espresso/ratioPreset2", 2.0).toDouble();
+}
+void SettingsBrew::setRatioPreset2(double r) {
+    r = YieldSpec::clampRatio(r);
+    if (ratioPreset2() != r) {
+        m_settings.setValue("espresso/ratioPreset2", r);
+        emit ratioPreset2Changed();
+    }
+}
+
+double SettingsBrew::ratioPreset3() const {
+    return m_settings.value("espresso/ratioPreset3", 3.0).toDouble();
+}
+void SettingsBrew::setRatioPreset3(double r) {
+    r = YieldSpec::clampRatio(r);
+    if (ratioPreset3() != r) {
+        m_settings.setValue("espresso/ratioPreset3", r);
+        emit ratioPreset3Changed();
+    }
+}
+
+double SettingsBrew::minRatio() const { return YieldSpec::kMinRatio; }
+double SettingsBrew::maxRatio() const { return YieldSpec::kMaxRatio; }
+
+double SettingsBrew::doseCupTareWeight() const {
+    return m_settings.value("espresso/doseCupTareWeight", 0.0).toDouble();
+}
+
+void SettingsBrew::setDoseCupTareWeight(double weight) {
+    if (weight < 0) weight = 0;  // a tare is never negative
+    if (doseCupTareWeight() != weight) {
+        m_settings.setValue("espresso/doseCupTareWeight", weight);
+        emit doseCupTareWeightChanged();
+    }
+}
+
+bool SettingsBrew::milkAutoCaptureEnabled() const {
+    return m_settings.value("steam/milkAutoCaptureEnabled", false).toBool();  // off by default; calibrating turns it on
+}
+void SettingsBrew::setMilkAutoCaptureEnabled(bool enabled) {
+    if (milkAutoCaptureEnabled() != enabled) {
+        m_settings.setValue("steam/milkAutoCaptureEnabled", enabled);
+        emit milkAutoCaptureEnabledChanged();
+    }
+}
+
+double SettingsBrew::lastSteamMilkG() const {
+    return m_settings.value("steam/lastSteamMilkG", 0.0).toDouble();
+}
+void SettingsBrew::setLastSteamMilkG(double g) {
+    if (g < 0) g = 0;
+    if (lastSteamMilkG() != g) {
+        m_settings.setValue("steam/lastSteamMilkG", g);
+        emit lastSteamMilkGChanged();
+    }
+}
+
+double SettingsBrew::lastSteamTimeS() const {
+    return m_settings.value("steam/lastSteamTimeS", 0.0).toDouble();
+}
+void SettingsBrew::setLastSteamTimeS(double s) {
+    if (s < 0) s = 0;
+    if (lastSteamTimeS() != s) {
+        m_settings.setValue("steam/lastSteamTimeS", s);
+        emit lastSteamTimeSChanged();
+    }
+}
+
+QString SettingsBrew::lastSteamPitcherName() const {
+    return m_settings.value("steam/lastSteamPitcherName").toString();
+}
+void SettingsBrew::setLastSteamPitcherName(const QString& name) {
+    if (lastSteamPitcherName() != name) {
+        m_settings.setValue("steam/lastSteamPitcherName", name);
+        emit lastSteamPitcherNameChanged();
+    }
+}
+
+double SettingsBrew::lastSteamPourMilkG() const {
+    return m_settings.value("steam/lastSteamPourMilkG", 0.0).toDouble();
+}
+void SettingsBrew::setLastSteamPourMilkG(double g) {
+    if (g < 0) g = 0;
+    if (lastSteamPourMilkG() != g) {
+        m_settings.setValue("steam/lastSteamPourMilkG", g);
+        emit lastSteamPourMilkGChanged();
+    }
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::trySetSteamPitcherSecondsPerGram(
+    int index, const QString& expectedName, double secondsPerGram)
+{
+    if (!std::isfinite(secondsPerGram))
+        return PresetMutationResult::Invalid;
+    const double rate = qMax(0.0, secondsPerGram);
+    const PresetMutationResult result = updateSteamPitcherPresetFields(index, expectedName,
+        QJsonObject{{QStringLiteral("secondsPerGram"), rate}}, false);
+    if (result == PresetMutationResult::Applied) {
+        DIAG_INFO(APP, "SettingsBrew") << "steam rate of pitcher"
+            << getSteamPitcherPreset(index).value(QStringLiteral("name")).toString()
+            << "set to" << rate << "s/g";
+    }
+    return result;
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::tryCalibrateSteamPitcher(
+    int index, const QString& expectedName, double milkG, double timeSec)
+{
+    if (!std::isfinite(milkG) || !std::isfinite(timeSec) || milkG <= 0.0 || timeSec <= 0.0)
+        return PresetMutationResult::Invalid;
+    const PresetMutationResult result =
+        trySetSteamPitcherSecondsPerGram(index, expectedName, timeSec / milkG);
+    // Weight-timed steaming is off by default; calibrating is the explicit opt-in.
+    if (result == PresetMutationResult::Applied || result == PresetMutationResult::NoChange)
+        setMilkAutoCaptureEnabled(true);
+    return result;
+}
+
+double SettingsBrew::steamRateForNewPitcher() const {
+    return SteamCalculations::presetSecondsPerGram(getSteamPitcherPreset(selectedSteamPitcher()));
+}
+
+bool SettingsBrew::seedSteamPitcherRates(double secondsPerGram) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"), &parseFailed);
+    if (parseFailed)
+        return false;
+    if (!std::isfinite(secondsPerGram) || secondsPerGram <= 0.0)
+        return true;   // nothing to copy; an absent rate already reads as uncalibrated
+
+    qsizetype filled = 0;
+    for (qsizetype i = 0; i < arr.size(); ++i) {
+        QJsonObject preset = arr.at(i).toObject();
+        if (preset.contains(QStringLiteral("secondsPerGram")))
+            continue;
+        preset.insert(QStringLiteral("secondsPerGram"), secondsPerGram);
+        arr[i] = preset;
+        ++filled;
+    }
+    DIAG_INFO(APP, "SettingsBrew") << "steam rate" << secondsPerGram << "s/g given to" << filled
+        << "of" << arr.size() << "pitchers; the rest already had their own";
+    if (filled > 0) {
+        m_settings.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+        emit steamPitcherPresetsChanged();
+    }
+    return true;
+}
+
+bool SettingsBrew::nameTakenIn(const QJsonArray& arr, const QString& name, int ignoreIndex) {
+    return SteamCalculations::nameTakenIn(arr.toVariantList(), name, ignoreIndex);
+}
+
+bool SettingsBrew::waterVesselNameTaken(const QString& name, int ignoreIndex) const {
+    return nameTakenIn(readPresetArray(QStringLiteral("water/vesselPresets")), name, ignoreIndex);
+}
+
+bool SettingsBrew::steamPitcherNameTaken(const QString& name, int ignoreIndex) const {
+    return SteamCalculations::steamPitcherNameTaken(
+        readPresetArray(QStringLiteral("steam/pitcherPresets")).toVariantList(), name, ignoreIndex);
+}
+
+QJsonArray SettingsBrew::readPresetArray(const QString& key, bool* parseFailed) const {
+    if (parseFailed) *parseFailed = false;
+    const QByteArray data = m_settings.value(key).toByteArray();
+    // Genuinely unset (or explicitly emptied) — not a failure, just no presets.
+    if (data.isEmpty()) return QJsonArray();
+
+    QJsonParseError err{};
+    const QJsonDocument doc = QJsonDocument::fromJson(data, &err);
+    if (err.error != QJsonParseError::NoError) {
+        if (parseFailed) *parseFailed = true;
+        // noquote so the key reads as a settings path rather than "a/b" — this
+        // line is the only notice a user or a bug report ever gets that their
+        // presets became unreadable.
+        DIAG_WARN(APP, "SettingsBrew").noquote() << "could not parse" << key << "-" << err.errorString()
+                             << "at offset" << err.offset
+                             << "- reporting no presets and refusing to overwrite the stored value";
+        return QJsonArray();
+    }
+    // Valid JSON that is not an array is equally unusable, and equally must not
+    // be written over.
+    if (!doc.isArray()) {
+        if (parseFailed) *parseFailed = true;
+        DIAG_WARN(APP, "SettingsBrew").noquote() << key << "holds valid JSON that is not an array"
+                             << "- reporting no presets and refusing to overwrite the stored value";
+        return QJsonArray();
+    }
+    return doc.array();
+}
+
+bool SettingsBrew::doseCaptureSoundEnabled() const {
+    return m_settings.value("espresso/doseCaptureSoundEnabled", false).toBool();
+}
+void SettingsBrew::setDoseCaptureSoundEnabled(bool enabled) {
+    if (doseCaptureSoundEnabled() != enabled) {
+        m_settings.setValue("espresso/doseCaptureSoundEnabled", enabled);
+        emit doseCaptureSoundEnabledChanged();
+    }
+}
+
+// Steam
+
+double SettingsBrew::steamTemperature() const {
+    return m_settings.value("steam/temperature", 160.0).toDouble();
+}
+
+void SettingsBrew::setSteamTemperature(double temp) {
+    if (steamTemperature() != temp) {
+        m_settings.setValue("steam/temperature", temp);
+        emit steamTemperatureChanged();
+    }
+}
+
+int SettingsBrew::steamTimeout() const {
+    return m_settings.value("steam/timeout", 120).toInt();
+}
+
+void SettingsBrew::setSteamTimeout(int timeout) {
+    if (steamTimeout() != timeout) {
+        m_settings.setValue("steam/timeout", timeout);
+        emit steamTimeoutChanged();
+    }
+}
+
+int SettingsBrew::steamFlow() const {
+    return m_settings.value("steam/flow", 150).toInt();  // 150 = 1.5 ml/s (range: 40-250)
+}
+
+void SettingsBrew::setSteamFlow(int flow) {
+    if (steamFlow() != flow) {
+        m_settings.setValue("steam/flow", flow);
+        emit steamFlowChanged();
+    }
+}
+
+bool SettingsBrew::steamDisabled() const {
+    return m_steamDisabled;
+}
+
+void SettingsBrew::setSteamDisabled(bool disabled) {
+    if (m_steamDisabled != disabled) {
+        m_steamDisabled = disabled;
+        emit steamDisabledChanged();
+    }
+}
+
+bool SettingsBrew::keepWarmWhenIdle() const {
+    // Same key as the old single setting: this half IS what it meant, so an
+    // existing user's choice carries over with no migration step of its own.
+    return m_settings.value("steam/keepHeaterOn", true).toBool();
+}
+
+void SettingsBrew::setKeepWarmWhenIdle(bool keep) {
+    if (keepWarmWhenIdle() != keep) {
+        m_settings.setValue("steam/keepHeaterOn", keep);
+        emit keepWarmWhenIdleChanged();
+    }
+}
+
+bool SettingsBrew::letRecipeDecide() const {
+    // Defaults ON, for existing installs as well as fresh ones. That is a
+    // deliberate behaviour change at upgrade — nearly every espresso recipe has
+    // no pitcher, so a user with one parked will find the heater off where it
+    // used to be warm. Shipping it off would deliver the feature only to people
+    // who go looking for a setting, which for a heater policy is nearly nobody.
+    return m_settings.value("steam/letRecipeDecide", true).toBool();
+}
+
+void SettingsBrew::setLetRecipeDecide(bool let) {
+    if (letRecipeDecide() != let) {
+        m_settings.setValue("steam/letRecipeDecide", let);
+        emit letRecipeDecideChanged();
+    }
+}
+
+int SettingsBrew::steamAutoFlushSeconds() const {
+    return m_settings.value("steam/autoFlushSeconds", 0).toInt();
+}
+
+void SettingsBrew::setSteamAutoFlushSeconds(int seconds) {
+    if (steamAutoFlushSeconds() != seconds) {
+        m_settings.setValue("steam/autoFlushSeconds", seconds);
+        emit steamAutoFlushSecondsChanged();
+    }
+}
+
+// Steam pitcher presets
+
+QVariantList SettingsBrew::steamPitcherPresets() const {
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"));
+
+    QVariantList result;
+    for (const QJsonValue& v : arr) {
+        result.append(v.toObject().toVariantMap());
+    }
+    result.append(heaterOffPitcherEntry());
+    return result;
+}
+
+// The built-in "Heater off" entry. Synthetic — assembled here, never stored.
+//
+// `disabled` is the flag every existing reader already tests (the policy, the
+// pill rows, SteamPage, the wizard), and it is what a user-created Off preset
+// carried. `builtin` is what marks this one unmodifiable.
+//
+// No translated name: this map is data, and the view translates the label. A
+// stored name would be stale after a language change, and worse, name is what
+// recipes historically matched a pitcher on.
+QVariantMap SettingsBrew::heaterOffPitcherEntry() {
+    QVariantMap entry;
+    entry.insert(QStringLiteral("disabled"), true);
+    entry.insert(QStringLiteral("builtin"), true);
+    return entry;
+}
+
+bool SettingsBrew::isHeaterOffPitcher(const QVariantMap& preset) {
+    // `disabled` is the flag every reader already tests, and it is what a
+    // user-created Off preset carried before the migration removed them.
+    return preset.value(QStringLiteral("disabled")).toBool();
+}
+
+QString SettingsBrew::heaterOffEnglishLabel() {
+    return SteamCalculations::heaterOffEnglishLabel();
+}
+
+bool SettingsBrew::isHeaterOffPitcher(int index) const {
+    if (index == HeaterOffPitcherIndex)
+        return true;
+    // The built-in also answers to its display position (the slot past the last
+    // stored preset), because the pill rows address delegates by index.
+    return index == steamPitcherCount();
+}
+
+SettingsBrew::PitcherApply SettingsBrew::applySteamPitcherValues(int index, double milkG) {
+    const QVariantMap preset = getSteamPitcherPreset(index);
+    if (preset.isEmpty())
+        return PitcherApply::Missing;
+
+    if (preset.value(QStringLiteral("disabled")).toBool()) {
+        // The built-in "Heater off" entry. Deliberately writes nothing: it
+        // carries no duration, flow or temperature, and steaming with it selected
+        // falls back to the live settings — which still hold the last real
+        // pitcher's values. Writing its (absent) fields would zero them.
+        return PitcherApply::HeaterOff;
+    }
+
+    setSteamTimeout(effectiveSteamDurationSec(index, milkG));
+    if (preset.contains(QStringLiteral("flow")))
+        setSteamFlow(preset.value(QStringLiteral("flow")).toInt());
+    if (preset.contains(QStringLiteral("temperature")))
+        setSteamTemperature(preset.value(QStringLiteral("temperature")).toDouble());
+    return PitcherApply::Applied;
+}
+
+int SettingsBrew::steamPitcherCount() const {
+    return SteamCalculations::steamPitcherCount(steamPitcherPresets());
+}
+
+int SettingsBrew::selectedSteamPitcher() const {
+    return m_settings.value("steam/selectedPitcher", 0).toInt();
+}
+
+int SettingsBrew::selectedSteamPitcherDisplayIndex() const {
+    return SteamPitcherSelection::displayIndex(steamPitcherPresets(), selectedSteamPitcher());
+}
+
+// Refuse an index that addresses the synthetic built-in entry. `verb` completes
+// "the built-in Heater off entry cannot be <verb>".
+//
+// One helper rather than the guard pasted at each mutator: it was five copies,
+// four of them carrying the same five-line comment and three the same warning
+// string, every one free to drift alone.
+bool SettingsBrew::rejectsBuiltInPitcher(int index, const char* verb) const {
+    // The built-in is not in the stored array, so it cannot be addressed by a
+    // mutator. Refusing explicitly rather than letting the index fall through:
+    // its display slot is one past the last stored preset, and an off-by-one
+    // there would silently edit or delete a real pitcher.
+    if (!isHeaterOffPitcher(index))
+        return false;
+    DIAG_WARN(APP, "SettingsBrew").noquote() << "the built-in Heater off entry cannot be"
+                         << QString::fromUtf8(verb);
+    return true;
+}
+
+int SettingsBrew::shiftedForRemoval(int index, int removedIndex) {
+    // Positions into an array that just shrank must SHIFT, not merely be
+    // clamped. Clamping was the pre-existing behaviour and it silently moved a
+    // selection to a different pitcher: delete index 0 while index 2 is
+    // selected and the survivors renumber, so 2 now names what used to be 3.
+    // The sentinel is positionless and is left alone by the `< 0` guard, which
+    // is what keeps a deliberate "Heater off" from being clamped into a real
+    // pitcher and warming the boiler.
+    if (index < 0) return index;                       // sentinel or unset
+    if (index == removedIndex) return HeaterOffPitcherIndex;   // it IS what was deleted
+    return index > removedIndex ? index - 1 : index;
+}
+
+int SettingsBrew::shiftedForMove(int index, int from, int to) {
+    if (index < 0) return index;                       // sentinel or unset
+    if (index == from) return to;
+    if (from < index && to >= index) return index - 1;
+    if (from > index && to <= index) return index + 1;
+    return index;
+}
+
+void SettingsBrew::setSelectedSteamCup(int index) {
+    // Normalise the built-in to its SENTINEL, never its display slot.
+    //
+    // The pill rows address delegates by position, so a tap on "Heater off"
+    // arrives here as steamPitcherCount() — and that value stops meaning
+    // "Heater off" the moment a preset is added or deleted. Worse,
+    // removeSteamPitcherPreset() USED TO clamp an out-of-range selection down to
+    // the last real pitcher, so deleting a preset silently turned a deliberate
+    // "keep the boiler cold" into a real pitcher and warmed it. (It shifts now —
+    // see there — but normalising here is what makes the sentinel positionless
+    // in the first place, so neither fix is sufficient alone.)
+    //
+    // Normalising HERE rather than at each caller is the point: isHeaterOffPitcher()
+    // deliberately answers to both representations so callers can pass either,
+    // which is exactly what makes an un-normalised store ambiguous. One seam.
+    const int stored = isHeaterOffPitcher(index) ? HeaterOffPitcherIndex : index;
+    if (selectedSteamPitcher() != stored) {
+        m_settings.setValue("steam/selectedPitcher", stored);
+        syncSelectedSteamPitcherTemperature();
+        emit selectedSteamPitcherChanged();
+    } else {
+        // Explicit selection may re-apply the same row after an external setting
+        // change. Preserve the pitcher as the authority without requiring a page.
+        syncSelectedSteamPitcherTemperature();
+    }
+}
+
+void SettingsBrew::syncSelectedSteamPitcherTemperature()
+{
+    const QVariantMap preset = getSteamPitcherPreset(selectedSteamPitcher());
+    if (preset.isEmpty() || preset.value(QStringLiteral("disabled")).toBool()
+        || !preset.contains(QStringLiteral("temperature"))) {
+        return;
+    }
+    setSteamTemperature(preset.value(QStringLiteral("temperature")).toDouble());
+}
+
+int SettingsBrew::standingSteamPitcher() const {
+    return m_settings.value("steam/standingPitcher", NoStandingPitcher).toInt();
+}
+
+void SettingsBrew::setStandingSteamPitcher(int index) {
+    // Normalise exactly as setSelectedSteamCup does. This stores the same kind
+    // of value — a parked SELECTION — and every current caller happens to pass
+    // an already-normalised one, which is an invariant held by review rather
+    // than by code. The display slot reaching here would rot the same way it
+    // rotted the live selection. NoStandingPitcher is passed through: it is not
+    // a pitcher at all, so isHeaterOffPitcher() must not get a say.
+    const int stored = (index == NoStandingPitcher || !isHeaterOffPitcher(index))
+        ? index : HeaterOffPitcherIndex;
+    m_settings.setValue("steam/standingPitcher", stored);
+}
+
+int SettingsBrew::resolveRecipePitcherOverride(int recipeIndex) {
+    // Discard an override parked by older versions; it must never be restored.
+    setStandingSteamPitcher(NoStandingPitcher);
+    return recipeIndex;
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::tryAddSteamPitcherPreset(
+    const QString& name, int duration, int flow, double temperature,
+    std::optional<double> secondsPerGram)
+{
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return PresetMutationResult::Unreadable;
+
+    // A preset is addressed BY NAME by everything downstream — recipes snapshot
+    // the vessel/pitcher by name and re-select it on activation, and the recipe
+    // wizard matches its tiles on it. Two presets sharing a name therefore both
+    // light up in the wizard and activation resolves to whichever comes first,
+    // so the clash is refused at the setter, where every caller inherits it.
+    // Existing duplicates already in storage are left alone: this rejects new
+    // ones, it does not delete anyone's data.
+    if (SteamCalculations::steamPitcherNameTaken(arr.toVariantList(), name, -1)) {
+        DIAG_WARN(APP, "SettingsBrew") << "refusing a duplicate steam pitcher named" << name
+                   << "- that name is already in use";
+        return PresetMutationResult::Invalid;
+    }
+
+    QJsonObject preset;
+    preset["name"] = name;
+    preset["duration"] = duration;
+    preset["flow"] = flow;
+    preset["temperature"] = temperature;
+    if (secondsPerGram && std::isfinite(*secondsPerGram)) {
+        preset["secondsPerGram"] = qMax(0.0, *secondsPerGram);
+    }
+    arr.append(preset);
+
+    m_settings.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+    emit steamPitcherPresetsChanged();
+    return PresetMutationResult::Applied;
+}
+
+void SettingsBrew::addSteamPitcherPreset(const QString& name, int duration, int flow, double temperature) {
+    (void)tryAddSteamPitcherPreset(name, duration, flow, temperature);
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::updateSteamPitcherPresetFields(
+    int index, const QString& expectedName, const QJsonObject& fields, bool allowNameChange)
+{
+    if (rejectsBuiltInPitcher(index, "modified"))
+        return PresetMutationResult::Invalid;
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return PresetMutationResult::Unreadable;
+
+    if (index < 0 || index >= arr.size())
+        return PresetMutationResult::Invalid;
+
+    QJsonObject preset = arr[index].toObject();
+    if (!expectedName.isNull() && preset.value(QStringLiteral("name")).toString() != expectedName)
+        return PresetMutationResult::Invalid;
+
+    if (!allowNameChange && fields.contains(QStringLiteral("name")))
+        return PresetMutationResult::Invalid;
+
+    // A preset is addressed BY NAME by everything downstream — recipes snapshot
+    // the vessel/pitcher by name and re-select it on activation, and the recipe
+    // wizard matches its tiles on it. Two presets sharing a name therefore both
+    // light up in the wizard and activation resolves to whichever comes first,
+    // so the clash is refused at the setter, where every caller inherits it.
+    // Existing duplicates already in storage are left alone: this rejects new
+    // ones, it does not delete anyone's data.
+    const QString name = fields.value(QStringLiteral("name")).toString();
+    if (fields.contains(QStringLiteral("name"))
+        && SteamCalculations::steamPitcherNameTaken(arr.toVariantList(), name, index)) {
+        DIAG_WARN(APP, "SettingsBrew") << "refusing a duplicate steam pitcher named" << name
+                   << "- that name is already in use";
+        return PresetMutationResult::Invalid;
+    }
+
+    const QString oldName = preset.value(QStringLiteral("name")).toString();
+    bool changed = false;
+    for (auto it = fields.constBegin(); it != fields.constEnd(); ++it) {
+        if (!preset.contains(it.key()) || preset.value(it.key()) != it.value()) {
+            preset.insert(it.key(), it.value());
+            changed = true;
+        }
+    }
+    if (!changed)
+        return PresetMutationResult::NoChange;
+
+    arr[index] = preset;
+    m_settings.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+    // The last pour follows its pitcher through a rename, so the old name can
+    // never come to mean a different pitcher.
+    if (fields.contains(QStringLiteral("name")) && !oldName.isEmpty()
+        && oldName == lastSteamPitcherName())
+        setLastSteamPitcherName(name);
+    if (index == selectedSteamPitcher() && fields.contains(QStringLiteral("temperature")))
+        syncSelectedSteamPitcherTemperature();
+    emit steamPitcherPresetsChanged();
+    return PresetMutationResult::Applied;
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::trySetSteamPitcherDuration(
+    int index, const QString& expectedName, int duration)
+{
+    return updateSteamPitcherPresetFields(index, expectedName,
+        QJsonObject{{QStringLiteral("duration"), duration}}, false);
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::trySetSteamPitcherFlow(
+    int index, const QString& expectedName, int flow)
+{
+    return updateSteamPitcherPresetFields(index, expectedName,
+        QJsonObject{{QStringLiteral("flow"), flow}}, false);
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::trySetSteamPitcherTemperature(
+    int index, const QString& expectedName, double temperatureC)
+{
+    return updateSteamPitcherPresetFields(index, expectedName,
+        QJsonObject{{QStringLiteral("temperature"), temperatureC}}, false);
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::tryRenameSteamPitcherPreset(
+    int index, const QString& expectedName, const QString& newName)
+{
+    return updateSteamPitcherPresetFields(index, expectedName,
+        QJsonObject{{QStringLiteral("name"), newName}}, true);
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::tryUpdateSteamPitcherPreset(
+    int index, const QString& name, int duration, int flow, double temperature)
+{
+    return updateSteamPitcherPresetFields(index, QString(),
+        QJsonObject{{QStringLiteral("name"), name},
+                    {QStringLiteral("duration"), duration},
+                    {QStringLiteral("flow"), flow},
+                    {QStringLiteral("temperature"), temperature}}, true);
+}
+
+void SettingsBrew::updateSteamPitcherPreset(int index, const QString& name,
+                                             int duration, int flow, double temperature)
+{
+    const PresetMutationResult result =
+        tryUpdateSteamPitcherPreset(index, name, duration, flow, temperature);
+    if (result == PresetMutationResult::NoChange) {
+        if (index == selectedSteamPitcher())
+            syncSelectedSteamPitcherTemperature();
+        emit steamPitcherPresetsChanged();
+    }
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::tryRemoveSteamPitcherPreset(
+    int index, const QString& expectedName)
+{
+    if (rejectsBuiltInPitcher(index, "modified"))
+        return PresetMutationResult::Invalid;
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return PresetMutationResult::Unreadable;
+
+    if (index < 0 || index >= arr.size())
+        return PresetMutationResult::Invalid;
+    if (!expectedName.isNull()
+        && arr.at(index).toObject().value(QStringLiteral("name")).toString() != expectedName)
+        return PresetMutationResult::Invalid;
+
+    const QString removedName = arr.at(index).toObject().value(QStringLiteral("name")).toString();
+    arr.removeAt(index);
+    m_settings.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+    // Its pour must not calibrate a later pitcher given the same name.
+    if (removedName == lastSteamPitcherName())
+        setLastSteamPitcherName(QString());
+
+    // Both live and parked selections shift through the same index transform.
+    setSelectedSteamCup(shiftedForRemoval(selectedSteamPitcher(), index));
+    setStandingSteamPitcher(shiftedForRemoval(standingSteamPitcher(), index));
+
+    emit steamPitcherPresetsChanged();
+    return PresetMutationResult::Applied;
+}
+
+void SettingsBrew::removeSteamPitcherPreset(int index) {
+    (void)tryRemoveSteamPitcherPreset(index, QString());
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::tryMoveSteamPitcherPreset(
+    int from, const QString& expectedFromName, int to, const QString& expectedToName)
+{
+    // Neither end may be the built-in entry — it is not in the stored array and
+    // has no position to move to or from.
+    if (rejectsBuiltInPitcher(from, "reordered") || rejectsBuiltInPitcher(to, "reordered"))
+        return PresetMutationResult::Invalid;
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return PresetMutationResult::Unreadable;
+
+    if (from < 0 || from >= arr.size() || to < 0 || to >= arr.size())
+        return PresetMutationResult::Invalid;
+    if (!expectedFromName.isNull()
+        && arr.at(from).toObject().value(QStringLiteral("name")).toString() != expectedFromName)
+        return PresetMutationResult::Invalid;
+    if (!expectedToName.isNull()
+        && arr.at(to).toObject().value(QStringLiteral("name")).toString() != expectedToName)
+        return PresetMutationResult::Invalid;
+    if (from == to)
+        return PresetMutationResult::NoChange;
+
+    QJsonValue item = arr[from];
+    arr.removeAt(from);
+    arr.insert(to, item);
+    m_settings.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+
+    setSelectedSteamCup(shiftedForMove(selectedSteamPitcher(), from, to));
+    setStandingSteamPitcher(shiftedForMove(standingSteamPitcher(), from, to));
+
+    emit steamPitcherPresetsChanged();
+    return PresetMutationResult::Applied;
+}
+
+void SettingsBrew::moveSteamPitcherPreset(int from, int to) {
+    (void)tryMoveSteamPitcherPreset(from, QString(), to, QString());
+}
+
+SettingsBrew::PresetMutationResult SettingsBrew::trySetSteamPitcherWeight(
+    int index, const QString& expectedName, double weightG)
+{
+    if (rejectsBuiltInPitcher(index, "modified"))
+        return PresetMutationResult::Invalid;
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return PresetMutationResult::Unreadable;
+
+    if (index < 0 || index >= arr.size())
+        return PresetMutationResult::Invalid;
+    QJsonObject preset = arr[index].toObject();
+    if (!expectedName.isNull()
+        && preset.value(QStringLiteral("name")).toString() != expectedName)
+        return PresetMutationResult::Invalid;
+    if (preset.value(QStringLiteral("pitcherWeightG")).isDouble()
+        && preset.value(QStringLiteral("pitcherWeightG")).toDouble() == weightG)
+        return PresetMutationResult::NoChange;
+    preset.insert(QStringLiteral("pitcherWeightG"), weightG);
+    arr[index] = preset;
+    m_settings.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+    emit steamPitcherPresetsChanged();
+    return PresetMutationResult::Applied;
+}
+
+void SettingsBrew::setSteamPitcherWeight(int index, double weightG) {
+    (void)trySetSteamPitcherWeight(index, QString(), weightG);
+}
+
+void SettingsBrew::setSteamPitcherCalibration(int index, double calibMilkG) {
+    if (rejectsBuiltInPitcher(index, "modified")) return;
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("steam/pitcherPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    if (index >= 0 && index < static_cast<int>(arr.size())) {
+        QJsonObject preset = arr[index].toObject();
+        if (calibMilkG > 0) {
+            preset["calibMilkG"] = calibMilkG;
+        } else {
+            preset.remove("calibMilkG");  // 0 / negative clears the calibration
+        }
+        arr[index] = preset;
+        m_settings.setValue("steam/pitcherPresets", QJsonDocument(arr).toJson());
+        emit steamPitcherPresetsChanged();
+        // Weight-timed steaming is off by default; setting a reference is the explicit
+        // opt-in, so calibrating turns it on. Clearing the reference leaves it as-is.
+        if (calibMilkG > 0)
+            setMilkAutoCaptureEnabled(true);
+    }
+}
+
+int SettingsBrew::scaledSteamTime(int index, double milkG) const {
+    return SteamCalculations::scaledSteamTime(getSteamPitcherPreset(index),
+                                               milkAutoCaptureEnabled(), milkG);
+}
+
+int SettingsBrew::effectiveSteamDurationSec(int index, double milkG) const {
+    const SteamCalculations::SteamDuration duration = SteamCalculations::effectiveSteamDuration(
+        getSteamPitcherPreset(index), milkAutoCaptureEnabled(), milkG);
+    if (duration.scaledSeconds > 0)
+        return duration.effectiveSeconds;
+    if (duration.presetMissing) {
+        // A stale/out-of-range selection index (e.g. every preset deleted). Unlike a
+        // disabled preset, this is never a deliberate state — warn so the resulting
+        // 0s steam timeout is diagnosable.
+        DIAG_WARN(APP, "SettingsBrew") << "no steam pitcher preset at index" << index
+                   << "— steam timeout will be 0s";
+        return 0;
+    }
+    if (duration.heaterOff) return 0;
+    // An enabled preset with no positive duration is corrupt (hand-edited/failed import);
+    // returning 0 here silently programs a 0s steam target, so make it loud.
+    if (duration.baseSeconds <= 0)
+        DIAG_WARN(APP, "SettingsBrew") << "enabled steam pitcher preset" << index
+                   << "has no positive duration — steam timeout will be 0s";
+    return duration.baseSeconds;
+}
+
+QVariantMap SettingsBrew::getSteamPitcherPreset(int index) const {
+    return SteamPitcherSelection::presetAt(steamPitcherPresets(), index);
+}
+
+// Hot water
+
+double SettingsBrew::waterTemperature() const {
+    return m_settings.value("water/temperature", 85.0).toDouble();
+}
+
+void SettingsBrew::setWaterTemperature(double temp) {
+    if (waterTemperature() != temp) {
+        m_settings.setValue("water/temperature", temp);
+        emit waterTemperatureChanged();
+    }
+}
+
+int SettingsBrew::waterVolume() const {
+    return m_settings.value("water/volume", 200).toInt();
+}
+
+void SettingsBrew::setWaterVolume(int volume) {
+    if (waterVolume() != volume) {
+        m_settings.setValue("water/volume", volume);
+        emit waterVolumeChanged();
+    }
+}
+
+QString SettingsBrew::waterVolumeMode() const {
+    return m_settings.value("water/volumeMode", "weight").toString();
+}
+
+void SettingsBrew::setWaterVolumeMode(const QString& mode) {
+    if (waterVolumeMode() != mode) {
+        m_settings.setValue("water/volumeMode", mode);
+        emit waterVolumeModeChanged();
+    }
+}
+
+int SettingsBrew::effectiveHotWaterVolume() const {
+    if (waterVolumeMode() != "volume") return 0;
+    return qBound(0, waterVolume(), 255);  // BLE uint8 range
+}
+
+double SettingsBrew::hotWaterSawOffset() const {
+    return m_settings.value("water/sawOffset", 2.0).toDouble();
+}
+
+void SettingsBrew::setHotWaterSawOffset(double offset) {
+    if (!qFuzzyCompare(hotWaterSawOffset(), offset)) {
+        m_settings.setValue("water/sawOffset", offset);
+        emit hotWaterSawOffsetChanged();
+    }
+}
+
+int SettingsBrew::hotWaterSawSampleCount() const {
+    return m_settings.value("water/sawSampleCount", 0).toInt();
+}
+
+void SettingsBrew::setHotWaterSawSampleCount(int count) {
+    if (hotWaterSawSampleCount() != count) {
+        m_settings.setValue("water/sawSampleCount", count);
+        emit hotWaterSawSampleCountChanged();
+    }
+}
+
+// Hot water vessel presets
+
+QVariantList SettingsBrew::waterVesselPresets() const {
+    QJsonArray arr = readPresetArray(QStringLiteral("water/vesselPresets"));
+
+    QVariantList result;
+    for (const QJsonValue& v : arr) {
+        QVariantMap preset = v.toObject().toVariantMap();
+        // Older rows omit optional fields or contain an empty mode/zero flow.
+        // Expose the effective selection values so an unrelated edit can be
+        // saved. Flow uses SettingsHardware::hotWaterFlowRate()'s device bounds.
+        if (preset.value(QStringLiteral("mode")).toString().isEmpty())
+            preset.insert(QStringLiteral("mode"), QStringLiteral("weight"));
+        preset.insert(QStringLiteral("flowRate"), qBound(5,
+            preset.value(QStringLiteral("flowRate"), 40).toInt(), 100));
+        if (!preset.contains(QStringLiteral("temperature")))
+            preset.insert(QStringLiteral("temperature"), waterTemperature());
+        result.append(preset);
+    }
+    return result;
+}
+
+int SettingsBrew::selectedWaterVessel() const {
+    return m_settings.value("water/selectedVessel", 0).toInt();
+}
+
+void SettingsBrew::setSelectedWaterCup(int index) {
+    if (selectedWaterVessel() != index) {
+        m_settings.setValue("water/selectedVessel", index);
+        emit selectedWaterVesselChanged();
+    }
+}
+
+void SettingsBrew::addWaterVesselPreset(const QString& name, int volume, const QString& mode, int flowRate, double temperature) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("water/vesselPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    // A preset is addressed BY NAME by everything downstream — recipes snapshot
+    // the vessel/pitcher by name and re-select it on activation, and the recipe
+    // wizard matches its tiles on it. Two presets sharing a name therefore both
+    // light up in the wizard and activation resolves to whichever comes first,
+    // so the clash is refused at the setter, where every caller inherits it.
+    // Existing duplicates already in storage are left alone: this rejects new
+    // ones, it does not delete anyone's data.
+    if (nameTakenIn(arr, name, -1)) {
+        DIAG_WARN(APP, "SettingsBrew") << "refusing a duplicate water vessel named" << name
+                   << "- that name is already in use";
+        return;
+    }
+
+    QJsonObject preset;
+    preset["name"] = name;
+    preset["volume"] = volume;
+    preset["mode"] = mode;
+    preset["flowRate"] = flowRate;
+    preset["temperature"] = temperature;
+    arr.append(preset);
+
+    m_settings.setValue("water/vesselPresets", QJsonDocument(arr).toJson());
+    emit waterVesselPresetsChanged();
+}
+
+void SettingsBrew::updateWaterVesselPreset(int index, const QString& name, int volume, const QString& mode, int flowRate, double temperature) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("water/vesselPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    // A preset is addressed BY NAME by everything downstream — recipes snapshot
+    // the vessel/pitcher by name and re-select it on activation, and the recipe
+    // wizard matches its tiles on it. Two presets sharing a name therefore both
+    // light up in the wizard and activation resolves to whichever comes first,
+    // so the clash is refused at the setter, where every caller inherits it.
+    // Existing duplicates already in storage are left alone: this rejects new
+    // ones, it does not delete anyone's data.
+    if (nameTakenIn(arr, name, index)) {
+        DIAG_WARN(APP, "SettingsBrew") << "refusing a duplicate water vessel named" << name
+                   << "- that name is already in use";
+        return;
+    }
+
+    if (index >= 0 && index < arr.size()) {
+        QJsonObject preset;
+        preset["name"] = name;
+        preset["volume"] = volume;
+        preset["mode"] = mode;
+        preset["flowRate"] = flowRate;
+        preset["temperature"] = temperature;
+        arr[index] = preset;
+
+        m_settings.setValue("water/vesselPresets", QJsonDocument(arr).toJson());
+        emit waterVesselPresetsChanged();
+    }
+}
+
+void SettingsBrew::removeWaterVesselPreset(int index) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("water/vesselPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    if (index >= 0 && index < arr.size()) {
+        arr.removeAt(index);
+        m_settings.setValue("water/vesselPresets", QJsonDocument(arr).toJson());
+
+        // Same shift the steam side applies, for the same reason: clamping
+        // only rescues a selection that ran off the END, so deleting a vessel
+        // BELOW the selected one left the index alone while the array shifted
+        // under it — the selection silently named a different vessel, and
+        // because setSelectedWaterCup was never called nothing downstream was
+        // told. That is invisible now that an active recipe is deactivated by
+        // a vessel change (recipe-blocks-editor-only): the recipe stays active
+        // against a vessel it does not name.
+        // shiftedForRemoval answers with the positionless sentinel when the
+        // selection IS what was deleted. Steam has a real "Heater off" entry to
+        // land on; water has none, and its consumers fall back to a hard-coded
+        // default volume for an out-of-range index, so resolve the sentinel to
+        // a surviving neighbour rather than inventing a no-vessel state.
+        int next = shiftedForRemoval(selectedWaterVessel(), index);
+        if (next < 0)
+            next = arr.isEmpty() ? 0 : qMin(index, static_cast<int>(arr.size()) - 1);
+        setSelectedWaterCup(next);
+
+        emit waterVesselPresetsChanged();
+    }
+}
+
+void SettingsBrew::moveWaterVesselPreset(int from, int to) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("water/vesselPresets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    if (from >= 0 && from < arr.size() && to >= 0 && to < arr.size() && from != to) {
+        QJsonValue item = arr[from];
+        arr.removeAt(from);
+        arr.insert(to, item);
+        m_settings.setValue("water/vesselPresets", QJsonDocument(arr).toJson());
+
+        setSelectedWaterCup(shiftedForMove(selectedWaterVessel(), from, to));
+
+        emit waterVesselPresetsChanged();
+    }
+}
+
+QVariantMap SettingsBrew::getWaterVesselPreset(int index) const {
+    const QVariantList presets = waterVesselPresets();
+
+    if (index >= 0 && index < presets.size()) {
+        return presets[index].toMap();
+    }
+    return QVariantMap();
+}
+
+// Flush
+
+QVariantList SettingsBrew::flushPresets() const {
+    QJsonArray arr = readPresetArray(QStringLiteral("flush/presets"));
+
+    QVariantList result;
+    for (const QJsonValue& v : arr) {
+        result.append(v.toObject().toVariantMap());
+    }
+    return result;
+}
+
+int SettingsBrew::selectedFlushPreset() const {
+    return m_settings.value("flush/selectedPreset", 0).toInt();
+}
+
+void SettingsBrew::setSelectedFlushPreset(int index) {
+    if (selectedFlushPreset() != index) {
+        m_settings.setValue("flush/selectedPreset", index);
+        emit selectedFlushPresetChanged();
+    }
+}
+
+double SettingsBrew::flushFlow() const {
+    return m_settings.value("flush/flow", 6.0).toDouble();
+}
+
+void SettingsBrew::setFlushFlow(double flow) {
+    if (flushFlow() != flow) {
+        m_settings.setValue("flush/flow", flow);
+        emit flushFlowChanged();
+    }
+}
+
+double SettingsBrew::flushSeconds() const {
+    return m_settings.value("flush/seconds", 5.0).toDouble();
+}
+
+void SettingsBrew::setFlushSeconds(double seconds) {
+    if (flushSeconds() != seconds) {
+        m_settings.setValue("flush/seconds", seconds);
+        emit flushSecondsChanged();
+    }
+}
+
+void SettingsBrew::addFlushPreset(const QString& name, double flow, double seconds) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("flush/presets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    QJsonObject preset;
+    preset["name"] = name;
+    preset["flow"] = flow;
+    preset["seconds"] = seconds;
+    arr.append(preset);
+
+    m_settings.setValue("flush/presets", QJsonDocument(arr).toJson());
+    emit flushPresetsChanged();
+}
+
+void SettingsBrew::updateFlushPreset(int index, const QString& name, double flow, double seconds) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("flush/presets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    if (index >= 0 && index < arr.size()) {
+        QJsonObject preset;
+        preset["name"] = name;
+        preset["flow"] = flow;
+        preset["seconds"] = seconds;
+        arr[index] = preset;
+
+        m_settings.setValue("flush/presets", QJsonDocument(arr).toJson());
+        emit flushPresetsChanged();
+    }
+}
+
+void SettingsBrew::removeFlushPreset(int index) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("flush/presets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    if (index >= 0 && index < arr.size()) {
+        arr.removeAt(index);
+        m_settings.setValue("flush/presets", QJsonDocument(arr).toJson());
+
+        int selected = selectedFlushPreset();
+        if (selected >= arr.size() && arr.size() > 0) {
+            setSelectedFlushPreset(static_cast<int>(arr.size()) - 1);
+        }
+
+        emit flushPresetsChanged();
+    }
+}
+
+void SettingsBrew::moveFlushPreset(int from, int to) {
+    bool parseFailed = false;
+    QJsonArray arr = readPresetArray(QStringLiteral("flush/presets"), &parseFailed);
+    // Refuse to append to an array we could not read: writing back would
+    // save an empty list over the user's unreadable presets.
+    if (parseFailed) return;
+
+    if (from >= 0 && from < arr.size() && to >= 0 && to < arr.size() && from != to) {
+        QJsonValue item = arr[from];
+        arr.removeAt(from);
+        arr.insert(to, item);
+        m_settings.setValue("flush/presets", QJsonDocument(arr).toJson());
+
+        int selected = selectedFlushPreset();
+        if (selected == from) {
+            setSelectedFlushPreset(to);
+        } else if (from < selected && to >= selected) {
+            setSelectedFlushPreset(selected - 1);
+        } else if (from > selected && to <= selected) {
+            setSelectedFlushPreset(selected + 1);
+        }
+
+        emit flushPresetsChanged();
+    }
+}
+
+QVariantMap SettingsBrew::getFlushPreset(int index) const {
+    QJsonArray arr = readPresetArray(QStringLiteral("flush/presets"));
+
+    if (index >= 0 && index < arr.size()) {
+        return arr[index].toObject().toVariantMap();
+    }
+    return QVariantMap();
+}
+
+// Temperature override (persistent)
+
+double SettingsBrew::temperatureOverride() const {
+    return m_temperatureOverride;
+}
+
+void SettingsBrew::setTemperatureOverride(double temp) {
+    if (!qFuzzyCompare(m_temperatureOverride, temp) || !m_hasTemperatureOverride) {
+        DIAG_DEBUG(APP, "settings_brew") << "setTemperatureOverride:" << m_temperatureOverride << "→" << temp;
+        m_temperatureOverride = temp;
+        m_hasTemperatureOverride = true;
+        m_settings.setValue("brew/temperatureOverride", temp);
+        m_settings.setValue("brew/hasTemperatureOverride", true);
+        emit temperatureOverrideChanged();
+    }
+}
+
+bool SettingsBrew::hasTemperatureOverride() const {
+    return m_hasTemperatureOverride;
+}
+
+void SettingsBrew::clearTemperatureOverride() {
+    if (m_hasTemperatureOverride || !qFuzzyIsNull(m_temperatureOverride)) {
+        m_hasTemperatureOverride = false;
+        m_temperatureOverride = 0.0;
+        m_settings.remove("brew/temperatureOverride");
+        m_settings.remove("brew/hasTemperatureOverride");
+        emit temperatureOverrideChanged();
+    }
+}
+
+// Brew yield override (persistent) — the session yield anchor {value, mode}.
+
+double SettingsBrew::brewYieldOverride() const {
+    return m_brewYieldOverride;
+}
+
+QString SettingsBrew::brewYieldMode() const {
+    return m_brewYieldMode;
+}
+
+void SettingsBrew::writeBrewYieldAnchor(double value, const QString& mode) {
+    QString newMode = YieldSpec::normalizedMode(mode);
+    double newValue = value;
+    if (newValue <= 0)
+        newMode = YieldSpec::modeNone();
+    // clampValue bounds BOTH modes from the shared vocabulary — the absolute
+    // bound used to be a magic qBound here, which is how the bag's writers
+    // came to enforce no upper bound at all.
+    newValue = YieldSpec::clampValue(newMode, newValue);
+
+    const bool changed = newMode != m_brewYieldMode
+        || !qFuzzyCompare(1.0 + m_brewYieldOverride, 1.0 + newValue);
+    if (!changed)
+        return;
+
+    m_brewYieldOverride = newValue;
+    m_brewYieldMode = newMode;
+    if (YieldSpec::isSet(newMode)) {
+        m_settings.setValue("brew/brewYieldOverride", newValue);
+        m_settings.setValue("espresso/brewYieldMode", newMode);
+    } else {
+        m_settings.remove("brew/brewYieldOverride");
+        m_settings.remove("espresso/brewYieldMode");
+        m_settings.remove("brew/hasBrewYieldOverride");
+    }
+    emit brewOverridesChanged();
+}
+
+void SettingsBrew::setBrewYieldOverride(double yield) {
+    writeBrewYieldAnchor(yield, YieldSpec::modeAbsolute());
+}
+
+void SettingsBrew::setBrewRatioAnchor(double ratio) {
+    writeBrewYieldAnchor(ratio, YieldSpec::modeRatio());
+}
+
+void SettingsBrew::setBrewYieldAnchor(double value, const QString& mode) {
+    writeBrewYieldAnchor(value, mode);
+}
+
+bool SettingsBrew::hasBrewYieldOverride() const {
+    return YieldSpec::isSet(m_brewYieldMode);
+}
+
+void SettingsBrew::clearAllBrewOverrides() {
+    bool changed = false;
+
+    if (YieldSpec::isSet(m_brewYieldMode) || !qFuzzyIsNull(m_brewYieldOverride)) {
+        m_brewYieldOverride = 0.0;
+        m_brewYieldMode = YieldSpec::modeNone();
+        m_settings.remove("brew/brewYieldOverride");
+        m_settings.remove("espresso/brewYieldMode");
+        m_settings.remove("brew/hasBrewYieldOverride");
+        changed = true;
+    }
+
+    bool tempChanged = false;
+    if (m_hasTemperatureOverride || !qFuzzyIsNull(m_temperatureOverride)) {
+        m_temperatureOverride = 0.0;
+        m_hasTemperatureOverride = false;
+        m_settings.remove("brew/temperatureOverride");
+        m_settings.remove("brew/hasTemperatureOverride");
+        changed = true;
+        tempChanged = true;
+    }
+
+    if (changed) {
+        emit brewOverridesChanged();
+    }
+    if (tempChanged) {
+        emit temperatureOverrideChanged();
+    }
+}
+
+void SettingsBrew::clearProfileScopedBrewOverrides(bool keepRatioAnchor) {
+    // A kept ratio is what makes brew-by-ratio persist with no setting
+    // (add-yield-ratio-anchor Decision 8; within a beverage group since #1941).
+    if (keepRatioAnchor && m_brewYieldMode == YieldSpec::modeRatio()) {
+        clearTemperatureOverride();
+        return;
+    }
+    clearAllBrewOverrides();
+}
+
+// Stop-at-volume gating
+
+bool SettingsBrew::ignoreVolumeWithScale() const {
+    return m_settings.value("espresso/ignoreVolumeWithScale", false).toBool();
+}
+
+void SettingsBrew::setIgnoreVolumeWithScale(bool enabled) {
+    if (ignoreVolumeWithScale() != enabled) {
+        m_settings.setValue("espresso/ignoreVolumeWithScale", enabled);
+        emit ignoreVolumeWithScaleChanged();
+    }
+}
+

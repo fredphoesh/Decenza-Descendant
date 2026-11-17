@@ -1,0 +1,698 @@
+#include <QTest>
+#include "ai/dialing_helpers.h"
+
+using namespace DialingHelpers;
+
+class TstDialingHelpers : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    void emptyInput_returnsNoSessions();
+    void singleShot_returnsOneSessionOfOne();
+    void twoAdjacentShots_inSameSession();
+    void twoFarApartShots_inSeparateSessions();
+    void issueExample_threeShots_twoSessions();
+    void exactlyAtThreshold_groupsTogether();
+    void justOverThreshold_breaksSession();
+    void thresholdIsConfigurable();
+
+    // buildBeanFreshness (openspec optimize-dialing-context-payload, task 6)
+    void buildBeanFreshness_emptyRoastDate_returnsEmptyObject();
+    void buildBeanFreshness_populatedRoastDate_carriesFreshnessKnownAndInstruction();
+    void buildBeanFreshness_neverEmitsAnyDayCountField();
+    // Freeze/thaw tracking — known storage flips guidance from ASK to thaw-age.
+    void buildBeanFreshness_freezeDates_setKnownAndUseThawInstruction();
+    void buildBeanFreshness_emptyRoastButFrozen_stillEmitsKnownBlock();
+    void buildBeanFreshness_defrostOnly_isKnown();
+    // bean-freshness-followup
+    void buildBeanFreshness_openedDate_isKnownWithoutFreeze();
+    void buildBeanFreshness_storageHintOnly_surfacedButNotKnown();
+    void buildBeanFreshness_frozenWithPlan_hintContributesNoAnchor();
+    void buildBeanFreshness_unknownInstruction_teachesUpperBound();
+    void buildBeanFreshness_defrostAndOpened_bothSurfaced();
+    void buildBeanFreshness_knownInstruction_carriesUnderRestedGuidance();
+    void buildBeanFreshness_openedAloneIsNotKnown();
+    void restAgeDays_data();
+    void restAgeDays();
+
+    // hoistSessionContext (openspec optimize-dialing-context-payload, task 1)
+    void hoistSessionContext_emptySession_returnsEmpty();
+    void hoistSessionContext_allShotsShareIdentity_contextHasAllOverridesEmpty();
+    void hoistSessionContext_oneShotDiffersOnBeanBrand_onlyThatShotOverrides();
+    void hoistSessionContext_singleShotSession_contextCarriesIdentity();
+    void hoistSessionContext_firstShotEmptyForField_fallsBackToFirstNonEmpty();
+    void hoistSessionContext_allShotsEmptyForField_contextOmitsField();
+    // bean-freshness-followup: lifecycle fields hoist like identity fields
+    void hoistSessionContext_sessionSpansThaw_differingShotOverridesDefrost();
+
+    // estimateFlowAtCutoff (issue #1021)
+    void estimateFlowAtCutoff_emptySamples_returnsZero();
+    void estimateFlowAtCutoff_zeroDuration_returnsZero();
+    void estimateFlowAtCutoff_averagesLastTwoSeconds();
+    void estimateFlowAtCutoff_skipsZeroFlowSamples();
+    void estimateFlowAtCutoff_shortShot_clampsWindowToZero();
+    void estimateFlowAtCutoff_customWindow();
+};
+
+void TstDialingHelpers::emptyInput_returnsNoSessions()
+{
+    QVERIFY(groupSessions({}).isEmpty());
+}
+
+void TstDialingHelpers::singleShot_returnsOneSessionOfOne()
+{
+    const auto sessions = groupSessions({1000});
+    QCOMPARE(sessions.size(), qsizetype(1));
+    QCOMPARE(sessions[0].size(), qsizetype(1));
+    QCOMPARE(sessions[0][0], qsizetype(0));
+}
+
+void TstDialingHelpers::twoAdjacentShots_inSameSession()
+{
+    // Two shots 7 minutes apart — well within the 60-min threshold.
+    const auto sessions = groupSessions({2000, 2000 - 7 * 60});
+    QCOMPARE(sessions.size(), qsizetype(1));
+    QCOMPARE(sessions[0].size(), qsizetype(2));
+    QCOMPARE(sessions[0][0], qsizetype(0));
+    QCOMPARE(sessions[0][1], qsizetype(1));
+}
+
+void TstDialingHelpers::twoFarApartShots_inSeparateSessions()
+{
+    // Two shots 24 hours apart.
+    const auto sessions = groupSessions({100000, 100000 - 24 * 3600});
+    QCOMPARE(sessions.size(), qsizetype(2));
+    QCOMPARE(sessions[0].size(), qsizetype(1));
+    QCOMPARE(sessions[1].size(), qsizetype(1));
+    QCOMPARE(sessions[0][0], qsizetype(0));
+    QCOMPARE(sessions[1][0], qsizetype(1));
+}
+
+void TstDialingHelpers::issueExample_threeShots_twoSessions()
+{
+    // Mirrors the issue #1009 example: shots 884 (today 9:36), 883 (today 9:29),
+    // 882 (yesterday 10:09). 884 and 883 are 7 min apart — same session.
+    // 883 and 882 are ~23 hours apart — separate sessions.
+    const qint64 t884 = 1000000;
+    const qint64 t883 = t884 - 7 * 60;
+    const qint64 t882 = t883 - 23 * 3600;
+    const auto sessions = groupSessions({t884, t883, t882});
+
+    QCOMPARE(sessions.size(), qsizetype(2));
+    QCOMPARE(sessions[0].size(), qsizetype(2));
+    QCOMPARE(sessions[1].size(), qsizetype(1));
+    // First session has indices [0, 1] (884 + 883), second has [2] (882).
+    QCOMPARE(sessions[0][0], qsizetype(0));
+    QCOMPARE(sessions[0][1], qsizetype(1));
+    QCOMPARE(sessions[1][0], qsizetype(2));
+}
+
+void TstDialingHelpers::exactlyAtThreshold_groupsTogether()
+{
+    // Exactly at the threshold (gap == threshold) → still same session.
+    const auto sessions = groupSessions({3600, 0}, /*thresholdSec=*/3600);
+    QCOMPARE(sessions.size(), qsizetype(1));
+    QCOMPARE(sessions[0].size(), qsizetype(2));
+}
+
+void TstDialingHelpers::justOverThreshold_breaksSession()
+{
+    // 1 second over the threshold → distinct sessions.
+    const auto sessions = groupSessions({3601, 0}, /*thresholdSec=*/3600);
+    QCOMPARE(sessions.size(), qsizetype(2));
+}
+
+void TstDialingHelpers::thresholdIsConfigurable()
+{
+    // With a 30-min threshold, a 45-min gap should split.
+    const auto sessions = groupSessions({3600, 3600 - 45 * 60}, /*thresholdSec=*/30 * 60);
+    QCOMPARE(sessions.size(), qsizetype(2));
+}
+
+// ---- buildBeanFreshness (openspec optimize-dialing-context-payload, task 6) ----
+//
+// The block replaces the precomputed `daysSinceRoast` + advisory note with a
+// structured shape that forces the AI to ASK about storage before quoting
+// age. Calendar age without storage context (frozen, thawed weekly,
+// vacuum-sealed) is misleading data dressed as precise data — many users
+// freeze beans, and the previous advisory note was demonstrably skimmed.
+
+void TstDialingHelpers::buildBeanFreshness_emptyRoastDate_returnsEmptyObject()
+{
+    QCOMPARE(buildBeanFreshness(QString()), QJsonObject());
+    QCOMPARE(buildBeanFreshness(QStringLiteral("")), QJsonObject());
+}
+
+void TstDialingHelpers::buildBeanFreshness_populatedRoastDate_carriesFreshnessKnownAndInstruction()
+{
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"));
+    QCOMPARE(block["roastDate"].toString(), QStringLiteral("2026-04-15"));
+    QCOMPARE(block["freshnessKnown"].toBool(), false);
+    QVERIFY2(block.contains("instruction"),
+             "block must carry the imperative storage instruction");
+    const QString instruction = block["instruction"].toString();
+    QVERIFY2(instruction.contains(QStringLiteral("ASK")),
+             "instruction must include an explicit ASK directive");
+    QVERIFY2(instruction.contains(QStringLiteral("storage")),
+             "instruction must reference storage as the missing variable");
+    QVERIFY2(instruction.contains(QStringLiteral("freeze"))
+             || instruction.contains(QStringLiteral("frozen")),
+             "instruction must surface the freezing pattern that breaks calendar-age reasoning");
+    // Unknown storage must not emit empty freeze-date keys — absence of the
+    // keys is how "no storage history" is signalled to the advisor.
+    QVERIFY2(!block.contains(QStringLiteral("frozenDate")),
+             "unknown-storage block must omit frozenDate, not emit it empty");
+    QVERIFY2(!block.contains(QStringLiteral("defrostDate")),
+             "unknown-storage block must omit defrostDate, not emit it empty");
+}
+
+void TstDialingHelpers::buildBeanFreshness_neverEmitsAnyDayCountField()
+{
+    // The block intentionally contains NO precomputed day count under any
+    // field name. This is the load-bearing contract — adding back any
+    // *days* field undoes the change. Pin it here so a future refactor
+    // can't accidentally reintroduce one.
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"));
+    const QStringList forbiddenKeys = {
+        QStringLiteral("daysSinceRoast"),
+        QStringLiteral("calendarDaysSinceRoast"),
+        QStringLiteral("effectiveAgeDays"),
+        QStringLiteral("ageDays"),
+        QStringLiteral("days")
+    };
+    for (const QString& key : forbiddenKeys) {
+        QVERIFY2(!block.contains(key),
+                 qPrintable(QString("beanFreshness must not contain a precomputed day-count field: %1").arg(key)));
+    }
+    // Also verify no key contains the substring "Day" (case-sensitive
+    // since field naming is conventionally camelCase here).
+    for (const QString& key : block.keys()) {
+        QVERIFY2(!key.contains(QStringLiteral("Day")),
+                 qPrintable(QString("unexpected day-related key in beanFreshness: %1").arg(key)));
+    }
+}
+
+void TstDialingHelpers::buildBeanFreshness_freezeDates_setKnownAndUseThawInstruction()
+{
+    // When the bag carries freeze/thaw dates, storage is KNOWN: the block must
+    // surface the dates, flip freshnessKnown to true, and drop the "ASK about
+    // storage" directive in favour of thaw-based aging guidance.
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"),
+                                                 QStringLiteral("2026-04-16"),
+                                                 QStringLiteral("2026-06-20"));
+    QCOMPARE(block["roastDate"].toString(), QStringLiteral("2026-04-15"));
+    QCOMPARE(block["frozenDate"].toString(), QStringLiteral("2026-04-16"));
+    QCOMPARE(block["defrostDate"].toString(), QStringLiteral("2026-06-20"));
+    QCOMPARE(block["freshnessKnown"].toBool(), true);
+    const QString instruction = block["instruction"].toString();
+    QVERIFY2(!instruction.contains(QStringLiteral("ASK")),
+             "known-storage instruction must NOT ask the user about storage");
+    QVERIFY2(instruction.contains(QStringLiteral("defrostDate"))
+             || instruction.contains(QStringLiteral("thaw")),
+             "known-storage instruction must anchor aging on the thaw date");
+}
+
+void TstDialingHelpers::buildBeanFreshness_emptyRoastButFrozen_stillEmitsKnownBlock()
+{
+    // Freeze data alone is enough to emit the block — the old contract
+    // suppressed the block whenever roastDate was empty, which would have
+    // discarded known storage history.
+    const QJsonObject block = buildBeanFreshness(QString(),
+                                                 QStringLiteral("2026-04-16"),
+                                                 QStringLiteral("2026-06-20"));
+    QVERIFY2(!block.isEmpty(), "block must be emitted when freeze data is present even without roastDate");
+    QVERIFY2(!block.contains(QStringLiteral("roastDate")),
+             "roastDate must be omitted when not supplied");
+    QCOMPARE(block["freshnessKnown"].toBool(), true);
+    QCOMPARE(block["frozenDate"].toString(), QStringLiteral("2026-04-16"));
+    // No roast date, no rest age: the instruction must not tell the AI to quote one.
+    QVERIFY(!block.contains(QStringLiteral("restAgeDays")));
+    QVERIFY(!block["instruction"].toString().contains(QStringLiteral("Quote it")));
+    // A roast date with anything after the date is text, not a date to compute with.
+    const QJsonObject timed = buildBeanFreshness(QStringLiteral("2026-04-15T10:00:00"));
+    QVERIFY(timed.contains(QStringLiteral("roastDateText")) && !timed.contains(QStringLiteral("roastDate")));
+}
+
+void TstDialingHelpers::buildBeanFreshness_defrostOnly_isKnown()
+{
+    // A thaw date with no recorded freeze date still counts as known storage.
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"),
+                                                 QString(),
+                                                 QStringLiteral("2026-06-20"));
+    QCOMPARE(block["freshnessKnown"].toBool(), true);
+    QVERIFY2(!block.contains(QStringLiteral("frozenDate")),
+             "frozenDate must be omitted when not supplied");
+    QCOMPARE(block["defrostDate"].toString(), QStringLiteral("2026-06-20"));
+}
+
+// ---- bean-freshness-followup ----
+
+void TstDialingHelpers::buildBeanFreshness_openedDate_isKnownWithoutFreeze()
+{
+    // A never-frozen bag that carries an openedDate (with an airtight storage
+    // hint) reports storage as KNOWN — the common non-freezer user must not be
+    // asked about storage forever.
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"),
+                                                 QString(), QString(),
+                                                 QStringLiteral("airtight"),
+                                                 QStringLiteral("2026-06-20"));
+    QCOMPARE(block["freshnessKnown"].toBool(), true);
+    QCOMPARE(block["storageHint"].toString(), QStringLiteral("airtight"));
+    QCOMPARE(block["openedDate"].toString(), QStringLiteral("2026-06-20"));
+    QVERIFY2(!block.contains(QStringLiteral("frozenDate")),
+             "frozenDate must be omitted for a never-frozen bag");
+    QVERIFY2(!block.contains(QStringLiteral("defrostDate")),
+             "defrostDate must be omitted for a never-frozen bag");
+    const QString instruction = block["instruction"].toString();
+    QVERIFY2(!instruction.contains(QStringLiteral("ASK")),
+             "known-storage instruction must NOT ask the user about storage");
+    QVERIFY2(instruction.contains(QStringLiteral("openedDate")),
+             "known instruction must explain what openedDate means for age");
+}
+
+// fix-storage-hint-freezer-independence: a frozen bag may now carry an
+// out-of-freezer plan. The plan is advisory only — it contributes no DATE, so
+// it must not act as an aging anchor. Here freshnessKnown is true purely on the
+// strength of frozenDate; the hint rides along as context.
+void TstDialingHelpers::buildBeanFreshness_frozenWithPlan_hintContributesNoAnchor()
+{
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-06-01"),
+                                                 QStringLiteral("2026-06-03"),  // frozenDate
+                                                 QString(),                     // no defrost
+                                                 QStringLiteral("vacuum-sealed"),
+                                                 QString());                    // no opened
+    QVERIFY(!block.isEmpty());
+    QCOMPARE(block["frozenDate"].toString(), QStringLiteral("2026-06-03"));
+    QCOMPARE(block["storageHint"].toString(), QStringLiteral("vacuum-sealed"));
+    QVERIFY2(block["freshnessKnown"].toBool(),
+             "frozenDate alone anchors the clock; the plan neither adds nor removes that");
+    // The plan carries no date, so no thaw/open anchor may appear.
+    QVERIFY2(!block.contains(QStringLiteral("defrostDate")),
+             "a storage plan must not synthesize a defrost anchor");
+    QVERIFY2(!block.contains(QStringLiteral("openedDate")),
+             "a storage plan must not synthesize an opened anchor");
+}
+
+void TstDialingHelpers::buildBeanFreshness_storageHintOnly_surfacedButNotKnown()
+{
+    // A storageHint with no dates is surfaced (advisory context) and keeps the
+    // block alive, but does NOT by itself flip freshnessKnown — only a
+    // frozen/defrost/opened DATE anchors the aging clock.
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-07-01"),
+                                                 QString(), QString(),
+                                                 QStringLiteral("vacuum-sealed"),
+                                                 QString());
+    QVERIFY2(!block.isEmpty(),
+             "storageHint alone must keep the block (not omitted)");
+    QCOMPARE(block["storageHint"].toString(), QStringLiteral("vacuum-sealed"));
+    QCOMPARE(block["freshnessKnown"].toBool(), false);
+    // When the storage TYPE is known (but no date), the instruction must NOT
+    // tell the AI to re-ask how the beans are stored — it must name the hint
+    // and, at most, ask only for the aging-start date and only if roast is old.
+    const QString instruction = block["instruction"].toString();
+    QVERIFY2(instruction.contains(QStringLiteral("vacuum-sealed")),
+             "instruction must name the known storage type so the AI doesn't re-ask it");
+    QVERIFY2(instruction.contains(QStringLiteral("do NOT ask how")),
+             "instruction must tell the AI not to re-ask the storage method");
+}
+
+void TstDialingHelpers::buildBeanFreshness_unknownInstruction_teachesUpperBound()
+{
+    // The no-date instruction must teach the asymmetry: roastDate caps
+    // staleness (storage only preserves), so the ask is conditional on the
+    // roast being OLD — recent-roast beans are fresh regardless of storage.
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-07-01"));
+    QCOMPARE(block["freshnessKnown"].toBool(), false);
+    const QString instruction = block["instruction"].toString();
+    QVERIFY2(instruction.contains(QStringLiteral("UPPER BOUND"))
+             || instruction.contains(QStringLiteral("upper bound")),
+             "unknown instruction must frame roastDate as the staleness ceiling");
+    QVERIFY2(instruction.contains(QStringLiteral("recent")),
+             "unknown instruction must carve out the recent-roast = fresh case");
+    QVERIFY2(instruction.contains(QStringLiteral("old")),
+             "unknown instruction must gate the ask on an OLD roast");
+    // A bare storageHint-free block must NOT carry the storage-hint clause.
+    QVERIFY2(!instruction.contains(QStringLiteral("already told you")),
+             "no-hint block must not claim a known storage type");
+}
+
+void TstDialingHelpers::buildBeanFreshness_defrostAndOpened_bothSurfaced()
+{
+    // When both a defrostDate and an openedDate are present (frozen, thawed,
+    // later moved to a jar), both are surfaced distinctly with the reference
+    // date they are measured to (no precomputed age field).
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"),
+                                                 QStringLiteral("2026-04-16"),
+                                                 QStringLiteral("2026-06-01"),
+                                                 QStringLiteral("counter"),
+                                                 QStringLiteral("2026-06-20"),
+                                                 QStringLiteral("2026-06-22"));
+    QCOMPARE(block["referenceDate"].toString(), QStringLiteral("2026-06-22"));
+    QCOMPARE(block["freshnessKnown"].toBool(), true);
+    QCOMPARE(block["defrostDate"].toString(), QStringLiteral("2026-06-01"));
+    QCOMPARE(block["openedDate"].toString(), QStringLiteral("2026-06-20"));
+    QCOMPARE(block["storageHint"].toString(), QStringLiteral("counter"));
+    // The one day count is the computed rest age: 1 day before freezing + 21 since the thaw.
+    QCOMPARE(block["restAgeDays"].toInt(), 22);
+}
+
+void TstDialingHelpers::buildBeanFreshness_openedAloneIsNotKnown()
+{
+    // Every bag's first shot stamps openedDate, so on its own it must not tell the
+    // AI storage is known: an old roast still gets the ASK, and no rest age.
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"), QString(), QString(),
+                                                 QString(), QStringLiteral("2026-06-20"),
+                                                 QStringLiteral("2026-06-22"));
+    QCOMPARE(block["freshnessKnown"].toBool(), false);
+    QVERIFY(block["instruction"].toString().contains(QStringLiteral("ASK")));
+    QVERIFY(!block.contains(QStringLiteral("restAgeDays")));
+    QCOMPARE(block["openedDate"].toString(), QStringLiteral("2026-06-20"));
+}
+
+void TstDialingHelpers::restAgeDays_data()
+{
+    QTest::addColumn<QString>("roast");
+    QTest::addColumn<QString>("frozen");
+    QTest::addColumn<QString>("defrost");
+    QTest::addColumn<int>("expected");
+    // Reference date 2026-10-08 throughout.
+    QTest::newRow("never frozen") << "2026-09-01" << "" << "" << 37;
+    QTest::newRow("frozen, ground from the freezer") << "2026-09-01" << "2026-09-03" << "" << 2;
+    QTest::newRow("frozen, thawed yesterday") << "2026-09-01" << "2026-09-03" << "2026-10-07" << 3;
+    QTest::newRow("thaw before freeze") << "2026-09-01" << "2026-09-03" << "2026-09-02" << -1;
+    QTest::newRow("thaw without freeze") << "2026-09-01" << "" << "2026-10-07" << -1;
+    QTest::newRow("roast not ISO") << "Sept 1" << "" << "" << -1;
+    QTest::newRow("roast with a time suffix") << "2026-09-01T10:00:00" << "" << "" << -1;
+}
+
+void TstDialingHelpers::restAgeDays()
+{
+    QFETCH(QString, roast);
+    QFETCH(QString, frozen);
+    QFETCH(QString, defrost);
+    QFETCH(int, expected);
+    QCOMPARE(DialingHelpers::restAgeDays(roast, frozen, defrost, QStringLiteral("2026-10-08")), expected);
+}
+
+void TstDialingHelpers::buildBeanFreshness_knownInstruction_carriesUnderRestedGuidance()
+{
+    // The known-storage instruction must teach the REVERSE direction: a recent
+    // thaw/open can mean under-rested/gassy (coarser grind), not just "fresher."
+    const QJsonObject block = buildBeanFreshness(QStringLiteral("2026-04-15"),
+                                                 QString(),
+                                                 QStringLiteral("2026-06-20"));
+    const QString instruction = block["instruction"].toString();
+    QVERIFY2(instruction.contains(QStringLiteral("gassy"))
+             || instruction.contains(QStringLiteral("under-rested")),
+             "known instruction must warn a recent date can mean under-rested/gassy");
+    QVERIFY2(instruction.contains(QStringLiteral("COARSER"))
+             || instruction.contains(QStringLiteral("coarser")),
+             "known instruction must mention the coarser-grind direction");
+    QVERIFY2(instruction.contains(QStringLiteral("does NOT reset age")),
+             "known instruction must say opening does not restart the aging clock");
+}
+
+// ---- hoistSessionContext (openspec optimize-dialing-context-payload, task 1) ----
+//
+// Empirical anchor: the Northbound 80's Espresso conversation has a 4-shot
+// session where every shot shares the same Niche Zero / 63mm Mazzer Kony /
+// Northbound bean. The pre-change payload repeats those five fields on
+// every shot in `dialInSessions[].shots[]`. After hoisting, the fields
+// surface once on `session.context` and zero times on per-shot entries.
+
+namespace {
+DialingHelpers::ShotIdentity makeIdentity(const QString& gBrand,
+                                              const QString& gModel,
+                                              const QString& gBurrs,
+                                              const QString& bBrand,
+                                              const QString& bType)
+{
+    DialingHelpers::ShotIdentity id;
+    id.grinderBrand = gBrand;
+    id.grinderModel = gModel;
+    id.grinderBurrs = gBurrs;
+    id.beanBrand = bBrand;
+    id.beanType = bType;
+    return id;
+}
+} // namespace
+
+void TstDialingHelpers::hoistSessionContext_emptySession_returnsEmpty()
+{
+    const auto out = hoistSessionContext({});
+    QVERIFY(out.context.grinderBrand.isEmpty());
+    QVERIFY(out.context.beanBrand.isEmpty());
+    QVERIFY(out.perShotOverrides.isEmpty());
+}
+
+void TstDialingHelpers::hoistSessionContext_allShotsShareIdentity_contextHasAllOverridesEmpty()
+{
+    // Mirrors the Northbound 80's Espresso 4-shot iteration session.
+    const auto shot = makeIdentity(
+        QStringLiteral("Niche"), QStringLiteral("Zero"),
+        QStringLiteral("63mm Mazzer Kony conical"),
+        QStringLiteral("Northbound Coffee Roasters"),
+        QStringLiteral("Spring Tour 2026 #2"));
+    const QList<DialingHelpers::ShotIdentity> shots{shot, shot, shot, shot};
+
+    const auto out = hoistSessionContext(shots);
+
+    QCOMPARE(out.context.grinderBrand, QStringLiteral("Niche"));
+    QCOMPARE(out.context.grinderModel, QStringLiteral("Zero"));
+    QCOMPARE(out.context.grinderBurrs, QStringLiteral("63mm Mazzer Kony conical"));
+    QCOMPARE(out.context.beanBrand, QStringLiteral("Northbound Coffee Roasters"));
+    QCOMPARE(out.context.beanType, QStringLiteral("Spring Tour 2026 #2"));
+    QCOMPARE(out.perShotOverrides.size(), shots.size());
+    for (const auto& override : out.perShotOverrides) {
+        QVERIFY2(override.grinderBrand.isEmpty()
+                 && override.grinderModel.isEmpty()
+                 && override.grinderBurrs.isEmpty()
+                 && override.beanBrand.isEmpty()
+                 && override.beanType.isEmpty(),
+                 "all shots share identity → no per-shot overrides");
+    }
+}
+
+void TstDialingHelpers::hoistSessionContext_oneShotDiffersOnBeanBrand_onlyThatShotOverrides()
+{
+    const auto a = makeIdentity(
+        QStringLiteral("Niche"), QStringLiteral("Zero"),
+        QStringLiteral("63mm conical"),
+        QStringLiteral("Northbound"), QStringLiteral("Spring Tour"));
+    const auto b = makeIdentity(
+        QStringLiteral("Niche"), QStringLiteral("Zero"),
+        QStringLiteral("63mm conical"),
+        QStringLiteral("Prodigal"), QStringLiteral("Buenos Aires"));
+    const QList<DialingHelpers::ShotIdentity> shots{a, b, a};
+
+    const auto out = hoistSessionContext(shots);
+
+    // Grinder fields uniform across all shots → all hoisted, no overrides.
+    QCOMPARE(out.context.grinderBrand, QStringLiteral("Niche"));
+    QCOMPARE(out.context.grinderBurrs, QStringLiteral("63mm conical"));
+    // Bean fields differ on shot[1]; context = shots[0]'s value.
+    QCOMPARE(out.context.beanBrand, QStringLiteral("Northbound"));
+    QCOMPARE(out.context.beanType, QStringLiteral("Spring Tour"));
+
+    QCOMPARE(out.perShotOverrides.size(), 3);
+    // Shot[0] matches context → no override.
+    QVERIFY(out.perShotOverrides[0].beanBrand.isEmpty());
+    QVERIFY(out.perShotOverrides[0].beanType.isEmpty());
+    QVERIFY(out.perShotOverrides[0].grinderBrand.isEmpty());
+    // Shot[1] differs on bean fields → override carries them.
+    QCOMPARE(out.perShotOverrides[1].beanBrand, QStringLiteral("Prodigal"));
+    QCOMPARE(out.perShotOverrides[1].beanType, QStringLiteral("Buenos Aires"));
+    // Shot[1]'s grinder still matches context → no grinder override.
+    QVERIFY(out.perShotOverrides[1].grinderBrand.isEmpty());
+    // Shot[2] matches context → no override.
+    QVERIFY(out.perShotOverrides[2].beanBrand.isEmpty());
+}
+
+void TstDialingHelpers::hoistSessionContext_singleShotSession_contextCarriesIdentity()
+{
+    const auto only = makeIdentity(
+        QStringLiteral("Niche"), QStringLiteral("Zero"),
+        QStringLiteral("63mm conical"),
+        QStringLiteral("Northbound"), QStringLiteral("Spring Tour"));
+    const auto out = hoistSessionContext({only});
+
+    QCOMPARE(out.context.grinderBrand, QStringLiteral("Niche"));
+    QCOMPARE(out.context.beanBrand, QStringLiteral("Northbound"));
+    QCOMPARE(out.perShotOverrides.size(), 1);
+    QVERIFY(out.perShotOverrides[0].grinderBrand.isEmpty());
+    QVERIFY(out.perShotOverrides[0].beanBrand.isEmpty());
+}
+
+void TstDialingHelpers::hoistSessionContext_firstShotEmptyForField_fallsBackToFirstNonEmpty()
+{
+    // Shot[0] has no recorded grinderBurrs (legacy import); shots[1+] do.
+    // Context should pick the first non-empty value rather than leave it
+    // blank — otherwise shots[1+] would all carry burrs as overrides
+    // even though they agree with each other.
+    const auto a = makeIdentity(
+        QStringLiteral("Niche"), QStringLiteral("Zero"),
+        QString(),  // empty burrs on legacy shot
+        QStringLiteral("Northbound"), QStringLiteral("Spring Tour"));
+    const auto b = makeIdentity(
+        QStringLiteral("Niche"), QStringLiteral("Zero"),
+        QStringLiteral("63mm conical"),
+        QStringLiteral("Northbound"), QStringLiteral("Spring Tour"));
+    const QList<DialingHelpers::ShotIdentity> shots{a, b, b};
+
+    const auto out = hoistSessionContext(shots);
+
+    QCOMPARE(out.context.grinderBurrs, QStringLiteral("63mm conical"));
+    // Shot[0] has empty burrs while context has a value — by the spec,
+    // the override carries the field iff `shot[i].field != context.field`.
+    // Empty != "63mm conical", so... but the override emits via
+    // `!override.field.isEmpty()`, so the empty value won't surface in
+    // JSON. This is the correct behavior: legacy shots inherit the
+    // session's modern burr identification rather than blanking it.
+    // The override IS empty for shots[1] and [2] (they match context).
+    QVERIFY(out.perShotOverrides[1].grinderBurrs.isEmpty());
+    QVERIFY(out.perShotOverrides[2].grinderBurrs.isEmpty());
+}
+
+void TstDialingHelpers::hoistSessionContext_allShotsEmptyForField_contextOmitsField()
+{
+    // No shot has a recorded grinderBurrs — context.grinderBurrs stays
+    // empty, and the JSON serializer omits the field from `context`.
+    const auto a = makeIdentity(
+        QStringLiteral("Niche"), QStringLiteral("Zero"),
+        QString(),
+        QStringLiteral("Northbound"), QStringLiteral("Spring Tour"));
+    const QList<DialingHelpers::ShotIdentity> shots{a, a, a};
+
+    const auto out = hoistSessionContext(shots);
+
+    QVERIFY2(out.context.grinderBurrs.isEmpty(),
+             "no shot has burrs → context.grinderBurrs stays empty (serializer omits)");
+    for (const auto& override : out.perShotOverrides) {
+        QVERIFY(override.grinderBurrs.isEmpty());
+    }
+}
+
+void TstDialingHelpers::hoistSessionContext_sessionSpansThaw_differingShotOverridesDefrost()
+{
+    // bean-freshness-followup: a 3-shot session where shots 1-2 were pulled on
+    // one thaw and shot 3 after a new thaw. defrostDate hoists to the shared
+    // value (first shot + majority) and only the differing shot overrides it —
+    // the same mechanism beanBrand/grinderBrand already use, giving the AI the
+    // raw signal that shot 3 came from a different portion.
+    auto withDefrost = [](const QString& defrost) {
+        DialingHelpers::ShotIdentity id;
+        id.grinderBrand = QStringLiteral("Niche");
+        id.beanBrand = QStringLiteral("Northbound");
+        id.defrostDate = defrost;
+        return id;
+    };
+    auto unrecorded = withDefrost(QString());
+    unrecorded.grinderBrand.clear();
+    const QList<DialingHelpers::ShotIdentity> shots{
+        withDefrost(QStringLiteral("2026-05-01")),
+        withDefrost(QStringLiteral("2026-05-01")),
+        withDefrost(QStringLiteral("2026-05-13")),
+        unrecorded};
+
+    const auto out = hoistSessionContext(shots);
+    // A shot with no thaw recorded says so explicitly rather than inheriting the
+    // context's date; an empty grinder still inherits (legacy shots).
+    QCOMPARE(out.unrecorded[3], QStringList{QStringLiteral("defrostDate")});
+    QVERIFY(out.unrecorded[2].isEmpty());
+
+    QCOMPARE(out.context.defrostDate, QStringLiteral("2026-05-01"));
+    QVERIFY2(out.perShotOverrides[0].defrostDate.isEmpty(),
+             "shot 0 matches the context → no override");
+    QVERIFY2(out.perShotOverrides[1].defrostDate.isEmpty(),
+             "shot 1 matches the context → no override");
+    QCOMPARE(out.perShotOverrides[2].defrostDate, QStringLiteral("2026-05-13"));
+}
+
+// ---- estimateFlowAtCutoff (issue #1021) ----
+//
+// SAW prediction needs a representative flow rate at the moment of cutoff.
+// We approximate by averaging the tail of the recorded flow curve.
+
+namespace {
+QVariantMap makeSample(double t, double y)
+{
+    QVariantMap m;
+    m["x"] = t;
+    m["y"] = y;
+    return m;
+}
+} // namespace
+
+void TstDialingHelpers::estimateFlowAtCutoff_emptySamples_returnsZero()
+{
+    QCOMPARE(estimateFlowAtCutoff({}, 30.0), 0.0);
+}
+
+void TstDialingHelpers::estimateFlowAtCutoff_zeroDuration_returnsZero()
+{
+    // No duration → no window. Defensive: legacy shots with bogus durations.
+    QVariantList samples;
+    samples.append(makeSample(10.0, 1.5));
+    QCOMPARE(estimateFlowAtCutoff(samples, 0.0), 0.0);
+}
+
+void TstDialingHelpers::estimateFlowAtCutoff_averagesLastTwoSeconds()
+{
+    // Shot duration = 30s; default window = 2s → samples in [28, 30] count.
+    QVariantList samples;
+    samples.append(makeSample(10.0, 0.5));   // outside window
+    samples.append(makeSample(20.0, 1.0));   // outside window
+    samples.append(makeSample(28.0, 1.6));   // inside (boundary)
+    samples.append(makeSample(29.0, 1.8));
+    samples.append(makeSample(30.0, 2.0));
+
+    const double avg = estimateFlowAtCutoff(samples, 30.0);
+    // Average of 1.6, 1.8, 2.0 = 1.8
+    QVERIFY(qFuzzyCompare(avg, 1.8));
+}
+
+void TstDialingHelpers::estimateFlowAtCutoff_skipsZeroFlowSamples()
+{
+    // y == 0 (drip detected as zero, scale rounding) shouldn't drag the avg
+    // down — the SAW prediction wants the flow regime that drove pour
+    // pressure, not stale zero readings between drops.
+    QVariantList samples;
+    samples.append(makeSample(28.0, 1.5));
+    samples.append(makeSample(29.0, 0.0));   // skip
+    samples.append(makeSample(30.0, 1.5));
+
+    const double avg = estimateFlowAtCutoff(samples, 30.0);
+    QVERIFY(qFuzzyCompare(avg, 1.5));
+}
+
+void TstDialingHelpers::estimateFlowAtCutoff_shortShot_clampsWindowToZero()
+{
+    // Shot shorter than the window — window must clamp to t >= 0 so we
+    // average the whole shot rather than emit garbage.
+    QVariantList samples;
+    samples.append(makeSample(0.5, 1.0));
+    samples.append(makeSample(1.0, 2.0));
+
+    // duration=1.0, default window=2.0 → window starts at max(0, 1.0-2.0) = 0
+    const double avg = estimateFlowAtCutoff(samples, 1.0);
+    QVERIFY(qFuzzyCompare(avg, 1.5));  // (1.0 + 2.0) / 2
+}
+
+void TstDialingHelpers::estimateFlowAtCutoff_customWindow()
+{
+    QVariantList samples;
+    samples.append(makeSample(25.0, 1.0));
+    samples.append(makeSample(28.0, 2.0));
+    samples.append(makeSample(30.0, 3.0));
+
+    // 5s window → [25, 30] all three samples → (1+2+3)/3 = 2.0
+    QVERIFY(qFuzzyCompare(estimateFlowAtCutoff(samples, 30.0, 5.0), 2.0));
+    // 1s window → [29, 30] only the t=30 sample → 3.0
+    QVERIFY(qFuzzyCompare(estimateFlowAtCutoff(samples, 30.0, 1.0), 3.0));
+}
+
+QTEST_APPLESS_MAIN(TstDialingHelpers)
+
+#include "tst_dialing_helpers.moc"

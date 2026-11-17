@@ -1,0 +1,792 @@
+#include "core/diagnosticlogging.h"
+#include "webdebuglogger.h"
+#include <limits>
+
+#include "core/logpaths.h"
+#include "core/logtags.h"
+#include "mcp/mcplogfilter.h"
+
+#include <algorithm>
+#include <QDebug>
+#include <QQmlEngine>
+#include <QStandardPaths>
+#include <QDir>
+#include <QFileInfo>
+#include <QTextStream>
+#include <QBuffer>
+#ifdef Q_OS_ANDROID
+#include <QJniObject>
+#endif
+
+namespace {
+const QString kSessionMarker = McpLogFilter::sessionStartMarker();
+// Written by trimLogFile() at the head of what survives a trim. Named because
+// it is produced at one site and READ at another (the headless-fragment scan in
+// sessionIndex(), which must not mistake it for log content) — and a banner
+// those two spelled differently would resurrect the phantom session it exists
+// to keep out.
+const QString kTrimBanner = QStringLiteral("... [log trimmed] ...");
+
+QStringList readMatchingSessionLines(QIODevice& file,
+    const std::function<bool(const QString&)>& matches, int maxLines,
+    QString* readError, qint64* readOffset)
+{
+    // Backwards in blocks, newest line first. The current session is the one after
+    // the LAST marker, so the first marker met ends the read. With no marker at all
+    // (the DECENZA_TESTING constructor, or a log predating markers) the read reaches
+    // the start of the file, which reads it as one session rather than as nothing.
+    constexpr qint64 kBlock = 64 * 1024;
+    const QByteArray marker = kSessionMarker.toUtf8();
+    QStringList newestFirst;
+    QByteArray carry;  // a line split across the block boundary, completed by the next read
+    qint64 pos = file.size();
+    bool done = false;
+    while (!done && pos > 0) {
+        const qint64 from = qMax<qint64>(0, pos - kBlock);
+        QByteArray chunk = file.seek(from) ? file.read(pos - from) : QByteArray();
+        if (chunk.size() != pos - from) {
+            *readError = file.errorString();
+            *readOffset = from;
+            break;
+        }
+        chunk += carry;
+        carry.clear();
+        pos = from;
+        qsizetype end = chunk.size();
+        while (end >= 0) {
+            const qsizetype nl = end > 0 ? chunk.lastIndexOf('\n', end - 1) : -1;
+            if (nl < 0 && pos > 0) {
+                carry = chunk.left(end);
+                break;
+            }
+            QByteArray raw = chunk.mid(nl + 1, end - nl - 1);
+            if (raw.endsWith('\r'))
+                raw.chop(1);
+            if (raw.startsWith(marker)) {
+                done = true;
+                break;
+            }
+            const QString line = QString::fromUtf8(raw);
+            if (matches(line)) {
+                newestFirst.append(line);
+                if (maxLines > 0 && newestFirst.size() >= maxLines) {
+                    done = true;
+                    break;
+                }
+            }
+            if (nl < 0)
+                break;
+            end = nl;
+        }
+    }
+    std::reverse(newestFirst.begin(), newestFirst.end());
+    return newestFirst;
+}
+
+QString portableSource(QString file)
+{
+    file.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    for (const auto* root : {"/qml/", "/src/"}) {
+        const auto pos = file.lastIndexOf(QLatin1String(root));
+        if (pos >= 0)
+            return file.mid(pos + 1);
+    }
+    if (file.startsWith(QLatin1String("qrc:/")))
+        return file.mid(5);
+    // Do not persist the builder's home directory for Qt/platform source files.
+    return QFileInfo(file).fileName();
+}
+
+QString diagnosticContext(const QMessageLogContext& context)
+{
+    QStringList fields;
+    if (context.category && *context.category && QByteArray(context.category) != "default")
+        fields.append(QStringLiteral("category=%1").arg(QString::fromUtf8(context.category)));
+    if (context.file && *context.file) {
+        QString source = portableSource(QString::fromUtf8(context.file));
+        if (context.line > 0)
+            source += QLatin1Char(':') + QString::number(context.line);
+        fields.append(QStringLiteral("source=%1").arg(source));
+    }
+    if ((!context.file || !*context.file || context.line <= 0)
+        && context.function && *context.function)
+        fields.append(QStringLiteral("function=%1").arg(QString::fromUtf8(context.function)));
+    QString result = fields.join(QLatin1Char(' '));
+    result.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    result.replace(QLatin1Char('\r'), QLatin1Char(' '));
+    return result.isEmpty() ? QString() : QStringLiteral(" {%1}").arg(result);
+}
+
+QString qmlMessage(const QString& subsystem, QString emitter, const QString& message)
+{
+    emitter.replace(QLatin1Char(']'), QLatin1Char('_'));
+    emitter.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    emitter.replace(QLatin1Char('\r'), QLatin1Char(' '));
+    const QString owner = DecenzaLog::isRegistered(subsystem)
+        ? subsystem : QString::fromLatin1(DECENZA_LOG_MARKER_RUNTIME);
+    return DecenzaLog::prefix(owner, emitter) + QLatin1Char(' ') + message;
+}
+}
+
+#ifdef Q_OS_ANDROID
+// Java may run before Qt loads (receivers/services) or before install(). It
+// keeps those records in logcat; once the logger exists, this is the sole write.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_io_github_kulitorum_decenza_1de1_DiagnosticLog_writeNative(
+    JNIEnv*, jclass, jint priority, jstring owner, jstring emitter, jstring message)
+{
+    if (!WebDebugLogger::instance())
+        return JNI_FALSE;
+    const QString text = qmlMessage(QJniObject(owner).toString(),
+                                    QJniObject(emitter).toString(), QJniObject(message).toString());
+    const QMessageLogger logger(nullptr, 0, nullptr, "android");
+    if (priority >= 6)
+        logger.critical().noquote() << text;
+    else if (priority == 5)
+        logger.warning().noquote() << text;
+    else if (priority == 4)
+        logger.info().noquote() << text;
+    else
+        logger.debug().noquote() << text;
+    return JNI_TRUE;
+}
+#endif
+
+WebDebugLogger* WebDebugLogger::s_instance = nullptr;
+QtMessageHandler WebDebugLogger::s_previousHandler = nullptr;
+
+WebDebugLogger* WebDebugLogger::instance()
+{
+    return s_instance;
+}
+
+void WebDebugLogger::install()
+{
+    if (!s_instance) {
+        s_instance = new WebDebugLogger();
+        s_previousHandler = qInstallMessageHandler(messageHandler);
+    }
+}
+
+WebDebugLogger* WebDebugLogger::create(QQmlEngine*, QJSEngine*)
+{
+    // Calls install() rather than assuming main() already did. install() is
+    // idempotent (the `if (!s_instance)` above) and needs nothing from the QML
+    // engine, so there is no real case where this should ever return null — and
+    // every caller in QML was written as if it could anyway (the PR Kulitorum/Decenza#1661 truthy-
+    // singleton trap: a registered type with no instance is TRUTHY, so
+    // `WebDebugLogger &&  WebDebugLogger.foo` still reaches the member read).
+    // Calling install() here removes the null case instead of asking every
+    // future view to keep guessing whether it needs a guard.
+    install();
+    // The QML engine must NOT own this. A singleton returned from create() is engine-owned
+    // by default, so the engine deleted the logger at its own teardown while the message
+    // handler was still installed and s_instance still pointed at it — every qDebug() after
+    // that read freed memory. It aborted under ASan in ShotServer::stop(), which logs from
+    // ~MainController long after QML is gone, and was a silent bad read in release.
+    //
+    // Logging has to outlive QML by definition: plenty of shutdown runs after the engine.
+    // So the logger is C++-owned and simply lives to process exit.
+    QQmlEngine::setObjectOwnership(s_instance, QQmlEngine::CppOwnership);
+    return s_instance;
+}
+
+WebDebugLogger::~WebDebugLogger()
+{
+    // Nothing should destroy the process-wide logger now that it is CppOwnership, but a
+    // static left pointing at freed memory is the bug above, so do not leave one. The
+    // handler stays installed: it is not ours to restore (btlogfilter installed over us),
+    // and messageHandler() already null-checks s_instance and forwards to the previous
+    // handler, so logging keeps working without the web buffer.
+    if (s_instance == this)
+        s_instance = nullptr;
+}
+
+WebDebugLogger::WebDebugLogger(QObject* parent)
+    : QObject(parent)
+    , m_startTime(QDateTime::currentDateTime())
+{
+    m_timer.start();
+
+    // External storage on Android so logs survive APK updates and the user can
+    // retrieve them; internal app data everywhere else. This body used to live
+    // here; it moved to logpaths.h when TranslationManager needed to write its
+    // key dump into the SAME directory, and getting that wrong on Android means
+    // a file the reader of the log cannot open.
+    m_logFilePath = DecenzaPaths::logsDirectory() + "/debug.log";
+
+    // Write session start marker
+    QFile file(m_logFilePath);
+    if (file.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream stream(&file);
+        stream << "\n" << kSessionMarker << " " << m_startTime.toString(Qt::ISODate) << " ==========\n";
+    } else {
+        m_writeFailureWarned = true;
+        DIAG_WARN(RUNTIME, "WebDebugLogger") << "cannot write session marker to" << m_logFilePath
+                   << "-" << file.errorString() << "- this session's log will not persist.";
+    }
+}
+
+#ifdef DECENZA_TESTING
+WebDebugLogger::WebDebugLogger(const QString& testLogFilePath, QObject* parent)
+    : QObject(parent)
+    , m_startTime(QDateTime::currentDateTime())
+{
+    m_timer.start();
+    m_logFilePath = testLogFilePath;
+}
+
+void WebDebugLogger::installForTesting(WebDebugLogger* instance)
+{
+    s_instance = instance;
+}
+#endif
+
+void WebDebugLogger::messageHandler(QtMsgType type, const QMessageLogContext& context, const QString& msg)
+{
+    // Forward to previous handler (console output) - wall clock comes from qSetMessagePattern
+    if (s_previousHandler) {
+        s_previousHandler(type, context, msg);
+    }
+
+    // Capture to our buffer (without prefix - internal use)
+    if (s_instance) {
+        s_instance->handleMessage(type, msg, context);
+    }
+}
+
+void WebDebugLogger::debug(const QString& subsystem, const QString& emitter, const QString& message)
+{
+    qDebug().noquote() << qmlMessage(subsystem, emitter, message); // log-marker-exempt: shared QML formatter validates the owner above
+}
+
+void WebDebugLogger::info(const QString& subsystem, const QString& emitter, const QString& message)
+{
+    qInfo().noquote() << qmlMessage(subsystem, emitter, message); // log-marker-exempt: shared QML formatter validates the owner above
+}
+
+void WebDebugLogger::warn(const QString& subsystem, const QString& emitter, const QString& message)
+{
+    qWarning().noquote() << qmlMessage(subsystem, emitter, message); // log-marker-exempt: shared QML formatter validates the owner above
+}
+
+void WebDebugLogger::error(const QString& subsystem, const QString& emitter, const QString& message)
+{
+    qCritical().noquote() << qmlMessage(subsystem, emitter, message); // log-marker-exempt: shared QML formatter validates the owner above
+}
+
+void WebDebugLogger::handleMessage(QtMsgType type, const QString& message,
+                                   const QMessageLogContext& context)
+{
+    QString category;
+    switch (type) {
+    case QtDebugMsg:    category = "DEBUG"; break;
+    case QtInfoMsg:     category = "INFO"; break;
+    case QtWarningMsg:  category = "WARN"; break;
+    case QtCriticalMsg: category = "ERROR"; break;
+    case QtFatalMsg:    category = "FATAL"; break;
+    }
+
+    double seconds = m_timer.elapsed() / 1000.0;
+    const QString envelope = QString("[%1] %2 ")
+        .arg(seconds, 8, 'f', 3)
+        .arg(category, -5);
+
+    // Parse only the explicit leading identity. No ownership heuristics based on
+    // class names, warning text or whichever page happens to be visible.
+    QString body = message;
+    body.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+    body.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+    QString identity = DecenzaLog::prefix(QLatin1String(DECENZA_LOG_MARKER_RUNTIME),
+                                         QStringLiteral("Unattributed"));
+    const auto close = body.indexOf(QLatin1Char(']'));
+    if (body.startsWith(QLatin1Char('[')) && close > 1
+        && DecenzaLog::isRegistered(body.mid(1, close - 1))) {
+        qsizetype end = close + 1;
+        while (end < body.size() && body.at(end) == QLatin1Char('[')) {
+            const auto tagEnd = body.indexOf(QLatin1Char(']'), end);
+            if (tagEnd < 0 || body.mid(end, tagEnd - end).contains(QLatin1Char('\n')))
+                break;
+            end = tagEnd + 1;
+        }
+        identity = body.left(end);
+        body.remove(0, end);
+        if (body.startsWith(QLatin1Char(' ')))
+            body.remove(0, 1);
+    }
+    const QString origin = (type == QtWarningMsg || type == QtCriticalMsg || type == QtFatalMsg)
+        ? diagnosticContext(context) : QString();
+    QStringList lines;
+    for (const auto& part : body.split(QLatin1Char('\n')))
+        lines.append(envelope + identity + QLatin1Char(' ') + part + origin);
+
+    QMutexLocker locker(&m_mutex);
+    m_lines.append(lines);
+
+    // Trim to max size (ring buffer)
+    while (m_lines.size() > m_maxLines) {
+        m_lines.removeFirst();
+    }
+
+    // Write to file with m_mutex released — holding it across the write would
+    // block every other logging thread on disk I/O. writeToFile() takes
+    // m_fileMutex, which orders the file operations without ordering the buffer.
+    locker.unlock();
+    // Reserve and enqueue under the same file lock so concurrent logging
+    // threads cannot deliver a newer sequence before an older one.
+    QMutexLocker fileDeliveryLocker(m_fileMutex.get());
+    const qint64 lastSequence = writeToFile(lines.join(QLatin1Char('\n')));
+    const qint64 firstSequence = lastSequence - lines.size() + 1;
+
+    // lineAppended is delivered from the event loop, never from here. This function
+    // runs inside the global message handler, i.e. inside whatever frame logged —
+    // Qt's own internals included — and the receivers are QML views, so a direct
+    // emit ran JS in the middle of those frames (suspected in #2030).
+    //
+    // A delivery whose slot logs posts nothing: the line is still buffered and
+    // written, but re-delivering it would make every delivery queue the next.
+    // The flag is per-thread because a line logged on another thread meanwhile is
+    // a real line and must still be delivered. This only guards slots on this
+    // object's thread; a receiver elsewhere gets a second queued hop.
+    static thread_local bool delivering = false;
+    if (delivering)
+        return;
+    QMetaObject::invokeMethod(this, [this, type, lines, firstSequence] {
+        struct Guard {
+            ~Guard() { delivering = false; }
+        } guard;
+        delivering = true;
+        qint64 sequence = firstSequence;
+        for (const auto& line : lines)
+            emit lineAppended(type, line, sequence++);
+    }, Qt::QueuedConnection);
+}
+
+qint64 WebDebugLogger::writeToFile(const QString& line)
+{
+    // Held across the append AND the trim below — see m_fileMutex's declaration.
+    QMutexLocker fileLocker(m_fileMutex.get());
+    // Each physical line has its own fence, while the entire diagnostic stays
+    // one append/trim operation. Views may suppress lines already in a snapshot.
+    *m_writtenSequence += line.count(QLatin1Char('\n')) + 1;
+    const qint64 sequence = *m_writtenSequence;
+
+    QFile file(m_logFilePath);
+    if (file.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream stream(&file);
+        stream << line << "\n";
+        file.close();
+
+        // Check if we need to trim
+        if (file.size() > MAX_LOG_FILE_SIZE) {
+            trimLogFile();
+        }
+    } else if (!m_writeFailureWarned) {
+        // Once only: every subsequent line hits the same open() and would
+        // otherwise repeat this at the very moment logging is already broken.
+        // Unmarked and to stderr deliberately — it cannot go through a
+        // registered-subsystem helper (this IS the persistence layer those
+        // helpers write through), and it cannot reach the connections views
+        // either, since they read this same file.
+        m_writeFailureWarned = true;
+        DIAG_WARN(RUNTIME, "WebDebugLogger") << "cannot write" << m_logFilePath
+                   << "-" << file.errorString()
+                   << "- all subsequent log lines will be lost from the persisted "
+                      "file, the connections views, Share, and debug_get_log.";
+    }
+    return sequence;
+}
+
+void WebDebugLogger::trimLogFile()
+{
+    // Recursive: writeToFile() already holds this when it calls us, and a direct
+    // caller does not.
+    QMutexLocker fileLocker(m_fileMutex.get());
+
+    QFile file(m_logFilePath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        // Latched, for the same reason as the write path below: writeToFile()
+        // re-checks the size after EVERY line, so a trim that cannot read the
+        // file is retried on every subsequent line, forever, while the file grows
+        // past its 2 MB cap without bound. This was a bare `return` — the failure
+        // with the largest user-visible consequence in this class said nothing at
+        // all, and the symptom (a huge debug.log whose recent past is unreachable)
+        // points nowhere near the cause.
+        if (!m_trimFailureWarned) {
+            m_trimFailureWarned = true;
+            DIAG_WARN(RUNTIME, "WebDebugLogger") << "cannot open" << m_logFilePath
+                       << "to read for trimming -" << file.errorString()
+                       << "- the log will keep growing past its" << MAX_LOG_FILE_SIZE
+                       << "byte cap. This warning is not repeated.";
+        }
+        return;
+    }
+
+    // Read all content
+    QByteArray content = file.readAll();
+    file.close();
+
+    // Keep last ~80% of max size to avoid frequent trimming
+    qint64 keepSize = MAX_LOG_FILE_SIZE * 80 / 100;
+    if (content.size() <= keepSize) {
+        return;
+    }
+
+    // Find a newline near the trim point to keep lines intact
+    qint64 trimPoint = content.size() - keepSize;
+    qint64 newlinePos = content.indexOf('\n', trimPoint);
+    if (newlinePos == -1) {
+        newlinePos = trimPoint;
+    }
+
+    // Write the trimmed content behind a banner, and NOTHING else.
+    //
+    // This used to re-emit a session marker here, "so it survives the trim". It
+    // did the opposite. The only start time this function holds is m_startTime —
+    // the CURRENTLY RUNNING session's — while the content it was introducing
+    // belongs to whatever older session survived the cut. sessionIndex()
+    // treats every SESSION START line as a boundary, so the forgery became a real
+    // session in every enumeration, carrying a timestamp from a different day
+    // than its own lines.
+    //
+    // Observed in a real log: five sessions enumerated as 07-29 18:17, 07-28
+    // 10:23, 07-29 08:21, 07-29 18:17, 07-30 08:20 — not chronological, and the
+    // duplicated timestamp is the run that performed the trim. Every session=N
+    // address was wrong, and old lines read as having been written just now,
+    // which is the exact hazard session scoping exists to prevent.
+    //
+    // The concern the old comment named is real: a trim CAN remove the running
+    // session's own marker, if that session alone exceeds keepSize. The remedy is
+    // in sessionIndex(), which reports a headless leading fragment as a
+    // session with an UNKNOWN start rather than borrowing one — an absent
+    // timestamp is recoverable, a wrong one is not.
+    // Both writes are checked, because by the time they run the truncate has
+    // ALREADY happened and the original file is unrecoverable. A short write here
+    // — a full disk, a full quota on Android external storage — amputates the log
+    // mid-line, and QFile::write is not [[nodiscard]], so -Werror=unused-result
+    // never said a word. CLAUDE.md's note about unannotated APIs is this case
+    // exactly: check the result yourself, because the compiler will not.
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+        const QByteArray banner = (kTrimBanner + "\n").toUtf8();
+        const QByteArray tail = content.mid(newlinePos + 1);
+        const qint64 wroteBanner = file.write(banner);
+        const qint64 wroteTail = file.write(tail);
+        if (!file.flush() || wroteBanner != banner.size() || wroteTail != tail.size()) {
+            DIAG_WARN(RUNTIME, "WebDebugLogger") << "log trim wrote" << wroteTail << "of"
+                       << tail.size() << "bytes to" << m_logFilePath << "-"
+                       << file.errorString()
+                       << "- the persisted log is now truncated and the lost lines are "
+                          "unrecoverable.";
+        }
+    } else {
+        // Warn once, not per line. writeToFile() re-checks the size after EVERY
+        // line, so a trim that cannot open the file is retried forever while the
+        // file grows past its cap without bound — a multi-hundred-megabyte
+        // debug.log and a debug_get_log that never reaches the recent past, with
+        // nothing anywhere saying why. A transient share violation on Windows or a
+        // remounted SD card on Android is enough to start it.
+        if (!m_trimFailureWarned) {
+            m_trimFailureWarned = true;
+            DIAG_WARN(RUNTIME, "WebDebugLogger") << "cannot open" << m_logFilePath
+                       << "to trim -" << file.errorString()
+                       << "- the log will keep growing past its size cap. This warning "
+                          "is not repeated.";
+        }
+    }
+}
+
+QString WebDebugLogger::getPersistedLog() const
+{
+    QByteArray bytes;
+    QString reason;
+    return persistedLogReader(std::numeric_limits<qint64>::max() - 1)(&bytes, &reason)
+        ? QString::fromUtf8(bytes) : QString();
+}
+
+WebDebugLogger::PersistedLogReader WebDebugLogger::persistedLogReader(qint64 maximumBytes) const
+{
+    return [path = m_logFilePath, mutex = m_fileMutex, maximumBytes](QByteArray* bytes, QString* reason) {
+        bytes->clear();
+        reason->clear();
+        QMutexLocker locker(mutex.get());
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            *reason = QStringLiteral("logReadFailed");
+            return false;
+        }
+        if (maximumBytes <= 0 || file.size() > maximumBytes) {
+            *reason = QStringLiteral("fileTooLarge");
+            return false;
+        }
+        *bytes = file.read(qMin(maximumBytes, file.size()) + 1);
+        if (file.error() != QFileDevice::NoError || !file.atEnd()) {
+            bytes->clear();
+            *reason = QStringLiteral("logReadFailed");
+            return false;
+        }
+        return true;
+    };
+}
+
+QStringList WebDebugLogger::getPersistedLogChunk(qsizetype offset, qsizetype limit, qsizetype* totalLines) const
+{
+    QFile file(m_logFilePath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        // Distinct from "log is genuinely empty" — surfaced so a caller isn't left
+        // reading an empty result as though nothing has ever been logged. QFileInfo's
+        // stat-based size()/mtime() (used by sessionIndex()'s cache key) can succeed
+        // even when the file can't be opened, so this warning is the only signal that
+        // the persisted log is currently unreadable.
+        DIAG_WARN(RUNTIME, "WebDebugLogger") << "failed to open persisted log for reading:" << m_logFilePath
+                   << file.errorString();
+        if (totalLines) *totalLines = 0;
+        return {};
+    }
+
+    QTextStream stream(&file);
+    QStringList result;
+    qsizetype lineNum = 0;
+
+    while (!stream.atEnd()) {
+        QString line = stream.readLine();
+        if (lineNum >= offset && result.size() < limit) {
+            result.append(line);
+        }
+        lineNum++;
+        // Stop once the page is full — but only when nobody asked for the total,
+        // because that is a count of the WHOLE file and needs every line. Without
+        // this the loop read to EOF even for a satisfied 400-line request, so the
+        // connections views paid a full 2 MB scan on top of sessionIndex()'s.
+        if (!totalLines && result.size() >= limit)
+            break;
+    }
+
+    if (totalLines) *totalLines = lineNum;
+    return result;
+}
+
+QList<WebDebugLogger::SessionBoundary> WebDebugLogger::sessionIndex(qsizetype* totalLines) const
+{
+    QMutexLocker locker(&m_sessionIndexMutex);
+
+    const QFileInfo info(m_logFilePath);
+    const qint64 size = info.size();
+    const QDateTime mtime = info.lastModified();
+
+    if (m_cachedFileSize != size || m_cachedFileMTime != mtime) {
+#ifdef DECENZA_TESTING
+        ++s_testSessionIndexRebuildCount;
+#endif
+        qsizetype scannedTotal = 0;
+        // Same 100,000-line cap the tool's filtered/tailed reads use — a
+        // generous superset of what MAX_LOG_FILE_SIZE (2MB) can ever hold.
+        const QStringList allLines = getPersistedLogChunk(0, 100000, &scannedTotal);
+
+        QList<SessionBoundary> sessions;
+
+        // A trim cuts from the FRONT, so it can leave lines whose own SESSION
+        // START marker is gone. Those lines are a session — they are just one
+        // whose start time was destroyed, and the file no longer holds the
+        // information needed to recover it.
+        //
+        // Report them as a boundary at line 0 with an EMPTY timestamp. Two
+        // properties follow, and both matter:
+        //
+        //   - The fragment is addressable. Without a boundary it belonged to no
+        //     session at all, so its lines were unreachable through session=N and
+        //     invisible in the line accounting.
+        //   - Its start time is absent rather than borrowed. trimLogFile() used to
+        //     supply one by writing a marker stamped with the running session's
+        //     start; that is why this branch exists rather than that one. An
+        //     absent timestamp tells a reader it is unknown. A borrowed one tells
+        //     them yesterday's disconnect happened this morning.
+        //
+        // Only ever the FIRST boundary: any later session was written whole and
+        // carries its own marker.
+        //
+        // "Content before the first marker" is NOT the same as "line 0 is not a
+        // marker", and it is not "line 0 is not blank" either. TWO lines can
+        // legitimately precede the first marker without any orphaned content
+        // existing, and counting either one invents a session:
+        //
+        //   - A BLANK line, on a healthy fresh log. The marker is written with a
+        //     leading newline (see the constructor), so line 0 is empty and the
+        //     marker sits on line 1.
+        //   - The TRIM BANNER, on any trimmed log. trimLogFile() writes it
+        //     unconditionally at the head of what survives.
+        //
+        // The banner case is not hypothetical and was shipped: on a real 21,553
+        // line log the trim landed just before a marker, so the surviving head was
+        // banner-then-marker with no orphaned lines at all, and this scan reported
+        // a session whose entire content was the banner. It read as a genuine
+        // one-line session in every enumeration.
+        //
+        // Skip both, and require something that is neither before concluding a
+        // fragment is real.
+        qsizetype firstMarkerLine = -1;
+        for (qsizetype i = 0; i < allLines.size(); ++i) {
+            if (allLines[i].startsWith(kSessionMarker)) {
+                firstMarkerLine = i;
+                break;
+            }
+        }
+        const qsizetype fragmentEnd =
+            (firstMarkerLine >= 0) ? firstMarkerLine : allLines.size();
+        bool hasHeadlessFragment = false;
+        for (qsizetype i = 0; i < fragmentEnd; ++i) {
+            const QString trimmed = allLines[i].trimmed();
+            if (!trimmed.isEmpty() && trimmed != kTrimBanner) {
+                hasHeadlessFragment = true;
+                break;
+            }
+        }
+        if (hasHeadlessFragment)
+            sessions.append({0, QString(), 0});
+
+        for (qsizetype i = 0; i < allLines.size(); ++i) {
+            if (allLines[i].startsWith(kSessionMarker)) {
+                QString ts;
+                const qsizetype tsStart = allLines[i].indexOf(kSessionMarker) + kSessionMarker.size();
+                const qsizetype tsEnd = allLines[i].indexOf(QStringLiteral("=========="), tsStart);
+                if (tsEnd > tsStart)
+                    ts = allLines[i].mid(tsStart, tsEnd - tsStart).trimmed();
+                sessions.append({i, ts, 0});
+            }
+        }
+        for (qsizetype i = 0; i < sessions.size(); ++i) {
+            const qsizetype nextStart = (i + 1 < sessions.size()) ? sessions[i + 1].startLine : scannedTotal;
+            sessions[i].lineCount = nextStart - sessions[i].startLine;
+        }
+
+        m_cachedSessionIndex = sessions;
+        m_cachedTotalLines = scannedTotal;
+        m_cachedFileSize = size;
+        m_cachedFileMTime = mtime;
+    }
+
+    if (totalLines) *totalLines = m_cachedTotalLines;
+    return m_cachedSessionIndex;
+}
+
+QString WebDebugLogger::logFilePath() const
+{
+    return m_logFilePath;
+}
+
+WebDebugLogger::SessionSnapshotReader WebDebugLogger::sessionSnapshotReader(
+    const QStringList& markers, const QString& minLevel, int maxLines, qint64 maximumBytes) const
+{
+    return [path = m_logFilePath, mutex = m_fileMutex, sequence = m_writtenSequence,
+            markers, minLevel, maxLines, maximumBytes] {
+        SessionSnapshot snapshot;
+        QByteArray contents;
+        {
+            QMutexLocker locker(mutex.get());
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) {
+                snapshot.reason = QStringLiteral("logReadFailed");
+                return snapshot;
+            }
+            if (maximumBytes <= 0 || file.size() > maximumBytes) {
+                snapshot.reason = QStringLiteral("fileTooLarge");
+                return snapshot;
+            }
+            contents = file.read(qMin(maximumBytes, file.size()) + 1);
+            if (file.error() != QFileDevice::NoError || !file.atEnd()) {
+                snapshot.reason = QStringLiteral("logReadFailed");
+                return snapshot;
+            }
+            snapshot.sequence = *sequence;
+        }
+        QBuffer buffer(&contents);
+        if (!buffer.open(QIODevice::ReadOnly)) {
+            snapshot.reason = QStringLiteral("logReadFailed");
+            return snapshot;
+        }
+        qint64 readOffset = 0;
+        snapshot.lines = readMatchingSessionLines(buffer,
+            [&markers, &minLevel](const QString& line) {
+                return McpLogFilter::lineMatches(line, markers, minLevel);
+            }, maxLines, &snapshot.reason, &readOffset);
+        if (!snapshot.reason.isEmpty()) snapshot.reason = QStringLiteral("logReadFailed");
+        return snapshot;
+    };
+}
+
+qint64 WebDebugLogger::writtenSequence() const
+{
+    QMutexLocker fileLocker(m_fileMutex.get());
+    return *m_writtenSequence;
+}
+
+QStringList WebDebugLogger::getLines(int afterIndex, int* lastIndex) const
+{
+    QMutexLocker locker(&m_mutex);
+
+    if (lastIndex) {
+        *lastIndex = static_cast<int>(m_lines.size());
+    }
+
+    if (afterIndex >= m_lines.size()) {
+        return QStringList();
+    }
+
+    if (afterIndex <= 0) {
+        return m_lines;
+    }
+
+    return m_lines.mid(afterIndex);
+}
+
+QStringList WebDebugLogger::getAllLines() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_lines;
+}
+
+void WebDebugLogger::clear(bool clearFile)
+{
+    QMutexLocker locker(&m_mutex);
+    m_lines.clear();
+
+    if (clearFile && !m_logFilePath.isEmpty()) {
+        locker.unlock();
+        // Truncates the same file writeToFile() appends to, so it takes the same
+        // lock — otherwise a concurrent append lands in a file being emptied.
+        QMutexLocker fileLocker(m_fileMutex.get());
+        QFile file(m_logFilePath);
+        if (file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            QTextStream stream(&file);
+            stream << "========== LOG CLEARED: " << QDateTime::currentDateTime().toString(Qt::ISODate) << " ==========\n";
+            // A session marker IS legitimate here, and the asymmetry with
+            // trimLogFile() is the whole point rather than an inconsistency.
+            //
+            // A trim must not write one because the content it precedes belongs
+            // to an OLDER session, so m_startTime would be a borrowed timestamp
+            // — the forgery this class was fixed to stop. After a clear, every
+            // line that follows belongs to the RUNNING session, so m_startTime is
+            // that content's true start and writing it states a fact.
+            //
+            // Without it the clear banner alone reads as a headless fragment, and
+            // the running session gets reported with an unknown start time and a
+            // note blaming a trim that never happened. The user pressed Clear.
+            stream << "\n" << kSessionMarker << " " << m_startTime.toString(Qt::ISODate)
+                   << " ==========\n";
+        } else {
+            // Never silent: the in-memory buffer is now empty, so the user has
+            // been shown a cleared log while the file still holds every line.
+            // Believing a log is gone when it is not is the wrong direction to be
+            // wrong in.
+            DIAG_WARN(RUNTIME, "WebDebugLogger") << "could not clear" << m_logFilePath << "-"
+                       << file.errorString()
+                       << "- the in-memory buffer was cleared but the file still holds "
+                          "the old log.";
+        }
+    }
+}
+
+int WebDebugLogger::lineCount() const
+{
+    QMutexLocker locker(&m_mutex);
+    return static_cast<int>(m_lines.size());
+}

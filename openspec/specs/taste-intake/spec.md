@@ -1,0 +1,132 @@
+# taste-intake Specification
+
+## Purpose
+
+Defines the tap-only taste intake the AI advisor shows for shots with no saved taste feedback, the structured taste columns stored on each shot, how a saved taste counts toward the advisor's feedback gate, and how taste taps map to Visualizer CVA attributes on upload.
+
+## Requirements
+### Requirement: Tap-only taste intake, gated per shot
+
+When `Settings.ai.tasteIntakeOnAsk` is true, the advisor SHALL show a text-free, tap-only taste intake whenever the shot has no saved taste feedback: no non-empty `taste_balance` or `taste_body`, and no non-zero `enjoyment0to100`. The gate SHALL be per shot and independent of conversation history, because the conversation is shared across many shots. The intake SHALL contain no free-text input of any kind.
+
+#### Scenario: Fresh shot with no saved feedback
+- **WHEN** the user opens the advisor for a shot with no saved enjoyment/taste, with the setting ON
+- **THEN** the intake SHALL be shown with all three rows and an "Ask" button
+- **AND** no keyboard or text field SHALL be presented
+
+#### Scenario: New shot during an ongoing conversation still shows the intake
+- **WHEN** the user has an active bean+profile conversation with history, then opens the advisor for a NEW shot of the same bean+profile that has no saved taste feedback
+- **THEN** the intake SHALL still be shown — the shared conversation history SHALL NOT suppress it — so the new shot's qualities can be captured
+
+#### Scenario: Setting off
+- **WHEN** `Settings.ai.tasteIntakeOnAsk` is false
+- **THEN** opening the advisor SHALL go directly to the text conversation with the shot attached, with no intake shown
+
+#### Scenario: Backed out without entering anything re-shows the intake
+- **WHEN** the user opened the advisor (intake shown), backed out without tapping/asking, so the shot still has no saved taste feedback
+- **THEN** re-opening the advisor for that shot SHALL show the intake again
+
+#### Scenario: Saved taste feedback suppresses the intake
+- **WHEN** the shot already has a saved rating and/or taste axis (data entered and saved)
+- **THEN** opening the advisor SHALL go straight to the text conversation, with no intake
+
+### Requirement: Intake rows and actions
+
+The intake SHALL offer three rows: Extraction (`Sour`, `Balanced`, `Bitter`), Body (`Thin`, `Medium`, `Heavy`), and Overall (the existing `RatingInput` with values 25, 50, 75 and 100). It SHALL also offer an "Ask" action and a "Skip" action.
+
+#### Scenario: Intake offers three rows and two actions
+- **WHEN** the intake is shown
+- **THEN** it SHALL display the Extraction, Body and Overall rows, plus "Ask" and "Skip"
+
+### Requirement: Ask composes a question from taps and attaches the shot
+
+The "Ask" action SHALL persist any tapped values to the shot, compose a
+first-person, qualitative natural-language message from the tapped values plus a
+"what do you think and how should I adjust" question, and send it with the shot
+attached on the same path the AI Advice button uses today. Tapping "Ask" with
+nothing selected SHALL send the plain "What do you think?" question.
+
+#### Scenario: Ask with taste and body tapped
+- **WHEN** the user taps `Sour` and `Thin` and then "Ask"
+- **THEN** `taste_balance` = `sour` and `taste_body` = `thin` SHALL be persisted to the shot
+- **AND** the sent message SHALL describe the taste in first person and ask for advice
+- **AND** the shot data SHALL be attached to the turn
+
+#### Scenario: Ask with nothing selected
+- **WHEN** the user taps "Ask" without selecting any row
+- **THEN** the plain "What do you think?" question SHALL be sent with the shot attached
+- **AND** no taste/body values SHALL be written
+
+### Requirement: Skip preserves the existing text flow
+
+The "Skip" action SHALL close the intake and enter the normal text conversation
+with the shot attached, identical to the pre-existing AI Advice behavior, writing
+no taste/body values.
+
+#### Scenario: Skip
+- **WHEN** the user taps "Skip"
+- **THEN** the text conversation SHALL open with the shot attached and no taste/body values written
+
+### Requirement: Structured taste storage on the shot
+
+The system SHALL store taste as shot columns `taste_balance` (`sour`, `balanced`, `bitter`) and `taste_body` (`thin`, `medium`, `heavy`), with an empty string meaning unset. Overall SHALL keep using `enjoyment0to100`. The post-shot review page SHALL use the same picker and columns: there SHALL NOT be a second taste UI or storage representation, such as encoding taste into notes.
+
+#### Scenario: Migration on an existing database
+- **WHEN** a pre-33 shots database is opened
+- **THEN** the `taste_balance` and `taste_body` columns SHALL be added with empty defaults and existing rows SHALL read as unset
+
+#### Scenario: Review-page and advisor share storage
+- **WHEN** the user sets taste on the post-shot review page and later opens the advisor for that shot
+- **THEN** the Taste row SHALL be treated as already-filled and SHALL NOT be shown in the intake
+
+### Requirement: Structured taste satisfies the advisor's taste-feedback gate
+
+The advisor's "has taste feedback" signal SHALL treat a set `taste_balance` or
+`taste_body` as taste feedback present, in addition to a non-zero enjoyment
+score. When taste feedback is present in the shot data, the advisor SHALL NOT be
+prompted to ask "how did it taste?" for that shot.
+
+#### Scenario: Taste tapped but Overall left unrated
+- **WHEN** the user taps only a Taste chip (no Overall rating) and asks
+- **THEN** the advisor's first prompt SHALL reflect taste feedback as present
+- **AND** the advisor SHALL NOT ask the user how the shot tasted
+
+#### Scenario: Skip leaves feedback absent
+- **WHEN** the user skips the intake and the shot has no enjoyment, taste, or body
+- **THEN** taste feedback SHALL read as absent and the advisor MAY ask how the shot tasted (reactive Layer-1 capture unchanged)
+
+### Requirement: Tap enums map to Visualizer CVA fields on upload
+
+When a tapped shot is uploaded or updated to Visualizer, the system SHALL translate the taps to SCA CVA attributes on the existing request body. `taste_balance` maps to `acidity` and `bitterness` (sour 12/4, balanced 8/8, bitter 4/12), and `taste_body` maps to `mouthfeel` (thin 4, medium 8, heavy 12). Overall SHALL continue to map to `espresso_enjoyment`. The mapping is one-directional; CVA values are not reverse-mapped on download.
+
+#### Scenario: Sour tap maps to acidity/bitterness
+- **WHEN** a shot with `taste_balance = sour` is PATCHed to Visualizer
+- **THEN** the request SHALL set `acidity = 12` and `bitterness = 4`
+- **AND** `sweetness`, `aftertaste`, `aroma`, `flavor`, `fragrance` SHALL be absent from the mapped fields
+
+#### Scenario: Untapped shot never clears hand-entered CVA
+- **WHEN** a shot the user has NOT tapped in Decenza is PATCHed to Visualizer (e.g. an enjoyment/notes edit)
+- **THEN** the request SHALL NOT include `acidity` / `bitterness` / `mouthfeel` (neither a value nor null)
+- **AND** any CVA scores the user entered by hand in Visualizer SHALL be preserved
+
+#### Scenario: Body tap maps to mouthfeel
+- **WHEN** a shot with `taste_body = heavy` is uploaded to Visualizer
+- **THEN** the request SHALL set `mouthfeel = 12`
+
+#### Scenario: Capture-time upload when auto-sync is on
+- **WHEN** the user taps a taste chip on an already-uploaded shot and `visualizerAutoUpdate` is enabled
+- **THEN** the mapped CVA fields SHALL be PATCHed to Visualizer at capture time via the existing auto-update path, with no separate upload action
+
+#### Scenario: Auto-sync off defers upload
+- **WHEN** the user taps a taste chip and Visualizer auto-sync is disabled
+- **THEN** the taste SHALL persist locally and upload on the next manual push, like any other shot field
+
+### Requirement: CVA fields are written only for tapped values
+
+A mapped CVA field SHALL be written ONLY when its local taste tap is set, and SHALL NEVER be sent as null. The system SHALL NOT set any CVA attribute a tap does not speak to (`sweetness`, `aftertaste`, `aroma`, `flavor`, `fragrance`). The mapping SHALL NOT read remote CVA state, so for a tapped shot the tap is authoritative for the mapped fields.
+
+#### Scenario: Tap overrides a hand-entered CVA value for a tapped shot
+- **GIVEN** a shot with `taste_body = heavy` and a `mouthfeel` value entered by hand in Visualizer
+- **WHEN** the shot is PATCHed to Visualizer
+- **THEN** `mouthfeel` SHALL be set to 12 from the tap
+

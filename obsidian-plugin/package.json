@@ -1,0 +1,19 @@
+{
+    "name": "obsidian-decenza-de1",
+    "version": "0.1.0",
+    "description": "Obsidian plugin for Decenza espresso shot data",
+    "main": "main.js",
+    "scripts": {
+        "dev": "node esbuild.config.mjs",
+        "build": "node esbuild.config.mjs production"
+    },
+    "devDependencies": {
+        "@types/node": "^26.6.6",
+        "esbuild": "^0.28.2",
+        "obsidian": "latest",
+        "typescript": "^7.0.2"
+    },
+    "dependencies": {
+        "chart.js": "^4.6.1"
+    }
+}

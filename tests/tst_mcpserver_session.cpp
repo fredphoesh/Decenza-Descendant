@@ -1,0 +1,484 @@
+#include <QtTest>
+#include "httpframing.h"
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QTcpServer>
+#include <QElapsedTimer>
+#include <QTcpSocket>
+
+#include "mcp/mcpserver.h"
+#include "mcp/mcpsession.h"
+#include "mcp/mcptoolregistry.h"
+#include "mcp/mcpresourceregistry.h"
+
+// Stub register functions — this test doesn't exercise tools/resources,
+// only session management, ping, and subscribe. Providing stubs avoids
+// linking the entire tool/resource stack and all their transitive dependencies.
+class DE1Device;
+class MachineState;
+class MainController;
+class ProfileManager;
+class ShotHistoryStorage;
+class Settings;
+class AccessibilityManager;
+class ScreensaverVideoManager;
+class BeanBaseClient;
+class TranslationManager;
+class BatteryManager;
+class CoffeeBagStorage;
+class BLEManager;
+class MemoryMonitor;
+class AIManager;
+void registerMachineTools(McpToolRegistry*, DE1Device*, MachineState*, MainController*, ProfileManager*) {}
+void registerShotTools(McpToolRegistry*, ShotHistoryStorage*) {}
+void registerProfileTools(McpToolRegistry*, ProfileManager*) {}
+void registerPresetsTools(McpToolRegistry*, Settings*, MainController*) {}
+class RecipeStorage;
+void registerRecipeTools(McpToolRegistry*, ShotHistoryStorage*, RecipeStorage*, MainController*, Settings*) {}
+void registerSettingsReadTools(McpToolRegistry*, Settings*, AccessibilityManager*, ScreensaverVideoManager*, TranslationManager*, BatteryManager*, AIManager*, MainController*) {}
+void registerDialingTools(McpToolRegistry*, MainController*, ProfileManager*, ShotHistoryStorage*, Settings*) {}
+void registerControlTools(McpToolRegistry*, DE1Device*, MachineState*, ProfileManager*, MainController*, Settings*) {}
+void registerWriteTools(McpToolRegistry*, ProfileManager*, ShotHistoryStorage*, Settings*, CoffeeBagStorage*, AccessibilityManager*, ScreensaverVideoManager*, TranslationManager*, BatteryManager*, AIManager*, BeanBaseClient*, MainController*) {}
+void registerScaleTools(McpToolRegistry*, MachineState*) {}
+void registerDeviceTools(McpToolRegistry*, BLEManager*, DE1Device*) {}
+void registerDebugTools(McpToolRegistry*, MemoryMonitor*) {}
+void registerMcpResources(McpResourceRegistry*, DE1Device*, MachineState*, ProfileManager*, ShotHistoryStorage*, MemoryMonitor*, Settings*) {}
+void registerAgentTools(McpToolRegistry*) {}
+void registerAITools(McpToolRegistry*, MainController*) {}
+
+// Test McpServer session management: findOrCreateSession, ping, subscribe/unsubscribe.
+// These tests exercise the server directly without full BLE/profile wiring.
+
+class tst_McpServerSession : public QObject {
+    Q_OBJECT
+
+private:
+    // Helper: send a JSON-RPC request to the server and return the response
+    struct RpcResult {
+        QJsonObject response;
+        QString sessionId;
+    };
+
+    // The connection every sendRpc() in this binary shares.
+    //
+    // It used to build a fresh QTcpServer AND a fresh QTcpSocket per call — two
+    // ephemeral ports each, both left in TIME_WAIT for 2*MSL (30 s on macOS).
+    // Across 29 call sites that is ~60 ports a run here, and the same pattern in
+    // tst_mcpserver_protocol.cpp cost 895 (measured). Repeated runs exhausted
+    // the machine's whole 33,768-port ephemeral range, after which every
+    // loopback connect failed EADDRNOTAVAIL, waitForNewConnection(1000) burned
+    // its full second per call, and the binaries ran until QtTest's 300 s
+    // watchdog aborted them. Reuse is sound because McpServer::sendHttpResponse
+    // writes and flushes but never closes the socket (mcpserver.cpp).
+    struct Pooled {
+        QTcpServer tcp;
+        QTcpSocket client;
+        QTcpSocket* serverSocket = nullptr;
+
+        bool isLive() const
+        {
+            return serverSocket && client.state() == QAbstractSocket::ConnectedState
+                   && serverSocket->state() == QAbstractSocket::ConnectedState;
+        }
+
+        bool ensureOpen()
+        {
+            if (isLive()) return true;
+            // A DELETE that ends a session drops the connection with it, so
+            // reopening is a normal step rather than a failure.
+            serverSocket = nullptr;
+            client.abort();
+            if (tcp.isListening()) tcp.close();
+            if (!tcp.listen(QHostAddress::LocalHost)) return false;
+            client.connectToHost(QHostAddress::LocalHost, tcp.serverPort());
+            if (!tcp.waitForNewConnection(1000)) return false;
+            serverSocket = tcp.nextPendingConnection();
+            return serverSocket && client.waitForConnected(1000);
+        }
+    };
+
+    // Heap, not a static by value: a static Pooled destructs at static-
+    // destruction time, and deleting a QTcpServer and its child socket after
+    // QCoreApplication is gone is undefined — the other pooled binary carries
+    // the same note and the same shape. cleanupTestCase() deletes it while the
+    // event loop is still up, which is also what keeps the nightly Linux ASan
+    // run clean.
+    static Pooled*& pooledConnection()
+    {
+        static Pooled* pool = nullptr;
+        return pool;
+    }
+
+    // Framing helper shared with the other pooled-connection test binary.
+    static QByteArray readOneResponse(QTcpSocket& client)
+    {
+        return HttpFraming::readOneResponse(client);
+    }
+
+    static RpcResult sendRpc(McpServer& server, const QString& method,
+                             const QJsonObject& params, const QString& sessionId = QString(),
+                             int id = 1)
+    {
+        RpcResult result;
+
+        Pooled*& pool = pooledConnection();
+        if (!pool) pool = new Pooled;
+        if (!pool->ensureOpen()) {
+            qWarning("sendRpc: could not open the pooled connection");
+            return result;
+        }
+        QTcpSocket* serverSocket = pool->serverSocket;
+        QTcpSocket& clientSocket = pool->client;
+
+        // Build request
+        QJsonObject request;
+        request["jsonrpc"] = "2.0";
+        request["id"] = id;
+        request["method"] = method;
+        request["params"] = params;
+        QByteArray body = QJsonDocument(request).toJson(QJsonDocument::Compact);
+
+        // Build headers
+        QByteArray headers = "Content-Type: application/json\r\n";
+        if (!sessionId.isEmpty())
+            headers += "Mcp-Session-Id: " + sessionId.toUtf8() + "\r\n";
+
+        server.handleHttpRequest(serverSocket, "POST", "/mcp", headers, body);
+
+        QByteArray rawResponse = readOneResponse(clientSocket);
+
+        // Extract session ID from response headers
+        for (const QByteArray& line : rawResponse.split('\n')) {
+            QByteArray lower = line.trimmed().toLower();
+            if (lower.startsWith("mcp-session-id:")) {
+                result.sessionId = QString::fromUtf8(line.mid(line.indexOf(':') + 1).trimmed());
+                break;
+            }
+        }
+
+        // Parse JSON body (after empty line)
+        qsizetype bodyStart = rawResponse.indexOf("\r\n\r\n");
+        if (bodyStart >= 0) {
+            QByteArray jsonBody = rawResponse.mid(bodyStart + 4);
+            result.response = QJsonDocument::fromJson(jsonBody).object();
+        }
+
+        return result;
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    // Close the pooled connection while QCoreApplication is still alive. The
+    // Pooled itself is a function-local static, so its QTcpServer would
+    // otherwise be destroyed after the application object is gone.
+    void cleanupTestCase()
+    {
+        Pooled*& pool = pooledConnection();
+        if (!pool) return;
+        pool->serverSocket = nullptr;
+        pool->client.abort();
+        pool->tcp.close();
+        delete pool;
+        pool = nullptr;
+    }
+
+    void initTestCase()
+    {
+        // No setup needed — warnings from McpServer without full wiring are expected
+    }
+
+    // --- findOrCreateSession ---
+
+    void testInitializeCreatesSession()
+    {
+        McpServer server;
+        auto result = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+
+        QVERIFY(!result.sessionId.isEmpty());
+        QVERIFY(result.response.contains("result"));
+        QVERIFY(result.response["result"].toObject().contains("protocolVersion"));
+        QCOMPARE(server.activeSessionCount(), 1);
+    }
+
+    void testReinitializeReusesSameSession()
+    {
+        McpServer server;
+
+        // First initialize — creates session
+        auto first = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QVERIFY(!first.sessionId.isEmpty());
+        QCOMPARE(server.activeSessionCount(), 1);
+
+        // Re-initialize with same session ID — should reuse, not create new
+        auto second = sendRpc(server, "initialize",
+                              QJsonObject{{"capabilities", QJsonObject{}}},
+                              first.sessionId);
+        QCOMPARE(second.sessionId, first.sessionId);
+        QCOMPARE(server.activeSessionCount(), 1);  // still 1, no leak
+    }
+
+    void testReinitializeWithStaleIdCreatesNew()
+    {
+        McpServer server;
+
+        // First initialize
+        auto first = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QCOMPARE(server.activeSessionCount(), 1);
+
+        // Re-initialize with non-existent session ID — should create new
+        auto second = sendRpc(server, "initialize",
+                              QJsonObject{{"capabilities", QJsonObject{}}},
+                              "00000000-0000-0000-0000-000000000000");
+        QVERIFY(!second.sessionId.isEmpty());
+        QVERIFY(second.sessionId != "00000000-0000-0000-0000-000000000000");
+        QCOMPARE(server.activeSessionCount(), 2);  // original + new
+    }
+
+    void testInitializeWithoutHeaderCreatesNew()
+    {
+        McpServer server;
+
+        auto first = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QCOMPARE(server.activeSessionCount(), 1);
+
+        // Initialize without session header — should always create new
+        auto second = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QVERIFY(!second.sessionId.isEmpty());
+        QVERIFY(second.sessionId != first.sessionId);
+        QCOMPARE(server.activeSessionCount(), 2);
+    }
+
+    void testMultipleReconnectsDoNotLeak()
+    {
+        McpServer server;
+
+        // First connect
+        auto initial = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QString sid = initial.sessionId;
+        QCOMPARE(server.activeSessionCount(), 1);
+
+        // Simulate 5 reconnects with same session ID
+        for (int i = 0; i < 5; i++) {
+            auto reconnect = sendRpc(server, "initialize",
+                                     QJsonObject{{"capabilities", QJsonObject{}}}, sid);
+            QCOMPARE(reconnect.sessionId, sid);
+        }
+
+        // Should still be exactly 1 session
+        QCOMPARE(server.activeSessionCount(), 1);
+    }
+
+    // --- Ephemeral (POST-only) sessions do not exhaust the cap ---
+
+    void testEphemeralSessionsDoNotExhaustPool()
+    {
+        McpServer server;
+
+        // The cloud MCP connectors (ChatGPT, claude.ai) re-run `initialize` on
+        // nearly every request without echoing the session header, and never
+        // hold an SSE stream open — so each is a fresh *ephemeral* session. This
+        // harness only ever POSTs (no GET SSE), so every session it creates is
+        // ephemeral. Far more than MaxSessions (8) of them must all succeed:
+        // none is stateful, so none counts toward the cap, and none is rejected
+        // with "Too many sessions". This is the exact wedge observed in the
+        // field when both connectors churn the pool.
+        const int kBursts = 12;
+        for (int i = 0; i < kBursts; i++) {
+            auto r = sendRpc(server, "initialize",
+                             QJsonObject{{"capabilities", QJsonObject{}}});
+            QVERIFY2(!r.sessionId.isEmpty(),
+                     qPrintable(QStringLiteral("initialize #%1 was rejected").arg(i + 1)));
+            QVERIFY2(r.response.contains("result"),
+                     qPrintable(QStringLiteral("initialize #%1 returned no result").arg(i + 1)));
+            QVERIFY2(!r.response.contains("error"),
+                     qPrintable(QStringLiteral("initialize #%1 returned an error").arg(i + 1)));
+        }
+        // All retained (none rejected). Before the fix the 9th would have failed
+        // with -32000 "Too many sessions".
+        QCOMPARE(server.activeSessionCount(), kBursts);
+    }
+
+    // The ephemeral test above proves "POST-only sessions don't count", but it
+    // would still pass if isStateful() were broken to always return false. This
+    // locks the other half of the invariant: statefulness tracks a *live* SSE
+    // socket, and reverts to ephemeral when that socket clears (ChatGPT's
+    // momentary-SSE transition) while hadSseSocket() stays sticky.
+    void testSessionStatefulTracksLiveSseSocket()
+    {
+        McpSession session;
+        QVERIFY(!session.isStateful());   // fresh: no SSE stream yet
+        QVERIFY(!session.hadSseSocket());
+
+        QTcpSocket socket;
+        session.setSseSocket(&socket);
+        QVERIFY(session.isStateful());    // live SSE → stateful
+        QVERIFY(session.hadSseSocket());
+
+        session.setSseSocket(nullptr);
+        QVERIFY(!session.isStateful());   // SSE closed → ephemeral again
+        QVERIFY(session.hadSseSocket());  // but "ever had SSE" stays true
+    }
+
+    // --- ping ---
+
+    void testPingReturnsEmptyResult()
+    {
+        McpServer server;
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+
+        auto ping = sendRpc(server, "ping", QJsonObject{}, init.sessionId, 2);
+        QVERIFY(ping.response.contains("result"));
+        QJsonObject result = ping.response["result"].toObject();
+        QVERIFY(result.isEmpty());  // empty object per spec
+        QVERIFY(!ping.response.contains("error"));
+    }
+
+    // --- resources/subscribe ---
+
+    void testResourcesSubscribe()
+    {
+        McpServer server;
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+
+        QJsonObject subParams;
+        subParams["uri"] = "decenza://machine/state";
+        auto sub = sendRpc(server, "resources/subscribe", subParams, init.sessionId, 2);
+
+        QVERIFY(sub.response.contains("result"));
+        QVERIFY(!sub.response.contains("error"));
+    }
+
+    void testResourcesSubscribeMissingUri()
+    {
+        McpServer server;
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+
+        auto sub = sendRpc(server, "resources/subscribe", QJsonObject{}, init.sessionId, 2);
+
+        // Should return an error about missing uri
+        QJsonObject result = sub.response["result"].toObject();
+        QVERIFY(result.contains("error") || sub.response.contains("error"));
+    }
+
+    void testResourcesUnsubscribe()
+    {
+        McpServer server;
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+
+        // Subscribe then unsubscribe
+        QJsonObject params;
+        params["uri"] = "decenza://machine/state";
+        sendRpc(server, "resources/subscribe", params, init.sessionId, 2);
+
+        auto unsub = sendRpc(server, "resources/unsubscribe", params, init.sessionId, 3);
+        QVERIFY(unsub.response.contains("result"));
+        QVERIFY(!unsub.response.contains("error"));
+    }
+
+    // --- DELETE session ---
+
+    void testDeleteSessionThenReinitialize()
+    {
+        McpServer server;
+
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QString sid = init.sessionId;
+        QCOMPARE(server.activeSessionCount(), 1);
+
+        // Delete the session via HTTP DELETE
+        QTcpServer tcpServer;
+        tcpServer.listen(QHostAddress::LocalHost);
+        QTcpSocket clientSocket;
+        clientSocket.connectToHost(QHostAddress::LocalHost, tcpServer.serverPort());
+        tcpServer.waitForNewConnection(1000);
+        QTcpSocket* serverSocket = tcpServer.nextPendingConnection();
+        clientSocket.waitForConnected(1000);
+
+        QByteArray headers = "Mcp-Session-Id: " + sid.toUtf8() + "\r\n";
+        server.handleHttpRequest(serverSocket, "DELETE", "/mcp", headers, QByteArray());
+
+        serverSocket->close();
+        clientSocket.close();
+
+        QCOMPARE(server.activeSessionCount(), 0);
+
+        // Re-initialize with deleted session ID — should create new
+        auto reinit = sendRpc(server, "initialize",
+                              QJsonObject{{"capabilities", QJsonObject{}}}, sid);
+        QVERIFY(!reinit.sessionId.isEmpty());
+        QVERIFY(reinit.sessionId != sid);  // new ID, old one was deleted
+        QCOMPARE(server.activeSessionCount(), 1);
+    }
+
+    // --- Auto-recover for non-initialize requests ---
+
+    void testAutoRecoverCreatesNewSession()
+    {
+        McpServer server;
+
+        // Send a non-initialize request with unknown session — should auto-recover
+        auto result = sendRpc(server, "tools/list", QJsonObject{},
+                              "nonexistent-session-id", 2);
+
+        // Should succeed (auto-recovered) or have tools list
+        // The response should have a new session ID
+        QVERIFY(!result.sessionId.isEmpty());
+        QVERIFY(result.sessionId != "nonexistent-session-id");
+        QCOMPARE(server.activeSessionCount(), 1);
+    }
+
+    void testAutoRecoverReusesSoleSession()
+    {
+        McpServer server;
+
+        // Create one session via initialize
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QString sid = init.sessionId;
+        QCOMPARE(server.activeSessionCount(), 1);
+
+        // Send request with stale ID — should reuse the sole existing session
+        auto result = sendRpc(server, "tools/list", QJsonObject{},
+                              "stale-session-id-that-doesnt-exist", 2);
+        QCOMPARE(result.sessionId, sid);  // reused, not a new session
+        QCOMPARE(server.activeSessionCount(), 1);  // no leak
+    }
+
+    void testAutoRecoverStaleIdDoesNotLeak()
+    {
+        McpServer server;
+
+        // Create one session
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QString sid = init.sessionId;
+
+        // Simulate 10 requests with a stale session ID
+        for (int i = 0; i < 10; i++) {
+            auto result = sendRpc(server, "tools/list", QJsonObject{},
+                                  "stale-id-from-expired-session", i + 10);
+            QCOMPARE(result.sessionId, sid);
+        }
+
+        // Should still be exactly 1 session — no leak
+        QCOMPARE(server.activeSessionCount(), 1);
+    }
+
+    // --- ping before initialized ---
+
+    void testPingWorksBeforeInitialized()
+    {
+        McpServer server;
+
+        // Create session via initialize but don't send notifications/initialized
+        auto init = sendRpc(server, "initialize", QJsonObject{{"capabilities", QJsonObject{}}});
+        QVERIFY(!init.sessionId.isEmpty());
+
+        // ping should work even before notifications/initialized
+        auto ping = sendRpc(server, "ping", QJsonObject{}, init.sessionId, 2);
+        QVERIFY(ping.response.contains("result"));
+        QVERIFY(!ping.response.contains("error"));
+    }
+};
+
+QTEST_MAIN(tst_McpServerSession)
+#include "tst_mcpserver_session.moc"

@@ -1,0 +1,713 @@
+#include "core/diagnosticlogging.h"
+#include "shotdatamodel.h"
+#include "machine/frameexitreason.h"
+#include "ai/conductance.h"
+#include "ai/portaltailanalyzer.h"
+#include "rendering/fastlinerenderer.h"
+#include <QDebug>
+
+ShotDataModel::ShotDataModel(QObject* parent)
+    : QObject(parent)
+{
+    // Pre-allocate vectors to avoid reallocations during shot
+    m_pressurePoints.reserve(INITIAL_CAPACITY);
+    m_portalSamples.reserve(INITIAL_CAPACITY);
+    m_flowPoints.reserve(INITIAL_CAPACITY);
+    m_temperaturePoints.reserve(INITIAL_CAPACITY);
+    m_temperatureMixPoints.reserve(INITIAL_CAPACITY);
+    m_resistancePoints.reserve(INITIAL_CAPACITY);
+    m_conductancePoints.reserve(INITIAL_CAPACITY);
+    m_darcyResistancePoints.reserve(INITIAL_CAPACITY);
+    m_waterDispensedPoints.reserve(INITIAL_CAPACITY);
+    m_temperatureGoalPoints.reserve(INITIAL_CAPACITY);
+    m_temperatureMixGoalPoints.reserve(INITIAL_CAPACITY);
+    m_weightPoints.reserve(INITIAL_CAPACITY);
+    m_cumulativeWeightPoints.reserve(INITIAL_CAPACITY);
+    m_weightFlowRatePoints.reserve(INITIAL_CAPACITY);
+
+    // Initialize first segments for goal curves
+    m_pressureGoalSegments.append(QVector<QPointF>());
+    m_pressureGoalSegments[0].reserve(INITIAL_CAPACITY);
+    m_flowGoalSegments.append(QVector<QPointF>());
+    m_flowGoalSegments[0].reserve(INITIAL_CAPACITY);
+
+    // Chart update timer (~30fps) - batches data samples for efficient chart redraw
+    m_flushTimer = new QTimer(this);
+    m_flushTimer->setInterval(FLUSH_INTERVAL_MS);
+    m_flushTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_flushTimer, &QTimer::timeout, this, &ShotDataModel::onFlushTimerTick);
+}
+
+ShotDataModel::~ShotDataModel() {
+    if (m_flushTimer) {
+        m_flushTimer->stop();
+    }
+}
+
+void ShotDataModel::registerFastSeries(FastLineRenderer* pressure, FastLineRenderer* flow,
+                                        FastLineRenderer* temperature,
+                                        FastLineRenderer* weight, FastLineRenderer* weightFlow,
+                                        FastLineRenderer* resistance,
+                                        FastLineRenderer* conductance,
+                                        FastLineRenderer* darcyResistance,
+                                        FastLineRenderer* temperatureMix) {
+    m_fastPressure = pressure;
+    m_fastFlow = flow;
+    m_fastTemperature = temperature;
+    m_fastWeight = weight;
+    m_fastWeightFlow = weightFlow;
+    m_fastResistance = resistance;
+    m_fastConductance = conductance;
+    m_fastDarcyResistance = darcyResistance;
+    m_fastTemperatureMix = temperatureMix;
+
+    // Reset flush indices
+    m_lastFlushedPressure = 0;
+    m_lastFlushedFlow = 0;
+    m_lastFlushedTemp = 0;
+    m_lastFlushedWeight = 0;
+    m_lastFlushedWeightFlow = 0;
+    m_lastFlushedResistance = 0;
+    m_lastFlushedConductance = 0;
+    m_lastFlushedDarcyResistance = 0;
+    m_lastFlushedTemperatureMix = 0;
+
+    // Bulk-load any existing data (e.g., returning to espresso page after shot)
+    if (!m_pressurePoints.isEmpty() || !m_flowPoints.isEmpty() || !m_weightPoints.isEmpty()) {
+        DIAG_DEBUG(SHOT, "ShotDataModel") << "Populating fast renderers with existing data ("
+                 << m_pressurePoints.size() << " pressure,"
+                 << m_flowPoints.size() << " flow,"
+                 << m_weightPoints.size() << " weight,"
+                 << m_weightFlowRatePoints.size() << " weight flow)";
+        if (m_fastPressure) m_fastPressure->setPoints(m_pressurePoints);
+        if (m_fastFlow) m_fastFlow->setPoints(m_flowPoints);
+        if (m_fastTemperature) m_fastTemperature->setPoints(m_temperaturePoints);
+        if (m_fastWeight) m_fastWeight->setPoints(m_weightPoints);
+        if (m_fastWeightFlow) m_fastWeightFlow->setPoints(m_weightFlowRatePoints);
+        if (m_fastResistance) m_fastResistance->setPoints(m_resistancePoints);
+        if (m_fastConductance) m_fastConductance->setPoints(m_conductancePoints);
+        if (m_fastDarcyResistance) m_fastDarcyResistance->setPoints(m_darcyResistancePoints);
+        if (m_fastTemperatureMix) m_fastTemperatureMix->setPoints(m_temperatureMixPoints);
+
+        // Mark all as flushed
+        m_lastFlushedPressure = m_pressurePoints.size();
+        m_lastFlushedFlow = m_flowPoints.size();
+        m_lastFlushedTemp = m_temperaturePoints.size();
+        m_lastFlushedWeight = m_weightPoints.size();
+        m_lastFlushedWeightFlow = m_weightFlowRatePoints.size();
+        m_lastFlushedResistance = m_resistancePoints.size();
+        m_lastFlushedConductance = m_conductancePoints.size();
+        m_lastFlushedDarcyResistance = m_darcyResistancePoints.size();
+        m_lastFlushedTemperatureMix = m_temperatureMixPoints.size();
+    }
+
+    DIAG_DEBUG(SHOT, "ShotDataModel") << "Registered fast renderers (QSGGeometryNode, pre-allocated VBO)";
+
+    // Replay any goal-curve data we already accumulated so the goal series'
+    // bindings see the current state immediately (e.g., returning to the
+    // espresso page after a shot completes).
+    if (!m_pressureGoalSegments.isEmpty() && !m_pressureGoalSegments[0].isEmpty()) {
+        m_goalCurvesDirty = true;
+        m_dirty = true;
+        onFlushTimerTick();
+    }
+
+    m_flushTimer->start();
+}
+
+void ShotDataModel::recordWeightSource(const QString& source)
+{
+    // Any synthetic or unclassified sample makes the whole curve ineligible.
+    if (m_weightSource.isEmpty()
+        || PortalTailAnalyzer::weightSourceFromString(m_weightSource) == PortalTailAnalyzer::WeightSource::PhysicalScale)
+        m_weightSource = source;
+}
+
+void ShotDataModel::clear() {
+    m_weightSource.clear();
+    m_portalMountingMode.clear();
+    // Stop timer during clear
+    m_flushTimer->stop();
+
+    // Clear data vectors (keep capacity)
+    m_pressurePoints.clear();
+    m_portalSamples.clear();
+    m_portalEcBounds = {};
+    m_portalGap = true;
+    m_portalDirty = false;
+    m_flowPoints.clear();
+    m_temperaturePoints.clear();
+    m_temperatureMixPoints.clear();
+    m_resistancePoints.clear();
+    m_conductancePoints.clear();
+    m_darcyResistancePoints.clear();
+    m_conductanceDerivativePoints.clear();
+    m_waterDispensedPoints.clear();
+    m_temperatureGoalPoints.clear();
+    m_temperatureMixGoalPoints.clear();
+    m_weightPoints.clear();
+    m_cumulativeWeightPoints.clear();
+    m_weightFlowRatePoints.clear();
+    m_weightFlowRateRawPoints.clear();
+    m_consecutiveSpikeRejections = 0;
+
+    // Reset goal segments - keep first segment with capacity
+    m_pressureGoalSegments.clear();
+    m_pressureGoalSegments.append(QVector<QPointF>());
+    m_pressureGoalSegments[0].reserve(INITIAL_CAPACITY);
+    m_flowGoalSegments.clear();
+    m_flowGoalSegments.append(QVector<QPointF>());
+    m_flowGoalSegments[0].reserve(INITIAL_CAPACITY);
+
+    // Clear fast renderers
+    if (m_fastPressure) m_fastPressure->clear();
+    if (m_fastFlow) m_fastFlow->clear();
+    if (m_fastTemperature) m_fastTemperature->clear();
+    if (m_fastWeight) m_fastWeight->clear();
+    if (m_fastWeightFlow) m_fastWeightFlow->clear();
+    if (m_fastResistance) m_fastResistance->clear();
+    if (m_fastConductance) m_fastConductance->clear();
+    if (m_fastDarcyResistance) m_fastDarcyResistance->clear();
+    if (m_fastTemperatureMix) m_fastTemperatureMix->clear();
+    m_lastFlushedPressure = 0;
+    m_lastFlushedFlow = 0;
+    m_lastFlushedTemp = 0;
+    m_lastFlushedWeight = 0;
+    m_lastFlushedWeightFlow = 0;
+    m_lastFlushedResistance = 0;
+    m_lastFlushedConductance = 0;
+    m_lastFlushedDarcyResistance = 0;
+    m_lastFlushedTemperatureMix = 0;
+
+    m_stopTime = -1;
+    m_weightAtStop = 0.0;
+
+    m_phaseMarkers.clear();
+    m_maxTime = 5.0;
+    m_rawTime = 0.0;
+    m_lastPumpModeIsFlow = false;
+    m_hasPumpModeData = false;
+    m_currentPressureGoalSegment = 0;
+    m_currentFlowGoalSegment = 0;
+    m_dirty = false;
+    m_rawTimeDirty = false;
+    m_goalCurvesDirty = false;
+
+    emit cleared();
+    emit portalSamplesChanged();
+    emit phaseMarkersChanged();
+    emit goalCurvesChanged();
+    emit maxTimeChanged();
+    emit rawTimeChanged();
+
+    // Restart timer
+    m_flushTimer->start();
+}
+
+void ShotDataModel::clearWeightData() {
+    // Clear any pre-tare weight samples (race condition fix)
+    m_weightPoints.clear();
+    m_cumulativeWeightPoints.clear();
+    m_weightFlowRatePoints.clear();
+    m_weightFlowRateRawPoints.clear();
+    if (m_fastWeight) m_fastWeight->clear();
+    if (m_fastWeightFlow) m_fastWeightFlow->clear();
+    m_lastFlushedWeight = 0;
+    m_lastFlushedWeightFlow = 0;
+    // The anchor these counted against is gone, so a run in progress no longer means anything.
+    m_consecutiveSpikeRejections = 0;
+    emit weightDataCleared();
+    DIAG_DEBUG(SHOT, "ShotDataModel") << "Cleared pre-tare weight data";
+}
+
+void ShotDataModel::addSample(double time, double pressure, double flow, double temperature,
+                              double mixTemp,
+                              double pressureGoal, double flowGoal, double temperatureGoal,
+                              double temperatureMixGoal,
+                              int frameNumber, bool isFlowMode) {
+    Q_UNUSED(frameNumber);
+
+    // Pure vector append - no signals, no chart updates
+    m_pressurePoints.append(QPointF(time, pressure));
+    m_flowPoints.append(QPointF(time, flow));
+    m_temperaturePoints.append(QPointF(time, temperature));
+    m_temperatureMixPoints.append(QPointF(time, mixTemp));
+
+    // Resistance (P/F), conductance (F²/P) and Darcy resistance (P/F², the
+    // inverse of conductance) all live in the Conductance:: namespace and are
+    // shared with the load-time recompute in ShotHistoryStorage, so per-sample
+    // production behavior and historical recompute can't drift apart. Conductance
+    // is additionally shared with tools/shot_eval (offline); shot_eval doesn't
+    // compute resistance or Darcy resistance, so that third leg is conductance-only.
+    const double resistance = Conductance::resistance(pressure, flow);
+    const double conductance = Conductance::sample(pressure, flow);
+    const double darcyResistance = Conductance::darcyResistanceSample(pressure, flow);
+    m_resistancePoints.append(QPointF(time, resistance));
+    m_conductancePoints.append(QPointF(time, conductance));
+    m_darcyResistancePoints.append(QPointF(time, darcyResistance));
+
+    // Water dispensed: cumulative flow integration (flow is ml/s)
+    double waterDispensed = 0.0;
+    if (!m_waterDispensedPoints.isEmpty()) {
+        double lastWater = m_waterDispensedPoints.last().y();
+        double lastTime = m_waterDispensedPoints.last().x();
+        double dt = time - lastTime;
+        if (dt > 0) {
+            waterDispensed = lastWater + flow * dt;
+        }
+    }
+    m_waterDispensedPoints.append(QPointF(time, waterDispensed));
+
+    // Start new segments when pump mode changes (creates visual gap in goal curves)
+    if (m_hasPumpModeData && isFlowMode != m_lastPumpModeIsFlow) {
+        if (isFlowMode) {
+            // Switching to flow mode: start new pressure goal segment
+            m_currentPressureGoalSegment++;
+            if (m_currentPressureGoalSegment >= m_pressureGoalSegments.size()) {
+                m_pressureGoalSegments.append(QVector<QPointF>());
+            }
+        } else {
+            // Switching to pressure mode: start new flow goal segment
+            m_currentFlowGoalSegment++;
+            if (m_currentFlowGoalSegment >= m_flowGoalSegments.size()) {
+                m_flowGoalSegments.append(QVector<QPointF>());
+            }
+        }
+    }
+    m_lastPumpModeIsFlow = isFlowMode;
+    m_hasPumpModeData = true;
+
+    // Add goal points to current segments
+    if (pressureGoal > 0) {
+        m_pressureGoalSegments[m_currentPressureGoalSegment].append(QPointF(time, pressureGoal));
+        m_goalCurvesDirty = true;
+    }
+    if (flowGoal > 0) {
+        m_flowGoalSegments[m_currentFlowGoalSegment].append(QPointF(time, flowGoal));
+        m_goalCurvesDirty = true;
+    }
+    m_temperatureGoalPoints.append(QPointF(time, temperatureGoal));
+    m_temperatureMixGoalPoints.append(QPointF(time, temperatureMixGoal));
+    m_goalCurvesDirty = true;
+
+    // Update raw time - QML uses this to calculate axis max with pixel-based padding
+    // Signal deferred to onFlushTimerTick() to avoid triggering chart axis recalc on every 5Hz sample
+    if (time > m_rawTime) {
+        m_rawTime = time;
+        m_rawTimeDirty = true;
+    }
+
+    m_dirty = true;
+    // Timer-driven: onFlushTimerTick() runs every 33ms (~30fps), batching samples
+}
+
+void ShotDataModel::addWeightSample(double time, double weight, double flowRate) {
+    // Store weight flow rate for visualizer export (flow["by_weight"])
+    // Clamp negative values to 0 (can occur from scale noise)
+    m_weightFlowRatePoints.append(QPointF(time, qMax(0.0, flowRate)));
+    addWeightSample(time, weight);
+}
+
+void ShotDataModel::addWeightSample(double time, double weight) {
+    // A pre-drip baseline feeds PORTAL mass integration but is not drawn.
+    if (weight < 0.1) {
+        if (weight >= -PortalTailAnalyzer::kCupMassToleranceG && !m_portalSamples.isEmpty() && m_weightPoints.isEmpty())
+            m_cumulativeWeightPoints.append(QPointF(time, weight));
+        return;
+    }
+
+    // Spike filtering: reject readings that jump unrealistically from the last value
+    // Max reasonable flow is ~5g/s, so anything faster is likely a scale glitch
+    //
+    // The comparison anchor is the last ACCEPTED point, which is only meaningful for an isolated
+    // glitch. A sustained move — cup nudged, second vessel set down, a real fast pour — fails the
+    // test on its first sample and then keeps failing, because every later sample is still measured
+    // against the pre-move anchor while the true weight walks further away. The filter recovers
+    // only by accident, once deltaTime has grown enough to dilute the rate below the threshold.
+    //
+    // A 2026-07-29 shot log shows the cost: 30 consecutive rejections over 2.0 s, all measured
+    // against a frozen 39.94 g while the scale climbed to 61.68 g. The weight series had a 2-second,
+    // 21-gram hole in it and the log had 30 near-identical WARN lines.
+    //
+    // So: cap the run. After kMaxConsecutiveRejections the move is no longer treated as a glitch —
+    // a glitch does not persist across four samples — and the sample is accepted, which re-anchors
+    // the filter on reality. Report once at the start of a run and once when it ends, never per
+    // sample.
+    constexpr int kMaxConsecutiveRejections = 3;
+    if (!m_weightPoints.isEmpty()) {
+        double lastWeight = m_weightPoints.last().y();
+        double lastTime = m_weightPoints.last().x();
+        double deltaWeight = qAbs(weight - lastWeight);
+        double deltaTime = time - lastTime;
+
+        // Max allowed change rate: 10g/s (very generous to avoid false positives)
+        // Minimum deltaTime of 0.05s to avoid division issues
+        if (deltaTime > 0.05) {
+            double changeRate = deltaWeight / deltaTime;
+            if (changeRate > 10.0 && m_consecutiveSpikeRejections < kMaxConsecutiveRejections) {
+                if (m_consecutiveSpikeRejections == 0) {
+                    m_firstRejectedWeight = weight;
+                    DIAG_DEBUG(SHOT, "ShotDataModel") << "Rejecting spike - weight:" << weight
+                               << "lastWeight:" << lastWeight
+                               << "deltaWeight:" << deltaWeight
+                               << "deltaTime:" << deltaTime
+                               << "rate:" << changeRate << "g/s";
+                }
+                m_consecutiveSpikeRejections++;
+                return;
+            }
+        }
+    }
+
+    if (m_consecutiveSpikeRejections > 0) {
+        // Either the reading came back into range on its own (an isolated glitch, which is what the
+        // filter is for, so DEBUG) or the run hit the cap and this sample is being accepted despite
+        // the rate, which can put a real jump on the graph (WARN). The stop decision is not made
+        // from this model: WeightProcessor filters its own copy and warns there.
+        if (m_consecutiveSpikeRejections >= kMaxConsecutiveRejections) {
+            DIAG_WARN(SHOT, "ShotDataModel") << "Spike run ended after" << m_consecutiveSpikeRejections
+                       << "rejected sample(s) - first rejected:" << m_firstRejectedWeight
+                       << "accepting:" << weight << "(cap reached - treating as a real move, re-anchoring)";
+        } else {
+            DIAG_DEBUG(SHOT, "ShotDataModel") << "Spike run ended after" << m_consecutiveSpikeRejections
+                       << "rejected sample(s) - first rejected:" << m_firstRejectedWeight
+                       << "accepting:" << weight << "(back in range)";
+        }
+        m_consecutiveSpikeRejections = 0;
+    }
+
+    // Store cumulative weight for export (visualizer, shot history)
+    m_cumulativeWeightPoints.append(QPointF(time, weight));
+
+    // Add initial zero point when weight curve starts (so line starts from zero at correct time)
+    if (m_weightPoints.isEmpty()) {
+        m_weightPoints.append(QPointF(time, 0.0));
+    }
+
+    // Plot cumulative weight (g) - shows weight progression during shot (0g -> 36g typical)
+    m_weightPoints.append(QPointF(time, weight));
+    m_dirty = true;
+    // Timer-driven: onFlushTimerTick() runs every 33ms (~30fps), batching samples
+    emit finalWeightChanged();  // For accessibility announcement
+}
+
+void ShotDataModel::markExtractionStart(double time) {
+    PhaseMarker marker;
+    marker.time = time;
+    marker.label = "Start";
+    marker.frameNumber = 0;
+    m_phaseMarkers.append(marker);
+
+    emit phaseMarkersChanged();
+}
+
+void ShotDataModel::markStopAt(double time) {
+    m_stopTime = time;
+
+    // Find the weight at or just before the stop time
+    m_weightAtStop = 0.0;
+    for (qsizetype i = m_weightPoints.size() - 1; i >= 0; --i) {
+        if (m_weightPoints[i].x() <= time) {
+            m_weightAtStop = m_weightPoints[i].y();
+            break;
+        }
+    }
+
+    PhaseMarker marker;
+    marker.time = time;
+    marker.label = "End";
+    marker.frameNumber = -1;
+    m_phaseMarkers.append(marker);
+
+    emit phaseMarkersChanged();
+    emit stopTimeChanged();
+    emit weightAtStopChanged();
+}
+
+void ShotDataModel::smoothWeightFlowRate(int window) {
+    // Save raw copy before smoothing (for by_weight_raw export)
+    m_weightFlowRateRawPoints = m_weightFlowRatePoints;
+
+    qsizetype n = m_weightFlowRatePoints.size();
+    if (n < 3) {
+        emit graphCorrectionFinished();
+        return;
+    }
+
+    // Centered moving average: each point averages with `window` neighbors on each side.
+    // With window=5 and ~5Hz data, this spans ~2.2s on top of the 1s LSLR recording window
+    // and the real-time EMA smoothing. X values (timestamps) are preserved.
+    QVector<QPointF> smoothed;
+    smoothed.reserve(n);
+    for (qsizetype i = 0; i < n; i++) {
+        qsizetype lo = qMax(qsizetype(0), i - window);
+        qsizetype hi = qMin(n - 1, i + window);
+        double sum = 0;
+        for (qsizetype j = lo; j <= hi; j++) {
+            sum += m_weightFlowRatePoints[j].y();
+        }
+        smoothed.append(QPointF(m_weightFlowRatePoints[i].x(), sum / (hi - lo + 1)));
+    }
+    m_weightFlowRatePoints = smoothed;
+    emit graphCorrectionFinished();
+}
+
+void ShotDataModel::computeConductanceDerivative() {
+    // Delegate to Conductance::derivative so ShotDataModel (per-sample live
+    // data) and tools/shot_eval (batch offline data) share one formula —
+    // keeps live-graph curves identical to offline-evaluation curves.
+    m_conductanceDerivativePoints = Conductance::derivative(m_conductancePoints);
+    DIAG_DEBUG(SHOT, "ShotDataModel") << "Computed conductance derivative ("
+             << m_conductanceDerivativePoints.size() << " points)";
+}
+
+void ShotDataModel::trimSettlingData() {
+    // Find the last sample with non-zero pressure — samples after this are from the
+    // SAW settling period where the DE1 reports 0 pressure/flow while the scale settles.
+    // De1app stops recording at the end of pouring substate; we trim at save time to
+    // preserve live drip visualization during settling but produce clean history graphs.
+    qsizetype trimIndex = m_pressurePoints.size();
+    while (trimIndex > 0 && m_pressurePoints[trimIndex - 1].y() <= 0.0) {
+        --trimIndex;
+    }
+
+    if (trimIndex >= m_pressurePoints.size()) {
+        return;  // Nothing to trim
+    }
+
+    if (trimIndex == 0) {
+        DIAG_WARN(SHOT, "ShotDataModel") << "trimSettlingData: all" << m_pressurePoints.size()
+                   << "samples have zero pressure — skipping trim to preserve data";
+        return;
+    }
+
+    qsizetype removed = m_pressurePoints.size() - trimIndex;
+    DIAG_DEBUG(SHOT, "ShotDataModel") << "Trimming" << removed << "trailing zero-pressure settling samples"
+             << "(keeping" << trimIndex << "of" << m_pressurePoints.size() << ")";
+
+    // Trim sensor data series to the same length
+    m_pressurePoints.resize(trimIndex);
+    m_flowPoints.resize(qMin(m_flowPoints.size(), trimIndex));
+    m_temperaturePoints.resize(qMin(m_temperaturePoints.size(), trimIndex));
+    m_temperatureMixPoints.resize(qMin(m_temperatureMixPoints.size(), trimIndex));
+    m_resistancePoints.resize(qMin(m_resistancePoints.size(), trimIndex));
+    m_conductancePoints.resize(qMin(m_conductancePoints.size(), trimIndex));
+    m_darcyResistancePoints.resize(qMin(m_darcyResistancePoints.size(), trimIndex));
+    m_waterDispensedPoints.resize(qMin(m_waterDispensedPoints.size(), trimIndex));
+
+    // Trim time-based series using cutoff from last retained pressure sample.
+    // Goals and weight flow rate have different sample counts than DE1 sensor data.
+    // (trimIndex is guaranteed > 0 by the early returns above)
+    double cutoffTime = m_pressurePoints.last().x();
+    for (auto& segment : m_pressureGoalSegments) {
+        while (!segment.isEmpty() && segment.last().x() > cutoffTime)
+            segment.removeLast();
+    }
+    for (auto& segment : m_flowGoalSegments) {
+        while (!segment.isEmpty() && segment.last().x() > cutoffTime)
+            segment.removeLast();
+    }
+    while (!m_temperatureGoalPoints.isEmpty() && m_temperatureGoalPoints.last().x() > cutoffTime)
+        m_temperatureGoalPoints.removeLast();
+    while (!m_temperatureMixGoalPoints.isEmpty() && m_temperatureMixGoalPoints.last().x() > cutoffTime)
+        m_temperatureMixGoalPoints.removeLast();
+    while (!m_weightFlowRatePoints.isEmpty() && m_weightFlowRatePoints.last().x() > cutoffTime)
+        m_weightFlowRatePoints.removeLast();
+    while (!m_weightFlowRateRawPoints.isEmpty() && m_weightFlowRateRawPoints.last().x() > cutoffTime)
+        m_weightFlowRateRawPoints.removeLast();
+
+    // Do NOT trim cumulative weight data (m_weightPoints, m_cumulativeWeightPoints) —
+    // weight continues to change during settling and the settled final weight is accurate.
+    emit graphDataCorrected();
+}
+
+void ShotDataModel::addPhaseMarker(double time, const QString& label, int frameNumber, bool isFlowMode, const QString& transitionReason) {
+    PhaseMarker marker;
+    marker.time = time;
+    marker.label = label;
+    marker.frameNumber = frameNumber;
+    marker.isFlowMode = isFlowMode;
+    marker.transitionReason = transitionReason;
+    m_phaseMarkers.append(marker);
+
+    emit phaseMarkersChanged();
+}
+
+QVariantList ShotDataModel::portalEcBounds(const QVariantList& samples) const {
+    PortalSamples::EcBounds bounds;
+    for (const auto& sample : PortalSamples::fromVariant(samples)) bounds.add(sample.ecRaw);
+    return {bounds.minimum, bounds.maximum};
+}
+
+void ShotDataModel::addPortalSample(double time, double ecRaw, double temperatureC,
+                                   std::optional<double> auxiliaryTemperatureRaw) {
+    if (!PortalSamples::valid(time, ecRaw, temperatureC,
+            m_portalSamples.isEmpty() ? -1 : m_portalSamples.last().time)) {
+        markPortalGap();
+        return;
+    }
+    // A stalled event loop may deliver the next packet before the freshness timer runs.
+    const bool silentGap = !m_portalSamples.isEmpty() && time - m_portalSamples.last().time > PortalSamples::StaleAfterSeconds;
+    const bool breakBefore = m_portalGap || silentGap;
+    m_portalSamples.append({time, ecRaw, temperatureC, breakBefore, auxiliaryTemperatureRaw});
+    m_portalEcBounds.add(ecRaw);
+    emit portalSampleAdded(time, ecRaw, temperatureC, breakBefore);
+    m_portalGap = false;
+    m_portalDirty = true;
+    m_dirty = true;
+    if (time > m_rawTime) { m_rawTime = time; m_rawTimeDirty = true; }
+    if (!m_flushTimer->isActive()) m_flushTimer->start();
+}
+
+void ShotDataModel::onFlushTimerTick() {
+    if (!m_dirty) return;
+
+    // Incrementally append new points to fast renderers (pre-allocated VBO, no rebuild)
+    if (m_fastPressure) {
+        for (qsizetype i = m_lastFlushedPressure; i < m_pressurePoints.size(); ++i)
+            m_fastPressure->appendPoint(m_pressurePoints[i].x(), m_pressurePoints[i].y());
+        m_lastFlushedPressure = m_pressurePoints.size();
+    }
+    if (m_fastFlow) {
+        for (qsizetype i = m_lastFlushedFlow; i < m_flowPoints.size(); ++i)
+            m_fastFlow->appendPoint(m_flowPoints[i].x(), m_flowPoints[i].y());
+        m_lastFlushedFlow = m_flowPoints.size();
+    }
+    if (m_fastTemperature) {
+        for (qsizetype i = m_lastFlushedTemp; i < m_temperaturePoints.size(); ++i)
+            m_fastTemperature->appendPoint(m_temperaturePoints[i].x(), m_temperaturePoints[i].y());
+        m_lastFlushedTemp = m_temperaturePoints.size();
+    }
+    if (m_fastWeight) {
+        for (qsizetype i = m_lastFlushedWeight; i < m_weightPoints.size(); ++i)
+            m_fastWeight->appendPoint(m_weightPoints[i].x(), m_weightPoints[i].y());
+        m_lastFlushedWeight = m_weightPoints.size();
+    }
+    if (m_fastWeightFlow) {
+        for (qsizetype i = m_lastFlushedWeightFlow; i < m_weightFlowRatePoints.size(); ++i)
+            m_fastWeightFlow->appendPoint(m_weightFlowRatePoints[i].x(), m_weightFlowRatePoints[i].y());
+        m_lastFlushedWeightFlow = m_weightFlowRatePoints.size();
+    }
+    if (m_fastResistance) {
+        for (qsizetype i = m_lastFlushedResistance; i < m_resistancePoints.size(); ++i)
+            m_fastResistance->appendPoint(m_resistancePoints[i].x(), m_resistancePoints[i].y());
+        m_lastFlushedResistance = m_resistancePoints.size();
+    }
+    if (m_fastConductance) {
+        for (qsizetype i = m_lastFlushedConductance; i < m_conductancePoints.size(); ++i)
+            m_fastConductance->appendPoint(m_conductancePoints[i].x(), m_conductancePoints[i].y());
+        m_lastFlushedConductance = m_conductancePoints.size();
+    }
+    if (m_fastDarcyResistance) {
+        for (qsizetype i = m_lastFlushedDarcyResistance; i < m_darcyResistancePoints.size(); ++i)
+            m_fastDarcyResistance->appendPoint(m_darcyResistancePoints[i].x(), m_darcyResistancePoints[i].y());
+        m_lastFlushedDarcyResistance = m_darcyResistancePoints.size();
+    }
+    if (m_fastTemperatureMix) {
+        for (qsizetype i = m_lastFlushedTemperatureMix; i < m_temperatureMixPoints.size(); ++i)
+            m_fastTemperatureMix->appendPoint(m_temperatureMixPoints[i].x(), m_temperatureMixPoints[i].y());
+        m_lastFlushedTemperatureMix = m_temperatureMixPoints.size();
+    }
+
+    // Goal-curve points republished as QML-bindable properties for the live graph's goal series.
+    if (m_goalCurvesDirty) {
+        m_goalCurvesDirty = false;
+        emit goalCurvesChanged();
+    }
+
+    // Emit deferred rawTimeChanged (axis recalc) at flush rate instead of per-sample
+    if (m_rawTimeDirty) {
+        m_rawTimeDirty = false;
+        emit rawTimeChanged();
+    }
+
+    if (m_portalDirty) {
+        m_portalDirty = false;
+        emit portalSamplesChanged();
+    }
+    m_dirty = false;
+    emit flushed();
+}
+
+double ShotDataModel::finalWeight() const {
+    if (m_weightPoints.isEmpty()) return 0.0;
+    return m_weightPoints.last().y();
+}
+
+QVariantList ShotDataModel::phaseMarkersVariant() const {
+    QVariantList result;
+    result.reserve(m_phaseMarkers.size());
+    for (const PhaseMarker& marker : m_phaseMarkers) {
+        QVariantMap map;
+        map["time"] = marker.time;
+        map["label"] = marker.label;
+        map["frameNumber"] = marker.frameNumber;
+        map["isFlowMode"] = marker.isFlowMode;
+        map["transitionReason"] = marker.transitionReason;
+        map["transitionSuffix"] = FrameExit::markerSuffix(marker.transitionReason);
+        result.append(map);
+    }
+    return result;
+}
+
+QVector<QPointF> ShotDataModel::pressureGoalData() const {
+    // Combine all segments for export
+    QVector<QPointF> combined;
+    for (const auto& segment : m_pressureGoalSegments) {
+        combined.append(segment);
+    }
+    return combined;
+}
+
+QVector<QPointF> ShotDataModel::flowGoalData() const {
+    // Combine all segments for export
+    QVector<QPointF> combined;
+    for (const auto& segment : m_flowGoalSegments) {
+        combined.append(segment);
+    }
+    return combined;
+}
+
+// Point lists for the live graph's goal series, which bind to these. Display only: a point in the middle of a flat run is dropped, since the line through
+// its neighbours is the same line. Goals hold one value per frame, and these lists are
+// rebuilt and redrawn on every flush.
+static QVariantList pointsToVariantList(const QVector<QPointF>& pts) {
+    QVariantList out;
+    out.reserve(pts.size());
+    for (qsizetype i = 0; i < pts.size(); ++i) {
+        const bool midRun = i > 0 && i + 1 < pts.size()
+            && pts[i - 1].y() == pts[i].y() && pts[i].y() == pts[i + 1].y();
+        if (!midRun)
+            out.append(QVariant::fromValue(pts[i]));
+    }
+    return out;
+}
+
+// All segments in one list, a NaN point between them: Qt Graphs starts a new subpath after
+// an invalid point (pointrenderer.cpp:555-557), so one series draws every segment. Series
+// count is what matters: any series change re-renders all of them.
+static QVariantList segmentsToVariantList(const QVector<QVector<QPointF>>& segments) {
+    QVariantList out;
+    for (const auto& segment : segments) {
+        if (segment.isEmpty()) continue;
+        if (!out.isEmpty()) out.append(QVariant::fromValue(QPointF(qQNaN(), qQNaN())));
+        out.append(pointsToVariantList(segment));
+    }
+    return out;
+}
+
+QVariantList ShotDataModel::pressureGoalPointsVariant() const {
+    return segmentsToVariantList(m_pressureGoalSegments);
+}
+
+QVariantList ShotDataModel::flowGoalPointsVariant() const {
+    return segmentsToVariantList(m_flowGoalSegments);
+}
+
+QVariantList ShotDataModel::temperatureGoalPointsVariant() const {
+    return pointsToVariantList(m_temperatureGoalPoints);
+}
+
+QVariantList ShotDataModel::temperatureMixGoalPointsVariant() const {
+    return pointsToVariantList(m_temperatureMixGoalPoints);
+}

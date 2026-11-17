@@ -1,0 +1,208 @@
+#pragma once
+
+#include <QObject>
+#include "core/logcollapse.h"
+
+#include <QTimer>
+
+class DE1Device;
+class Settings;
+
+// BatteryManager — controls the DE1's USB charge port to protect the tablet battery.
+//
+// Hardware setup
+// ──────────────
+// The tablet (which runs this app) charges through a USB cable plugged into the DE1
+// espresso machine. The DE1 has a hardware-controlled USB charge port that can be
+// switched on or off via a BLE MMR write (address 0x803854, 1=on, 0=off). This class
+// decides when to enable or disable that port based on the tablet's battery level.
+//
+// The DE1 has a built-in 10-minute safety timeout that automatically re-enables its
+// USB port if it hasn't received a command. We resend our decision every 60 seconds
+// to stay in control.
+//
+// USB charger switch
+// ──────────────────
+// usbChargerEnabled=false keeps the port OFF regardless of mode, for a device that is
+// not charged from the DE1. Persisted, so it survives restarts.
+//
+// Smart charging modes (apply only while usbChargerEnabled)
+// ─────────────────────────────────────────────────────────
+// Off   — DE1 USB port always on. Battery charges freely to 100%.
+// On    — Cycles between 55 % and 65 %. Port turns off at 65 %, back on at 55 %.
+//         Extends long-term battery lifespan by avoiding constant top-up charging.
+// Night — Cycles between 90 % and 95 %. Keeps battery high for morning use while
+//         still avoiding 100 % stress.
+//
+// Mismatch detection
+// ──────────────────
+// On Android and iOS we read the actual charging status from the OS (independent of
+// what we commanded). If we have told the DE1 to enable its USB port but the OS reports
+// the tablet is still DISCHARGING, that means the DE1's port isn't delivering power —
+// likely because the DE1 went to sleep and cut the port, or a BLE write silently failed.
+// We retry the BLE command immediately but wait for 5 consecutive failed 60-second
+// checks (~5 min) before alerting the user, since the DE1 can temporarily cut USB
+// power for its own hardware needs (e.g. during preheating).
+//
+// Note: on iOS, UIDevice.batteryState can report Charging/Full/Unplugged but cannot
+// distinguish the DE1 USB port from a wall charger. If the tablet is on wall power,
+// mismatch detection will see "CHARGING" even when the DE1 port is off — it won't
+// produce false alerts, but it also can't detect "wrong power source".
+
+class BatteryManager : public QObject {
+    Q_OBJECT
+
+    // Current tablet battery level (0–100), updated every 60 s.
+    Q_PROPERTY(int batteryPercent READ batteryPercent NOTIFY batteryPercentChanged)
+
+    // Whether the tablet is actually receiving charging current from the DE1 USB port.
+    // On Android and iOS this reflects the real OS charging status, NOT just what we commanded.
+    // On desktop it reflects the commanded state (no real battery to read).
+    Q_PROPERTY(bool isCharging READ isCharging NOTIFY isChargingChanged)
+
+    // Active smart charging mode (Off / On / Night). Persisted in QSettings.
+    Q_PROPERTY(int chargingMode READ chargingMode WRITE setChargingMode NOTIFY chargingModeChanged)
+
+    // false = keep the DE1 USB port off, ignoring chargingMode. Persisted in QSettings.
+    Q_PROPERTY(bool usbChargerEnabled READ usbChargerEnabled WRITE setUsbChargerEnabled NOTIFY usbChargerEnabledChanged)
+
+public:
+    // Charging modes — stored as int in QSettings under "smartBatteryCharging".
+    enum ChargingMode {
+        Off   = 0,  // DE1 USB port always on  — battery charges freely to 100 %
+        On    = 1,  // Smart charging 55–65 %  — extends battery lifespan
+        Night = 2   // Smart charging 90–95 %  — keeps battery high for morning use
+    };
+    Q_ENUM(ChargingMode)
+
+    explicit BatteryManager(QObject* parent = nullptr);
+
+    // Must be called once at startup before checkBattery() can send any commands.
+    // Connects to DE1Device::connectedChanged so charging is applied immediately
+    // when the DE1 comes online rather than waiting for the next 60-second tick.
+    void setDE1Device(DE1Device* device);
+
+    // Must be called once at startup. Loads chargingMode and the discharging flag
+    // from QSettings so the charge/discharge cycle survives app restarts.
+    void setSettings(Settings* settings);
+
+    int  batteryPercent() const { return m_batteryPercent; }
+    bool isCharging()     const { return m_isCharging; }
+    int  chargingMode()   const { return m_chargingMode; }
+    bool usbChargerEnabled() const { return m_usbChargerEnabled; }
+
+    // Call on app exit or suspend. Turns the DE1 USB port back on so the tablet can
+    // charge while the app is not running (de1app behaviour) — unless the user has
+    // switched the USB charger off.
+    void ensureChargerOn();
+
+    // Call from the applicationStateChanged handler: false on Suspended, true on
+    // any other state. While false, checkBattery() is a no-op — see m_appActive.
+    void setAppActive(bool active);
+
+public slots:
+    // Change the smart charging mode and apply it immediately. Persists to QSettings.
+    void setChargingMode(int mode);
+
+    // Persist the USB charger switch and apply it immediately.
+    void setUsbChargerEnabled(bool enabled);
+
+    // Read battery level and apply smart charging. Called every 60 s by the internal
+    // timer, on DE1 connect, and whenever the charging mode changes.
+    void checkBattery();
+
+
+signals:
+    void batteryPercentChanged();
+    void isChargingChanged();
+    void chargingModeChanged();
+    void usbChargerEnabledChanged();
+
+    // Emitted when we have commanded the DE1 USB port ON but the OS has reported
+    // DISCHARGING (port not delivering power) for 5 consecutive 60-second checks (~5 min).
+    // Connect in QML to show the user a visible warning.
+    void chargingMismatchDetected();
+
+    // Emitted when the above mismatch clears — charging resumed as expected.
+    void chargingMismatchResolved();
+
+private:
+    // Read the tablet battery level from the platform. On Android and iOS also captures
+    // m_androidBatteryStatus and m_androidPlugged so applySmartCharging() can compare
+    // commanded vs actual charging state.
+    int  readPlatformBatteryPercent();
+
+    // Core decision function — decides whether the DE1 USB port should be on or off,
+    // sends the BLE command, logs current state, and runs mismatch detection.
+    void applySmartCharging();
+
+    DE1Device* m_device   = nullptr;
+    Settings*  m_settings = nullptr;
+    QTimer     m_checkTimer;  // Fires every 60 s to run checkBattery()
+
+    // Suspend gate for the poll. m_checkTimer keeps ticking on its own 60 s
+    // cadence regardless of app lifecycle state, so its callback can land after
+    // applicationStateChanged reports Suspended but before Android freezes the
+    // event loop. There's nothing useful for the poll to do in that window:
+    // ensureChargerOn() runs later in the same suspend handler — before the
+    // event loop can deliver a gated tick — and commands the DE1 USB port ON
+    // when the DE1 is connected and the USB charger is enabled (otherwise the
+    // DE1's own 10-minute auto-enable restores the port); the UI isn't visible; and
+    // main.cpp re-runs checkBattery() on resume. Skipping also keeps JNI work
+    // out of the suspend window — the poll's JNI allocation is where crash
+    // #1408 surfaced (its stack aborts inside ART's AddGlobalRef, whose FATAL
+    // path is global-ref table overflow, i.e. a slow leak elsewhere; the gate
+    // removes the suspended-poll trigger, it does not fix such a leak).
+    //
+    // main.cpp re-arms the gate on ANY non-Suspended state, not just Active —
+    // a resume can land on Inactive and stay there (split-screen with the
+    // other window focused, focus-stealing overlays), and a gate that waits
+    // for the literal Active transition would strand the poll off while the
+    // app is visible: battery display frozen and, worse, smart charging no
+    // longer reasserting port-OFF, so the DE1's 10-minute auto-enable would
+    // quietly charge the tablet past the configured ceiling.
+    bool m_appActive = true;
+
+    int  m_batteryPercent = 100;
+    bool m_isCharging     = true;
+    int  m_chargingMode   = On;
+    bool m_usbChargerEnabled = true;
+
+    // Tracks which half of the charge/discharge cycle we are in.
+    // true  = waiting for battery to fall to the lower threshold before re-enabling the port
+    // false = port is on (or we just started), charging toward the upper threshold
+    // Persisted to QSettings ("battery/discharging") so restarts don't reset the cycle.
+    bool m_discharging = false;
+
+    // Actual charging state as reported by the OS (Android intent or iOS UIDevice).
+    // These are read independently of what we commanded to detect when the DE1 USB port
+    // is not delivering power despite our instructions.
+    //
+    // m_androidBatteryStatus — uses Android BATTERY_STATUS_* constants as canonical values:
+    //   1=UNKNOWN  2=CHARGING  3=DISCHARGING  4=NOT_CHARGING  5=FULL
+    //   On iOS, UIDeviceBatteryState is mapped to these same values.
+    //   In this hardware setup, DISCHARGING means the DE1 USB port is off (no power).
+    //
+    // m_androidPlugged — power source type:
+    //   0=UNPLUGGED  1=AC  2=USB (from DE1)  4=WIRELESS
+    //   On iOS, Charging/Full maps to USB(2) since iOS can't distinguish the source.
+    //   UNPLUGGED means the tablet is not receiving external power.
+    //
+    // Both remain -1 on desktop (no real battery).
+    int m_androidBatteryStatus = -1;
+    int m_androidPlugged       = -1;
+
+    // Mismatch detection state — how many consecutive 60-second checks have seen
+    // shouldChargerBeOn=true but OS reports DISCHARGING.
+    int  m_chargingMismatchCount = 0;
+    bool m_chargingMismatch      = false;  // true while mismatch signal is active
+    // The last charger command this process sent. False until one is sent: a port
+    // we never commanded cannot be evidence that our command failed.
+    bool m_portCommandedOn       = false;
+
+    // Process-lifetime polls: retain state transitions and five-point progress.
+    // Pending similar-sample counts ride on the next meaningful change.
+    LogCollapse m_pollCollapse{LogCollapse::kChangesOnly};
+    int m_lastLoggedBatteryPercent = -1;
+    QString m_lastLoggedBatteryState;
+};

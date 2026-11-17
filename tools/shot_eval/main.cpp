@@ -1,0 +1,1581 @@
+// shot_eval — standalone CLI for evaluating Decenza's ShotAnalysis
+// heuristics against real shot data. Links the production code directly
+// (src/ai/shotanalysis.cpp, src/ai/conductance.cpp) so running this against
+// a corpus of shots validates whatever the current algorithm is doing.
+//
+// Inputs: one or more visualizer.coffee-format JSON files (download via
+//   curl https://visualizer.coffee/api/shots/<uuid>/download > shot.json
+// and point this tool at the saved file). Glob patterns and directories
+// are accepted.
+//
+// Phase-mode inference: visualizer payloads don't carry the per-frame
+// isFlowMode flag Decenza uses internally, so we derive it at each sample
+// from the published goal curves. A sample is "flow-mode" when the flow
+// goal is active and the pressure goal is not (and vice versa). Runs of
+// same-mode samples become HistoryPhaseMarker spans, identical in shape to
+// what maincontroller.cpp records for live shots.
+//
+// Output: a table per shot showing baseline (unrestricted) vs mode-aware
+// detector verdicts alongside counts, peaks, and the mask coverage the
+// mode-aware windowing produces. Optional --json emits one JSON object
+// per shot to stdout for diffing.
+
+#include "ai/conductance.h"
+#include "ai/shotanalysis.h"
+#include "ai/shotsummarizer.h"                  // KB-cluster: flags + expert band
+#include "history/shothistorystorage.h"  // HistoryPhaseMarker
+#include "history/shotbadgeprojection.h"         // deriveBadgesFromAnalysis
+#include "controllers/settlingconstants.h"
+#include "machine/scaleflow.h"
+#include "profile/beveragetype.h"
+
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QRegularExpression>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QList>
+#include <QPointF>
+#include <QString>
+#include <QStringList>
+#include <QTextStream>
+#include <QVector>
+
+#include <algorithm>
+#include <cmath>
+
+namespace {
+
+struct LoadedShot {
+    QString path;
+    QString id;
+    QString profileTitle;
+    QString beverageType;
+    double durationSec = 0.0;
+    int enjoyment = 0;
+    double doseG = 0.0;
+    double yieldG = 0.0;
+    double targetWeightG = 0.0;  // SAW target; not in standard visualizer format, hand-added per fixture
+    QString grinderSetting;
+
+    QVector<QPointF> pressure;
+    QVector<QPointF> flow;
+    QVector<QPointF> pressureGoal;
+    QVector<QPointF> flowGoal;
+
+    QList<HistoryPhaseMarker> phases;
+    QVector<QPointF> conductance;
+    QVector<QPointF> conductanceDerivative;
+
+    double pourStart = 0.0;
+    double pourEnd = 0.0;
+};
+
+double toDouble(const QJsonValue& v)
+{
+    if (v.isDouble()) return v.toDouble();
+    if (v.isString()) {
+        bool ok = false;
+        double d = v.toString().toDouble(&ok);
+        return ok ? d : 0.0;
+    }
+    return 0.0;
+}
+
+// Pair a scalar array with a timeframe (or synthesize a 10 Hz axis if the
+// timeframe array is missing — visualizer exports sometimes omit it).
+QVector<QPointF> buildSeries(const QJsonArray& values, const QJsonArray& timeframe,
+                              double fallbackDt = 0.1)
+{
+    QVector<QPointF> out;
+    out.reserve(values.size());
+    const bool useTimeframe = timeframe.size() == values.size();
+    for (qsizetype i = 0; i < values.size(); ++i) {
+        const double t = useTimeframe ? toDouble(timeframe[i]) : i * fallbackDt;
+        const double y = toDouble(values[i]);
+        out.append(QPointF(t, y));
+    }
+    return out;
+}
+
+// Treat visualizer "no goal" sentinels (negative or tiny values) as absent.
+bool hasActiveGoal(double v)
+{
+    return v >= ShotAnalysis::WINDOW_MIN_GOAL;
+}
+
+// Walk the two goal series and emit one HistoryPhaseMarker each time the
+// inferred control mode changes. The marker times are the transition
+// boundaries; each marker's isFlowMode describes the span that *starts* at
+// that time and runs until the next marker (or shot end).
+QList<HistoryPhaseMarker> inferPhasesFromGoals(const QVector<QPointF>& pressure,
+                                                const QVector<QPointF>& pressureGoal,
+                                                const QVector<QPointF>& flowGoal)
+{
+    QList<HistoryPhaseMarker> markers;
+    const qsizetype n = pressure.size();
+    if (n == 0) return markers;
+
+    auto modeAt = [&](qsizetype i) -> int {
+        // -1 = unknown / no active goal; 0 = pressure; 1 = flow.
+        const double t = pressure[i].x();
+        // Match by index when lengths align, else interpolate by time.
+        double pg = 0.0, fg = 0.0;
+        if (i < pressureGoal.size()) pg = pressureGoal[i].y();
+        if (i < flowGoal.size()) fg = flowGoal[i].y();
+        // Fall back to time-based lookup if series lengths diverge.
+        if (pressureGoal.size() != n) {
+            for (const auto& pt : pressureGoal) {
+                if (pt.x() >= t) { pg = pt.y(); break; }
+            }
+        }
+        if (flowGoal.size() != n) {
+            for (const auto& pt : flowGoal) {
+                if (pt.x() >= t) { fg = pt.y(); break; }
+            }
+        }
+        const bool pActive = hasActiveGoal(pg);
+        const bool fActive = hasActiveGoal(fg);
+        if (fActive && !pActive) return 1;
+        if (pActive && !fActive) return 0;
+        return -1;
+    };
+
+    int currentMode = -1;
+    int frameNumber = 0;
+    for (qsizetype i = 0; i < n; ++i) {
+        const int m = modeAt(i);
+        if (m < 0) continue;  // unknown — don't emit, keep previous
+        if (m == currentMode) continue;
+        // Emit a marker at this transition.
+        HistoryPhaseMarker marker;
+        marker.time = pressure[i].x();
+        marker.label = (m == 1) ? QStringLiteral("FlowPhase") : QStringLiteral("PressurePhase");
+        marker.frameNumber = frameNumber++;
+        marker.isFlowMode = (m == 1);
+        markers.append(marker);
+        currentMode = m;
+    }
+
+    // Return an empty list when no mode ever resolved. Under the current
+    // buildChannelingWindows contract, empty phases triggers the whole-pour
+    // legacy fallback, which is what we want for visualizer shots without
+    // populated goal curves. A synthesized pressure-mode marker would make
+    // buildChannelingWindows probe pressureGoal, get NaN everywhere, and
+    // return an empty window list — which the detector now treats as
+    // "silence" rather than "unrestricted fallback".
+    return markers;
+}
+
+// Visualizer's public download drops `app.data.settings.advanced_shot` so we
+// can't see the per-frame `pump` field. The same shot's profile is reachable
+// at /api/shots/<uuid>/profile in raw Tcl; downloaders can save it next to
+// the shot JSON as `<basename>.profile.tcl` (or `<basename>.profile`). This
+// helper extracts the ordered pump modes from the advanced_shot block — the
+// only field we need for proper isFlowMode attribution.
+//
+// Returns an empty list when no sidecar is present or the regex matches
+// nothing — callers fall back to the goal-curve inference path.
+QStringList loadSidecarPumpModes(const QString& shotJsonPath)
+{
+    const QFileInfo fi(shotJsonPath);
+    const QString base = fi.absolutePath() + "/" + fi.completeBaseName();
+    QString profilePath = base + ".profile.tcl";
+    if (!QFileInfo::exists(profilePath)) {
+        profilePath = base + ".profile";
+        if (!QFileInfo::exists(profilePath)) return {};
+    }
+    QFile f(profilePath);
+    if (!f.open(QIODevice::ReadOnly)) return {};
+    const QString content = QString::fromUtf8(f.readAll());
+
+    // The advanced_shot block lists steps in order; each step has exactly one
+    // `pump <pressure|flow>` field. No other Tcl key uses the literal `pump `
+    // prefix followed by `pressure` or `flow` as a bare word (the rest are
+    // `pressure_end`, `flow_profile_*`, etc.), so a flat ordered match
+    // suffices without nested-brace parsing.
+    static const QRegularExpression re(QStringLiteral(R"(\bpump\s+(pressure|flow)\b)"));
+    QStringList modes;
+    auto it = re.globalMatch(content);
+    while (it.hasNext()) modes.append(it.next().captured(1));
+    return modes;
+}
+
+// Build phase markers from Visualizer's espresso_state_change array combined
+// with the ordered pump modes from the sidecar profile. The state_change
+// array carries one entry per pressure sample, alternating sign at each
+// frame transition (de1app convention). Frame N's mode comes from
+// pumpModes[N]; frames past the end of pumpModes are treated as unknown
+// mode (we emit them as pressure-mode markers since that's the safer
+// default for the grind detector — Arm 1 ignores pressure-mode samples).
+//
+// Returns empty if either input is missing or the state_change array's
+// length disagrees with the pressure series — callers fall back to the
+// goal-curve inference path.
+QList<HistoryPhaseMarker> phasesFromStateChange(
+    const QVector<QPointF>& pressure,
+    const QJsonArray& stateChange,
+    const QStringList& pumpModes)
+{
+    QList<HistoryPhaseMarker> markers;
+    if (pumpModes.isEmpty() || stateChange.size() != pressure.size()) return markers;
+
+    int frame = 0;
+    auto emitMarker = [&](double t) {
+        HistoryPhaseMarker m;
+        m.time = t;
+        m.frameNumber = frame;
+        m.isFlowMode = (frame < pumpModes.size()
+            && pumpModes[frame].compare(QStringLiteral("flow"), Qt::CaseInsensitive) == 0);
+        m.label = (frame < pumpModes.size())
+            ? QStringLiteral("frame%1_%2").arg(frame).arg(pumpModes[frame])
+            : QStringLiteral("frame%1").arg(frame);
+        markers.append(m);
+    };
+
+    // Frame 0 starts at the first sample.
+    emitMarker(pressure[0].x());
+    bool prevPositive = toDouble(stateChange[0]) > 0;
+    for (qsizetype i = 1; i < stateChange.size(); ++i) {
+        const bool curPositive = toDouble(stateChange[i]) > 0;
+        if (curPositive != prevPositive) {
+            ++frame;
+            emitMarker(pressure[i].x());
+        }
+        prevPositive = curPositive;
+    }
+    return markers;
+}
+
+// Native-export variant of phasesFromStateChange. Decenza's `state_change`
+// encodes the machine SUBSTATE boundary (preinfusion vs pour), not one
+// flip per profile frame: consecutive same-substate frames (e.g.
+// Filling+Infusing) collapse into a single segment, so the number of
+// sign-flip segments is typically <= the profile step count. The
+// visualizer head-aligns segment k -> pumpModes[k]; doing that here would
+// leave the final flow-controlled pour step unreached whenever
+// preinfusion frames collapsed (the segment count fell short), silently
+// marking the whole pour pressure-mode and killing the flow-vs-goal grind
+// arm (regressed malabar_grind_too_fine). Tail-align instead: the LAST
+// segment is always the pour and maps to the LAST profile step's pump
+// mode, the previous segment to the previous step, etc. The grind
+// detector only needs the pour segment's mode correct; tail-alignment
+// guarantees exactly that and is identity when segments == steps.
+// Returns empty (→ caller falls back) when the inputs can't yield a real
+// segmentation: empty pumpModes, a length-mismatched state_change, or a
+// degenerate no-flip state_change on a multi-step profile (a bailed-out
+// shot with no recorded substate transition — see the guard below).
+QList<HistoryPhaseMarker> phasesFromNativeStateChange(
+    const QVector<QPointF>& pressure,
+    const QJsonArray& stateChange,
+    const QStringList& pumpModes)
+{
+    QList<HistoryPhaseMarker> markers;
+    if (pumpModes.isEmpty() || stateChange.size() != pressure.size()) return markers;
+
+    QList<qsizetype> boundaries;       // sample index where each segment starts
+    boundaries.append(0);
+    bool prevPositive = toDouble(stateChange[0]) > 0;
+    for (qsizetype i = 1; i < stateChange.size(); ++i) {
+        const bool curPositive = toDouble(stateChange[i]) > 0;
+        if (curPositive != prevPositive) boundaries.append(i);
+        prevPositive = curPositive;
+    }
+    const int segCount = static_cast<int>(boundaries.size());
+    const int stepCount = static_cast<int>(pumpModes.size());
+
+    // A state_change with no sign flips (one segment) but a multi-step
+    // profile is degenerate: the machine never recorded a substate
+    // transition (e.g. a bailed-out short shot), so there is no real
+    // preinfusion/pour boundary to recover. Tail-aligning would emit ONE
+    // marker for the whole shot — non-empty, so it would BLOCK the
+    // fallback chain while being structurally wrong (the multi-frame
+    // profile flattened to a single tail-step frame at t=0). Return empty
+    // instead so the goal-jump / inferPhasesFromGoals fallbacks engage —
+    // the same recover path an absent state_change takes. A genuinely
+    // single-step profile (stepCount == 1) is not degenerate and is left
+    // to the normal path below.
+    if (segCount == 1 && stepCount > 1) return markers;
+
+    const int offset = stepCount - segCount;  // >=0 when frames collapsed
+    for (int seg = 0; seg < segCount; ++seg) {
+        const int stepIdx = std::clamp(seg + offset, 0, stepCount - 1);
+        HistoryPhaseMarker m;
+        m.time = pressure[boundaries[seg]].x();
+        m.frameNumber = stepIdx;
+        m.isFlowMode =
+            pumpModes[stepIdx].compare(QStringLiteral("flow"), Qt::CaseInsensitive) == 0;
+        m.label = QStringLiteral("frame%1_%2").arg(stepIdx).arg(pumpModes[stepIdx]);
+        markers.append(m);
+    }
+    return markers;
+}
+
+// Pour-start proxy for visualizer shots which don't expose Decenza's phase
+// markers directly. Scans for the first sample where P > 2.0 bar and
+// F > 0.2 ml/s — the same heuristic ShotSummarizer falls back to.
+double pourStartFromCurves(const QVector<QPointF>& pressure, const QVector<QPointF>& flow)
+{
+    const qsizetype n = std::min(pressure.size(), flow.size());
+    for (qsizetype i = 0; i < n; ++i) {
+        if (pressure[i].y() > 2.0 && flow[i].y() > 0.2) return pressure[i].x();
+    }
+    return pressure.isEmpty() ? 0.0 : pressure.first().x();
+}
+
+// Decenza's ShotHistoryExporter writes JSONs shaped like
+//   { "elapsed": [...], "pressure": {"pressure": [...], "goal": [...]},
+//     "flow": {"flow": [...], "goal": [...]}, "profile": {"steps": [...]}, ... }
+// Very different from visualizer.coffee's flat "data.espresso_pressure" shape.
+// Detect the format on the first key seen and dispatch to the matching
+// loader so one tool invocation can mix a visualizer dump and an export
+// directory.
+bool looksLikeDecenzaFormat(const QJsonObject& root)
+{
+    return root.contains("elapsed") && root.value("pressure").isObject();
+}
+
+bool loadVisualizerFormat(const QJsonObject& root, const QString& path,
+                           LoadedShot& out, QString* errOut)
+{
+    out.id = root.value("id").toString();
+    out.profileTitle = root.value("profile_title").toString();
+    out.beverageType = root.value("beverage_type").toString();
+    out.durationSec = toDouble(root.value("duration"));
+    out.enjoyment = root.value("espresso_enjoyment").toInt();
+    out.doseG = toDouble(root.value("bean_weight"));
+    out.yieldG = toDouble(root.value("drink_weight"));
+    out.targetWeightG = toDouble(root.value("target_weight"));
+    out.grinderSetting = root.value("grinder_setting").toString();
+
+    const QJsonObject data = root.value("data").toObject();
+    const QJsonArray timeframe = data.value("timeframe").toArray();
+    out.pressure = buildSeries(data.value("espresso_pressure").toArray(), timeframe);
+    out.flow = buildSeries(data.value("espresso_flow").toArray(), timeframe);
+    out.pressureGoal = buildSeries(data.value("espresso_pressure_goal").toArray(), timeframe);
+    out.flowGoal = buildSeries(data.value("espresso_flow_goal").toArray(), timeframe);
+
+    if (out.pressure.size() < 5) {
+        if (errOut) *errOut = QStringLiteral("not enough samples");
+        return false;
+    }
+    // Prefer state_change + sidecar profile when both are available — this
+    // matches the per-sample isFlowMode the production code captures from
+    // BLE, instead of inferring mode from goal curves (which silently drops
+    // pressure-mode preinfusion samples whose flow goal is a safety
+    // limiter, see PRs Kulitorum/Decenza#811/#864). Fall back to inferPhasesFromGoals when
+    // either source is absent.
+    const QJsonArray stateChange = data.value("espresso_state_change").toArray();
+    const QStringList pumpModes = loadSidecarPumpModes(path);
+    if (!stateChange.isEmpty() && !pumpModes.isEmpty()) {
+        out.phases = phasesFromStateChange(out.pressure, stateChange, pumpModes);
+    }
+    if (out.phases.isEmpty()) {
+        out.phases = inferPhasesFromGoals(out.pressure, out.pressureGoal, out.flowGoal);
+    }
+    return true;
+}
+
+bool loadDecenzaFormat(const QJsonObject& root, LoadedShot& out, QString* errOut)
+{
+    const QJsonArray elapsed = root.value("elapsed").toArray();
+    const QJsonObject pressureObj = root.value("pressure").toObject();
+    const QJsonObject flowObj = root.value("flow").toObject();
+    const QJsonObject profile = root.value("profile").toObject();
+    const QJsonObject meta = root.value("meta").toObject();
+    const QJsonObject totals = root.value("totals").toObject();
+
+    out.profileTitle = profile.value("title").toString();
+    out.beverageType = profile.value("beverage_type").toString();
+    if (!elapsed.isEmpty()) out.durationSec = toDouble(elapsed.last());
+
+    // Shot metadata lives under meta.shot / meta.bean / meta.grinder
+    const QJsonObject metaShot = meta.value("shot").toObject();
+    const QJsonObject metaBean = meta.value("bean").toObject();
+    const QJsonObject metaGrinder = meta.value("grinder").toObject();
+    out.id = metaShot.value("uuid").toString();
+    if (out.id.isEmpty()) out.id = metaShot.value("id").toString();
+    out.enjoyment = metaShot.value("enjoyment").toInt();
+    out.doseG = toDouble(meta.value("in"));
+    out.yieldG = toDouble(meta.value("out"));
+    if (out.yieldG <= 0.0) out.yieldG = toDouble(totals.value("weight").toArray().last());
+    out.grinderSetting = metaGrinder.value("setting").toString();
+    if (out.grinderSetting.isEmpty()) out.grinderSetting = metaBean.value("grinder").toString();
+
+    out.pressure = buildSeries(pressureObj.value("pressure").toArray(), elapsed);
+    out.flow = buildSeries(flowObj.value("flow").toArray(), elapsed);
+    out.pressureGoal = buildSeries(pressureObj.value("goal").toArray(), elapsed);
+    out.flowGoal = buildSeries(flowObj.value("goal").toArray(), elapsed);
+
+    if (out.pressure.size() < 5) {
+        if (errOut) *errOut = QStringLiteral("not enough samples");
+        return false;
+    }
+
+    const QJsonArray steps = profile.value("steps").toArray();
+
+    // Authoritative path: Decenza native exports carry a per-sample
+    // `state_change` array (de1app convention: one entry per pressure
+    // sample, sign flips at each frame transition) — the SAME data the app
+    // persists and the visualizer loader already prefers via
+    // phasesFromStateChange. Pair it with the embedded profile.steps[].pump
+    // modes for the real per-frame isFlowMode. This makes the native
+    // loader's pour window frame-faithful to the app instead of inferring
+    // boundaries from goal-curve jumps. The goal-jump heuristic mis-places
+    // frame boundaries on D-Flow/Q-style profiles whose pressure goal ramps
+    // to 0 during a flow-controlled pour; empirically that drove the
+    // production pour-window peak to 0.0 bar and spuriously fired the
+    // expert band (observed on shot 782: real peak ~7.7 bar, in-band,
+    // reported 0.0). Falls back to the goal heuristic only when
+    // state_change is absent, length-mismatched, or degenerate (no flips).
+    const QJsonArray stateChange = root.value("state_change").toArray();
+    QStringList pumpModes;
+    pumpModes.reserve(steps.size());
+    for (const auto& s : steps)
+        pumpModes << s.toObject().value("pump").toString();
+    if (!stateChange.isEmpty() && !pumpModes.isEmpty()) {
+        out.phases = phasesFromNativeStateChange(out.pressure, stateChange, pumpModes);
+        // Provenance: this tool is a feature-gate instrument; a silent
+        // drop from the authoritative path to the goal heuristic is
+        // exactly the degradation that previously hid 22 spurious fires.
+        // Surface it on stderr, matching the loader's "skip <file>: <err>"
+        // convention, so an auditor can see which shots did NOT use the
+        // app-faithful path.
+        if (out.phases.isEmpty())
+            QTextStream(stderr) << "note " << out.path
+                << ": native state_change present but unusable "
+                   "(degenerate/length-mismatch) — using goal-jump fallback\n";
+    }
+
+    // Fallback: profile.steps carries the canonical control mode but no
+    // explicit boundaries, so locate them by scanning goal curves for
+    // discontinuities and assign isFlowMode per step. Used only when the
+    // authoritative state_change path above produced nothing.
+    if (out.phases.isEmpty() && !steps.isEmpty()) {
+        QList<HistoryPhaseMarker> markers;
+        // Heuristic boundary detection: step into a new frame when the
+        // PRIMARY goal for the active mode jumps by >0.5 units, OR when the
+        // mode itself flips (pressure→flow or flow→pressure).
+        auto prevMode = [&](double pg, double fg) -> int {
+            const bool pActive = pg >= ShotAnalysis::WINDOW_MIN_GOAL;
+            const bool fActive = fg >= ShotAnalysis::WINDOW_MIN_GOAL;
+            if (fActive && !pActive) return 1;
+            if (pActive && !fActive) return 0;
+            return -1;
+        };
+        int stepIdx = 0;
+        int lastMode = -1;
+        double lastSetpoint = 0.0;
+        const double setpointJump = 0.5;  // bar or ml/s — coarse boundary sniff
+        for (qsizetype i = 0; i < out.pressure.size() && stepIdx < steps.size(); ++i) {
+            const double t = out.pressure[i].x();
+            const double pg = i < out.pressureGoal.size() ? out.pressureGoal[i].y() : 0.0;
+            const double fg = i < out.flowGoal.size() ? out.flowGoal[i].y() : 0.0;
+            const int mode = prevMode(pg, fg);
+            if (mode < 0) continue;
+            const double setpoint = (mode == 1) ? fg : pg;
+            const bool modeChanged = (lastMode >= 0 && mode != lastMode);
+            const bool setpointShift = (lastMode >= 0
+                && std::abs(setpoint - lastSetpoint) > setpointJump);
+            if (lastMode < 0 || modeChanged || setpointShift) {
+                // Advance to the next step on a transition — unless this is
+                // the very first marker (lastMode < 0).
+                if (lastMode >= 0) stepIdx = static_cast<int>(std::min<qsizetype>(stepIdx + 1, steps.size() - 1));
+                const QJsonObject step = steps[stepIdx].toObject();
+                HistoryPhaseMarker m;
+                m.time = t;
+                m.label = step.value("name").toString();
+                m.frameNumber = stepIdx;
+                m.isFlowMode = step.value("pump").toString().toLower() == QStringLiteral("flow");
+                markers.append(m);
+            }
+            lastMode = mode;
+            lastSetpoint = setpoint;
+        }
+        if (!markers.isEmpty()) out.phases = markers;
+    }
+    if (out.phases.isEmpty()) {
+        // Fall back to pure goal-curve inference.
+        out.phases = inferPhasesFromGoals(out.pressure, out.pressureGoal, out.flowGoal);
+    }
+    return true;
+}
+
+bool loadShotFile(const QString& path, LoadedShot& out, QString* errOut)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        if (errOut) *errOut = QStringLiteral("cannot open: %1").arg(f.errorString());
+        return false;
+    }
+    QJsonParseError pe;
+    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &pe);
+    if (doc.isNull() || !doc.isObject()) {
+        if (errOut) *errOut = QStringLiteral("invalid JSON: %1").arg(pe.errorString());
+        return false;
+    }
+    const QJsonObject root = doc.object();
+    out.path = path;
+
+    const bool ok = looksLikeDecenzaFormat(root)
+        ? loadDecenzaFormat(root, out, errOut)
+        : loadVisualizerFormat(root, path, out, errOut);
+    if (!ok) return false;
+    out.conductance = Conductance::fromPressureFlow(out.pressure, out.flow);
+    out.conductanceDerivative = Conductance::derivative(out.conductance);
+
+    out.pourStart = pourStartFromCurves(out.pressure, out.flow);
+    out.pourEnd = out.pressure.last().x();
+    return true;
+}
+
+const char* severityName(ShotAnalysis::ChannelingSeverity s)
+{
+    switch (s) {
+        case ShotAnalysis::ChannelingSeverity::Sustained: return "Sustained";
+        case ShotAnalysis::ChannelingSeverity::Transient: return "Transient";
+        case ShotAnalysis::ChannelingSeverity::None:      return "None";
+    }
+    return "?";
+}
+
+struct EvaluatedShot {
+    LoadedShot shot;
+    ShotAnalysis::ChannelingSeverity baseline = ShotAnalysis::ChannelingSeverity::None;
+    ShotAnalysis::ChannelingSeverity modeAware = ShotAnalysis::ChannelingSeverity::None;
+    int baselineElevated = 0;
+    double baselineMaxSpike = 0.0;
+    double baselineSpikeTime = 0.0;
+    int maskElevated = 0;
+    double maskMaxSpike = 0.0;
+    double maskSpikeTime = 0.0;
+    double maskSeconds = 0.0;
+    double maskPct = 0.0;
+    bool grindIssue = false;
+    double grindDelta = 0.0;
+    qsizetype grindSamples = 0;
+    bool grindHasData = false;
+    bool grindSkipped = false;
+    bool skippedInProd = false;  // production-path short-circuit (cleaning/filter/etc)
+    bool pourTruncated = false;  // peak pressure never reached PRESSURE_FLOOR_BAR
+    QString verdict;             // channeling-severity label for the table view (NOT the user-facing verdict)
+    QString summaryVerdict;      // user-facing verdict text from the production analyzeShot path
+    QString verdictCategory;     // DetectorResults::verdictCategory (drives the app's tint)
+    bool expertBandFired = false;
+    QString expertBandText;      // the expert_band_deviation observation line, if any
+};
+
+// Count elevated samples + find max spike in a dC/dt series across a time
+// window (matches the core loop of detectChannelingFromDerivative but
+// exposes the intermediate metrics for the report).
+void tallyDerivative(const QVector<QPointF>& dcdt, double t0, double t1,
+                     const QVector<ShotAnalysis::DetectionWindow>& windows,
+                     int* outCount, double* outMaxSpike, double* outMaxSpikeTime)
+{
+    int count = 0;
+    double maxSpike = 0.0;
+    double maxSpikeTime = 0.0;
+    auto inWindow = [&](double t) {
+        if (windows.isEmpty()) return true;
+        for (const auto& w : windows) if (t >= w.start && t <= w.end) return true;
+        return false;
+    };
+    for (const auto& pt : dcdt) {
+        if (pt.x() < t0) continue;
+        if (pt.x() > t1) break;
+        if (!inWindow(pt.x())) continue;
+        const double v = std::abs(pt.y());
+        if (v > maxSpike) { maxSpike = v; maxSpikeTime = pt.x(); }
+        if (v > ShotAnalysis::CHANNELING_DC_ELEVATED) ++count;
+    }
+    if (outCount) *outCount = count;
+    if (outMaxSpike) *outMaxSpike = maxSpike;
+    if (outMaxSpikeTime) *outMaxSpikeTime = maxSpikeTime;
+}
+
+EvaluatedShot evaluate(const LoadedShot& s)
+{
+    EvaluatedShot ev;
+    ev.shot = s;
+    const double analysisStart = s.pourStart + ShotAnalysis::CHANNELING_DC_POUR_SKIP_SEC;
+    // Keep the reporting tally aligned with what detectChannelingFromDerivative
+    // actually analyzes — trim both ends so baseline/mode-aware counts agree
+    // with the Sustained/Transient/None verdicts.
+    const double analysisEnd = s.pourEnd - ShotAnalysis::CHANNELING_DC_POUR_SKIP_END_SEC;
+
+    // Faithful to the production callsite: cleaning / tea / steam /
+    // filter / pourover and turbo-style shots never reach the channeling
+    // detector in live Decenza (ShotHistoryStorage::storeRecord() gates
+    // on shouldSkipChannelingCheck). Mirror that here so the evaluation
+    // report reflects real app behavior — not the raw detector's answer
+    // on shots it would never have seen.
+    const bool skippedInProd = ShotAnalysis::shouldSkipChannelingCheck(
+        s.beverageType, s.flow, s.pourStart, s.pourEnd);
+    ev.skippedInProd = skippedInProd;
+
+    if (skippedInProd) {
+        ev.baseline = ShotAnalysis::ChannelingSeverity::None;
+        ev.modeAware = ShotAnalysis::ChannelingSeverity::None;
+    } else {
+        // Baseline detector — unrestricted analysis. Pass a single
+        // whole-pour window to force the legacy "no masking" path (empty
+        // windows now report None under the new production contract).
+        const QVector<ShotAnalysis::DetectionWindow> wholePour{
+            {s.pourStart, s.pourEnd},
+        };
+        ev.baseline = ShotAnalysis::detectChannelingFromDerivative(
+            s.conductanceDerivative, s.pourStart, s.pourEnd, wholePour, &ev.baselineSpikeTime);
+        tallyDerivative(s.conductanceDerivative, analysisStart, analysisEnd, wholePour,
+                        &ev.baselineElevated, &ev.baselineMaxSpike, &ev.baselineSpikeTime);
+
+        // Mode-aware detector — mask from phase-inferred windows.
+        const auto windows = ShotAnalysis::buildChannelingWindows(
+            s.pressure, s.flow, s.pressureGoal, s.flowGoal, s.phases, s.pourStart, s.pourEnd);
+        ev.modeAware = ShotAnalysis::detectChannelingFromDerivative(
+            s.conductanceDerivative, s.pourStart, s.pourEnd, windows, &ev.maskSpikeTime);
+        tallyDerivative(s.conductanceDerivative, analysisStart, analysisEnd, windows,
+                        &ev.maskElevated, &ev.maskMaxSpike, &ev.maskSpikeTime);
+
+        double maskSec = 0.0;
+        for (const auto& w : windows) maskSec += (w.end - w.start);
+        ev.maskSeconds = maskSec;
+        const double pourSpan = std::max(0.001, s.pourEnd - s.pourStart);
+        ev.maskPct = 100.0 * maskSec / pourSpan;
+    }
+
+    // --- App parity (scoped — read this) ---
+    // Route through the ONE production analyzeShot with the SAME inputs the
+    // app resolves (analysisFlags + expertBand + profileKbResolved gate),
+    // instead of the old empty-flags reimpl that silently diverged on
+    // flow_trend_ok suppression + the expert-band line.
+    //
+    // editorType is inferred from the title prefix below — keep in sync
+    // with Profile::editorType (src/profile/profile.cpp:344). A title
+    // starting with "D-Flow" / "A-Flow" identifies the editor namespace,
+    // which lets matchProfileKey's editor-type-default fallback resolve
+    // custom-titled editor profiles ("D-Flow / Malabar") to the editor-
+    // default KB entry the same way prepareAnalysisInputs does in the
+    // live app. Without this, shot_eval would silently drop those
+    // fixtures into the unresolved bucket and the new profileKbResolved
+    // gate (openspec skip-grind-arm1-when-kb-unresolved) would skip
+    // Arm 1 on them — a false divergence from production. The "*"
+    // leading-character convention for renamed copies is honored for
+    // the same reason. Pressure/flow/advanced editor types have no
+    // title prefix in this convention and no editor-default KB entry
+    // either, so they fall through to "" with the same consequence on
+    // both sides. TstShotCorpus validates shot_eval against its own
+    // manifest baseline, not against the live app — but the title-prefix
+    // inference closes the largest known divergence (#1198 +
+    // skip-grind-arm1-when-kb-unresolved era).
+    QString editorTypeHint;
+    {
+        const QString t = s.profileTitle.startsWith(QLatin1Char('*'))
+            ? s.profileTitle.mid(1) : s.profileTitle;
+        if (t.startsWith(QStringLiteral("D-Flow"), Qt::CaseInsensitive))
+            editorTypeHint = QStringLiteral("dflow");
+        else if (t.startsWith(QStringLiteral("A-Flow"), Qt::CaseInsensitive))
+            editorTypeHint = QStringLiteral("aflow");
+    }
+    const QString kbId =
+        ShotSummarizer::computeProfileKbId(s.profileTitle, editorTypeHint);
+    const QStringList analysisFlags = ShotSummarizer::getAnalysisFlags(kbId);
+    const std::optional<ShotAnalysis::ExpertBand> expertBand =
+        ShotSummarizer::expertBandForKbId(kbId);
+    // Resolved kbId gates grind Arm 1 on; an unresolved one gates it off.
+    // See openspec change skip-grind-arm1-when-kb-unresolved.
+    const bool profileKbResolved = !kbId.isEmpty();
+
+    const ShotAnalysis::AnalysisResult R = ShotAnalysis::analyzeShot(
+        s.pressure, s.flow, /*weight=*/{}, s.conductanceDerivative, s.phases,
+        s.beverageType, s.durationSec, s.pressureGoal, s.flowGoal,
+        analysisFlags, /*firstFrameConfiguredSeconds=*/-1.0,
+        s.targetWeightG, s.yieldG, /*expectedFrameCount=*/-1, expertBand,
+        profileKbResolved);
+
+    const decenza::BadgeFlags badges =
+        decenza::deriveBadgesFromAnalysis(R.detectors);
+
+    // Grind diagnostic columns + the two grind/pour badges — all from the
+    // single analyzeShot result (no separate empty-flags call).
+    ev.grindDelta   = R.detectors.grindFlowDeltaMlPerSec;
+    ev.grindSamples = R.detectors.grindSampleCount;
+    ev.grindHasData = R.detectors.grindHasData;
+    ev.grindSkipped = !R.detectors.grindChecked;
+    ev.grindIssue    = badges.grindIssueDetected;     // the app's badge
+    ev.pourTruncated = badges.pourTruncatedDetected;   // the app's badge
+    ev.verdictCategory = R.detectors.verdictCategory;
+
+    for (const QVariant& v : R.lines) {
+        const QVariantMap m = v.toMap();
+        if (m.value(QStringLiteral("type")).toString() == QStringLiteral("verdict"))
+            ev.summaryVerdict = m.value(QStringLiteral("text")).toString();
+        if (m.value(QStringLiteral("kind")).toString()
+                == QStringLiteral("expert_band_deviation")) {
+            ev.expertBandFired = true;
+            ev.expertBandText = m.value(QStringLiteral("text")).toString();
+        }
+    }
+
+    // Short verdict for the table: report any direction the two detectors
+    // disagree on — that's what the user cares about when evaluating a
+    // proposed algorithm change.
+    if (ev.baseline != ev.modeAware) {
+        ev.verdict = QStringLiteral("%1 -> %2")
+                         .arg(severityName(ev.baseline), severityName(ev.modeAware));
+    } else {
+        ev.verdict = severityName(ev.modeAware);
+    }
+    return ev;
+}
+
+// ---------------------------------------------------------------------------
+// Settling replay (#1280): offline analyzer that reproduces
+// ShotTimingController's settling stability gate against a saved shot's
+// embedded `app.data.debug_log`. Reports the recorded yield, the value the
+// fixed cup-removed handler would persist, and surfaces shots where the
+// recorded value differs from the actual settled weight.
+//
+// Thresholds come from controllers/settlingconstants.h, shared with
+// ShotTimingController. SETTLING_CLEAN_CAPTURE_MS (250 ms) is approximated here as
+// MIN_CONSECUTIVE_STABLE_FIRES = 3 samples, because this log carries no times.
+//
+// SETTLING_STABLE_MS (1000 ms) is intentionally NOT mirrored: this tool
+// only replays the abandoned-settle path (cup lift or over-rise), not the full
+// settlement path that fires onSettlingComplete via the 1-second stability gate.
+// The detection is mirrored here; the weight saved comes from the shared
+// Settling::abandonedSettleWeight().
+// ---------------------------------------------------------------------------
+struct SettlingReport {
+    QString path;
+    QString id;
+    bool hasDebugLog = false;
+    bool hasSawTrigger = false;
+    double stopWeight = 0.0;        // SAW trigger weight from `[SAW] Stop triggered:`
+    double stopFlow = 0.0;          // flow at the stop, from the same line
+    double settleStart = 0.0;       // weight when settling started, `[SAW] Starting settling`
+    double recordedYieldG = 0.0;    // meta.out / totals.weight.last() — what's persisted today
+    double lastCleanAvg = 0.0;      // last rolling-window avg that passed the stability gate
+    double preFixWeight = 0.0;      // what m_weight ends up as in today's code
+    double postFixWeight = 0.0;     // what m_weight would be under abandonedSettleWeight()
+    bool cupRemoved = false;        // saw `[SAW] Cup removed during settling`
+    bool overRise = false;          // a reading rose past maxPlausibleDripG() of the stop
+    int settlingSamples = 0;
+    QString note;                   // human-readable summary
+};
+
+QString extractDebugLog(const QJsonObject& root)
+{
+    const QJsonObject app = root.value(QStringLiteral("app")).toObject();
+    const QJsonObject data = app.value(QStringLiteral("data")).toObject();
+    return data.value(QStringLiteral("debug_log")).toString();
+}
+
+// Parse a single `[SAW] Settling: "<w>" g delta: "..." avg: "<a>" drift: "<d>" stable: <s> ms`
+// line. Returns false if the line doesn't match. Drift is informational only
+// here — we recompute the stability conditions ourselves so the offline
+// analyzer's gate matches what ShotTimingController would have evaluated
+// even if the log's printed drift was rounded.
+bool parseSettlingLine(const QString& line, double* outWeight, double* outAvg, double* outDrift)
+{
+    // Custom raw-string delimiter `RX(...)RX` so the regex's own `)` chars
+    // inside capture groups don't terminate the literal early.
+    static const QRegularExpression rx(
+        QStringLiteral(R"RX(\[SAW\] Settling:\s*"([-\d.]+)"\s*g\s+delta:\s*"[-\d.]+"\s+avg:\s*"([-\d.]+)"\s+drift:\s*"([-\d.]+)")RX"));
+    const auto m = rx.match(line);
+    if (!m.hasMatch()) return false;
+    *outWeight = m.captured(1).toDouble();
+    *outAvg = m.captured(2).toDouble();
+    *outDrift = m.captured(3).toDouble();
+    return true;
+}
+
+bool parseStopTriggered(const QString& line, double* outWeight, double* outFlow)
+{
+    // Two variants in the log: `[SAW-Worker] Stop triggered: weight= X` and
+    // `[SAW] Stop triggered: weight= X flow= F`. The bare `[SAW]` form is the one
+    // ShotTimingController emits via onSawTriggered() — those are the values
+    // m_weightAtStop and m_flowRateAtStop capture. Prefer it.
+    static const QRegularExpression rx(
+        QStringLiteral(R"RX(\[SAW\] Stop triggered:\s*weight=\s*([-\d.]+)(?:\s+flow=\s*([-\d.]+))?)RX"));
+    const auto m = rx.match(line);
+    if (!m.hasMatch()) return false;
+    *outWeight = m.captured(1).toDouble();
+    *outFlow = m.captured(2).toDouble();
+    return true;
+}
+
+SettlingReport analyzeShotSettling(const QString& path, const QJsonObject& root)
+{
+    SettlingReport r;
+    r.path = path;
+
+    // Recorded yield: prefer meta.out (the persisted finalWeightG), fall
+    // back to totals.weight.last() so visualizer-format shots still resolve.
+    const QJsonObject meta = root.value(QStringLiteral("meta")).toObject();
+    r.recordedYieldG = toDouble(meta.value(QStringLiteral("out")));
+    if (r.recordedYieldG <= 0.0) {
+        const QJsonArray w = root.value(QStringLiteral("totals")).toObject()
+            .value(QStringLiteral("weight")).toArray();
+        if (!w.isEmpty()) r.recordedYieldG = toDouble(w.last());
+    }
+    r.id = meta.value(QStringLiteral("shot")).toObject().value(QStringLiteral("uuid")).toString();
+    if (r.id.isEmpty()) r.id = QFileInfo(path).baseName();
+
+    const QString log = extractDebugLog(root);
+    if (log.isEmpty()) {
+        r.note = QStringLiteral("no embedded debug_log (visualizer-format shot?)");
+        return r;
+    }
+    r.hasDebugLog = true;
+
+    using namespace Settling;
+
+    const bool amountCheck = BeverageType::group(root.value(QStringLiteral("profile")).toObject()
+        .value(QStringLiteral("beverage_type")).toString()) == QLatin1String("espresso");
+
+    double curWeight = 0.0;
+    double peakWeight = 0.0;
+    bool cupRemovedFired = false;
+    bool overRiseFired = false;
+    int overRiseRun = 0;
+    static const QRegularExpression startRx(
+        QStringLiteral(R"RX(Starting settling \(.*?current weight: "?([-\d.]+))RX"));
+    int consecutiveStableFires = 0;
+    // ShotTimingController's SETTLING_CLEAN_CAPTURE_MS = 250 at ~100 ms per
+    // sample ≈ 3 consecutive stable samples before lastCleanAvg can be
+    // captured. Keeping the offline mirror in sync with production prevents
+    // the tool from reporting "phantom recoveries" on shots whose rolling
+    // avg only transiently met the gate amid noisy settling.
+    constexpr int MIN_CONSECUTIVE_STABLE_FIRES = 3;
+
+    // Walk every line. Stop accumulating samples after cup-removal so the
+    // post-removal artifacts (which the production code wouldn't see — it
+    // returns at cup-removed) don't pollute the offline view either.
+    const QStringList lines = log.split(QLatin1Char('\n'));
+    for (const QString& line : lines) {
+        if (!r.hasSawTrigger) {
+            double w = 0.0, flow = 0.0;
+            if (parseStopTriggered(line, &w, &flow)) {
+                r.stopWeight = w;
+                r.stopFlow = flow;
+                r.hasSawTrigger = true;
+                curWeight = 0.0;
+                // Seeding 0 made the first settling sample test `weight < -20`
+                // instead of `weight < stopWeight - 20`, missing a small-shot lift
+                // that lands on that sample. The trigger weight is the closest seed
+                // the log offers, but it is NOT what production uses: production
+                // seeds from m_weight at endShot, which is higher by whatever drip
+                // accrued during the stop latency. So this still under-detects a
+                // first-sample lift by that margin — conservative, not equivalent.
+                // curWeight above keeps the 0 seed and the same asymmetry.
+                peakWeight = w;
+                continue;
+            }
+        }
+        if (r.hasSawTrigger && r.settleStart == 0.0) {
+            const auto start = startRx.match(line);
+            if (start.hasMatch()) r.settleStart = start.captured(1).toDouble();
+        }
+        if (line.contains(QStringLiteral("Cup removed during settling"))) {
+            cupRemovedFired = true;
+            r.cupRemoved = true;
+            break;
+        }
+        if (!r.hasSawTrigger) continue;
+        double weight = 0.0, avg = 0.0, drift = 0.0;
+        if (!parseSettlingLine(line, &weight, &avg, &drift)) continue;
+
+        // Mirrors ShotTimingController's amount check: a lone sample past the limit is
+        // dropped, a second in a row abandons settling, and so does a cup lift. These
+        // logs carry no sample times, so the flow check is --settle-replay's alone.
+        const double base = settleBaseG(r.stopWeight, r.settleStart);
+        overRiseRun = amountCheck && isOverRise(weight, base, r.stopFlow) ? overRiseRun + 1 : 0;
+        if (overRiseRun > 0 && overRiseRun < DISTURBED_SAMPLES) continue;
+        if (overRiseRun >= DISTURBED_SAMPLES) {
+            overRiseFired = true;
+            r.overRise = true;
+            break;
+        }
+        if (isCupLift(weight, peakWeight)) {
+            cupRemovedFired = true;
+            r.cupRemoved = true;
+            break;
+        }
+
+        if (weight > peakWeight) peakWeight = weight;
+        curWeight = weight;
+        ++r.settlingSamples;
+
+        // Stability gate — capture the avg only when all three conditions
+        // hold. Mirrors the `if (avgDrift < SETTLING_AVG_THRESHOLD &&
+        // !avgBelowStop && !weightAboveAvg)` check in
+        // ShotTimingController::onWeightSample. Window-fill check
+        // approximated by sample count.
+        if (r.settlingSamples < SETTLING_WINDOW_SIZE) continue;
+        const bool avgBelowStop = (r.stopWeight > 0 && avg < r.stopWeight - SETTLING_AVG_BELOW_STOP_G);
+        const bool weightAboveAvg = (weight > avg + SETTLING_ABOVE_AVG_MARGIN);
+        if (drift < SETTLING_AVG_THRESHOLD && !avgBelowStop && !weightAboveAvg) {
+            ++consecutiveStableFires;
+            if (consecutiveStableFires >= MIN_CONSECUTIVE_STABLE_FIRES)
+                r.lastCleanAvg = avg;
+        } else {
+            consecutiveStableFires = 0;
+        }
+    }
+
+    // A reading past the limit with no sample after it: the app abandons on completion.
+    if (!cupRemovedFired && !overRiseFired && overRiseRun > 0) {
+        overRiseFired = true;
+        r.overRise = true;
+    }
+
+    r.preFixWeight = curWeight;
+
+    // Only an abandoned settle changes the saved weight — clean settles already
+    // write `m_weight = avg` via onSettlingComplete.
+    r.postFixWeight = curWeight;
+    AbandonedSettleSource source = AbandonedSettleSource::LastReading;
+    if (cupRemovedFired || overRiseFired) {
+        const AbandonedSettle saved = abandonedSettleWeight(
+            r.lastCleanAvg, settleBaseG(r.stopWeight, r.settleStart), curWeight, overRiseFired);
+        r.postFixWeight = saved.weightG;
+        source = saved.source;
+    }
+
+    if (!r.hasSawTrigger)
+        r.note = QStringLiteral("no SAW trigger in log (non-SAW shot)");
+    else if (!cupRemovedFired && !overRiseFired)
+        r.note = QStringLiteral("clean settle");
+    else
+        r.note = (overRiseFired ? QStringLiteral("over-rise") : QStringLiteral("cup-lifted"))
+            + QStringLiteral(" — saved ") + QString::fromLatin1(abandonedSettleSourceText(source));
+
+    return r;
+}
+
+void printSettlingTable(const QList<SettlingReport>& rows, QTextStream& out)
+{
+    out << QStringLiteral("%1  %2  %3  %4  %5  %6  %7  %8\n")
+               .arg("file", -32)
+               .arg("stopW", 6)
+               .arg("recorded", 8)
+               .arg("preFix", 6)
+               .arg("postFix", 7)
+               .arg("Δ", 6)
+               .arg("abandon", 7)
+               .arg("note");
+    out << QString(120, '-') << '\n';
+    int affected = 0;
+    double totalDelta = 0.0;
+    for (const auto& r : rows) {
+        const QString file = QFileInfo(r.path).fileName().left(32);
+        if (!r.hasSawTrigger) {
+            out << QStringLiteral("%1  %2\n").arg(file, -32).arg(r.note);
+            continue;
+        }
+        const double delta = r.postFixWeight - r.preFixWeight;
+        if (std::abs(delta) >= 0.05) {
+            ++affected;
+            totalDelta += delta;
+        }
+        const QString flag = (std::abs(delta) >= 0.05) ? QStringLiteral("***") : QString();
+        out << QStringLiteral("%1  %2  %3  %4  %5  %6  %7  %8 %9\n")
+                   .arg(file, -32)
+                   .arg(r.stopWeight, 6, 'f', 1)
+                   .arg(r.recordedYieldG, 8, 'f', 1)
+                   .arg(r.preFixWeight, 6, 'f', 1)
+                   .arg(r.postFixWeight, 7, 'f', 1)
+                   .arg(delta, 6, 'f', 1)
+                   .arg(r.overRise ? "rise" : r.cupRemoved ? "lift" : "no", 7)
+                   .arg(r.note, flag);
+    }
+    out << '\n'
+        << QStringLiteral("Summary: %1 shots scanned, %2 changed by the abandoned-settle fallback, total Δ=%3 g\n")
+               .arg(rows.size()).arg(affected).arg(totalDelta, 0, 'f', 1);
+}
+
+// ---------------------------------------------------------------------------
+// Settle replay: the FULL settlement decision (not only the cup-removal chain
+// above), replayed from the weight series a Decenza shot record stores. The
+// series keeps every scale sample ShotTimingController saw while settling, so
+// no per-sample log line is needed. Input is ShotServer's /api/shot/<id> JSON.
+//
+// Mirrors ShotTimingController::onWeightSample + onDisplayTimerTick (50 ms tick),
+// with the shared controllers/settlingconstants.h thresholds, including the abandoned
+// settle on a cup lift or an over-rise. `proposed` adds two rules:
+//   symmetricMoving - a reading BELOW the window avg by more than the margin is
+//                     still moving, as a reading above it already is;
+//   floorAtPlateau  - never settle below the highest clean avg captured: post-stop
+//                     drip only adds weight, so a later fall is not yield.
+// The series timestamps are sample times, not arrival times, so the "current"
+// replay reproduces the saved weight on most shots but not all; the summary
+// reports how many, and the proposed delta is applied to the SAVED value.
+// ---------------------------------------------------------------------------
+struct SettleRules {
+    bool symmetricMoving = false;
+    bool floorAtPlateau = false;
+};
+const SettleRules kCurrentRules{};
+const SettleRules kProposedRules{/*symmetricMoving*/ true, /*floorAtPlateau*/ true};
+
+struct SettleOutcome {
+    double weight = 0.0;
+    QString how;
+};
+
+struct SettleInput {
+    QString path;
+    QString when;
+    double stopWeight = 0.0;
+    double stopFlow = 0.0;
+    double startWeight = 0.0;
+    double savedWeight = 0.0;
+    double targetWeight = 0.0;
+    QString beverageType;
+    QList<QPair<double, double>> lead;     // (seconds, grams), the last second of the pour
+    QList<QPair<double, double>> samples;  // (seconds, grams) after the shot ended
+};
+
+bool loadSettleInput(const QString& path, const QJsonObject& root, SettleInput& in)
+{
+    // Current logs carry `Recorded stop from worker: weight=X g flow=F g/s`; older ones
+    // `[SAW] Stop triggered: weight= X flow= F`.
+    static const QRegularExpression stopRx(
+        QStringLiteral(R"RX((?:Recorded stop from worker|\[SAW\] Stop triggered): weight=\s*([-\d.]+)\s*g?\s+flow=\s*([-\d.]+))RX"));
+    static const QRegularExpression startRx(
+        QStringLiteral(R"RX(Starting settling \(.*?current weight: ([-\d.]+))RX"));
+    const QString log = root.value(QStringLiteral("debugLog")).toString();
+    const auto stop = stopRx.match(log);
+    const auto start = startRx.match(log);
+    if (!stop.hasMatch() || !start.hasMatch()) return false;
+    in.path = path;
+    in.when = root.value(QStringLiteral("timestampIso")).toString().left(16);
+    in.stopWeight = stop.captured(1).toDouble();
+    in.stopFlow = stop.captured(2).toDouble();
+    in.startWeight = start.captured(1).toDouble();
+    in.savedWeight = toDouble(root.value(QStringLiteral("finalWeightG")));
+    in.targetWeight = toDouble(root.value(QStringLiteral("targetWeightG")));
+    in.beverageType = root.value(QStringLiteral("beverageType")).toString();
+    const double endSec = toDouble(root.value(QStringLiteral("durationSec")));
+    for (const QJsonValue& v : root.value(QStringLiteral("weight")).toArray()) {
+        const QJsonObject p = v.toObject();
+        const double x = toDouble(p.value(QStringLiteral("x")));
+        const double y = toDouble(p.value(QStringLiteral("y")));
+        if (x > endSec + 1e-6) in.samples.append({x, y});
+        else if (x > endSec - 1.0) in.lead.append({x, y});
+    }
+    return !in.samples.isEmpty();
+}
+
+SettleOutcome replaySettle(const SettleInput& in, const SettleRules& rules)
+{
+    using namespace Settling;
+    constexpr int WINDOW = SETTLING_WINDOW_SIZE;
+    constexpr double AVG_THRESHOLD = SETTLING_AVG_THRESHOLD;
+    constexpr double ABOVE_AVG_MARGIN = SETTLING_ABOVE_AVG_MARGIN;
+    constexpr double STABLE_S = SETTLING_STABLE_MS / 1000.0;
+    constexpr double SILENCE_OVERRIDE_S = SETTLING_SILENCE_OVERRIDE_MS / 1000.0;
+    constexpr double CLEAN_CAPTURE_S = SETTLING_CLEAN_CAPTURE_MS / 1000.0;
+    constexpr double TICK_S = 0.05;  // ShotTimingController's display timer
+
+    QList<double> window;
+    double weight = in.startWeight, lastStable = in.startWeight, lastAvg = in.startWeight;
+    double peak = in.startWeight, lastClean = 0.0;
+    const double base = settleBaseG(in.stopWeight, in.startWeight);
+    const bool amountCheck = BeverageType::group(in.beverageType) == QLatin1String("espresso");
+    // Shared buffer arithmetic over the graph's last second, not the worker's raw
+    // arrivals. Cached/omitted graph readings make the resulting flow approximate.
+    QList<ScaleFlow::Sample> flowBuf;
+    for (const auto& p : in.lead) flowBuf.append({qRound64(p.first * 1000), p.second});
+    double flowRef = -1.0;
+    int disturbedRun = 0;
+    SettleDisturbance pending = SettleDisturbance::None;
+    double pendingWeight = 0.0;
+    RateRiseRecovery rateRecovery;
+    double lastChange = in.samples.first().first - TICK_S;
+    double stableSince = -1.0, plateau = 0.0;
+    const auto avg = [&] { double s = 0; for (double w : window) s += w; return s / window.size(); };
+    const auto moving = [&](double w, double a) {
+        return w > a + ABOVE_AVG_MARGIN || (rules.symmetricMoving && w < a - ABOVE_AVG_MARGIN);
+    };
+    const auto label = [](SettleDisturbance d) {
+        return d == SettleDisturbance::RateRise ? QStringLiteral("rate-rise")
+             : d == SettleDisturbance::OverRise ? QStringLiteral("over-rise")
+                                                : QStringLiteral("lift");
+    };
+    const auto finish = [&](double w, const QString& how) -> SettleOutcome {
+        if (disturbedRun > 0)  // the scale went quiet mid-disturbance: completeSettling()
+            return {abandonedSettleWeight(lastClean, base, weight, true).weightG, label(pending)};
+        if (rules.floorAtPlateau && plateau > 0.0 && w < plateau - ABOVE_AVG_MARGIN)
+            return {plateau, how + QStringLiteral("+floored")};
+        return {w, how};
+    };
+
+    qsizetype next = 0;
+    const double end = in.samples.last().first + SILENCE_OVERRIDE_S + TICK_S;
+    for (double t = lastChange; t <= end; t += TICK_S) {
+        for (; next < in.samples.size() && in.samples[next].first <= t; ++next) {
+            const double x = in.samples[next].first;
+            const double w = in.samples[next].second;
+            const qint64 ms = qRound64(x * 1000);
+            ScaleFlow::append(flowBuf, {ms, w});
+            const double flowShort = ScaleFlow::slopeGps(flowBuf, ScaleFlow::shortWindowMs(flowBuf));
+            if (flowRef < 0.0) flowRef = settleFlowRefGps(in.stopFlow, flowShort);
+            const SettleDisturbance d = rateRecovery.filter(
+                classifySettleSample(w, flowShort, base, in.stopFlow, flowRef, amountCheck),
+                w, weight, disturbedRun > 0, pendingWeight);
+            disturbedRun = d != SettleDisturbance::None ? disturbedRun + 1 : 0;
+            if (disturbedRun > 0 && disturbedRun < DISTURBED_SAMPLES) {
+                pending = d;
+                pendingWeight = w;
+                continue;
+            }
+            peak = std::max(peak, w);
+            if (d != SettleDisturbance::None || isCupLift(w, peak)) {
+                const AbandonedSettle saved =
+                    abandonedSettleWeight(lastClean, base, weight, d != SettleDisturbance::None);
+                return {saved.weightG, label(d)};
+            }
+            weight = w;
+            window.append(weight);
+            if (window.size() > WINDOW) window.removeFirst();
+            double stableS = x - lastChange;
+            if (std::abs(weight - lastStable) >= SETTLING_STILL_DELTA_G) { lastStable = weight; lastChange = x; stableS = 0; }
+            const double a = avg();
+            const double drift = std::abs(a - lastAvg);
+            lastAvg = a;
+            if (stableS >= STABLE_S) return finish(weight, QStringLiteral("still"));
+            if (window.size() < WINDOW) continue;
+            const bool belowStop = in.stopWeight > 0 && a < in.stopWeight - SETTLING_AVG_BELOW_STOP_G;
+            if (drift < AVG_THRESHOLD && !belowStop && !moving(weight, a)) {
+                if (stableSince < 0) stableSince = x;
+                if (x - stableSince >= CLEAN_CAPTURE_S) { plateau = std::max(plateau, a); lastClean = a; }
+                if (x - stableSince >= STABLE_S) return finish(a, QStringLiteral("avg"));
+            } else {
+                stableSince = -1.0;
+            }
+        }
+        if (t - lastChange >= STABLE_S && !window.isEmpty()) {
+            if (t - lastChange >= SILENCE_OVERRIDE_S) return finish(weight, QStringLiteral("silence"));
+            if (moving(weight, avg())) stableSince = -1.0;
+            else return finish(weight, QStringLiteral("timer-still"));
+        } else if (stableSince >= 0 && t - stableSince >= STABLE_S) {
+            if (moving(weight, avg())) stableSince = -1.0;
+            else return finish(avg(), QStringLiteral("timer-avg"));
+        }
+    }
+    return finish(weight, QStringLiteral("end of samples"));
+}
+
+void printSettleReplay(const QList<SettleInput>& shots, QTextStream& out)
+{
+    out << QStringLiteral("Approximate settling simulation using graph-derived flow; not worker-flow parity.\n"
+                          "Graph samples can duplicate or omit scale arrivals and exclude rejected readings.\n\n");
+    out << QStringLiteral("%1  %2  %3  %4  %5  %6  %7  %8\n")
+               .arg("when", -16).arg("stop", 5).arg("saved", 5).arg("peak", 5)
+               .arg("current", 7).arg("proposed", 8).arg("Δ", 5).arg("how (current → proposed)");
+    out << QString(110, '-') << '\n';
+    int reproduced = 0, changed = 0;
+    QList<double> errNow, errProposed;
+    for (const auto& in : shots) {
+        const SettleOutcome now = replaySettle(in, kCurrentRules);
+        const SettleOutcome next = replaySettle(in, kProposedRules);
+        const double delta = next.weight - now.weight;
+        if (std::abs(std::round(now.weight * 10) / 10 - in.savedWeight) <= 0.051) ++reproduced;
+        if (in.targetWeight > 0 && in.savedWeight < in.targetWeight + 10) {
+            errNow.append(in.savedWeight - in.targetWeight);
+            errProposed.append(in.savedWeight + delta - in.targetWeight);
+        }
+        if (std::abs(delta) < 0.05) continue;
+        ++changed;
+        double peak = 0;
+        for (const auto& s : in.samples) peak = std::max(peak, s.second);
+        out << QStringLiteral("%1  %2  %3  %4  %5  %6  %7  %8 → %9\n")
+                   .arg(in.when, -16).arg(in.stopWeight, 5, 'f', 1).arg(in.savedWeight, 5, 'f', 1)
+                   .arg(peak, 5, 'f', 1).arg(now.weight, 7, 'f', 2).arg(next.weight, 8, 'f', 2)
+                   .arg(delta, 5, 'f', 2).arg(now.how, next.how);
+    }
+    const auto stats = [](QList<double> v) {
+        if (v.isEmpty()) return QStringLiteral("n=0");
+        std::sort(v.begin(), v.end());
+        double mean = 0; for (double e : v) mean += e; mean /= v.size();
+        double var = 0; for (double e : v) var += (e - mean) * (e - mean);
+        const auto within = [&](double g) {
+            return 100.0 * std::count_if(v.begin(), v.end(), [g](double e) { return std::abs(e) <= g; }) / v.size();
+        };
+        return QStringLiteral("median %1 g, sd %2 g, within ±0.3 g %3%, within ±0.5 g %4%")
+            .arg(v[v.size() / 2], 0, 'f', 2).arg(std::sqrt(var / v.size()), 0, 'f', 2)
+            .arg(within(0.3), 0, 'f', 0).arg(within(0.5), 0, 'f', 0);
+    };
+    out << '\n'
+        << QStringLiteral("%1 graph curves simulated; current estimates match the saved weight on %2; "
+                          "proposed estimates change %3.\n").arg(shots.size()).arg(reproduced).arg(changed)
+        << QStringLiteral("Observed saved vs target:  %1\n").arg(stats(errNow))
+        << QStringLiteral("Estimated proposal vs target: %1\n").arg(stats(errProposed));
+}
+
+void expandInputPaths(const QStringList& inputs, QStringList& files)
+{
+    for (const auto& p : inputs) {
+        const QFileInfo fi(p);
+        if (fi.isDir()) {
+            QDir dir(p);
+            const auto entries = dir.entryInfoList({"*.json"}, QDir::Files, QDir::Name);
+            for (const auto& e : entries) files.append(e.absoluteFilePath());
+        } else if (fi.exists()) {
+            files.append(fi.absoluteFilePath());
+        } else if (p.contains('*') || p.contains('?')) {
+            // Glob through the parent directory.
+            QDir dir(fi.absolutePath());
+            const auto entries = dir.entryInfoList({fi.fileName()}, QDir::Files, QDir::Name);
+            for (const auto& e : entries) files.append(e.absoluteFilePath());
+        } else {
+            QTextStream(stderr) << "warning: skipping missing path: " << p << '\n';
+        }
+    }
+}
+
+void printTable(const QList<EvaluatedShot>& shots, QTextStream& out)
+{
+    // Column widths sized for typical profile titles; truncated if needed.
+    out << QStringLiteral("%1  %2  %3  %4  %5  %6  %7  %8  %9  %10\n")
+               .arg("id", -12)
+               .arg("profile", -28)
+               .arg("dur", 6)
+               .arg("yield", 6)
+               .arg("baseline", -20)
+               .arg("mode-aware", -20)
+               .arg("mask%", 6)
+               .arg("maxΔ", 6)
+               .arg("grind", -10)
+               .arg("puck");
+    out << QString(132, '-') << '\n';
+    for (const auto& ev : shots) {
+        QString id = ev.shot.id.left(12);
+        QString title = ev.shot.profileTitle.left(28);
+        QString baseline = QStringLiteral("%1 (%2/%3)")
+                               .arg(severityName(ev.baseline))
+                               .arg(ev.baselineElevated)
+                               .arg(ev.baselineMaxSpike, 0, 'f', 2);
+        QString mode = QStringLiteral("%1 (%2/%3)")
+                           .arg(severityName(ev.modeAware))
+                           .arg(ev.maskElevated)
+                           .arg(ev.maskMaxSpike, 0, 'f', 2);
+        QString grind;
+        if (ev.grindSkipped) grind = "skip";
+        else if (!ev.grindHasData) grind = "n/a";
+        else grind = QStringLiteral("%1 (%2%3)")
+                         .arg(ev.grindIssue ? "ISSUE" : "ok",
+                              ev.grindDelta >= 0 ? "+" : "")
+                         .arg(ev.grindDelta, 0, 'f', 2);
+        QString puck = ev.pourTruncated ? "TRUNCATED" : "ok";
+        out << QStringLiteral("%1  %2  %3  %4  %5  %6  %7  %8  %9  %10\n")
+                   .arg(id, -12)
+                   .arg(title, -28)
+                   .arg(ev.shot.durationSec, 6, 'f', 1)
+                   .arg(ev.shot.yieldG, 6, 'f', 1)
+                   .arg(baseline, -20)
+                   .arg(mode, -20)
+                   .arg(ev.maskPct, 6, 'f', 1)
+                   .arg(ev.maskMaxSpike, 6, 'f', 2)
+                   .arg(grind, -10)
+                   .arg(puck);
+    }
+}
+
+QJsonObject toJsonRow(const EvaluatedShot& ev)
+{
+    QJsonObject o;
+    o["id"] = ev.shot.id;
+    o["path"] = ev.shot.path;
+    o["profileTitle"] = ev.shot.profileTitle;
+    o["durationSec"] = ev.shot.durationSec;
+    o["yieldG"] = ev.shot.yieldG;
+    o["doseG"] = ev.shot.doseG;
+    o["grinderSetting"] = ev.shot.grinderSetting;
+    o["enjoyment"] = ev.shot.enjoyment;
+    o["pourStart"] = ev.shot.pourStart;
+    o["pourEnd"] = ev.shot.pourEnd;
+    o["phaseCount"] = static_cast<int>(ev.shot.phases.size());
+
+    QJsonObject baseline;
+    baseline["verdict"] = severityName(ev.baseline);
+    baseline["elevatedCount"] = ev.baselineElevated;
+    baseline["maxSpike"] = ev.baselineMaxSpike;
+    baseline["maxSpikeTime"] = ev.baselineSpikeTime;
+    o["baseline"] = baseline;
+
+    QJsonObject modeAware;
+    modeAware["verdict"] = severityName(ev.modeAware);
+    modeAware["elevatedCount"] = ev.maskElevated;
+    modeAware["maxSpike"] = ev.maskMaxSpike;
+    modeAware["maxSpikeTime"] = ev.maskSpikeTime;
+    modeAware["maskSeconds"] = ev.maskSeconds;
+    modeAware["maskPct"] = ev.maskPct;
+    o["modeAware"] = modeAware;
+    o["skippedInProd"] = ev.skippedInProd;
+    o["beverageType"] = ev.shot.beverageType;
+    o["pourTruncated"] = ev.pourTruncated;
+
+    QJsonObject grind;
+    grind["skipped"] = ev.grindSkipped;
+    grind["hasData"] = ev.grindHasData;
+    grind["delta"] = ev.grindDelta;
+    grind["sampleCount"] = ev.grindSamples;
+    grind["issue"] = ev.grindIssue;
+    o["grind"] = grind;
+
+    // verdictCategory (drives the app's tint) + the expert-band fire
+    // decision per shot — the A6.1/A6.2 instrument. `summaryVerdict` is the
+    // user-facing verdict line from the production analyzeShot.
+    o["verdictCategory"] = ev.verdictCategory;
+    o["summaryVerdict"] = ev.summaryVerdict;
+    QJsonObject expertBand;
+    expertBand["fired"] = ev.expertBandFired;
+    if (ev.expertBandFired)
+        expertBand["text"] = ev.expertBandText;
+    o["expertBand"] = expertBand;
+
+    return o;
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    QCoreApplication app(argc, argv);
+    QCoreApplication::setApplicationName("shot_eval");
+    QCoreApplication::setApplicationVersion("1.0");
+
+    QCommandLineParser parser;
+    parser.setApplicationDescription(
+        "Evaluate ShotAnalysis heuristics against visualizer.coffee shot JSONs.\n"
+        "Links production src/ai/shotanalysis.cpp + src/ai/conductance.cpp so\n"
+        "results match whatever the live algorithm does.");
+    parser.addHelpOption();
+    parser.addVersionOption();
+    parser.addPositionalArgument("paths",
+        "JSON files, directories, or globs. Download a shot with:\n"
+        "  curl https://visualizer.coffee/api/shots/<uuid>/download > shot.json",
+        "<paths...>");
+    QCommandLineOption jsonOpt({"j", "json"},
+        "Emit one JSON object per shot to stdout (machine-readable).");
+    parser.addOption(jsonOpt);
+    QCommandLineOption validateOpt("validate",
+        "Validate shots against a manifest.json with expected verdicts.\n"
+        "Exits non-zero on mismatch. Positional args ignored; manifest is\n"
+        "the sole input. See tests/data/shots/manifest.json for format.",
+        "manifest");
+    parser.addOption(validateOpt);
+    QCommandLineOption settlingOpt("settling",
+        "Settling-replay mode (#1280). Parses each shot's embedded "
+        "app.data.debug_log and reports the SAW stop weight, recorded "
+        "yield, today's m_weight when settling is abandoned (cup lift or a "
+        "rise past what drip can add), and the value the fallback would persist. "
+        "Useful for scanning a personal shot corpus for those cases. Mutually "
+        "exclusive with --validate.");
+    parser.addOption(settlingOpt);
+    QCommandLineOption settleReplayOpt("settle-replay",
+        "Approximate the post-stop settle decision from each shot's stored graph weight "
+        "series (ShotServer /api/shot/<id> JSON), under the current rules and the "
+        "proposed ones (a falling reading is still moving; never settle below the "
+        "pre-fall plateau). Reports estimated saved weights; graph-derived flow "
+        "cannot verify runtime rate-rise decisions without raw worker samples.");
+    parser.addOption(settleReplayOpt);
+    parser.process(app);
+
+    const QStringList inputs = parser.positionalArguments();
+    const bool validating = parser.isSet(validateOpt);
+    const bool settlingMode = parser.isSet(settlingOpt);
+    const bool settleReplayMode = parser.isSet(settleReplayOpt);
+    if (inputs.isEmpty() && !validating) {
+        parser.showHelp(1);
+    }
+    if (validating && settlingMode) {
+        QTextStream(stderr) << "--validate and --settling are mutually exclusive\n";
+        return 1;
+    }
+
+    QTextStream out(stdout);
+
+    if (validating) {
+        const QString manifestPath = parser.value(validateOpt);
+        QFile mf(manifestPath);
+        if (!mf.open(QIODevice::ReadOnly)) {
+            QTextStream(stderr) << "cannot open manifest: " << manifestPath << '\n';
+            return 1;
+        }
+        QJsonParseError pe;
+        const QJsonDocument doc = QJsonDocument::fromJson(mf.readAll(), &pe);
+        if (doc.isNull() || !doc.isObject()) {
+            QTextStream(stderr) << "invalid manifest JSON: " << pe.errorString() << '\n';
+            return 1;
+        }
+        const QJsonArray shotArr = doc.object().value("shots").toArray();
+        const QFileInfo mfInfo(manifestPath);
+        const QString baseDir = mfInfo.absolutePath();
+
+        int passed = 0, failed = 0;
+        for (const auto& v : shotArr) {
+            const QJsonObject entry = v.toObject();
+            const QString relFile = entry.value("file").toString();
+            const QJsonObject expect = entry.value("expect").toObject();
+            const QString path = baseDir + "/" + relFile;
+
+            LoadedShot shot;
+            QString err;
+            if (!loadShotFile(path, shot, &err)) {
+                out << "FAIL  " << relFile << "  (load error: " << err << ")\n";
+                ++failed;
+                continue;
+            }
+            const EvaluatedShot ev = evaluate(shot);
+
+            // Compare expected vs actual. Missing expect-fields are not
+            // checked — authors opt into each invariant explicitly.
+            QStringList mismatches;
+            if (expect.contains("channeling")) {
+                const QString want = expect.value("channeling").toString();
+                const QString got = severityName(ev.modeAware);
+                if (want != got)
+                    mismatches << QStringLiteral("channeling: want=%1 got=%2").arg(want, got);
+            }
+            if (expect.contains("grindIssue")) {
+                const bool want = expect.value("grindIssue").toBool();
+                if (want != ev.grindIssue)
+                    mismatches << QStringLiteral("grindIssue: want=%1 got=%2")
+                                      .arg(want ? "true" : "false",
+                                           ev.grindIssue ? "true" : "false");
+            }
+            if (expect.contains("pourTruncated")) {
+                const bool want = expect.value("pourTruncated").toBool();
+                if (want != ev.pourTruncated)
+                    mismatches << QStringLiteral("pourTruncated: want=%1 got=%2")
+                                      .arg(want ? "true" : "false",
+                                           ev.pourTruncated ? "true" : "false");
+            }
+            // Substring match against the user-facing verdict text — guards
+            // wording regressions in the verdict cascade (e.g. the puck-failed
+            // "Don't tune off this shot" lead-in from PR Kulitorum/Decenza#922). Substring
+            // rather than exact so manifest authors can lock in the
+            // diagnostic phrase without freezing the entire sentence.
+            if (expect.contains("summaryVerdictContains")) {
+                const QString want = expect.value("summaryVerdictContains").toString();
+                if (!ev.summaryVerdict.contains(want, Qt::CaseInsensitive))
+                    mismatches << QStringLiteral("summaryVerdictContains: want=%1 got=%2")
+                                      .arg(want, ev.summaryVerdict);
+            }
+            // Expert-band regression lock (Phase B/C): fixtures assert
+            // whether the cited band line fired and, optionally, the
+            // verdictCategory the band drives. This is the corpus guard
+            // that keeps Adaptive v2 / Allongé / the median-flow measure
+            // working — without it, band-eligible fixtures are inert.
+            if (expect.contains("expertBandFired")) {
+                const bool want = expect.value("expertBandFired").toBool();
+                if (want != ev.expertBandFired)
+                    mismatches << QStringLiteral("expertBandFired: want=%1 got=%2")
+                                      .arg(want ? "true" : "false",
+                                           ev.expertBandFired ? "true" : "false");
+            }
+            if (expect.contains("verdictCategory")) {
+                const QString want = expect.value("verdictCategory").toString();
+                if (want != ev.verdictCategory)
+                    mismatches << QStringLiteral("verdictCategory: want=%1 got=%2")
+                                      .arg(want, ev.verdictCategory);
+            }
+
+            if (mismatches.isEmpty()) {
+                out << "PASS  " << relFile << "\n";
+                ++passed;
+            } else {
+                out << "FAIL  " << relFile << "\n";
+                for (const auto& m : mismatches)
+                    out << "      " << m << "\n";
+                ++failed;
+            }
+        }
+        out << QStringLiteral("\n%1 / %2 shots passed.\n")
+                   .arg(passed).arg(passed + failed);
+        return failed == 0 ? 0 : 1;
+    }
+
+    QStringList files;
+    expandInputPaths(inputs, files);
+    if (files.isEmpty()) {
+        QTextStream(stderr) << "no input files found\n";
+        return 1;
+    }
+
+    if (settleReplayMode) {
+        QList<SettleInput> shots;
+        for (const auto& f : files) {
+            QFile file(f);
+            if (!file.open(QIODevice::ReadOnly)) continue;
+            const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+            SettleInput in;
+            if (doc.isObject() && loadSettleInput(f, doc.object(), in)) shots.append(in);
+        }
+        std::sort(shots.begin(), shots.end(),
+                  [](const SettleInput& a, const SettleInput& b) { return a.when < b.when; });
+        printSettleReplay(shots, out);
+        return 0;
+    }
+
+    if (settlingMode) {
+        QList<SettlingReport> rows;
+        rows.reserve(files.size());
+        for (const auto& f : files) {
+            QFile file(f);
+            if (!file.open(QIODevice::ReadOnly)) {
+                QTextStream(stderr) << "skip " << f << ": cannot open\n";
+                continue;
+            }
+            QJsonParseError pe;
+            const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &pe);
+            if (!doc.isObject()) {
+                QTextStream(stderr) << "skip " << f << ": " << pe.errorString() << '\n';
+                continue;
+            }
+            rows.append(analyzeShotSettling(f, doc.object()));
+        }
+        printSettlingTable(rows, out);
+        return 0;
+    }
+
+    QList<EvaluatedShot> results;
+    for (const auto& f : files) {
+        LoadedShot shot;
+        QString err;
+        if (!loadShotFile(f, shot, &err)) {
+            QTextStream(stderr) << "skip " << f << ": " << err << '\n';
+            continue;
+        }
+        results.append(evaluate(shot));
+    }
+
+    if (parser.isSet(jsonOpt)) {
+        QJsonArray arr;
+        for (const auto& ev : results) arr.append(toJsonRow(ev));
+        out << QJsonDocument(arr).toJson(QJsonDocument::Indented);
+    } else {
+        printTable(results, out);
+        // Summary line: how many verdicts changed.
+        int downgraded = 0, upgraded = 0, same = 0;
+        for (const auto& ev : results) {
+            const int b = static_cast<int>(ev.baseline);
+            const int m = static_cast<int>(ev.modeAware);
+            if (m < b) ++downgraded;
+            else if (m > b) ++upgraded;
+            else ++same;
+        }
+        out << '\n'
+            << QStringLiteral("Summary: %1 shots — %2 relaxed, %3 tightened, %4 unchanged.\n")
+                   .arg(results.size()).arg(downgraded).arg(upgraded).arg(same);
+    }
+    return 0;
+}

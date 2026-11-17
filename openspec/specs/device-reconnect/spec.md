@@ -1,0 +1,150 @@
+# device-reconnect Specification
+
+## Purpose
+Defines the BLE reconnect strategy for scales and the DE1: background scale reconnect uses passive scanning rather than a parked `connectToDevice()`, a bounded direct-connect fast path is reserved for foreground-triggered scale connects (aborting the controller on timeout) with duplicate-attempt protection, while the DE1 retains sustained direct-connect for sleep-wake and has its own recovery path for a connect attempt that hangs in `Connecting`.
+## Requirements
+### Requirement: Background scale reconnect uses passive scanning, not parked direct-connect
+
+When a saved BT scale is not connected and no intentional foreground trigger is active, the system SHALL pursue it with a passive BLE scan and SHALL NOT hold an open `connectToDevice()` attempt against the saved address. A direct `connectToDevice()` to the scale SHALL be issued only after the scale is observed advertising in a scan.
+
+#### Scenario: Saved scale is powered off
+- **WHEN** a saved BT scale is disconnected and powered off, and the periodic reconnect tick fires
+- **THEN** the system starts (or continues) a passive scan for the scale
+- **AND** does NOT open a direct `connectToDevice()` against the saved scale address
+- **AND** the BLE radio is not held in a `Connecting` state waiting on the absent scale
+
+#### Scenario: Saved scale powers back on
+- **WHEN** the saved scale begins advertising and is seen in a scan
+- **THEN** the system issues a direct `connectToDevice()` to the discovered device and connects
+
+#### Scenario: DE1 link is unaffected by an absent scale
+- **WHEN** a saved scale remains absent for an extended period while the DE1 is connected
+- **THEN** the DE1 link experiences no reconnect-induced write failures or controller errors attributable to scale reconnect activity
+
+### Requirement: Bounded foreground direct-connect fast-path for scales
+
+At intentional foreground triggers — selecting/switching to a BT scale in the device picker, and app startup (and optionally DE1 wake / app resume) — the system MAY attempt a single direct `connectToDevice()` to the saved scale address to connect faster, bounded to approximately 4 seconds. This fast-path SHALL NOT be used for the periodic background reconnect.
+
+#### Scenario: User switches to a BT scale that is present
+- **WHEN** the user selects a saved BT scale from the device picker and the scale is advertising
+- **THEN** the system issues one direct `connectToDevice()` and connects within the bound, without waiting for a full scan cycle
+
+#### Scenario: Foreground direct-connect to an absent scale
+- **WHEN** a foreground direct-connect is attempted but the scale does not connect within ~4 seconds
+- **THEN** the system aborts the attempt and falls back to passive scanning (it does not retry the direct-connect on the background timer)
+
+### Requirement: Direct-connect timeout aborts the controller
+When a scale connect attempt times out, the system SHALL abort it by calling `disconnectFromDevice()` and destroying the `QLowEnergyController`, not merely clearing an in-progress flag. This SHALL apply to every scale attempt still in `Connecting` at the timeout, however it was initiated. A controller still in `Connecting` SHALL request disconnection before it is destroyed.
+
+#### Scenario: Timeout tears down the connecting controller
+- **WHEN** a scale direct-connect attempt reaches its timeout deadline without connecting
+- **THEN** the system closes/deletes the connecting `QLowEnergyController`
+- **AND** no `Connecting` controller for the scale remains pending afterward
+
+#### Scenario: Timeout tears down a scan-initiated connect
+- **WHEN** a scale connect that was started from scan discovery is still in `Connecting` at the connection timeout
+- **THEN** it is torn down on the same terms as a direct-connect
+- **AND** the next retry is able to start a fresh connect rather than being rejected as a duplicate
+
+#### Scenario: Radio is not left to the supervision timeout
+
+- **WHEN** a scale connect attempt times out
+- **THEN** the controller is torn down rather than left for Android's own roughly 30-second supervision timeout
+
+### Requirement: Concurrent connect attempts to the same scale are prevented
+
+The system SHALL NOT have more than one outstanding connect attempt to the same scale at a time. A scan-discovery-triggered connect and a foreground direct-connect SHALL be deduplicated so a second connect is not issued while one is already in progress.
+
+#### Scenario: Scan finds the scale during a direct-connect
+- **WHEN** a foreground direct-connect is in progress and the same scale is also discovered by a scan
+- **THEN** the system does not start a second connect to that scale
+
+### Requirement: DE1 retains sustained direct-connect for sleep-wake
+
+The DE1 SHALL continue to be pursued by direct `connectToDevice()` while disconnected, because a sleeping DE1 does not advertise but remains connectable. This sustained direct-connect applies to the DE1 only and SHALL NOT be applied to scales.
+
+#### Scenario: Sleeping DE1 is reconnected
+- **WHEN** the DE1 is asleep (not advertising) and the DE1 reconnect tick fires
+- **THEN** the system issues a direct `connectToDevice()` to the saved DE1 address to wake and reconnect it
+
+### Requirement: Recovery from a DE1 connect that hangs in Connecting
+If a DE1 connect stays in `Connecting` for a bounded time without connecting or erroring, the system SHALL tear down the attempt (closing and recreating the controller) and continue retrying. Reconnect logic SHALL NOT stop retrying solely because the controller reports `isConnecting()`. Any automatic remedy SHALL report its true outcome, and SHALL NOT report recovery when the state it acted on did not change.
+
+#### Scenario: DE1 connect wedges with no error
+- **WHEN** a DE1 connect attempt remains in `Connecting` past the bounded deadline without connecting or erroring
+- **THEN** the system aborts and recreates the controller and re-attempts the connection
+- **AND** the DE1 reconnect loop does not give up permanently while in this state
+
+#### Scenario: Link recovers without an app restart
+- **WHEN** the DE1 link has wedged after a controller error and subsequent connects hang in `Connecting`
+- **THEN** the recovery path restores the DE1 connection without requiring the user to restart the app
+
+#### Scenario: Adapter power control is unavailable to the app
+- **WHEN** the platform does not permit a non-privileged application to power the Bluetooth adapter off and on
+- **THEN** no adapter power-cycle is attempted, and no time is spent waiting for a state change that cannot occur
+
+#### Scenario: A remedy that did not change anything is not reported as recovery
+- **WHEN** an automatic recovery attempt completes without the state it acted on having changed
+- **THEN** the outcome recorded is that the attempt did not take effect, not that the stack recovered
+
+### Requirement: No adapter power-cycle remedy
+The system SHALL NOT power-cycle the Bluetooth adapter as an automatic remedy on platforms where a non-privileged app cannot control adapter power. There the call has no effect, and the recovery completes through its fallback path, which looks like a real recovery unless the outcome is checked.
+
+#### Scenario: Adapter power is not attempted without control
+
+- **WHEN** the platform denies the app control of adapter power
+- **THEN** no power-cycle is attempted as a recovery step
+
+### Requirement: Retiring the adapter remedy preserves the reconnect-ladder re-arm
+Removing the adapter power-cycle SHALL NOT remove the reconnect-ladder reset that accompanied it. The system SHALL retain an explicit path that, on concluding a recovery attempt while the DE1 is disconnected, resets the DE1 reconnect attempt counter and promptly re-attempts. Retiring the remedy SHALL name the path that now reaches this reset.
+
+#### Scenario: Recovery attempt concludes and the ladder is re-armed
+- **WHEN** an automatic BLE recovery attempt concludes while the DE1 is disconnected
+- **THEN** the DE1 reconnect attempt counter is reset and a reconnect is attempted promptly
+- **AND** the device is not left waiting on the slow retry tier
+
+#### Scenario: Re-arm does not fire against a healthy link
+- **WHEN** a recovery attempt concludes and the DE1 is already connected or connecting
+- **THEN** no reconnect is forced
+
+#### Scenario: The re-arm path is reachable after the remedy is retired
+- **WHEN** the adapter power-cycle no longer runs, so no adapter state transition occurs
+- **THEN** the re-arm still occurs, driven by a path that does not depend on those transitions
+
+#### Scenario: Fast retry tier is kept where the power-cycle was ineffective
+
+- **WHEN** a recovery attempt concludes on a platform where the adapter power-cycle had no effect
+- **THEN** the reconnect ladder is re-armed, so the device stays on the fast retry tier
+
+### Requirement: Peripheral connect ordering is established by GATT serialization, not by a timer
+The system SHALL order a scale or refractometer connect against an in-progress DE1 connect through the GATT serialization guarantee, and SHALL NOT gate it on an elapsed-time cap. This ordering SHALL cover every non-DE1 peripheral and any connect initiated at any time, not only at startup.
+
+#### Scenario: The DE1 connect takes longer than any previously fixed cap
+
+- **WHEN** a DE1 connect and notification subscription take substantially longer than usual
+- **AND** a scale connect is pending during that time
+- **THEN** the scale connect is still ordered behind the DE1's in-flight GATT operations
+- **AND** the DE1's connection setup completes with every required notification stream enabled
+
+#### Scenario: No DE1 is present
+
+- **WHEN** a scale or refractometer connect is requested and no DE1 connect is in progress, or the DE1 connect attempt has terminated in failure
+- **THEN** the connect proceeds without waiting
+- **AND** it does not wait out any fixed interval before starting
+
+#### Scenario: A refractometer connect starts while the DE1 is in use
+
+- **WHEN** a refractometer connect is initiated during a session in which the DE1 is already connected and delivering telemetry
+- **THEN** the refractometer's connect and discovery are ordered against the DE1's GATT traffic
+- **AND** the DE1's telemetry continues uninterrupted
+
+### Requirement: A slow DE1 connect does not indefinitely block other peripherals
+
+The system SHALL ensure that a DE1 connect which never reaches a terminal outcome does not prevent other peripherals from ever connecting. Ordering SHALL be released by the DE1 connect reaching success or failure, including the failure paths the system already detects for a connect that hangs.
+
+#### Scenario: The DE1 connect hangs and is recovered
+
+- **WHEN** a DE1 connect hangs and is aborted by the system's existing recovery for a connect stuck in `Connecting`
+- **THEN** that abort is a terminal outcome for ordering purposes
+- **AND** a pending scale or refractometer connect proceeds
+

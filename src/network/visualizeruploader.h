@@ -1,0 +1,465 @@
+#pragma once
+
+#include <QObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QVector>
+#include <QPointF>
+#include <QElapsedTimer>
+#include <QHash>
+#include <functional>
+
+#include "../history/shotprojection.h"
+#include "../history/shothistory_types.h"
+#include "accountlink.h"
+#include "shotuploaddestination.h"
+
+#include <QtQmlIntegration/qqmlintegration.h>
+class Profile;
+class Settings;
+class DE1Device;
+class ShotHistoryStorage;
+class TranslationManager;
+
+// DYE (Describe Your Espresso) metadata for shot uploads
+struct ShotMetadata {
+    QString beanBrand;
+    QString beanType;
+    QString roastDate;      // ISO format: YYYY-MM-DD
+    QString roastLevel;     // Light, Medium, Dark
+    QString grinderBrand;
+    QString grinderModel;
+    QString grinderBurrs;
+    QString grinderSetting;
+    qint64 equipmentId = 0; // Equipment package (add-equipment-packages); 0 = none
+    qint64 rpm = 0;         // Grinder rpm dial-in; 0 = unset
+    double beanWeight = 0;  // Dose weight in grams
+    // No drinkWeight here on purpose. The yield is a per-shot MEASUREMENT, saved
+    // from saveShot()'s finalWeight argument; uploads read it from the row.
+    // Carrying a second copy in this struct — which is otherwise sticky setup
+    // state that outlives a shot — is what let the previous shot's yield reach
+    // Visualizer. One source only.
+    double drinkTds = 0;
+    double drinkEy = 0;
+    int espressoEnjoyment = 0;  // 0-100
+    QString espressoNotes;
+    QString barista;
+    // Compact-JSON linked-bean snapshot ("" = unlinked, the common free-text
+    // case) — Visualizer canonical or Bean Base sourced. Persisted per shot
+    // so history stays accurate even after the preset is edited or deleted.
+    QString beanBaseJson;
+
+    // Active coffee bag snapshot (bean-bag-inventory): the bag the shot was
+    // pulled with and its freeze lifecycle at shot time. "No bag" sentinel is
+    // bagId <= 0 (default -1) — see bagIdIsSet() in bagid.h. The dates record
+    // the beans' thermal history permanently, even after the bag's defrostDate
+    // moves on to the next portion.
+    qint64 bagId = -1;
+    QString frozenDate;   // ISO yyyy-MM-dd, "" = not frozen
+    QString defrostDate;  // ISO yyyy-MM-dd, "" = not defrosted
+    // Non-frozen storage lifecycle (bean-freshness-followup): the bag's
+    // storage category and opened date at shot time. Local history only —
+    // not part of the Visualizer upload payload.
+    QString storageHint;  // counter/airtight/vacuum-sealed/fridge, "" = unset
+    QString openedDate;   // ISO yyyy-MM-dd, "" = not opened
+
+    // Recipe provenance (add-recipes): the recipe active at shot start
+    // (<= 0 = none) and compact-JSON snapshots of the steam and hot-water specs
+    // in effect, so promote-from-shot round-trips the whole drink. Local history
+    // only — not part of the Visualizer upload payload.
+    qint64 recipeId = -1;
+    QString steamJson;
+    QString hotWaterJson;
+    QString hotWaterResultJson;
+
+    // Yield anchor provenance (add-yield-ratio-anchor): the anchor that
+    // produced the shot's resolved gram target. Local history only — never
+    // part of the Visualizer upload payload (DYE has no such field).
+    QString yieldMode;             // "none" | "absolute" | "ratio"
+    double yieldAnchorValue = 0;   // grams (absolute) or dose multiplier (ratio)
+
+    // The effective flow calibration multiplier in force while the shot was
+    // pulled, latched at shot start (ProfileManager::latchedFlowCalibration()).
+    // Local history only — never part of the Visualizer upload payload, which
+    // has no such field. 0 = not recorded; 1.0 is a real multiplier and must
+    // not stand in for unknown.
+    double flowCalibration = 0;
+};
+
+class VisualizerUploader : public QObject, public ShotUploadDestination {
+    Q_OBJECT
+
+    // Compile-time QML registration, so qmllint, qmlcachegen and the language server can
+    // follow MainController's property through to this class. A runtime qmlRegister* call is
+    // invisible to all three. Full rationale in src/controllers/maincontroller.h.
+    QML_ELEMENT
+    QML_UNCREATABLE("VisualizerUploader is created in C++ and reached via MainController")
+
+    Q_PROPERTY(bool uploading READ isUploading NOTIFY uploadingChanged)
+    Q_PROPERTY(QString lastUploadStatus READ lastUploadStatus NOTIFY lastUploadStatusChanged)
+    Q_PROPERTY(QString lastShotUrl READ lastShotUrl NOTIFY lastShotUrlChanged)
+    Q_PROPERTY(bool connecting READ connecting NOTIFY connectingChanged)
+
+public:
+    explicit VisualizerUploader(QNetworkAccessManager* networkManager, Settings* settings, QObject* parent = nullptr);
+
+    // A request is out, or a ShotUploads send is in progress (reading, sending or waiting to retry).
+    bool isUploading() const { return m_uploading || m_jobShotId != 0; }
+    // True when a queue snapshot was dropped because a pass was already
+    // draining. The caller re-reads the queue on beanRepairFinished when set;
+    // accepting any later snapshot clears it.
+    bool beanRepairMissedWork() const { return m_beanRepairMissedWork; }
+    QString lastUploadStatus() const { return m_lastUploadStatus; }
+    QString lastShotUrl() const { return m_lastShotUrl; }
+
+    void setDevice(DE1Device* device) { m_device = device; }
+    void setStorage(ShotHistoryStorage* storage) { m_storage = storage; }
+
+    // ShotUploadDestination: uploads the saved row, or PATCHes it when the shot
+    // is already on Visualizer.
+    QString name() const override { return QStringLiteral("visualizer"); }
+    bool isActive() const override;
+    bool holdsShot(QSqlDatabase& db, qint64 shotId) const override;
+    QString heldCondition() const override { return QStringLiteral("COALESCE(visualizer_id, '') != ''"); }
+    QString unsentEditCondition() const override { return QStringLiteral("visualizer_dirty != 0"); }
+    void attemptSavedShot(qint64 shotId, Send how) override;
+    // Publishes the send's result: savedShotFinished, and a failure's status.
+    void sendFinished(qint64 shotId, Attempt last) override;
+
+    // Inject the TranslationManager so user-visible upload/status/error strings
+    // localize (mirrors VisualizerImporter). Wired from
+    // MainController::setTranslationManager. Until injected, tr_() returns the
+    // English fallback.
+    void setTranslationManager(TranslationManager* tm) { m_translationManager = tm; }
+
+    // The {"shot": ...} object of that PATCH. Pure, so the field-subset rule is
+    // unit-tested.
+    static QJsonObject buildShotUpdateBody(const ShotProjection& shotData, quint32 fields);
+
+    // An authenticated JSON request to the Visualizer API path (shared with
+    // VisualizerShotSync, which pulls through the same account).
+    QNetworkRequest makeApiJsonRequest(const QString& path) const;
+    // The user-facing message for a failed API reply: the server's own `error`
+    // text when it sent one, which is how a disabled account (403) or the rate
+    // limit (429) explains itself.
+    QString apiErrorMessage(int status, const QByteArray& body, const QString& transportError) const;
+
+    // One request per 4 s, derived from the server's published limits rather
+    // than guessed at: Api::BaseController declares 50/minute per IP, 200/10
+    // minutes per IP and 200/10 minutes per user, so the sustained budget is
+    // 0.33 req/s and the burst budget 0.83. 4 s is 15/min and 150 per 10
+    // minutes, which leaves the 10-minute budget room for ordinary shot uploads:
+    // those share the same limit, so an unpaced background pass can 429 a
+    // user's actual espresso uploads for the rest of the window. Every
+    // background pass (bean repair, VisualizerShotSync) paces by it.
+    static constexpr int kApiRequestIntervalMs = 4000;
+    // Runs `send` at the next free slot of that interval, shared by every
+    // background pass, so two passes together still keep to it, and not before a
+    // 429's wait ends. Dropped if `context` is destroyed first.
+    void paceApiRequest(QObject* context, std::function<void()> send);
+    // How long a 429's wait has left, in ms (0: none). Background requests that are
+    // not paced check it and wait for their next turn instead of sending.
+    qint64 rateLimitWait() const;
+    static constexpr const char* VISUALIZER_BASE_URL = "https://visualizer.coffee";
+    // Upload missing shots is a background pass too.
+    void paceBackground(QObject* context, std::function<void()> send) override { paceApiRequest(context, std::move(send)); }
+
+    // Counts the pushes started for a shot or bag. A pull compares it from
+    // before its read to just before applying: a push in between makes the
+    // read possibly older than Visualizer, so the pull skips that item.
+    quint64 shotPushGeneration(qint64 shotId) const { return m_shotPushGeneration.value(shotId); }
+    quint64 bagPushGeneration(qint64 bagId) const { return m_bagPushGeneration.value(bagId); }
+
+    // Checks the credentials against visualizer.coffee and saves them only if
+    // they work; connecting switches Visualizer on. Answers with
+    // accountConnectFinished.
+    Q_INVOKABLE void connectAccount(const QString& username, const QString& password);
+    Q_INVOKABLE void disconnectAccount();
+    bool connecting() const { return m_connecting; }
+
+    // --- Visualizer Coffee Management sync (bean-bag-inventory) ---
+    // CM state is probed at upload time with a single-field PATCH on our own
+    // just-uploaded shot (spike-verified: 200 = CM on, 400 = param dropped =
+    // CM off; bag CRUD is premium-gated, not CM-gated). Cached per session;
+    // connectAccount() resets it so a toggle on visualizer.coffee converges
+    // on the next upload.
+    enum class CmState { Unknown, Active, NoCoffeeManagement, PremiumNoCm };
+    CmState cmState() const { return m_cmState; }
+    // Whether a bag edit is pushed in this state: only a definitive CM-off
+    // stops it. Unknown pushes: only a bag Coffee Management created has a
+    // visualizerBagId, so the PATCH answers for itself (200 lands, 403 caches
+    // not-premium) instead of waiting for a shot upload to confirm CM.
+    static bool bagEditPushAllowed(CmState state)
+    {
+        return state != CmState::NoCoffeeManagement && state != CmState::PremiumNoCm;
+    }
+    // Shot history DB path — needed to read the uploaded shot's bag row and
+    // persist visualizerBagId/visualizerRoasterId back. Set by MainController.
+    void setLocalDbPath(const QString& dbPath) { m_localDbPath = dbPath; }
+
+    // Push a local bag edit to its already-synced Visualizer bag (PATCH
+    // /api/coffee_bags/:id). No-op when CM is known to be off, or the bag has
+    // no visualizerBagId (an unsynced bag is created later, on its next shot
+    // upload). When the bag has a roaster name, re-resolves the roaster by that
+    // name so a rename re-points roaster_id; with no roaster name it PATCHes the
+    // descriptive fields alone. Caller (MainController) gates on
+    // visualizerActive + upload autoUpdate and only invokes this for Visualizer-stored field
+    // edits (CoffeeBagStorage::bagVisualizerFieldsChanged).
+    Q_INVOKABLE void updateBagOnVisualizer(qint64 localBagId);
+    // Re-push every sync-pending bag: from the upload read-back, and at the end
+    // of each VisualizerShotSync pass so a parked edit reaches Visualizer on a
+    // device that never uploads a shot.
+    void retrySyncPendingBags();
+
+
+    // Repair the shots visualizer.coffee renamed from a borrowed canonical
+    // record. `repairs` is the queue from
+    // ShotHistoryStorage::pendingBeanRepairsReady — the shots whose bag we
+    // unlinked, recorded at that moment, NOT a library-wide comparison.
+    //
+    // Each shot is READ first and only written when the server actually
+    // disagrees; `beanRepairSettled(shotId)` then clears its flag. One request
+    // per kApiRequestIntervalMs (see there — it is derived from the server's
+    // published limits, not chosen); the first 429 or 401 abandons the pass and
+    // the flags keep the remainder for next boot.
+    void repairShotBeans(const QVector<BeanRepair>& repairs);
+
+    // Build a visualizer-compatible JSON payload from a ShotProjection.
+    // Local exporters opt in to the unverified PORTAL extension.
+    // Thread-safe; does not touch instance state. Reused by ShotHistoryExporter.
+    static QByteArray buildHistoryShotJson(const ShotProjection& shotData, bool includePortal = false,
+                                           const QJsonObject& machineState = {});
+
+    // The descriptive-field PATCH body to enrich a server coffee bag: only the
+    // fields we hold locally that the server left blank (fill-blanks, never
+    // clobbering a user-set value). Pure (no network) and public so the
+    // blob→API field mapping and the fill-blanks contract are unit-tested.
+    static QJsonObject buildBagEnrichBody(const QJsonObject& remoteBag, const QVariantMap& bag);
+
+signals:
+    void uploadingChanged();
+    void lastUploadStatusChanged();
+    void lastShotUrlChanged();
+    void uploadSuccess(const QString& shotId, const QString& url);
+    // Like uploadSuccess but carries the originating local shots.id so
+    // MainController can persist the link without a UI page. dbShotId is
+    // 0 when the upload had no associated local row (should not happen
+    // on the normal paths).
+    void uploadSucceededForShot(qint64 dbShotId, const QString& visualizerId, const QString& url);
+    void uploadFailed(const QString& error);
+    // Emitted when an upload attempt is rejected by policy rather than
+    // an actual failure (maintenance profile, too-short shot). Listeners
+    // that track real failure conditions should NOT react to this.
+    void uploadSkipped(const QString& reason);
+    // A send ShotUploads made is over, after its last attempt: an empty error and
+    // skip reason mean it was uploaded, updated, or had nothing to send.
+    void savedShotFinished(qint64 shotId, const QString& error, const QString& skipReason);
+    void accountConnectFinished(AccountLink::Error error);
+    void connectingChanged();
+    // A bag edit-push was rejected by server validation (HTTP 422 — e.g. the
+    // renamed bag collides with an existing roaster+name+roast_date, or the
+    // defrost date precedes the frozen date). Definitive: not retried; local
+    // values stay as edited. Carries the bag's display name (a 422 can fire
+    // from the retry drain long after the edit) and the server's message for
+    // a one-shot non-blocking toast (add-bag-detail-editing).
+    void bagPushRejected(qint64 localBagId, const QString& bagName, const QString& message);
+    // One queued shot needs nothing further — repaired, already correct, or gone
+    // from visualizer.coffee. The caller clears its bean_repair_pending flag.
+    void beanRepairSettled(qint64 shotId);
+    // The bean-repair pass ended. `repaired` counts shots corrected; `complete`
+    // is false when anything was left queued, which only happens on a real
+    // failure — the shots stay flagged and a later boot retries them.
+    void beanRepairFinished(int repaired, bool complete);
+
+private slots:
+    void onUploadFinished(QNetworkReply* reply);
+    void onUpdateFinished(QNetworkReply* reply, const QString& visualizerId);
+
+private:
+    // PATCH `fields` (VisualizerSync::Field bits) of an already-uploaded shot;
+    // false if nothing was sent.
+    bool updateShotOnVisualizer(const QString& visualizerId, const ShotProjection& shotData, quint32 fields);
+    // False if nothing was sent (unreadable or ineligible shot, no account).
+    bool uploadShotFromHistory(const ShotProjection& shotData);
+    // Ends this attempt of the job's send with `outcome` (ShotUploads may retry it).
+    void endAttempt(qint64 shotId, Outcome outcome, int httpStatus = 0);
+    void setUploading(bool uploading);
+    // True when the job's failed attempt is left for sendFinished to announce (ShotUploads may retry it).
+    bool jobAttemptMayRetry(Outcome outcome, const QString& visualizerId = QString()) const;
+    // Clears the fields the running job sent from the shot's unsent edits, if
+    // their seq was read.
+    void clearJobDirty();
+    // Records a failure as the running job's result; a PATCH failure only when it
+    // is the job's own.
+    void noteJobFailure(const QString& message, const QString& visualizerId = QString());
+
+    QByteArray buildMultipartData(const QByteArray& jsonData, const QString& boundary);
+    QString authHeader() const;
+
+    // Translate a user-visible string via the injected TranslationManager,
+    // falling back to the English source when none is set.
+    QString tr_(const char* key, const char* fallback) const;
+
+    static QJsonObject buildAppInfoJson();
+    static QJsonObject buildProfileSettings(const Profile* profile);
+    bool validateUpload(const ShotProjection& shot);
+    void sendUpload(const QByteArray& jsonData);
+
+
+    // Take the next queued shot: GET it, compare against the app's values, and
+    // PATCH only on a real difference. Emits beanRepairFinished when the queue
+    // drains. Serial by construction — one request in flight at a time, spaced
+    // by kApiRequestIntervalMs.
+    void sendNextBeanRepair();
+    void sendBeanRepairPatch(const BeanRepair& repair);
+    // The names-free half of the repair, for a shot whose local bean fields are
+    // incomplete: clears the borrowed canonical link and asserts nothing else.
+    void sendCanonicalClearOnly(const BeanRepair& repair);
+    // Statuses that cannot differ per shot (429, 401) — retrying the queue
+    // against them is guaranteed waste, so the pass stops. 403 is NOT one of
+    // them on the PATCH (it is an ownership verdict there) but IS treated as
+    // one on the GET, which authorizes nothing; see both call sites.
+    static bool isBeanRepairFatalStatus(int status);
+    void abandonBeanRepairPass(int status);
+    void scheduleNextBeanRepair();
+    // Every bean-repair REQUEST is spaced through here — the GET and the PATCH
+    // alike. Pacing only the shot loop let a repaired shot fire two requests
+    // back to back at double the intended rate.
+    void scheduleBeanRepairRequest(std::function<void()> send);
+    // Decide what a queued shot needs, given what the server holds. Pure, so the
+    // rule that governs every write this pass makes is unit-testable without a
+    // network (tst_coffeebags).
+public:
+    enum class BeanRepairAction { AlreadyCorrect, NeedsPatch };
+    static BeanRepairAction decideBeanRepair(const QString& remoteBrand, const QString& remoteType,
+                                             const QString& localBrand, const QString& localType);
+
+    // What a queued shot can actually have done to it, decided from the read
+    // rather than from the local row alone — `remoteHasCoffeeBag` is only
+    // knowable after the GET. Pure, so the rule that decides whether this pass
+    // writes to a user's account at all is unit-testable without a network.
+    enum class BeanRepairPlan {
+        RestoreNames,         // complete local names: compare, and PATCH on a real difference
+        ClearCanonicalOnly,   // no complete names, no server bag: drop the borrowed link
+        NothingToDo,          // no complete names, but a server bag re-derives the link anyway
+    };
+    static BeanRepairPlan planBeanRepair(bool remoteHasCoffeeBag,
+                                         const QString& localBrand, const QString& localType);
+
+    // Whether the shot the server returned has a coffee_bag. Three states, not a
+    // bool: "we could not read the field" must not collapse into "no bag",
+    // because that is the answer that licenses a write.
+    enum class RemoteBagState { Absent, Present, Unreadable };
+    static RemoteBagState remoteCoffeeBagState(const QJsonObject& remote);
+private:
+    QVector<BeanRepair> m_beanRepairQueue;
+    // Split because one number labelled "corrected" was three different account
+    // states: names actually restored, a borrowed link cleared, and shots the
+    // pass declined to touch. A pass reporting 0 told a reader nothing.
+    int m_beanRepairDone = 0;      // names restored and verified
+    int m_beanRepairCleared = 0;   // borrowed canonical link dropped
+    int m_beanRepairDeclined = 0;  // nothing written, by design
+    // Something went wrong and the affected shots stay queued: an unreadable
+    // response, a malformed entry, a failed PATCH. The only reason a pass ends
+    // with work left, so `beanRepairFinished`'s `complete` flag is its negation.
+    bool m_beanRepairFailed = false;
+    // A queue snapshot arrived while a pass was draining and was dropped. The
+    // shots are still flagged, so nothing is lost — but only a re-drain sees
+    // them before the next launch. Deliberately NOT "re-drain whenever a pass
+    // ends": that loops forever if a flag clear fails, since the same shots come
+    // straight back. This is set only by a real dropped snapshot.
+    bool m_beanRepairMissedWork = false;
+    bool m_beanRepairRunning = false;
+
+    // --- Coffee Management sync (bean-bag-inventory) ---
+    // Entry point, called after a successful upload POST. Loads the shot's bag
+    // from the local DB on a background thread, then reconciles it. No-op for
+    // CM-off accounts (cached per session).
+    void syncCoffeeBagAfterUpload(qint64 dbShotId, const QString& visualizerShotId);
+    // Read the shot back to learn the coffee_bag the SERVER auto-linked (it
+    // find-or-creates the bag from bean_brand/bean_type/roast_date on every
+    // upload). An empty coffee_bag_id means CM is off → cache the negative.
+    // Otherwise capture the authoritative ids (self-healing a stale local id)
+    // and enrich. Replaces the old guess/probe/find-or-create chain.
+    void reconcileShotBag(const QString& visualizerShotId, const QVariantMap& bag);
+    // GET the server bag and PATCH only the descriptive fields it left blank
+    // (origin/region/producer/etc. + lifecycle + canonical link). Never touches
+    // server-managed name/roast_date/roast_level, and never clobbers a value the
+    // user set on visualizer.coffee. 404 → bag deleted mid-flight, clear local id.
+    void enrichRemoteBag(const QString& serverBagId, const QVariantMap& bag);
+    // Best-effort verified-roaster badge: link the server-created roaster to its
+    // canonical when blank (the badge is cosmetic, so failures are ignored).
+    void enrichRemoteRoaster(const QString& roasterId, const QString& canonicalRoasterId);
+    // PATCH the shot's canonical_coffee_bag_id (not CM-gated). Canonical-only
+    // mode: attaches a known coffee to a shot with no personal bag.
+    void linkShotCanonical(const QString& visualizerShotId, const QString& canonicalId);
+    // Find-or-create a Visualizer roaster by name; calls onResolved(roasterId)
+    // on success (not called on empty name or HTTP/parse failure). Creates only
+    // while CM is Active; otherwise an unmatched name resolves to "". Carries the
+    // canonical roaster UUID onto a freshly-created roaster for the verified
+    // badge. A 403 on create caches NoCoffeeManagement (CRUD is premium-gated).
+    // Used by the bag-edit path (updateBagOnVisualizer).
+    void resolveRoasterId(const QString& roasterName, const QString& canonicalRoasterId,
+                          std::function<void(const QString& roasterId)> onResolved);
+    // PATCH /api/coffee_bags/:visualizerBagId with the descriptive fields, plus
+    // roaster_id when `roasterId` differs from the bag's stored one (rename).
+    // Persists the new visualizerRoasterId on a roaster change. 403 → not premium
+    // (NoCoffeeManagement); 404 → remote bag deleted, id left stale and re-created
+    // on the next shot upload. The bag-edit counterpart to enrichRemoteBag.
+    void patchRemoteBag(const QVariantMap& bag, const QString& roasterId);
+    void persistBagSyncIds(qint64 localBagId, const QString& visualizerBagId,
+                           const QString& visualizerRoasterId);
+    // Set/clear coffee_bags.visualizer_sync_pending (background write, no
+    // signals). Park-first contract: updateBagOnVisualizer SETS it before any
+    // network I/O; it is CLEARED only by an outcome — patchRemoteBag's reply
+    // (200/403/404/422), nothing left to send, or the not-synced-yet skip. Failures that never produce
+    // a reply (roaster-list GET dying offline, roaster create dropped, bag load
+    // failure) therefore leave it set for the next retry. One deliberate leak: a
+    // roaster-create 403 flips CM off with the flag still set — inert (retry
+    // skips CM-off) and self-draining if premium returns.
+    void persistBagSyncPending(qint64 localBagId, bool pending);
+    // Records the fields a bag push set as what Visualizer now holds.
+    void persistBagSeen(qint64 localBagId, const QVariantMap& sent);
+
+    // Single mutation point for m_cmState — every CM-probe transition flows
+    // through here so there is one place to log old->new. The CM probing is
+    // notoriously fiddly to debug; reads still use m_cmState / cmState()
+    // directly. No-op when the state is unchanged.
+    void setCmState(CmState state);
+
+    Settings* m_settings;
+    QNetworkAccessManager* m_networkManager;
+    DE1Device* m_device = nullptr;
+    TranslationManager* m_translationManager = nullptr;
+    bool m_uploading = false;
+    bool m_connecting = false;
+    QString m_lastUploadStatus;
+    QString m_lastShotUrl;
+    // The local shots.id the in-flight upload is for; emitted with
+    // uploadSucceededForShot. ShotUploads sends one shot at a time.
+    qint64 m_uploadingDbShotId = 0;
+    QString m_uploadingShotTimestamp;
+
+    // Coffee Management sync state (see CmState above).
+    CmState m_cmState = CmState::Unknown;
+    QString m_localDbPath;
+    ShotHistoryStorage* m_storage = nullptr;
+    // The shot ShotUploads is sending, from its first attempt until sendFinished; 0 when idle.
+    qint64 m_jobShotId = 0;
+    Send m_jobHow = Send::UploadOrUpdate;
+    QString m_jobError;
+    QString m_jobSkipReason;
+    // The visualizer id that job is PATCHing.
+    QString m_jobVisualizerId;
+    QHash<qint64, quint64> m_shotPushGeneration;
+    QHash<qint64, quint64> m_bagPushGeneration;
+    QElapsedTimer m_apiPaceClock;
+    qint64 m_nextApiSlotMs = 0;
+    // The fields that job sends, and the shot's visualizer_dirty_seq when it was
+    // read (-1 if unread): a success clears those fields only if no edit landed since.
+    quint32 m_jobFields = 0;
+    qint64 m_jobDirtySeq = -1;
+    // The send already re-uploaded after a PATCH 404 (at most once).
+    bool m_jobRelinked = false;
+
+};

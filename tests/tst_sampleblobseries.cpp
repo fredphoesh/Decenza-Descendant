@@ -1,0 +1,443 @@
+#include <QtTest>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QTemporaryDir>
+
+#include "core/dbutils.h"
+#include "history/shothistorystorage.h"
+#include "history/shothistory_types.h"
+#include "history/shotprojection.h"
+#include "history/shotfileparser.h"
+#include <limits>
+#include "models/shotdatamodel.h"
+#include "network/visualizeruploader.h"
+
+// Guards the mix temperature goal's trip through the sample blob.
+//
+// Shot series are not table columns — they live in a qCompress'd JSON object in
+// shot_samples.data_blob, whose series keys are read back optionally. That is
+// what makes adding a series migration-free, and what makes the "absent key"
+// case real: every shot recorded before this series existed has a blob without
+// it, and must load with an EMPTY vector rather than a defaulted or zeroed one.
+class tst_SampleBlobSeries : public QObject {
+    Q_OBJECT
+
+    QTemporaryDir m_dir;
+
+private:
+    // convertShotRecord() early-returns an empty projection for id == 0, so a
+    // record built by hand needs one or every assertion below passes vacuously.
+    static void giveIdentity(ShotRecord& record) {
+        record.summary.id = 1;
+    }
+
+    // Feed the model a few samples with distinct basket/mix goals. Mirrors
+    // production's saveShot(), which always runs computeConductanceDerivative()
+    // before compressSampleData() — skipping it here would leave the blob's
+    // conductanceDerivative empty, which decompressSampleData's unconditional
+    // recompute would then (correctly) flag as a correction on every test that
+    // reuses this fixture.
+    static void populate(ShotDataModel& model) {
+        for (int i = 0; i < 5; i++) {
+            double t = i * 0.2;
+            model.addSample(t, 9.0, 2.0, 92.0, 90.0, 9.0, 0.0, /*tempGoal*/ 92.0,
+                            /*tempMixGoal*/ 94.0);
+        }
+        model.computeConductanceDerivative();
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+
+    void portalLiveAppendIsIncrementalAndRangeResets() {
+        ShotDataModel model;
+        QSignalSpy points(&model, &ShotDataModel::portalSampleAdded);
+        for (int i = 0; i < 6000; ++i) model.addPortalSample(i * 0.1, i * 0.001 - 1.0, 75.0);
+        QCOMPARE(points.count(), 6000);
+        QCOMPARE(model.portalSampleCount(), 6000);
+        QCOMPARE(model.portalEcMin(), -1.0);
+        QCOMPARE(model.portalEcBounds(model.portalSamplesVariant()),
+                 QVariantList({model.portalEcMin(), model.portalEcMax()}));
+        QVERIFY(model.portalEcMax() > 4.9);
+        QCOMPARE(points.last()[0].toDouble(), 599.9);
+        QVERIFY(points.first()[3].toBool());
+        QVERIFY(!points.last()[3].toBool());
+        model.addPortalSample(599.8, 99.0, 75.0); // invalid ordering must not reach renderer or range
+        QCOMPARE(points.count(), 6000);
+        QVERIFY(model.portalEcMax() < 5.0);
+        model.clear();
+        QCOMPARE(model.portalSampleCount(), 0);
+        QCOMPARE(model.portalEcMin(), 0.0);
+        QCOMPARE(model.portalEcMax(), 0.1);
+        model.addPortalSample(0, 0.5, 25.0);
+        QVERIFY(points.last()[3].toBool());
+    }
+
+    void portalSamplesKeepTimestampsAndGaps() {
+        ShotDataModel model;
+        QSignalSpy changed(&model, &ShotDataModel::portalSamplesChanged);
+        model.addPortalSample(0.15, 0.073, 23.0);
+        model.addPortalSample(0.42, 0.8, 75.0);
+        model.markPortalGap();
+        model.addPortalSample(0.9, 1.2, 82.0);
+        model.addPortalSample(0.8, 5.0, 85.0); // out of order, not a new point
+        model.addPortalSample(1.0, std::numeric_limits<double>::quiet_NaN(), 85.0);
+        model.addPortalSample(1.2, 1.1, 83.0);
+        model.addPortalSample(7.0, 0.1, 40.0); // silent gap also breaks the line
+        QCOMPARE(model.portalSamples().size(), 5);
+        QCOMPARE(model.portalSamples()[1].time, 0.42);
+        QCOMPARE(model.portalSamples()[1].temperatureC, 75.0);
+        QVERIFY(!model.portalSamples()[1].breakBefore);
+        QVERIFY(model.portalSamples()[2].breakBefore);
+        QVERIFY(model.portalSamples()[3].breakBefore);
+        QVERIFY(model.portalSamples()[4].breakBefore);
+        QTRY_VERIFY(changed.count() > 0);
+        const auto samples = model.portalSamplesVariant();
+        QCOMPARE(PortalSamples::toVariant(PortalSamples::fromVariant(samples)), samples);
+        model.clear();
+        QVERIFY(model.portalSamples().isEmpty());
+    }
+
+    void portalSurvivesBlobProjectionExportAndRecordImport() {
+        QVERIFY(m_dir.isValid());
+        const QString path = m_dir.filePath("portal_roundtrip.db");
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(path));
+        ShotDataModel model;
+        populate(model);
+        model.addPortalSample(0.15, 0.073, 23.0);
+        model.addPortalSample(0.42, 0.8, 75.0);
+        model.markPortalGap();
+        model.addPortalSample(1.2, 1.1, 83.0);
+        model.recordWeightSource(QStringLiteral("physical_scale"));
+        model.setPortalMountingMode(QStringLiteral("independent"));
+        ShotRecord record;
+        giveIdentity(record);
+        record.summary.timestamp = 1755000000;
+        record.summary.uuid = "portal-roundtrip-uuid";
+        ShotHistoryStorage::decompressSampleData(storage.compressSampleData(&model), &record);
+        QCOMPARE(PortalSamples::toVariant(record.portalSamples), model.portalSamplesVariant());
+        const auto projection = ShotHistoryStorage::convertShotRecord(record);
+        QCOMPARE(projection.portalSamples, model.portalSamplesVariant());
+        QCOMPARE(ShotProjection::fromVariantMap(projection.toVariantMap()).portalSamples, model.portalSamplesVariant());
+        const QJsonObject exported = QJsonDocument::fromJson(VisualizerUploader::buildHistoryShotJson(projection, true)).object();
+        const auto upload = QJsonDocument::fromJson(VisualizerUploader::buildHistoryShotJson(projection)).object();
+        QVERIFY(!upload.contains("decenza_portal_samples"));
+        QVERIFY(exported.contains("decenza_portal_samples"));
+        // Visualizer's download schema differs from Decenza's v2 file export.
+        // Exercise optional PORTAL decoding with a valid download-shaped fixture;
+        // this does not assert that the remote service retains the extension.
+        const QJsonObject download{{"timeframe", exported["elapsed"]},
+            {"data", QJsonObject{{"espresso_pressure", exported["pressure"].toObject()["pressure"]}}},
+            {"decenza_portal_samples", exported["decenza_portal_samples"]},
+            {"decenza_weight_source", exported["decenza_weight_source"]},
+            {"decenza_portal_mounting_mode", exported["decenza_portal_mounting_mode"]}};
+        auto parsed = ShotFileParser::parseVisualizerShot(download, "", "", record.summary.timestamp);
+        QVERIFY2(parsed.success, qPrintable(parsed.errorMessage));
+        QCOMPARE(PortalSamples::toVariant(parsed.record.portalSamples), model.portalSamplesVariant());
+        // Provenance decides calibration eligibility, so it must survive the file round trip.
+        QCOMPARE(parsed.record.weightSource, QStringLiteral("physical_scale"));
+        QCOMPARE(parsed.record.portalMountingMode, QStringLiteral("independent"));
+        const qint64 id = storage.importShotRecord(parsed.record, false);
+        QVERIFY(id > 0);
+        withTempDb(path, "portal_reload", [&](QSqlDatabase& db) {
+            const auto loaded = ShotHistoryStorage::loadShotRecordStatic(db, id);
+            QCOMPARE(PortalSamples::toVariant(loaded.portalSamples), model.portalSamplesVariant());
+            QCOMPARE(loaded.weightSource, QStringLiteral("physical_scale"));
+            QCOMPARE(loaded.portalMountingMode, QStringLiteral("independent"));
+        });
+        storage.close();
+        QTRY_VERIFY(storage.isDbWorkIdle());
+    }
+
+    void legacyAndMalformedPortalDataDoNotCreateZeroCurves() {
+        ShotDataModel model;
+        populate(model);
+        ShotHistoryStorage storage;
+        ShotRecord record;
+        giveIdentity(record);
+        ShotHistoryStorage::decompressSampleData(storage.compressSampleData(&model), &record);
+        QVERIFY(record.portalSamples.isEmpty());
+        const auto projection = ShotHistoryStorage::convertShotRecord(record);
+        QVERIFY(!projection.toVariantMap().contains("portalSamples"));
+        QVERIFY(!QJsonDocument::fromJson(VisualizerUploader::buildHistoryShotJson(projection)).object().contains("decenza_portal_samples"));
+        QVariantList invalid{QVariantMap{{"time", 0.0}, {"ecRaw", 0.1}},
+            QVariantMap{{"time", -1.0}, {"ecRaw", 0.1}, {"temperatureC", 23.0}}};
+        QVERIFY(PortalSamples::fromVariant(invalid).isEmpty());
+        invalid.append(QVariantMap{{"time", 0.5}, {"ecRaw", 0.073}, {"temperatureC", 23.0}});
+        const auto valid = PortalSamples::fromVariant(invalid);
+        QCOMPARE(valid.size(), 1);
+        QVERIFY(valid.first().breakBefore);
+        QCOMPARE(valid.first().ecRaw, 0.073);
+    }
+
+    // The live graph's goal lists drop mid-run points; the recorded goal data must not.
+    void goalDisplayListsDropOnlyMidRunPoints() {
+        ShotDataModel model;
+        const double tempGoals[] = {92, 92, 92, 92, 88, 88};
+        for (int i = 0; i < 6; ++i)
+            model.addSample(i * 0.2, 9.0, 2.0, 92.0, 90.0, 9.0, 0.0, tempGoals[i], 94.0);
+
+        const QVariantList shown = model.temperatureGoalPointsVariant();
+        QList<QPointF> pts;
+        for (const QVariant& v : shown) pts.append(v.toPointF());
+        // First and last of each run survive, so the step and the live end are both drawn.
+        QCOMPARE(pts, (QList<QPointF>{{0.0, 92}, {0.6, 92}, {0.8, 88}, {1.0, 88}}));
+        QCOMPARE(model.temperatureGoalData().size(), 6);
+
+        // Pressure segments split at a flow-mode stretch share one list, with a NaN point
+        // between them so the series breaks the line there.
+        ShotDataModel segmented;
+        const double pressureGoals[] = {6, 6, 0, 0, 8, 8};
+        const bool flowMode[] = {false, false, true, true, false, false};
+        for (int i = 0; i < 6; ++i)
+            segmented.addSample(i * 0.2, 9.0, 2.0, 92.0, 90.0, pressureGoals[i], flowMode[i] ? 2.0 : 0.0,
+                                92.0, 94.0, -1, flowMode[i]);
+        QList<QPointF> seg;
+        for (const QVariant& v : segmented.pressureGoalPointsVariant()) seg.append(v.toPointF());
+        QCOMPARE(seg.size(), 5);
+        QVERIFY(qIsNaN(seg[2].x()) && qIsNaN(seg[2].y()));
+        QCOMPARE(seg.mid(0, 2), (QList<QPointF>{{0.0, 6}, {0.2, 6}}));
+        QCOMPARE(seg.mid(3), (QList<QPointF>{{0.8, 8}, {1.0, 8}}));
+    }
+
+    void mixGoalRoundTripsThroughBlob() {
+        ShotHistoryStorage storage;
+        ShotDataModel model;
+        populate(model);
+
+        QByteArray blob = storage.compressSampleData(&model);
+        ShotRecord record;
+        ShotHistoryStorage::decompressSampleData(blob, &record);
+
+        QCOMPARE(record.temperatureMixGoal.size(), model.temperatureMixGoalData().size());
+        QVERIFY(!record.temperatureMixGoal.isEmpty());
+        QVERIFY(qAbs(record.temperatureMixGoal.first().y() - 94.0) < 0.01);
+        // The basket goal must survive alongside it, not be displaced by it.
+        QVERIFY(qAbs(record.temperatureGoal.first().y() - 92.0) < 0.01);
+    }
+
+    // A shot saved before this series existed: same blob shape, minus the key.
+    void blobWithoutMixGoalKeyLoadsEmpty() {
+        ShotHistoryStorage storage;
+        ShotDataModel model;
+        populate(model);
+
+        QByteArray blob = storage.compressSampleData(&model);
+        QJsonObject root = QJsonDocument::fromJson(qUncompress(blob)).object();
+        root.remove("temperatureMixGoal");
+        QByteArray legacyBlob = qCompress(QJsonDocument(root).toJson(QJsonDocument::Compact), 9);
+
+        ShotRecord record;
+        ShotHistoryStorage::decompressSampleData(legacyBlob, &record);
+
+        // Empty means "not recorded" — never a zero-filled series, which would
+        // upload a 0 °C goal line and draw one on the graph.
+        QVERIFY(record.temperatureMixGoal.isEmpty());
+        // Every other series must still load.
+        QVERIFY(!record.temperatureGoal.isEmpty());
+        QVERIFY(!record.pressure.isEmpty());
+    }
+
+    // recompute-shot-curves-on-load (#1822): resistance was briefly computed as
+    // P/F² instead of P/F (44bd47b6..a6a58c21), so shots recorded in that window
+    // have a stored resistance curve identical to darcyResistance forever. Pin
+    // that decompressSampleData recomputes from pressure/flow instead of
+    // trusting the stored formula, and reports a corrected blob when it differs.
+    void staleResistanceFormulaGetsCorrectedOnLoad() {
+        ShotHistoryStorage storage;
+        ShotDataModel model;
+        populate(model);  // constant pressure 9.0, flow 2.0 -> correct P/F resistance = 4.5
+
+        QByteArray blob = storage.compressSampleData(&model);
+        QJsonObject root = QJsonDocument::fromJson(qUncompress(blob)).object();
+
+        // Overwrite the stored resistance with what the P/F² bug would have
+        // produced (9.0 / 2.0² = 2.25), same shape ({t: [...], v: [...]}) as
+        // every other series in the blob.
+        QJsonObject staleResistance;
+        staleResistance["t"] = root["pressure"].toObject()["t"];
+        QJsonArray staleValues;
+        const qsizetype n = root["pressure"].toObject()["t"].toArray().size();
+        for (qsizetype i = 0; i < n; i++) staleValues.append(9.0 / (2.0 * 2.0));
+        staleResistance["v"] = staleValues;
+        root["resistance"] = staleResistance;
+        QByteArray staleBlob = qCompress(QJsonDocument(root).toJson(QJsonDocument::Compact), 9);
+
+        ShotRecord record;
+        QByteArray corrected;
+        ShotHistoryStorage::decompressSampleData(staleBlob, &record, &corrected);
+
+        QVERIFY(!record.resistance.isEmpty());
+        QVERIFY2(qAbs(record.resistance.first().y() - 4.5) < 0.01,
+                 "resistance must be recomputed as P/F (4.5), not trusted as the stale P/F² value (2.25)");
+        QVERIFY2(!corrected.isEmpty(), "a stale stored curve must produce a corrected blob to persist");
+    }
+
+    // The counterpart to the above: a shot whose stored curves already match
+    // the current formula must NOT report a correction on every load — that
+    // would rewrite shot_samples.data_blob on every single view.
+    void alreadyCorrectBlobProducesNoCorrection() {
+        ShotHistoryStorage storage;
+        ShotDataModel model;
+        populate(model);
+
+        QByteArray blob = storage.compressSampleData(&model);
+        ShotRecord record;
+        QByteArray corrected;
+        ShotHistoryStorage::decompressSampleData(blob, &record, &corrected);
+
+        QVERIFY2(corrected.isEmpty(), "an already-correct blob must not be flagged for rewrite");
+    }
+
+    // The DB-backed counterpart: loadShotRecordStatic must persist the
+    // corrected blob back to shot_samples on the same connection (mirroring
+    // the existing badge-persist behavior), exactly once — loading the same
+    // shot again afterward must not keep rewriting an already-corrected row.
+    void staleResistancePersistsCorrectedBlobOnceViaLoadShotRecordStatic() {
+        QVERIFY(m_dir.isValid());
+        const QString path = m_dir.filePath("resistance_selfheal.db");
+        ShotHistoryStorage storage;
+        QVERIFY(storage.initialize(path));
+
+        ShotRecord record;
+        record.summary.uuid = QStringLiteral("resistance-selfheal-uuid");
+        record.summary.timestamp = 1755000000;
+        record.summary.profileName = QStringLiteral("Profile R");
+        record.summary.beverageType = QStringLiteral("espresso");
+        // Correct P/F resistance for constant pressure=9.0, flow=2.0 is 4.5;
+        // store the P/F² value (2.25) instead, simulating the formula bug
+        // that shipped between 44bd47b6 and a6a58c21.
+        for (int i = 0; i < 5; i++) {
+            double t = i * 0.2;
+            record.pressure.append(QPointF(t, 9.0));
+            record.flow.append(QPointF(t, 2.0));
+            record.resistance.append(QPointF(t, 9.0 / (2.0 * 2.0)));
+        }
+
+        const qint64 shotId = storage.importShotRecord(record, false);
+        QVERIFY2(shotId > 0, "import should insert");
+
+        auto readBlob = [&]() {
+            QByteArray blob;
+            withTempDb(path, "shs_test_resistance_read", [&](QSqlDatabase& db) {
+                QSqlQuery q(db);
+                q.prepare(QStringLiteral("SELECT data_blob FROM shot_samples WHERE shot_id = ?"));
+                q.bindValue(0, shotId);
+                if (q.exec() && q.next()) blob = q.value(0).toByteArray();
+            });
+            return blob;
+        };
+
+        const QByteArray blobBefore = readBlob();
+        QVERIFY(!blobBefore.isEmpty());
+
+        auto readUpdatedAt = [&]() {
+            qint64 updatedAt = -1;
+            withTempDb(path, "shs_test_resistance_updated_at", [&](QSqlDatabase& db) {
+                QSqlQuery q(db);
+                q.prepare(QStringLiteral("SELECT updated_at FROM shots WHERE id = ?"));
+                q.bindValue(0, shotId);
+                if (q.exec() && q.next()) updatedAt = q.value(0).toLongLong();
+            });
+            return updatedAt;
+        };
+
+        // Rewind updated_at into the past first — importShotRecord's INSERT
+        // defaults it to "now", and strftime('%s','now') only has 1-second
+        // resolution, so without this the self-heal's own bump could land in
+        // the same second and the "did it increase" assertion below would
+        // pass even if the bump never ran.
+        withTempDb(path, "shs_test_resistance_rewind", [&](QSqlDatabase& db) {
+            QSqlQuery q(db);
+            q.prepare(QStringLiteral("UPDATE shots SET updated_at = updated_at - 1000 WHERE id = ?"));
+            q.bindValue(0, shotId);
+            QVERIFY(q.exec());
+        });
+        const qint64 updatedAtBefore = readUpdatedAt();
+        QVERIFY(updatedAtBefore > 0);
+
+        withTempDb(path, "shs_test_resistance_load", [&](QSqlDatabase& db) {
+            ShotRecord loaded = ShotHistoryStorage::loadShotRecordStatic(db, shotId);
+            QVERIFY(!loaded.resistance.isEmpty());
+            QVERIFY2(qAbs(loaded.resistance.first().y() - 4.5) < 0.01,
+                     "loaded resistance must be the corrected P/F value, not the stale stored P/F^2");
+        });
+
+        const QByteArray blobAfter = readBlob();
+        QVERIFY2(blobBefore != blobAfter, "a stale stored curve must trigger a persisted correction");
+        // The self-heal write must also bump shots.updated_at (same reason the
+        // sibling badge-persist UPDATE does) — otherwise ShotHistoryExporter's
+        // exportedFileIsFresh() never notices the shot changed and keeps
+        // serving a stale pre-fix export forever.
+        const qint64 updatedAtAfter = readUpdatedAt();
+        QVERIFY2(updatedAtAfter > updatedAtBefore,
+                 "curve self-heal must bump shots.updated_at");
+
+        // Loading the now-corrected shot again must not keep rewriting it —
+        // neither the blob nor updated_at.
+        withTempDb(path, "shs_test_resistance_reload", [&](QSqlDatabase& db) {
+            ShotHistoryStorage::loadShotRecordStatic(db, shotId);
+        });
+        QCOMPARE(readBlob(), blobAfter);
+        QCOMPARE(readUpdatedAt(), updatedAtAfter);
+
+        // Drains on the real condition (isDbWorkIdle) rather than a fixed sleep —
+        // see tests/shotrowfixtures.h's initAndCloseStorage, which this mirrors.
+        storage.close();
+        QTRY_VERIFY(storage.isDbWorkIdle());
+    }
+
+    // The seam between the blob and the upload/chart surfaces. Without this,
+    // dropping the one convertShotRecord() line leaves every other test green
+    // while no stored shot ever uploads mix_goal and no detail page plots it —
+    // and every upload is built from the stored shot.
+    void mixGoalSurvivesRecordToProjectionToJson() {
+        ShotHistoryStorage storage;
+        ShotDataModel model;
+        populate(model);
+
+        ShotRecord record;
+        giveIdentity(record);
+        ShotHistoryStorage::decompressSampleData(storage.compressSampleData(&model), &record);
+        ShotProjection p = ShotHistoryStorage::convertShotRecord(record);
+
+        QVERIFY(!p.temperatureMixGoal.isEmpty());
+
+        QJsonObject temp = QJsonDocument::fromJson(VisualizerUploader::buildHistoryShotJson(p))
+                               .object()["temperature"].toObject();
+        QVERIFY(temp.contains("mix_goal"));
+    }
+
+    // Same seam for a shot recorded before the series existed: absence has to
+    // survive the whole chain too, or old shots upload a 0 °C goal line.
+    void legacyShotStaysAbsentThroughProjectionToJson() {
+        ShotHistoryStorage storage;
+        ShotDataModel model;
+        populate(model);
+
+        QJsonObject root = QJsonDocument::fromJson(qUncompress(storage.compressSampleData(&model))).object();
+        root.remove("temperatureMixGoal");
+
+        ShotRecord record;
+        giveIdentity(record);
+        ShotHistoryStorage::decompressSampleData(
+            qCompress(QJsonDocument(root).toJson(QJsonDocument::Compact), 9), &record);
+        ShotProjection p = ShotHistoryStorage::convertShotRecord(record);
+
+        QVERIFY(p.temperatureMixGoal.isEmpty());
+        // The conversion ran for real — otherwise the assertion above would
+        // hold for an empty projection and prove nothing.
+        QVERIFY(!p.temperatureGoal.isEmpty());
+
+        QJsonObject temp = QJsonDocument::fromJson(VisualizerUploader::buildHistoryShotJson(p))
+                               .object()["temperature"].toObject();
+        QVERIFY(!temp.contains("mix_goal"));
+    }
+};
+
+QTEST_MAIN(tst_SampleBlobSeries)
+#include "tst_sampleblobseries.moc"

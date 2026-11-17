@@ -1,0 +1,527 @@
+// Dispatch for every layout-widget action string, and the context-filtered Shot History
+// filters that some of them build.
+//
+// This lives in a singleton rather than in CustomItem because it now has TWO kinds of
+// caller: the Custom widget, and the ten built-in action widgets whose gestures a user can
+// override (layout-widget-gesture-overrides). Those built-ins render two ways — compiled to
+// CustomItem in the center/action zones, and as their own items/<Type>Item.qml elsewhere —
+// and the second kind cannot reach a function that lives on CustomItem. Copying the
+// dispatch into them was the alternative, and a copied 170-line switch is the drift shape
+// this codebase keeps paying for.
+//
+// `ctx` carries what the dispatch cannot look up for itself: `idlePage`, needed by
+// togglePreset to find the preset row. Callers that have no IdlePage ancestor pass nothing
+// and togglePreset warns, exactly as before.
+pragma Singleton
+
+import QtQuick
+import Decenza
+
+QtObject {
+    id: layoutActions
+
+    // ONE prefix for every diagnostic from this dispatch. It was written by hand
+    // at eleven sites in two families — "CustomItem: " and "[CustomItem] " — so
+    // no single grep returned the widget's story from a submitted log, which is
+    // how these are actually read (docs/CLAUDE_MD/LOGGING.md). Now that built-in
+    // widgets dispatch through here too, the prefix names the SUBSYSTEM rather
+    // than one widget.
+    function _warn(msg) {
+        WebDebugLogger.warn("App", "LayoutActions", ["" + msg].map(String).join(" "))
+    }
+
+    // --- Context-filtered Shot History filters (custom-widget-history-actions).
+    // Each returns the props object AppShell.shotHistoryRequested expects: an
+    // `initialFilter` map, or `null` when there is nothing active to filter on.
+    //
+    // `null`, NOT `{}`, and the difference is load-bearing. An empty props object
+    // reaching the already-showing path reads as "show everything" and CLEARS the
+    // filter and the search text the user typed — so a button meant to narrow
+    // would wipe their work. `null` means "no context"; goToShotHistory() leaves a
+    // visible list alone and only opens unfiltered History on the push path, where
+    // there is no state to lose.
+    //
+    // Recipe and bag match on an ID, so a rename cannot orphan the filter and
+    // two records sharing a name stay distinct; their names ride along under
+    // recipeName/bagLabel, which ShotHistoryPage uses for the banner label ONLY
+    // and never as a query term. Bean has no such id on a shot row (shots store
+    // bean_brand/bean_type as text), so it matches those two strings — which is
+    // also what makes it the wider of the two coffee filters: the same coffee
+    // across every bag of it, where the bag filter is one bag.
+    //
+    // Each warns when it finds no context. Every other unresolvable case in
+    // executeActionString() warns; these were the only silent arms, and "the
+    // button did nothing" is exactly the report that needs a log line behind it.
+    function _recipeHistoryFilter() {
+        var id = RecipeService.activeRecipeId
+        if (!(id > 0)) {
+            _warn("historyRecipe with no active recipe")
+            return null
+        }
+        var name = ""
+        for (let i = 0; i < RecipeService.recipes.length; ++i) {
+            if (RecipeService.recipes[i].id === id) {
+                name = RecipeService.recipes[i].name || ""
+                break
+            }
+        }
+        return { initialFilter: { recipeId: id, recipeName: name } }
+    }
+
+    function _beanHistoryFilter() {
+        var f = {}
+        // Omit rather than send "" — ShotHistoryPage drops empty fields anyway,
+        // and omitting keeps a brand-only bean filtering on the brand.
+        if (RecipeContext.preferences.dyeBeanBrand) f.beanBrand = RecipeContext.preferences.dyeBeanBrand
+        if (RecipeContext.preferences.dyeBeanType) f.beanType = RecipeContext.preferences.dyeBeanType
+        if (Object.keys(f).length === 0) {
+            _warn("historyBean with no bean selected")
+            return null
+        }
+        return { initialFilter: f }
+    }
+
+    function _bagHistoryFilter() {
+        var id = BagService.activeBagId
+        if (!(id > 0)) {
+            _warn("historyBag with no active bag")
+            return null
+        }
+        var label = RecipeContext.preferences.dyeBeanType || RecipeContext.preferences.dyeBeanBrand || ""
+        return { initialFilter: { bagId: id, bagLabel: label } }
+    }
+
+    function _profileHistoryFilter() {
+        // currentProfileTitle, NOT currentProfileName: the latter is a DISPLAY
+        // string that becomes "*Londinium" (or "Londinium (modified)" for a
+        // read-only profile) as soon as the profile is edited, while shots store
+        // the bare title. Filtering on the decorated form matched nothing and
+        // showed an empty list under a "Filtered:" banner — indistinguishable
+        // from "you have never pulled this profile".
+        var title = ProfileService.currentProfileSummary.title || ""
+        if (title === "") {
+            _warn("historyProfile with no profile loaded")
+            return null
+        }
+        return { initialFilter: { profileName: title } }
+    }
+
+    // The ONE place a built-in action widget asks "has the user overridden this
+    // gesture?" (layout-widget-gesture-overrides). Returns true when an override ran,
+    // so the caller's default is skipped:
+    //
+    //     onAccessibleLongPressed: if (!LayoutActions.runGesture(modelData, "longPressAction", ctx)) root.goToBeanInfo()
+    //
+    // Ten widgets need this, in two render formats, and a hand-written
+    // "check override, else default" in each is exactly the copy that drifts. An
+    // absent or empty override returns false, which is what keeps every untouched
+    // widget behaving exactly as it did.
+    // The action list BOTH editors offer, filtered to a page context. It lived in
+    // CustomEditorPopup; the built-in widgets' options popup needs exactly the same
+    // list, and a second copy of "read the catalog, filter by context, translate" is
+    // the drift this catalog was centralized to end.
+    // `excludeSubmenu` drops actions that need a second selection step to complete
+    // (`command:loadProfile:<file>`). A surface without that sub-picker must not offer
+    // them: it would store the bare id, which the dispatch then rejects — the same
+    // exclusion the web editor makes, for the same reason.
+    function pickerActions(pageContext, excludeSubmenu) {
+        var ctx = pageContext || "idle"
+        var out = []
+        var catalog = LayoutService.layoutActionCatalog()
+        // An empty catalog means the C++ table did not reach QML at all. The picker
+        // would render as a lone "None" row, which reads like a context restriction
+        // rather than a fault — say so instead of showing nothing.
+        if (!catalog || catalog.length === 0) {
+            _warn("layoutActionCatalog() returned nothing; the action picker will be empty")
+            return out
+        }
+        for (let i = 0; i < catalog.length; ++i) {
+            let a = catalog[i]
+            if (a.contexts.indexOf(ctx) < 0 && a.contexts.indexOf("all") < 0)
+                continue
+            if (excludeSubmenu && a.expandsToSubmenu)
+                continue
+            // Reading TranslationManager.translate (a Q_PROPERTY holding a callable)
+            // establishes the dependency, so these labels re-resolve on a language change.
+            let label = TranslationManager.translate(a.labelKey, a.label)
+            // Marked in the catalog, not matched by id here: an id comparison on the far
+            // side of the C++/QML boundary goes stale in silence if the id is renamed,
+            // taking with it the only cue that this row opens a second list.
+            if (a.expandsToSubmenu)
+                label += "..."
+            out.push({ id: a.id, label: label, contexts: a.contexts })
+        }
+        return out
+    }
+
+    // Same list with the leading "None" entry the pickers show. "None" is the absence
+    // of an action, which is why it is not in the catalog.
+    // `defaultLabel`, when non-empty, adds a restore-the-default row ABOVE "None"
+    // and NAMES what it restores ("Default (opens Bean Info)") — "Default" alone
+    // does not tell the user what they are going back to, and going back is the
+    // thing they most need to be able to do confidently.
+    //
+    // Only passed where unset and "nothing" actually differ: a widget that
+    // reserves a destination opens a page when unset. Everywhere else unset
+    // already means nothing happens, and two rows with one effect is worse than
+    // one honest row.
+    function pickerItems(pageContext, excludeSubmenu, defaultLabel) {
+        var items = []
+        if (defaultLabel)
+            items.push({ id: "", label: defaultLabel })
+        items.push({ id: defaultLabel ? layoutActions.kNoAction : "",
+                     label: TranslationManager.translate("customeditor.action.none", "None") })
+        var filtered = pickerActions(pageContext, excludeSubmenu)
+        for (let i = 0; i < filtered.length; i++)
+            items.push(filtered[i])
+        return items
+    }
+
+    // What TalkBack/VoiceOver says after the widget's name when a gesture carries an
+    // override. Action labels stay generic: a stored action string ("navigate:settings")
+    // has no human-readable label at this point.
+    //
+    // Lives here rather than on CustomItem for the reason the dispatch does — every
+    // built-in action widget needs the same sentence, and the dedicated items cannot
+    // reach a property on CustomItem. Three of them announced nothing at all, which
+    // matters most to the users who cannot see the widget: AccessibleTapHandler
+    // disables double-tap detection in accessibility mode, so long press is the ONLY
+    // secondary gesture a screen-reader user has.
+    // A stored kNoAction is an explicit silence, so it announces nothing: promising a
+    // secondary action that deliberately does nothing is worse than promising none.
+    // CustomItem's own hint used to count it as an action; this is that fix too.
+    function gestureHint(modelData) {
+        var lp = modelData ? modelData.longPressAction : ""
+        var dc = modelData ? modelData.doubleclickAction : ""
+        var hasLP = !!lp && lp !== layoutActions.kNoAction
+        var hasDC = !!dc && dc !== layoutActions.kNoAction
+        if (hasLP && hasDC)
+            return TranslationManager.translate("customitem.accessible.hint.both", "Long-press or double-tap for additional actions.")
+        if (hasLP)
+            return TranslationManager.translate("customitem.accessible.hint.longpress", "Long-press for additional action.")
+        if (hasDC)
+            return TranslationManager.translate("customitem.accessible.hint.doubletap", "Double-tap for additional action.")
+        return ""
+    }
+
+    // Explicitly "do nothing on this gesture" — DISTINCT from unset. Unset ("")
+    // means "whatever this widget does by default", which on most action widgets
+    // is opening its page. A user who wants the gesture silenced needs a way to
+    // say so that is not the same value as "I haven't chosen".
+    readonly property string kNoAction: "none"
+
+    function runGesture(modelData, gestureKey, ctx) {
+        if (!modelData) return false
+        var stored = modelData[gestureKey]
+        if (!stored) return false
+        // Consumed, not dispatched: returning true is what stops
+        // runGestureOrReserved falling through to the reserved destination.
+        if (stored === layoutActions.kNoAction) return true
+        execute(stored, ctx)
+        return true
+    }
+
+    // Whether the gesture resolves to an action, by the same rule as runGestureOrReserved.
+    // supportDoubleClick binds to it: double-tap detection holds every single tap for the
+    // double-click interval (300 ms), which a widget whose double-tap does nothing should
+    // not pay (#1976). A type absent from the reserved table (history, settings, a custom
+    // widget) has no default, so only a stored action counts.
+    function hasGesture(modelData, gestureKey) {
+        if (!modelData) return false
+        var stored = modelData[gestureKey]
+        if (stored)
+            return stored !== layoutActions.kNoAction
+        return LayoutService.gestureReservedActionForType(modelData.type || "") !== ""
+    }
+
+    // What a gesture does, all in: the user's override if they set one, otherwise the
+    // widget type's RESERVED destination — the action that keeps its page reachable.
+    //
+    // The reserved destination is read from the C++ table and nowhere else. It used to be
+    // stated three times for every widget — in the compiled tile's longPressAction, in the
+    // dedicated item's goToX(), and in gestureReservedDestination() — three copies free to
+    // drift, with nothing failing if they did. Now the C++ table is the only declaration
+    // and both render formats resolve through here.
+    function runGestureOrReserved(modelData, gestureKey, ctx) {
+        if (runGesture(modelData, gestureKey, ctx))
+            return
+        var reserved = LayoutService.gestureReservedActionForType(modelData.type || "")
+        if (reserved)
+            execute(reserved, ctx)
+    }
+
+    // A Sleep widget's per-instance option (allowQuit / confirmQuit / showIcon), or the C++
+    // default when the instance has not set it.
+    function sleepOption(modelData, key) {
+        if (modelData && modelData[key] !== undefined)
+            return modelData[key]
+        return LayoutService.sleepOptionDefaults()[key]
+    }
+
+    // The same Home control sleeps an awake machine and wakes one in Sleep.
+    // Keeping the state check and command together makes compact and compiled
+    // Sleep widgets follow the host's shared machine state identically.
+    function machineIsAsleep() {
+        return MachineState.phase === MachineState.Phase.Sleep
+    }
+
+    function sleepButtonAction() {
+        return machineIsAsleep() ? "command:wake" : "command:sleep"
+    }
+
+    function sleepButtonLabel() {
+        return machineIsAsleep()
+            ? TranslationManager.translate("idle.button.wake", "Wake")
+            : TranslationManager.translate("idle.button.sleep", "Sleep")
+    }
+
+    // What holding a Sleep widget does, in both its compact and centre-tile forms.
+    function sleepLongPressAction(modelData) {
+        if (!sleepOption(modelData, "allowQuit"))
+            return ""
+        return sleepOption(modelData, "confirmQuit") ? "command:quitConfirm" : "command:quit"
+    }
+
+    // The CustomItem modelData an action-button type compiles to in a centre zone, or
+    // null for a type that is not compiled. Shared by LayoutItemDelegate and the
+    // library card's preview. `tileFill` is the fill the caller's surface draws tiles in.
+    function compiledTile(type, modelData, tileFill) {
+        switch (type) {
+            case "espresso": return {
+                emoji: "qrc:/icons/profile.svg",
+                content: TranslationManager.translate("idle.button.profiles", "Profiles"),
+                action: "togglePreset:espresso",
+                backgroundColor: HomePresetActions.selectedFavoriteIndex === -1 ? Theme.highlightColor : tileFill
+            }
+            case "steam": return {
+                emoji: "qrc:/icons/steam.svg",
+                content: TranslationManager.translate("idle.button.steam", "Steam"),
+                action: "togglePreset:steam",
+                backgroundColor: tileFill
+            }
+            case "hotwater": return {
+                emoji: "qrc:/icons/water.svg",
+                content: TranslationManager.translate("idle.button.hotwater", "Hot Water"),
+                action: "togglePreset:hotwater",
+                backgroundColor: tileFill
+            }
+            case "flush": return {
+                emoji: "qrc:/icons/flush.svg",
+                content: TranslationManager.translate("idle.button.flush", "Flush"),
+                action: "togglePreset:flush",
+                backgroundColor: tileFill
+            }
+            case "beans": return {
+                emoji: "qrc:/icons/coffeebeans.svg",
+                content: TranslationManager.translate("idle.button.beaninfo", "Beans"),
+                action: "togglePreset:beans",
+                backgroundColor: BagService.activeBagId <= 0 ? Theme.highlightColor : tileFill
+            }
+            case "recipes": return {
+                emoji: "qrc:/icons/espresso.svg",
+                content: TranslationManager.translate("idle.button.recipes", "Recipes"),
+                action: "togglePreset:recipes",
+                backgroundColor: tileFill
+            }
+            case "equipment": return {
+                emoji: "qrc:/icons/grind.svg",
+                content: TranslationManager.translate("idle.button.equipment", "Equipment"),
+                action: "togglePreset:equipment",
+                backgroundColor: tileFill
+            }
+            case "history": return {
+                emoji: "qrc:/icons/history.svg",
+                content: TranslationManager.translate("idle.button.history", "History"),
+                action: "navigate:history",
+                longPressAction: "",
+                doubleclickAction: "",
+                backgroundColor: tileFill
+            }
+            case "settings": return {
+                emoji: "qrc:/icons/settings.svg",
+                content: TranslationManager.translate("idle.button.settings", "Settings"),
+                action: "navigate:settings",
+                longPressAction: "",
+                doubleclickAction: "",
+                backgroundColor: tileFill
+            }
+            case "autofavorites": return {
+                emoji: "qrc:/icons/star.svg",
+                content: TranslationManager.translate("idle.button.autofavorites", "Favorites"),
+                action: "navigate:autofavorites",
+                longPressAction: "",
+                doubleclickAction: "",
+                backgroundColor: tileFill
+            }
+            case "sleep": return {
+                emoji: sleepOption(modelData, "showIcon") ? "qrc:/icons/sleep.svg" : "",
+                content: sleepButtonLabel(),
+                action: sleepButtonAction(),
+                longPressAction: sleepLongPressAction(modelData),
+                doubleclickAction: "",
+                backgroundColor: "#555555"
+            }
+            case "quit": return {
+                emoji: "qrc:/icons/quit.svg",
+                content: TranslationManager.translate("idle.button.quit", "Quit"),
+                action: "command:quit",
+                longPressAction: "",
+                doubleclickAction: "",
+                backgroundColor: "#555555"
+            }
+            default: return null
+        }
+    }
+
+    function execute(actionStr, ctx) {
+        if (!actionStr) return
+        var parts = actionStr.split(":")
+        if (parts.length < 2) {
+            _warn("malformed action '" + actionStr + "' (expected 'category:target')")
+            return
+        }
+        var category = parts[0]
+        var target = parts.slice(1).join(":")
+
+        if (category === "togglePreset") {
+            let p = ctx && ctx.idlePage ? ctx.idlePage : null
+            if (p && typeof p.togglePresetFunction === "function") {
+                p.togglePresetFunction(target)
+            } else {
+                _warn("togglePreset couldn't find IdlePage ancestor; preset '" + target + "' not toggled")
+            }
+        } else if (category === "navigate") {
+            // `target` is USER CONFIGURATION — the widget editor stores whichever destination the
+            // user picked — so a string key is inherent here, unlike the call sites that had one
+            // only because nobody had declared a name. It is dispatched to a named AppShell signal
+            // rather than mapped to a page FILENAME: a bad key now warns below instead of
+            // resolving to a 404 URL, and the shell decides how the page is entered.
+            switch (target) {
+            case "settings":        AppShell.settingsRequested(""); break
+            case "history":         AppShell.shotHistoryRequested({}); break
+            // Context-filtered History (custom-widget-history-actions). Each
+            // resolves its filter HERE, from live state, so the widget stores
+            // only the action id and follows whatever is active now — a layout
+            // exported to another device filters by that device's beans. A
+            // helper returns null when there is no context; see the note on
+            // them for why that is not the same as {}.
+            case "historyRecipe":   AppShell.shotHistoryRequested(_recipeHistoryFilter()); break
+            case "historyBean":     AppShell.shotHistoryRequested(_beanHistoryFilter()); break
+            case "historyBag":      AppShell.shotHistoryRequested(_bagHistoryFilter()); break
+            case "historyProfile":  AppShell.shotHistoryRequested(_profileHistoryFilter()); break
+            case "profiles":        AppShell.profileSelectorRequested(); break
+            case "profileEditor":   AppShell.profileEditorRequested(); break
+            case "dflowEditor":         AppShell.dflowEditorRequested(); break
+            case "recipeList":      AppShell.recipesRequested(); break
+            case "descaling":       AppShell.descalingRequested(); break
+            case "ai":              AppShell.aiSettingsRequested(); break
+            case "visualizer":      AppShell.visualizerBrowserRequested(); break
+            case "autofavorites":   AppShell.autoFavoritesRequested(); break
+            case "steam":           AppShell.steamRequested(); break
+            case "hotwater":        AppShell.hotWaterRequested(); break
+            case "flush":           AppShell.flushRequested(); break
+            case "beaninfo":        AppShell.beanInfoRequested(); break
+            case "equipment":       AppShell.equipmentRequested(); break
+            case "espresso":        AppShell.espressoRequested(); break
+            case "flowCalibration": AppShell.flowCalibrationRequested(); break
+            case "profileImport":   AppShell.profileImportRequested(); break
+            case "shotReview": {
+                let shotId = HistoryService.lastSavedShotId
+                if (shotId > 0)
+                    AppShell.postShotReviewRequested(shotId, false)
+                break
+            }
+            default:
+                _warn("unknown or retired navigate target '" + target
+                      + "'; reassign this widget's action in the Custom widget editor")
+            }
+        } else if (category === "command") {
+            // The hardware Group Head Controller (GHC), when present and active, takes
+            // exclusive control of starting shots/steam/etc., so on-screen start calls
+            // are only valid in headless (no/inactive GHC) or simulation mode.
+            let canStart = typeof DE1Device !== "undefined" && DE1Device !== null
+                    && DE1Device.guiEnabled
+                    && (DE1Device.isHeadless || DE1Device.simulationMode)
+            switch (target) {
+                case "sleep":
+                    HomePresetActions.sleepMachine()
+                    break
+                case "wake":
+                    HomePresetActions.wakeMachine()
+                    break
+                case "startEspresso":
+                    if (canStart)
+                        HomePresetActions.startEspresso()
+                    break
+                case "startSteam":
+                    if (canStart)
+                        HomePresetActions.startSteam()
+                    break
+                case "startHotWater":
+                    if (canStart)
+                        HomePresetActions.startHotWater()
+                    break
+                case "startFlush":
+                    if (canStart)
+                        HomePresetActions.startFlush()
+                    break
+                case "idle":
+                    HomePresetActions.requestIdle()
+                    break
+                case "tare":
+                    if (SteamService.ready)
+                        SteamService.request("tare", {}, SteamService.state.controlContextId)
+                    break
+                case "scanDE1":
+                case "scanScale":
+                    HomePresetActions.scanForDevices()
+                    break
+                case "brewSettings":
+                    AppShell.brewSettingsRequested()
+                    break
+                case "toggleCharging":
+                    HomePresetActions.toggleCharging()
+                    break
+                case "tempToggleSteam":
+                    HomePresetActions.toggleSteamHeater()
+                    break
+                case "uploadVisualizer": {
+                    // Every active destination; a shot already uploaded is updated.
+                    let lastId = HistoryService.lastSavedShotId
+                    if (lastId > 0) {
+                        ShotReviewActions.uploadShot(lastId)
+                    } else {
+                        _warn("uploadVisualizer — no saved shot this session, nothing to upload")
+                    }
+                    break
+                }
+                case "disconnectDE1":
+                    HomePresetActions.disconnectMachine()
+                    break
+                case "previousProfile":
+                    HomePresetActions.loadPreviousProfile()
+                    break
+                case "quit":
+                    AppShell.immediateQuitRequested()
+                    break
+                case "quitConfirm":
+                    AppShell.quitRequested()
+                    break
+                default:
+                    // Handle parameterized commands like loadProfile:<name>
+                    if (target.indexOf("loadProfile:") === 0) {
+                        let profileName = target.substring("loadProfile:".length)
+                        if (profileName)
+                            HomePresetActions.loadProfile(profileName)
+                        else
+                            _warn("loadProfile command with empty profile name")
+                    } else {
+                        _warn("unknown command '" + target + "'")
+                    }
+                    break
+            }
+        } else {
+            _warn("unknown action category '" + category + "' in '" + actionStr + "'")
+        }
+    }
+}

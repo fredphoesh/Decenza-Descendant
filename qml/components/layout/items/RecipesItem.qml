@@ -1,0 +1,318 @@
+// `layer.effect` declares an inline component, so this file's ids are not statically
+// resolvable inside it without this pragma. No delegate in this file takes an injected
+// model role, so no `required property` is needed -- see ThemedIcon.qml for the same case.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import QtQuick.Effects
+import QtQuick.Window
+import Decenza
+import "../PillFit.js" as PillFit
+
+// Recipes quick-switch (add-recipes): structural mirror of BeansItem. Tap
+// toggles a pill row that pages through the recipe list, as many as fit in two
+// rows per page (descriptive-recipe-names; MRU-ordered); a pill tap
+// activates the recipe (profile + bag + equipment + dose/yield/temp + the
+// recipe's own grind + steam, via RecipeService's single activation path). Double-tap
+// or long-press opens the Recipes management page; with zero recipes a plain
+// tap goes straight there. MRU replaces any favorite flag.
+LayoutWidgetItem {
+    id: root
+
+    // `Window` is an ATTACHED property: it resolves against the current scope, so it is read here
+    // on the item itself rather than as `root.appWindow` from inside the popup below. That
+    // spelling works at runtime but is an attached lookup through an id, which qmllint cannot see
+    // — it reports `Member "Window" not found on type "RecipesItem"`. Reading it once also removes the
+    // duplicate lookups.
+    readonly property var appWindow: Window.window
+
+    property var idlePage: {
+        var p = root.parent
+        while (p) {
+            if (p.objectName === "idlePage") return p
+            p = p.parent
+        }
+        return null
+    }
+
+    // The host-owned action controller serves both regular and compact preset rows.
+    function tryStartRecipe(recipe) {
+        if (recipe)
+            HomePresetActions.tapRecipe(recipe.id)
+    }
+
+    // The full MRU-ordered non-archived recipe list (inventoryReady is MRU-ordered);
+    // the popup pages through it so each page occupies at most two rows (see the
+    // live-fit block below). The full list also lives on the Recipes page.
+    property var inventoryRecipes: []
+    property int recipePageIndex: 0
+    // Set while the close-time re-request is in flight — see onInventoryReady.
+    property bool _recipeOrderLiftPending: false
+
+    // Live two-row fit (descriptive-recipe-names): the longer bean+type+profile
+    // names made a fixed "5 per page" spill past two rows, so instead pack the
+    // MRU list into pages that each occupy AT MOST TWO ROWS at the pill row's
+    // real available width. The per-page count varies with name length and from
+    // page to page. Widths are measured with metrics that MIRROR PresetPillRow's
+    // pill metrics (font 16 bold, icon 20+6, padding 40, spacing 12) — keep in
+    // sync with PresetPillRow.qml / PillFit.js. Only the width formula is
+    // mirrored; the available width comes from the row's real effectiveMaxWidth,
+    // less the ring allowance the row itself reserves (PresetPillRow.ringOutset).
+    readonly property real _pillFitAvail: recipesPillRow ? recipesPillRow.effectiveMaxWidth - 2 * recipesPillRow.ringOutset : Theme.scaled(600)
+    // FontMetrics.advanceWidth() (not a mutated TextMetrics.text/.width) so
+    // measuring inside a reactive binding doesn't self-trigger a binding loop.
+    FontMetrics { id: recipePillMetrics; font.pixelSize: Theme.scaled(16); font.bold: true }
+    function _recipePillWidths() {
+        var out = []
+        for (let i = 0; i < inventoryRecipes.length; ++i)
+            // Recipe pills always carry a drink-type icon → always add its width.
+            out.push(recipePillMetrics.advanceWidth(inventoryRecipes[i].name || "")
+                     + Theme.scaled(20) + Theme.scaled(6) + Theme.scaled(40))
+        return out
+    }
+    readonly property var _recipePageSizes: {
+        var widths = _recipePillWidths()
+        var sizes = PillFit.packPageSizes(widths, Theme.scaled(12), _pillFitAvail, 2)
+        if (sizes.length <= 1)
+            return sizes
+        // Paginating → arrows appear → repack against the width minus the
+        // symmetric arrow gutters (matches PresetPillRow.pillsAvailableWidth).
+        return PillFit.packPageSizes(widths, Theme.scaled(12),
+                                     Math.max(0, _pillFitAvail - 2 * Theme.scaled(48)), 2)
+    }
+    readonly property int recipePageCount: Math.max(1, _recipePageSizes.length)
+    readonly property var visibleRecipes: {
+        if (inventoryRecipes.length === 0)
+            return []
+        var idx = Math.max(0, Math.min(recipePageIndex, _recipePageSizes.length - 1))
+        var start = 0
+        for (let p = 0; p < idx; ++p)
+            start += _recipePageSizes[p]
+        return inventoryRecipes.slice(start, start + (_recipePageSizes[idx] || 0))
+    }
+
+    Component.onCompleted: RecipeService.requestInventory()
+
+    Connections {
+        target: RecipeService
+        function onInventoryReady(recipes) {
+            // While the popup is open, hold the order the user is looking at —
+            // activating a recipe bumps last_used and a re-sort would move the
+            // pills mid-tap (#1673). Lifted on close (see presetPopup.onClosed);
+            // that lift wins even if the popup is already open again, because a
+            // fast close→reopen can beat the async inventory reply.
+            const freeze = presetPopup.visible && !root._recipeOrderLiftPending
+            root._recipeOrderLiftPending = false
+            root.inventoryRecipes = freeze
+                ? PillFit.keepOrder(root.inventoryRecipes, recipes, "id")
+                : recipes
+            root.recipePageIndex = Math.max(0, Math.min(root.recipePageIndex, root.recipePageCount - 1))
+        }
+        function onRecipesChanged() {
+            RecipeService.requestInventory()
+        }
+    }
+
+    // Highlight while this mode is selected on the home screen, or — in
+    // compact mode, where tapping opens presetPopup — while the popup is open.
+    readonly property bool isActive:
+        (idlePage ? idlePage.activePresetFunction : "") === "recipes" || presetPopup.visible
+
+    implicitWidth: compactContent.implicitWidth
+    implicitHeight: compactContent.implicitHeight
+
+    function togglePresets() {
+        if (root.inventoryRecipes.length === 0) {
+            goToRecipes()
+        } else if (root.isCompact) {
+            if (!presetPopup.visible && !HomePresetActions.selectPreparationMode("espresso"))
+                return
+            presetPopup.visible ? presetPopup.close() : presetPopup.open()
+        } else if (root.idlePage) {
+            root.idlePage.togglePresetFunction("recipes")
+        }
+    }
+
+    function goToRecipes() {
+            AppShell.recipesRequested()
+    }
+
+    // --- COMPACT MODE ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: compactRow.implicitWidth + Theme.scaled(16)
+        implicitHeight: Theme.bottomBarHeight
+
+        RowLayout {
+            id: compactRow
+            anchors.centerIn: parent
+            spacing: Theme.spacingSmall
+
+            Image {
+                source: "qrc:/icons/espresso.svg"
+                sourceSize.height: Theme.scaled(20)
+                fillMode: Image.PreserveAspectFit
+                Accessible.ignored: true
+                layer.enabled: true
+                layer.smooth: true
+                layer.effect: MultiEffect {
+                    colorization: 1.0
+                    colorizationColor: root.isActive ? Theme.accentColor : Theme.textColor
+                }
+            }
+            Tr {
+                key: "idle.button.recipes"
+                fallback: "Recipes"
+                font: Theme.bodyFont
+                color: root.isActive ? Theme.accentColor : Theme.textColor
+                Accessible.ignored: true
+            }
+        }
+
+        AccessibleTapHandler {
+            anchors.fill: parent
+            supportLongPress: true
+            supportDoubleClick: LayoutActions.hasGesture(root.modelData, "doubleclickAction")
+            accessibleName: TranslationManager.translate("idle.button.recipes", "Recipes")
+                            + (root.isActive ? ", " + TranslationManager.translate("accessibility.selected", "selected") : "")
+            accessibleDescription: TranslationManager.translate("idle.accessible.recipes.hint", "Tap to toggle recipe pills. Double-tap or long-press for the recipe list.")
+            onAccessibleClicked: root.togglePresets()
+            onAccessibleDoubleClicked: LayoutActions.runGestureOrReserved(root.modelData, "doubleclickAction", { idlePage: root.idlePage })
+            onAccessibleLongPressed: LayoutActions.runGestureOrReserved(root.modelData, "longPressAction", { idlePage: root.idlePage })
+        }
+    }
+
+    // --- RECIPE PILL POPUP ---
+    // Dialog (not Popup) so TalkBack can trap focus inside the pill list —
+    // same reasoning as BeansItem's bag pill popup.
+    DecenzaDialog {
+        id: presetPopup
+        modal: true
+        dim: false
+        header: null
+        footer: null
+        padding: Theme.spacingMedium
+        closePolicy: Popup.CloseOnPressOutside
+
+        // Announce the list for screen-reader users (feature parity with the
+        // full-mode path, which announces via IdlePage).
+        onAboutToShow: root.recipePageIndex = 0  // Always open on the most-recent five.
+
+        onClosed: {
+            if (root.idlePage) root.idlePage.releasePanelClearance()
+            // Lift the order freeze held while open (#1673) — this request comes
+            // back in true MRU order, so the next open shows the fresh order.
+            root._recipeOrderLiftPending = true
+            RecipeService.requestInventory()
+        }
+        onOpened: {
+            if (root.idlePage) {
+                let rootTopInPage = root.mapToItem(root.idlePage, 0, 0).y
+                root.idlePage.requestPanelClearance(rootTopInPage + presetPopup.y, presetPopup.height)
+            }
+            if (typeof AccessibilityManager === "undefined" || AccessibilityManager === null || !AccessibilityManager.enabled) return
+            var recipes = root.visibleRecipes
+            if (recipes.length === 0) return
+            var names = []
+            var selectedName = ""
+            for (let i = 0; i < recipes.length; ++i) {
+                names.push(recipes[i].name)
+                if (recipes[i].id === MachineControlService.selectedRecipeId) selectedName = recipes[i].name
+            }
+            var announcement = recipes.length + " " + TranslationManager.translate("idle.accessible.recipes", "recipes") + ": " + names.join(", ")
+            if (selectedName !== "") {
+                announcement += ". " + selectedName + " " + TranslationManager.translate("idle.accessible.isSelected", "is selected")
+            }
+            AccessibilityManager.announce(announcement)
+        }
+
+        width: {
+            var win = root.appWindow
+            var w = Theme.scaled(600) + 2 * padding
+            return win ? Math.min(w, win.width) : w
+        }
+
+        y: {
+            var _v = visible // Force re-evaluation when popup opens (mapToItem is not reactive)
+            var win = root.appWindow
+            if (win) {
+                let globalY = root.mapToItem(null, 0, 0).y
+                let spaceBelow = win.height - globalY - root.height - Theme.spacingSmall
+                let spaceAbove = globalY - Theme.spacingSmall
+                if (height > spaceBelow && spaceAbove > spaceBelow)
+                    return -height - Theme.spacingSmall
+            }
+            return parent.height + Theme.spacingSmall
+        }
+
+        x: {
+            var _v = visible // Force re-evaluation when popup opens (mapToItem is not reactive)
+            var win = root.appWindow
+            if (win) {
+                let globalX = root.mapToItem(null, 0, 0).x
+                let centered = -width / 2 + parent.width / 2
+                if (globalX + centered + width > win.width)
+                    centered = win.width - globalX - width
+                if (globalX + centered < 0)
+                    centered = -globalX
+                return centered
+            }
+            return -width / 2 + parent.width / 2
+        }
+
+        background: Rectangle {
+            // With the glass chrome on, float the pills directly (matching
+            // the center inline preset rows) instead of showing a panel; keep the
+            // opaque surface panel when the glass chrome is off.
+            readonly property bool hasGlassChrome: Theme.glassChrome
+            color: hasGlassChrome ? "transparent" : Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.color: Theme.borderColor
+            border.width: hasGlassChrome ? 0 : 1
+        }
+
+        contentItem: PresetPillRow {
+            id: recipesPillRow
+            maxWidth: Theme.scaled(600)
+            // Drink-type icon per pill (add-recipe-wizard-tea): the stored
+            // drinkType, with a block-derived fallback for legacy rows (the
+            // DrinkType singleton — no profile lookup). A stale recipe (its
+            // linked bag finished) dims but still activates.
+            presets: root.visibleRecipes.map(function(r) {
+                return { name: r.name,
+                         icon: DrinkType.icon(DrinkType.fromRecipeMap(r)),
+                         dimmed: r.stale === true,
+                         stateHint: r.stale === true ? TranslationManager.translate(
+                             "recipes.pill.bagFinished", "bag finished") : "" }
+            })
+            selectedIndex: {
+                var list = root.visibleRecipes
+                for (let i = 0; i < list.length; ++i) {
+                    if (list[i].id === MachineControlService.selectedRecipeId) return i
+                }
+                return -1
+            }
+
+            pageCount: root.recipePageCount
+            pageIndex: root.recipePageIndex
+            prevPageAccessibleName: TranslationManager.translate("idle.pagination.previousRecipes", "Previous recipes")
+            nextPageAccessibleName: TranslationManager.translate("idle.pagination.nextRecipes", "Next recipes")
+            onPageChangeRequested: function(delta) {
+                root.recipePageIndex = Math.max(0, Math.min(root.recipePageIndex + delta, root.recipePageCount - 1))
+            }
+
+            onPresetSelected: function(index) {
+                var recipe = root.visibleRecipes[index]
+                if (!recipe) return
+                // First tap selects (activates); tapping the selected recipe
+                // again starts the shot — same as the regular-layout pill row.
+                root.tryStartRecipe(recipe)
+                presetPopup.close()
+            }
+        }
+    }
+}

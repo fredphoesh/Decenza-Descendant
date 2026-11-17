@@ -1,0 +1,315 @@
+#include "remote/profileimportservicesource.h"
+#include "profile/profileimporter.h"
+#include "remote/importservicesource.h"
+#include "remote/filebundlepolicy.h"
+#include "history/shotimporter.h"
+
+#include <QDir>
+#include <QFile>
+#include <QSignalSpy>
+#include <QQmlEngine>
+#include <QRemoteObjectHost>
+#include <QRemoteObjectNode>
+#include <QtTest>
+
+#include "remote/profileimportservice_qml.h"
+#include "rep_profileimportservice_source.h"
+
+class TestProfileImportStateSource final : public ProfileImportStateSimpleSource
+{
+    Q_OBJECT
+public:
+    using ProfileImportStateSimpleSource::setReady;
+    int calls = 0;
+    void refresh() override {}
+    void execute(QString requestId, QString operation, QVariantMap) override
+    {
+        ++calls;
+        emit operationCompleted(requestId, operation, true, {}, {});
+    }
+};
+
+class tst_profileimportservicesource final : public QObject
+{
+    Q_OBJECT
+private slots:
+    void initTestCase() { QTest::failOnWarning(); }
+
+    void refreshDoesNotStartAnUnrequestedScan()
+    {
+        ProfileImporter importer(nullptr, nullptr);
+        NativeProfileImportServiceSource source(&importer, nullptr);
+        QSignalSpy scanSpy(&importer, &ProfileImporter::scanComplete);
+        source.refresh();
+        QCOMPARE(scanSpy.size(), 0);
+        QVERIFY(!importer.isScanning());
+        QVERIFY(!source.ready());
+    }
+
+    void facadeReportsNotReadyUntilHostSnapshotIsReady()
+    {
+        TestProfileImportStateSource source;
+        QRemoteObjectHost host;
+        QRemoteObjectNode node;
+        QQmlEngine engine;
+        QVERIFY(host.setHostUrl(QUrl(QStringLiteral("tcp://127.0.0.1:0"))));
+        QVERIFY(host.enableRemoting<ProfileImportStateSourceAPI>(&source));
+        QVERIFY(node.connectToNode(host.hostUrl()));
+        ProfileImportService::setPublishedNode(&node);
+        auto* service = ProfileImportServiceForeign::create(&engine, &engine);
+        QTRY_VERIFY(!service->ready());
+        QVERIFY(service->execute(QStringLiteral("scanProfiles")).isEmpty());
+        QCOMPARE(source.calls, 0);
+        source.setReady(true);
+        QTRY_VERIFY(service->ready());
+        const QString id = service->execute(QStringLiteral("scanProfiles"));
+        QVERIFY(!id.isEmpty());
+        QTRY_COMPARE(source.calls, 1);
+        ProfileImportService::setPublishedNode(nullptr);
+    }
+
+    void cancelDuplicateCompletesOriginalRequestAndClearsOwner()
+    {
+        ProfileImporter importer(nullptr, nullptr);
+        NativeImportServiceSource transfer(nullptr, nullptr, nullptr);
+        NativeProfileImportServiceSource source(&importer, &transfer);
+        QSignalSpy completed(&source, &ProfileImportStateSimpleSource::operationCompleted);
+
+        QVERIFY(source.m_requests.begin(QStringLiteral("request-1"))
+                == ServiceRequestIds::Start::Accepted);
+        source.m_activeId = QStringLiteral("request-1");
+        source.m_activeOperation = QStringLiteral("importProfile");
+        source.m_duplicateId = QStringLiteral("request-1");
+        source.execute(QStringLiteral("request-1"), QStringLiteral("cancelImport"), {});
+
+        QCOMPARE(completed.size(), 1);
+        const QList<QVariant> values = completed.takeFirst();
+        QCOMPARE(values.at(0).toString(), QStringLiteral("request-1"));
+        QCOMPARE(values.at(1).toString(), QStringLiteral("importProfile"));
+        QCOMPARE(values.at(2).toBool(), false);
+        QCOMPARE(values.at(4).toString(), QStringLiteral("cancelled"));
+        QVERIFY(source.m_activeId.isEmpty());
+        QVERIFY(source.m_activeOperation.isEmpty());
+        QVERIFY(source.m_duplicateId.isEmpty());
+        QCOMPARE(source.m_requests.pendingCount(), qsizetype(0));
+    }
+
+    void batchCompletionCannotBeClaimedBySingleItemSignal()
+    {
+        ProfileImporter importer(nullptr, nullptr);
+        NativeImportServiceSource transfer(nullptr, nullptr, nullptr);
+        NativeProfileImportServiceSource source(&importer, &transfer);
+        QSignalSpy completed(&source, &ProfileImportStateSimpleSource::operationCompleted);
+
+        QVERIFY(source.m_requests.begin(QStringLiteral("batch-1"))
+                == ServiceRequestIds::Start::Accepted);
+        source.m_activeId = QStringLiteral("batch-1");
+        source.m_activeOperation = QStringLiteral("importAllNew");
+
+        emit importer.importSuccess(QStringLiteral("unrelated single import"));
+        QCOMPARE(completed.size(), 0);
+        QCOMPARE(source.m_activeId, QStringLiteral("batch-1"));
+
+        emit importer.batchImportComplete(2, 1, 0);
+        QCOMPARE(completed.size(), 1);
+        const QList<QVariant> values = completed.takeFirst();
+        QCOMPARE(values.at(0).toString(), QStringLiteral("batch-1"));
+        QCOMPARE(values.at(1).toString(), QStringLiteral("importAllNew"));
+        QCOMPARE(values.at(2).toBool(), true);
+        QCOMPARE(values.at(3).toMap().value(QStringLiteral("imported")).toInt(), 2);
+        QVERIFY(source.m_activeId.isEmpty());
+    }
+
+    void invalidDuplicateResolutionKeepsDraftRequestPending()
+    {
+        ProfileImporter importer(nullptr, nullptr);
+        NativeImportServiceSource transfer(nullptr, nullptr, nullptr);
+        NativeProfileImportServiceSource source(&importer, &transfer);
+        QSignalSpy rejected(&source, &ProfileImportStateSimpleSource::requestRejected);
+        QSignalSpy completed(&source, &ProfileImportStateSimpleSource::operationCompleted);
+
+        QVERIFY(source.m_requests.begin(QStringLiteral("duplicate-1"))
+                == ServiceRequestIds::Start::Accepted);
+        source.m_activeId = QStringLiteral("duplicate-1");
+        source.m_activeOperation = QStringLiteral("importProfile");
+        source.m_duplicateId = QStringLiteral("duplicate-1");
+        source.execute(QStringLiteral("duplicate-1"), QStringLiteral("saveWithNewName"),
+                       {{QStringLiteral("name"), QString(121, QLatin1Char('x'))}});
+
+        QCOMPARE(rejected.size(), 1);
+        QCOMPARE(rejected.at(0).at(0).toString(), QStringLiteral("duplicate-1"));
+        QCOMPARE(rejected.at(0).at(1).toString(), QStringLiteral("saveWithNewName"));
+        QCOMPARE(rejected.at(0).at(2).toString(), QStringLiteral("invalidName"));
+        QCOMPARE(completed.size(), 0);
+        QCOMPARE(source.m_requests.pendingCount(), qsizetype(1));
+        QCOMPARE(source.m_duplicateId, QStringLiteral("duplicate-1"));
+    }
+
+    void languageTransferRejectsMultipleWrongTypeAndOversizedFiles()
+    {
+        ShotImporter shots(nullptr);
+        ProfileImporter profiles(nullptr, nullptr);
+        NativeImportServiceSource transfer(&shots, nullptr);
+        // Exercise byte transfer independently of DE1-app directory discovery.
+        transfer.m_profiles = &profiles;
+        QSignalSpy completed(&transfer, &ImportStateSimpleSource::operationCompleted);
+        const QVariantMap json{{QStringLiteral("name"), QStringLiteral("translations.json")},
+                               {QStringLiteral("size"), 2}};
+        QVariantMap large = json;
+        large.insert(QStringLiteral("size"), FileBundlePolicy::MaximumLanguageJsonBytes + 1);
+        QVariantMap wrongType = json;
+        wrongType.insert(QStringLiteral("name"), QStringLiteral("translations.zip"));
+        QVariantMap wrongSize = json;
+        wrongSize.insert(QStringLiteral("size"), QStringLiteral("2"));
+        const QList<QVariantList> invalidSelections{{json, json}, {large}, {wrongType}, {wrongSize}};
+        for (qsizetype i = 0; i < invalidSelections.size(); ++i) {
+            transfer.execute(QStringLiteral("language-invalid-%1").arg(i), QStringLiteral("beginTransfer"),
+                {{QStringLiteral("kind"), QStringLiteral("languageJson")},
+                 {QStringLiteral("files"), invalidSelections.at(i)}});
+            QCOMPARE(completed.size(), i + 1);
+            QVERIFY(!completed.last().at(2).toBool());
+        }
+    }
+
+    void languageTransferMustBeCompleteBeforeItsSingleUseHostHandoff()
+    {
+        ShotImporter shots(nullptr);
+        ProfileImporter profiles(nullptr, nullptr);
+        NativeImportServiceSource transfer(&shots, nullptr);
+        transfer.m_profiles = &profiles;
+        QSignalSpy completed(&transfer, &ImportStateSimpleSource::operationCompleted);
+        transfer.execute(QStringLiteral("language-begin"), QStringLiteral("beginTransfer"),
+            {{QStringLiteral("kind"), QStringLiteral("languageJson")},
+             {QStringLiteral("files"), QVariantList{QVariantMap{
+                {QStringLiteral("name"), QStringLiteral("translations.json")},
+                {QStringLiteral("size"), 2}}}}});
+        QCOMPARE(completed.size(), 1);
+        QVERIFY(completed.last().at(2).toBool());
+        const QString id = completed.last().at(3).toMap().value(QStringLiteral("transferId")).toString();
+        QVERIFY(!id.isEmpty());
+        QVERIFY(!transfer.takeCompletedTransfer(id, QStringLiteral("languageJson")));
+        transfer.execute(QStringLiteral("language-incomplete"), QStringLiteral("commitTransfer"),
+                         {{QStringLiteral("transferId"), id}});
+        QCOMPARE(completed.last().at(4).toString(), QStringLiteral("incompleteTransfer"));
+        transfer.execute(QStringLiteral("language-append"), QStringLiteral("appendTransferChunk"),
+            {{QStringLiteral("transferId"), id}, {QStringLiteral("fileIndex"), 0},
+             {QStringLiteral("offset"), 0}, {QStringLiteral("data"), QByteArrayLiteral("{}")}});
+        QVERIFY(completed.last().at(2).toBool());
+        transfer.execute(QStringLiteral("language-commit"), QStringLiteral("commitTransfer"),
+                         {{QStringLiteral("transferId"), id}});
+        QVERIFY(completed.last().at(2).toBool());
+        QVERIFY(!transfer.takeCompletedTransfer(id, QStringLiteral("profileFiles")));
+        auto directory = transfer.takeCompletedTransfer(id, QStringLiteral("languageJson"));
+        QVERIFY(directory && directory->isValid());
+        const QStringList names = QDir(directory->path()).entryList(QDir::Files);
+        QCOMPARE(names.size(), 1);
+        QFile file(directory->filePath(names.first()));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(file.readAll(), QByteArrayLiteral("{}"));
+        QVERIFY(!transfer.takeCompletedTransfer(id, QStringLiteral("languageJson")));
+    }
+
+    void cancelledBeginCannotLeaveOrRemoveAnotherTransfer()
+    {
+        ShotImporter shots(nullptr);
+        ProfileImporter profiles(nullptr, nullptr);
+        NativeImportServiceSource transfer(&shots, nullptr);
+        transfer.m_profiles = &profiles;
+        QSignalSpy completed(&transfer, &ImportStateSimpleSource::operationCompleted);
+        const auto begin = [&](const QString& request) {
+            transfer.execute(request, QStringLiteral("beginTransfer"),
+                {{QStringLiteral("kind"), QStringLiteral("backupArchive")},
+                 {QStringLiteral("files"), QVariantList{QVariantMap{
+                     {QStringLiteral("name"), QStringLiteral("backup.zip")},
+                     {QStringLiteral("size"), 2}}}}});
+            QVERIFY(completed.last().at(2).toBool());
+        };
+        const auto cancel = [&](const QString& request, const QString& beginId) {
+            transfer.execute(request, QStringLiteral("cancelTransfer"),
+                {{QStringLiteral("requestId"), beginId}});
+        };
+        begin(QStringLiteral("begin-old"));
+        QVERIFY(transfer.m_transfer);
+        const QString oldTicket = transfer.m_transfer->id;
+        cancel(QStringLiteral("wrong-cancel"), QStringLiteral("another-begin"));
+        QVERIFY(transfer.m_transfer);
+        QCOMPARE(transfer.m_transfer->id, oldTicket);
+        cancel(QStringLiteral("cancel-old"), QStringLiteral("begin-old"));
+        QVERIFY(!transfer.m_transfer);
+        begin(QStringLiteral("begin-new"));
+        const QString newTicket = transfer.m_transfer->id;
+        QVERIFY(newTicket != oldTicket);
+        cancel(QStringLiteral("late-old-cancel"), QStringLiteral("begin-old"));
+        QVERIFY(transfer.m_transfer);
+        QCOMPARE(transfer.m_transfer->id, newTicket);
+        cancel(QStringLiteral("cancel-new"), QStringLiteral("begin-new"));
+        QVERIFY(!transfer.m_transfer);
+    }
+
+    void hostConsumerUploadsRetainOnlyCompleteSingleUseFiles_data()
+    {
+        QTest::addColumn<QString>("kind");
+        QTest::addColumn<QString>("filename");
+        QTest::addColumn<bool>("supported");
+        QTest::newRow("personal-media") << QStringLiteral("personalMediaFile") << QStringLiteral("Holiday.PNG") << true;
+        QTest::newRow("apk") << QStringLiteral("apkFile") << QStringLiteral("app.apk") << true;
+        QTest::newRow("native-backup") << QStringLiteral("backupArchive") << QStringLiteral("backup.zip") << true;
+        QTest::newRow("legacy-backup") << QStringLiteral("backupArchive") << QStringLiteral("backup.dcbackup") << true;
+        QTest::newRow("unsupported-database-backup") << QStringLiteral("backupArchive") << QStringLiteral("backup.db") << false;
+    }
+
+    void hostConsumerUploadsRetainOnlyCompleteSingleUseFiles()
+    {
+        QFETCH(QString, kind);
+        QFETCH(QString, filename);
+        QFETCH(bool, supported);
+        ShotImporter shots(nullptr);
+        ProfileImporter profiles(nullptr, nullptr);
+        NativeImportServiceSource transfer(&shots, nullptr);
+        transfer.m_profiles = &profiles;
+        QSignalSpy completed(&transfer, &ImportStateSimpleSource::operationCompleted);
+        const auto begin = [&](const QString& request, QVariant size, QVariantList files = {}) {
+            if (files.isEmpty()) files.append(QVariantMap{{QStringLiteral("name"), filename},
+                                                         {QStringLiteral("size"), size}});
+            transfer.execute(request, QStringLiteral("beginTransfer"),
+                {{QStringLiteral("kind"), kind}, {QStringLiteral("files"), files}});
+        };
+        if (!supported) {
+            begin(QStringLiteral("unsupported"), 2);
+            QVERIFY(!completed.last().at(2).toBool());
+            QCOMPARE(completed.last().at(4).toString(), QStringLiteral("invalidFileMetadata"));
+            QVERIFY(!transfer.m_transfer);
+            return;
+        }
+        begin(QStringLiteral("oversize"), FileBundlePolicy::maximumUploadFileBytes(kind) + 1);
+        QVERIFY(!completed.last().at(2).toBool());
+        begin(QStringLiteral("fractional"), 2.5);
+        QVERIFY(!completed.last().at(2).toBool());
+        const QVariantMap file{{QStringLiteral("name"), filename}, {QStringLiteral("size"), 2}};
+        begin(QStringLiteral("multiple"), 2, {file, file});
+        QVERIFY(!completed.last().at(2).toBool());
+        begin(QStringLiteral("begin"), 2);
+        QVERIFY(completed.last().at(2).toBool());
+        const QString ticket = completed.last().at(3).toMap().value(QStringLiteral("transferId")).toString();
+        QVERIFY(!transfer.takeCompletedTransfer(ticket, kind));
+        transfer.execute(QStringLiteral("append"), QStringLiteral("appendTransferChunk"),
+            {{QStringLiteral("transferId"), ticket}, {QStringLiteral("fileIndex"), 0},
+             {QStringLiteral("offset"), 0}, {QStringLiteral("data"), QByteArrayLiteral("ok")}});
+        QVERIFY(completed.last().at(2).toBool());
+        transfer.execute(QStringLiteral("commit"), QStringLiteral("commitTransfer"),
+            {{QStringLiteral("transferId"), ticket}});
+        QVERIFY(completed.last().at(2).toBool());
+        QVERIFY(!transfer.takeCompletedTransfer(ticket, QStringLiteral("languageJson")));
+        auto directory = transfer.takeCompletedTransfer(ticket, kind);
+        QVERIFY(directory && directory->isValid());
+        const QStringList names = QDir(directory->path()).entryList(QDir::Files);
+        QCOMPARE(names.size(), 1);
+        QFile uploaded(directory->filePath(names.first()));
+        QVERIFY(uploaded.open(QIODevice::ReadOnly));
+        QCOMPARE(uploaded.readAll(), QByteArrayLiteral("ok"));
+        QVERIFY(!transfer.takeCompletedTransfer(ticket, kind));
+    }
+};
+
+QTEST_GUILESS_MAIN(tst_profileimportservicesource)
+#include "tst_profileimportservicesource.moc"

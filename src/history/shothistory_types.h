@@ -1,0 +1,471 @@
+#pragma once
+
+#include <QString>
+#include <QStringList>
+#include <QByteArray>
+#include <QPointF>
+#include <QVector>
+#include <QList>
+#include <optional>
+
+#include "ai/portaltailanalyzer.h"
+#include "ai/shotanalysis.h"
+#include "history/bagid.h"
+#include "models/portalsample.h"
+
+// Lightweight shot summary for list display
+struct HistoryShotSummary {
+    qint64 id = 0;
+    QString uuid;
+    qint64 timestamp = 0;
+    QString profileName;
+    double duration = 0;
+    double finalWeight = 0;
+    double doseWeight = 0;
+    QString beanBrand;
+    QString beanType;
+    int enjoyment = 0;
+    bool hasVisualizerUpload = false;
+    QString beverageType;
+};
+
+// Phase marker for shot display
+struct HistoryPhaseMarker {
+    double time = 0;
+    QString label;
+    int frameNumber = 0;
+    bool isFlowMode = false;
+    // Why the PRECEDING frame exited. Confirmed ground truth: "weight",
+    // "pressure", "flow" — the threshold was satisfied at the transition
+    // sample, or reached by extrapolating one sample forward at the measured
+    // rate of change (see FrameExit::inferReason). Likely-but-unconfirmed
+    // sensor exit (threshold not reached even with that extrapolation):
+    // "pressure_unconfirmed", "flow_unconfirmed". Time-based: "time".
+    // "" = unknown/old data.
+    QString transitionReason;
+};
+
+// Full shot record for detail view / comparison
+struct ShotRecord {
+    HistoryShotSummary summary;
+
+    // Full metadata
+    QString roastDate;
+    QString roastLevel;
+    QString grinderBrand;
+    QString grinderModel;
+    QString grinderBurrs;
+    // Basket identity resolved via equipment_id (add-basket-equipment); empty when
+    // the package has no basket.
+    QString basketBrand;
+    QString basketModel;
+    // Puck-prep canonical flag string resolved via equipment_id
+    // (add-puckprep-equipment); empty when the package has no puck prep.
+    QString puckPrep;
+    QString grinderSetting;
+    qint64 equipmentId = 0;  // FK -> equipment_packages.id (add-equipment-packages); 0 = none
+    qint64 rpm = 0;          // grinder rpm dial-in; 0 = unset
+    // Lineage state of the shot's equipment package, resolved at load (add-
+    // equipment-packages 4b.7): "" = current or no equipment, "older" = a newer
+    // package superseded this one (copy-on-write fork), "retired" = removed from
+    // inventory with no successor. Rendered as a muted qualifier in history.
+    QString equipmentState;
+    // Package display name, resolved at load (defaults to "{brand} {model}").
+    QString equipmentName;
+    double drinkTds = 0;
+    double drinkEy = 0;
+    QString espressoNotes;
+    QString beanNotes;
+    QString barista;
+    QString profileNotes;
+    QString visualizerId;
+    QString visualizerUrl;
+
+    // Compact-JSON linked-bean snapshot at shot time ("" = unlinked /
+    // pre-migration-18 shot) — Visualizer canonical or Bean Base sourced;
+    // see docs/CLAUDE_MD/BEAN_BASE.md and ShotSaveData::beanBaseJson.
+    QString beanBaseJson;
+
+    // Coffee bag snapshot (bean-bag-inventory, migration 19): the bag this
+    // shot was pulled with and its freeze lifecycle at shot time. "No bag /
+    // pre-bag shot" sentinel is bagId <= 0 (default -1; the DB read maps NULL
+    // to -1) — see bagIdIsSet() in bagid.h.
+    qint64 bagId = -1;
+    QString frozenDate;
+    QString defrostDate;
+    // Non-frozen storage lifecycle snapshot (bean-freshness-followup,
+    // migration 32): the bag's storage_hint / opened_date at shot time, the
+    // non-frozen analogue of frozenDate/defrostDate. "" = unset.
+    QString storageHint;
+    QString openedDate;
+
+    // Structured taste axes (add-ai-taste-intake, migration 33): the two dial-in
+    // taste signals the shot curve can't reveal, tapped in the AI intake picker
+    // or on the review page. tasteBalance: "sour"|"balanced"|"bitter";
+    // tasteBody: "thin"|"medium"|"heavy". "" = unset. Mapped to Visualizer CVA
+    // fields (acidity/bitterness/mouthfeel) on upload.
+    QString tasteBalance;
+    QString tasteBody;
+
+    // Recipe provenance (add-recipes, migration 25): the recipe active at
+    // shot start (<= 0 = none / pre-recipe shot) and the steam-spec snapshot
+    // in effect, so promote-from-shot round-trips the whole drink. hotWaterJson
+    // (migration 27) is the added-hot-water snapshot for the same reason.
+    qint64 recipeId = -1;
+    QString steamJson;
+    QString hotWaterJson;
+    QString hotWaterResultJson;
+
+    QString weightSource;
+    QString portalMountingMode;
+    QVector<PortalSample> portalSamples;
+    PortalTailAnalyzer::PersistedSummary portalSummary;
+    QVector<PortalTailAnalyzer::CalibrationPoint> portalCalibrationPoints;
+    bool portalCalibrationFailed = false; // The reference read failed (logged); not "no references".
+
+    // Time-series data (lazily loaded)
+    QVector<QPointF> pressure;
+    QVector<QPointF> flow;
+    QVector<QPointF> temperature;
+    QVector<QPointF> pressureGoal;
+    QVector<QPointF> flowGoal;
+    QVector<QPointF> temperatureGoal;
+    QVector<QPointF> temperatureMixGoal;  // Empty for shots recorded before this series existed
+    QVector<QPointF> temperatureMix;
+    QVector<QPointF> resistance;
+    QVector<QPointF> conductance;
+    QVector<QPointF> darcyResistance;
+    QVector<QPointF> conductanceDerivative;
+    QVector<QPointF> waterDispensed;
+    QVector<QPointF> weight;
+    QVector<QPointF> weightFlowRate;  // Flow rate from scale (g/s) for visualizer export
+    QVector<QPointF> weightFlowRateRaw;  // The same before smoothing (Visualizer by_weight_raw); absent on older shots
+
+    // Phase markers
+    QList<HistoryPhaseMarker> phases;
+
+    // Debug log
+    QString debugLog;
+
+    // Brew overrides, written by MainController on save:
+    //   - temperatureOverride: user override OR profile espresso_temperature,
+    //     read from the live session at save time.
+    //   - targetWeight: the target the shot was actually PULLED at, read from
+    //     the start-of-shot snapshot (ProfileManager::latchedTargetG), not
+    //     from the live session. Save runs after SAW settling — i.e. after
+    //     the latch has been released — so reading live here would record a
+    //     target the shot never used whenever the dial moved during the pour.
+    //     Falls back to finalWeight for volume/timer profiles where neither
+    //     is set (so the favorites system always has something to restore).
+    // For shots imported from external formats (de1app, visualizer.coffee)
+    // these fields may stay at 0 — importers don't populate them. Analysis
+    // code that relies on targetWeight as the SAW target (e.g. the grind
+    // detector's yield-ratio arm) treats 0 as "unknown" and disables itself.
+    //
+    // Persisted in the `shots.yield_override` DB column — the column name
+    // predates the rename. JSON projection emits this as `targetWeightG`
+    // (units-suffixed per MCP convention).
+    double temperatureOverride = 0.0;
+    double targetWeight = 0.0;
+
+    // Yield anchor provenance (add-yield-ratio-anchor): the anchor that
+    // PRODUCED targetWeight — intent alongside the outcome above. mode is
+    // "none" | "absolute" | "ratio" (src/core/yieldspec.h); anchorValue is
+    // grams when absolute, a dose multiplier when ratio. STORED, never
+    // derived at read time from targetWeight / doseWeight: the dose is
+    // post-shot editable, and deriving would mint a ratio nobody chose.
+    // Promotion (recipepromotion.cpp) copies these verbatim. Persisted in
+    // shots.yield_mode / shots.yield_anchor_value (migration 34); legacy
+    // rows were backfilled 'absolute' from yield_override (>0), else 'none'.
+    QString yieldMode;
+    double yieldAnchorValue = 0.0;
+
+    // The effective flow calibration multiplier the shot was PULLED at, i.e.
+    // the value written to the DE1 while it poured (per-profile when auto
+    // calibration is on and one exists, else global). Latched at shot start —
+    // auto calibration can write a NEW per-profile value at shot end, before
+    // the save, so a save-time read would record a multiplier this shot never
+    // ran under. Persisted in shots.flow_calibration (migration 39).
+    //
+    // 0.0 means NOT RECORDED — a shot saved before the column existed, an
+    // imported shot whose source had no such value, or a fake/dev shot. 1.0 is
+    // a legitimate multiplier, so the two must never collapse: every consumer
+    // reads absence as unknown, not as neutral.
+    double flowCalibration = 0.0;
+
+    // Why the shot ended (#1161). One of: "weight" (stop-at-weight / SAW),
+    // "volume" (stop-at-volume / SAV), "manual" (user tapped Stop in the
+    // app), "profileEnd" (profile ran its course OR the DE1's own button —
+    // the BLE protocol does not distinguish these), or "" (unknown:
+    // pre-migration-17 shots, imported shots, fake/dev shots). Persisted in
+    // the `shots.stopped_by` column. A "manual" stop — or any non-"weight"/
+    // non-"volume" stop whose finalWeight fell well short of targetWeight —
+    // means the yield was user-chosen, not an extraction outcome, so it is
+    // not dial-in diagnostic.
+    QString stoppedBy;
+
+    // Profile snapshot
+    QString profileJson;
+
+    // AI knowledge base ID (e.g. "d-flow", "blooming espresso") for profile-aware analysis
+    QString profileKbId;
+
+    // Quality flags (computed at save time, recomputed on-the-fly for legacy shots).
+    //
+    // pourTruncatedDetected is the dominant flag — when it fires, the puck never
+    // built pressure, so channeling / grind signals are unreliable readings
+    // off curves the failed puck didn't produce. The save and load paths force
+    // those two (channelingDetected, grindIssueDetected) to false in that case
+    // so the UI doesn't show a contradictory "Clean extraction" chip on top
+    // of a puck failure. skipFirstFrameDetected is NOT suppressed — it's a
+    // machine/profile issue orthogonal to puck integrity and can co-fire
+    // with pourTruncatedDetected.
+    // See ShotAnalysis::detectPourTruncated for the underlying detector.
+    bool channelingDetected = false;
+    bool grindIssueDetected = false;
+    bool skipFirstFrameDetected = false;
+    bool pourTruncatedDetected = false;
+
+    // Phase summaries JSON (per-phase metrics: duration, avgPressure, avgFlow, weightGained, etc.)
+    QString phaseSummariesJson;
+
+    // Cached output of ShotAnalysis::analyzeShot, populated by
+    // ShotHistoryStorage::loadShotRecordStatic after the badge projection
+    // runs. ShotHistoryStorage::convertShotRecord reads from this when
+    // present so the detector pipeline runs exactly once per detail-load
+    // (load + convert), not twice. When absent — direct construction in
+    // tests, or any path that bypasses loadShotRecordStatic —
+    // convertShotRecord falls back to running analyzeShot inline.
+    //
+    // Invalidation rule: if any input curve on this ShotRecord
+    // (pressure/flow/temperature/etc.) is mutated after load, callers
+    // MUST reset cachedAnalysis to std::nullopt. Today no caller mutates
+    // ShotRecord between loadShotRecordStatic and convertShotRecord, so
+    // this is structurally safe — but the rule is documented here so
+    // future callers don't introduce a stale-cache bug.
+    std::optional<ShotAnalysis::AnalysisResult> cachedAnalysis;
+
+    // Canonical KB entry name this shot's profile was resolved to BY SHAPE,
+    // empty for every other resolution. Populated beside cachedAnalysis and
+    // for the same reason: it is derived from the same AnalysisInputs walk,
+    // and the fast path in convertShotRecord has no way to re-derive it
+    // without redoing that walk — which is the whole cost the cache exists to
+    // avoid. Set it wherever cachedAnalysis is set; a cache holding one and
+    // not the other silently drops the "Based on X" line in production while
+    // every test that constructs a ShotRecord by hand still sees it.
+    QString cachedKbDerivedFrom;
+};
+
+// Grinder settings context from shot history (shared by MCP and in-app AI)
+struct GrinderContext {
+    QString model;
+    QString beverageType;
+    QStringList settingsObserved;
+    bool allNumeric = false;
+    double minSetting = 0;
+    double maxSetting = 0;
+    // The grinder's effective dial step: the smallest increment the user makes
+    // REPEATEDLY between observed settings (deriveGrindStep). Not the raw minimum
+    // (a single mistyped setting would collapse it) nor the most-common gap (that
+    // hides a fine step the user uses less often than a coarse one). Computed
+    // grinder-model-wide, not bean-scoped — the step is a grinder property.
+    // 0 when fewer than 2 distinct numeric settings are available.
+    double stepSize = 0;
+    // RPM axis (variable-RPM grinders): the second half of the dial-in. Empty /
+    // 0 when the grinder has no recorded RPM history. RPM is an integer domain,
+    // so min/max are int; rpmStepSize stays double (reuses the same estimator as
+    // stepSize) and is grinder-model-wide, not bean-scoped.
+    QList<int> rpmsObserved;
+    int rpmMin = 0;
+    int rpmMax = 0;
+    double rpmStepSize = 0;
+};
+
+// Filter criteria for queries
+struct ShotFilter {
+    QString profileName;
+    QString beanBrand;
+    QString beanType;
+    QString grinderBrand;
+    QString grinderModel;
+    QString grinderBurrs;
+    QString grinderSetting;
+    // One equipment package, exactly — not the grinder-identity approximation
+    // the three fields above resolve to. -1 means "not filtering on it"; 0 is a
+    // real bucket (the unpackaged pool), the same convention as AdviceScope.
+    // Auto-favourite cards are keyed on the package, so "Show" has to select on
+    // the package or it returns a different set than the card counted.
+    qint64 equipmentId = -1;
+    QString roastLevel;
+    int minEnjoyment = -1;
+    int maxEnjoyment = -1;
+    double minDose = -1;
+    double maxDose = -1;
+    double minYield = -1;         // filters final_weight (actual pour)
+    double maxYield = -1;
+    double targetWeight = -1;    // filters yield_override (saved target) — exact match
+    double minDuration = -1;
+    double maxDuration = -1;
+    double minTds = -1;
+    double maxTds = -1;
+    double minEy = -1;
+    double maxEy = -1;
+    qint64 dateFrom = 0;       // Unix timestamp
+    qint64 dateTo = 0;
+    QString searchText;        // FTS search in notes
+
+    // Recipe identity (history-recipe-identity). Two deliberately different
+    // scopes: recipeId is the exact tap-through (rename-proof, unambiguous
+    // between same-named recipes), recipeName is the `recipe:` keyword's
+    // case-insensitive SUBSTRING on the recipe's name only — narrower than
+    // searchText, which also sprays across notes/bean/profile/grinder.
+    qint64 recipeId = -1;      // -1 = unset; matches shots.recipe_id exactly
+    QString recipeName;        // substring of recipes.name
+
+    // Bag identity (history-bag-filter). The same two scopes as recipe above,
+    // for the same reasons: bagId is the exact selection (the Custom widget's
+    // "this bag" action, rename-proof and unambiguous between two bags of the
+    // same coffee), bagTerm is the `bag:` keyword's substring.
+    //
+    // bagTerm matches across coffee_name + roaster_name + roast_date rather
+    // than one column: bag identity is spread over all three and a user
+    // narrowing by `bag:"guji 2026-07"` should not have to know which field
+    // carries which word. (Roast dates are stored ISO, so a month is "2026-07",
+    // not "july".)
+    //
+    // A bag filter answers a DIFFERENT question from beanBrand/beanType above,
+    // rather than being a guaranteed subset of it: those match editable text on
+    // the shot row across every bag of a coffee, this matches one bag by id.
+    // Both are kept for that reason.
+    qint64 bagId = -1;         // -1 = unset. Test with bagIdIsSet() (bagid.h),
+                               // never a hand-rolled comparison.
+    QString bagTerm;           // substring of a bag's coffee/roaster/roast date.
+                               // Empty = unset; WHITESPACE-ONLY = match nothing
+                               // (the sentinel the search box sends for `bag:""`).
+
+    bool onlyWithVisualizer = false;
+    bool filterChanneling = false;
+    bool filterGrindIssue = false;
+    bool filterSkipFirstFrame = false;
+    bool filterPourTruncated = false;
+    QString sortColumn = "timestamp";
+    QString sortDirection = "DESC";
+};
+
+// Pre-extracted data for async shot saving (no QObject pointers, thread-safe by value)
+struct ShotSaveData {
+    QString uuid;
+    qint64 timestamp = 0;
+    QString profileName;
+    QString profileJson;
+    QString beverageType;
+    double duration = 0;
+    double finalWeight = 0;
+    double doseWeight = 0;
+    double temperatureOverride = 0;
+    double targetWeight = 0;
+
+    // Yield anchor provenance (add-yield-ratio-anchor): see ShotRecord.
+    QString yieldMode;
+    double yieldAnchorValue = 0;
+
+    // The flow calibration multiplier the shot ran under: see ShotRecord.
+    // 0 = not recorded.
+    double flowCalibration = 0;
+
+    // Why the shot ended (#1161): "weight" | "volume" | "manual" |
+    // "profileEnd" | "" (unknown). Classified in MainController::onShotEnded
+    // from SAW/SAV state + the user-stop flag. See ShotRecord::stoppedBy.
+    QString stoppedBy;
+
+    // Metadata
+    QString beanBrand;
+    QString beanType;
+    QString roastDate;
+    QString roastLevel;
+    QString grinderBrand;
+    QString grinderModel;
+    QString grinderBurrs;
+    QString grinderSetting;
+    qint64 equipmentId = 0;  // FK -> equipment_packages.id (add-equipment-packages); 0 = none
+    qint64 rpm = 0;          // grinder rpm dial-in; 0 = unset
+    double drinkTds = 0;
+    double drinkEy = 0;
+    int espressoEnjoyment = 0;
+    QString espressoNotes;
+    QString barista;
+    QString profileNotes;
+    QString debugLog;
+
+    // Compact-JSON linked-bean snapshot at shot time ("" = unlinked, the
+    // common free-text case) — Visualizer canonical or Bean Base sourced.
+    // Snapshotted per shot so history stays accurate after the preset is
+    // edited or deleted.
+    QString beanBaseJson;
+
+    // Coffee bag snapshot (bean-bag-inventory): see ShotRecord. "No bag" when
+    // !bagIdIsSet(bagId) (bagId <= 0). Default -1.
+    qint64 bagId = -1;
+    QString frozenDate;
+    QString defrostDate;
+    // Non-frozen storage lifecycle snapshot (bean-freshness-followup): see
+    // ShotRecord. "" = unset.
+    QString storageHint;
+    QString openedDate;
+
+    // Recipe provenance (add-recipes): see ShotRecord. <= 0 = none.
+    qint64 recipeId = -1;
+    QString steamJson;
+    QString hotWaterJson;
+    QString hotWaterResultJson;
+
+    // AI knowledge base ID (e.g. "d-flow", "blooming espresso") — computed at save time
+    QString profileKbId;
+
+    // Quality flags (computed at save time using ShotAnalysis helpers). When
+    // pourTruncatedDetected fires, channelingDetected / grindIssueDetected
+    // are forced to false; skipFirstFrameDetected is not. See the matching
+    // comment on ShotRecord.
+    bool channelingDetected = false;
+    bool grindIssueDetected = false;
+    bool skipFirstFrameDetected = false;
+    bool pourTruncatedDetected = false;
+
+    // Phase summaries JSON (per-phase metrics for UI display)
+    QString phaseSummariesJson;
+
+    // PORTAL columns (migration 51).
+    PortalTailAnalyzer::PersistedSummary portalSummary;
+    QString weightSource;
+    bool portalPresent = false;
+    QString portalMountingMode;
+
+    // Pre-compressed sample data blob
+    QByteArray compressedSamples;
+    int sampleCount = 0;
+
+    // Phase markers (pre-extracted from QVariantList)
+    QList<HistoryPhaseMarker> phaseMarkers;
+};
+
+// One entry of the Visualizer bean-repair queue: a shot whose bag was unlinked
+// from a borrowed canonical record, and which visualizer.coffee may therefore
+// have renamed.
+//
+// A struct rather than the QVariantMap this started as. The consumer performs
+// destructive writes to the user's cloud account, and a mistyped key in a map
+// reads back as an empty QString — which the repair's own comparison treats as
+// a disagreement, so a typo would have PATCHed EMPTY bean names onto the shot
+// and then settled it as done. Every such mistake is now a compile error.
+struct BeanRepair {
+    qint64 shotId = 0;          // local shots.id — clears bean_repair_pending
+    QString visualizerId;       // never empty: the producer filters on it
+    QString beanBrand;          // the app's values, which are authoritative
+    QString beanType;
+    // Empty means CLEAR the link server-side (the borrowed record is what
+    // renamed the shot); non-empty means keep it. Emptiness is a decision here,
+    // not "unset" — resolved on the storage side so the network layer never
+    // re-parses a blob.
+    QString canonicalId;
+    qint64 timestamp = 0;       // shot time, for the log line only
+};

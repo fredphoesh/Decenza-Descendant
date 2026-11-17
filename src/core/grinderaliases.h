@@ -1,0 +1,641 @@
+#pragma once
+
+#include <QString>
+#include <QStringList>
+#include <QVector>
+#include <QRegularExpression>
+
+#include <cmath>
+#include <optional>
+
+namespace GrinderAliases {
+
+// How this grinder's `grinder_setting` strings encode a linear dial value.
+//   NumericWithSuffix : "25", "8.5", "24 1400rpm", "30 clicks" — leading
+//                        decimal number, optional trailing whitespace +
+//                        ignorable annotation. The default.
+//   Compound          : "1+4" — rotations + position with a model-specific
+//                        modulus `positionsPerRev`. Linear = a·N + b.
+//                        Examples: Eureka Mignon micrometric line (N=100,
+//                        24 µm per position); 1Zpresso families (N varies
+//                        by model — Q/J: 30, JX-Pro: 40, K-Pro/K-Plus/
+//                        K-Max/ZP6: 90, K-Ultra/J-Ultra: 100).
+// Grinders that emit truly non-measurable strings (letters, free-text)
+// just stay in NumericWithSuffix and fail to parse — they fall to the
+// calibration block's directional path, which doesn't need a setting
+// number at all (it uses KB UGS ordering vs the current profile).
+enum class SettingNotation { NumericWithSuffix, Compound };
+
+// DARK (visualizer/communityRelativeGrind, default off): a per-grinder map from
+// the linear dial scalar (what parseGrinderSetting returns) to burr gap in
+// microns, so a grind recorded on one grinder can be expressed on another.
+// Two anchors define an affine line micron = m·linear + c; interpolation and
+// extrapolation are the same formula. A scale is only USABLE when both anchors
+// are real (populated()) AND prov is not None — an all-zero default is inert, so
+// an unpopulated entry simply disables cross-grinder grind for that grinder
+// rather than asserting a false conversion. We ship every scale UNPOPULATED: we
+// have no vendor micron data on file and must not fabricate it. The field exists
+// so the mechanism and its tests are real and the data can be filled later from a
+// vouched source (vendor spec, measured, or a community estimate — recorded in
+// prov so the UI can caveat a soft number differently from a hard one).
+struct MicronScale {
+    double linearA = 0.0;
+    double micronA = 0.0;
+    double linearB = 0.0;
+    double micronB = 0.0;
+    enum class Provenance { None, Vendor, Measured, CommunityEstimate };
+    Provenance prov = Provenance::None;
+
+    // Two distinct anchors with real micron readings. Distinct linear values are
+    // required so the slope is finite; micron readings must be positive (a burr
+    // gap of zero or less is not physical).
+    bool populated() const {
+        return prov != Provenance::None
+            && linearA != linearB
+            && micronA > 0.0 && micronB > 0.0;
+    }
+};
+
+struct GrinderEntry {
+    QString brand;
+    QString model;
+    QStringList aliases;
+    QStringList stockBurrs;  // Multiple options (e.g. Duo ships with espresso + filter burrs)
+    bool burrSwappable;
+    int burrSizeMm;
+    QString mountPattern;    // Compatible mount group (e.g. "mazzer64", "mazzer83", "ek98")
+    SettingNotation notation = SettingNotation::NumericWithSuffix;
+    int positionsPerRev = 0; // Compound only; ignored for NumericWithSuffix
+    // True when the motor RPM is user-adjustable (Turin V models, Varia VS4/VS6,
+    // Sculptor S, single-dose Lagom/Weber/Kafatek, etc.). Mahlkonig "W"/"GbW" is
+    // grind-by-weight, NOT variable speed; Eureka Turbo/Single Dose are fixed. Users
+    // commonly annotate the grinder_setting with the RPM (`24 1400rpm`
+    // on a DF83V); parseGrinderSetting tolerates that suffix so the
+    // shot is not silently discarded. The calibration block today does
+    // NOT split within-batch pairs by RPM (Phase-2 work); instead, when
+    // this flag is true and the block publishes `approximate`, the
+    // usageConstraint string is extended with a per-RPM caveat so the
+    // model quotes the recommended setting only relative to the
+    // anchor's RPM. Manual hand grinders are false (no motor).
+    bool variableRpm = false;
+    // DARK: linear<->micron anchors for cross-grinder grind. Default is an inert
+    // unpopulated scale; no existing row needs editing. See MicronScale above.
+    MicronScale micronScale{};
+};
+
+struct LookupResult {
+    QString brand;
+    QString model;
+    QString stockBurrs;  // Primary (first) stock burr set
+    bool burrSwappable = false;
+    bool found = false;
+};
+
+// By const reference: findEntry() returns a POINTER INTO this, and while it
+// returned by value that pointer stayed valid only because QVector is implicitly
+// shared, so the copy's buffer was the static's. Correct by luck, not lifetime.
+inline const QVector<GrinderEntry>& allGrinders()
+{
+    static const QVector<GrinderEntry> entries = {
+        // --- Niche ---
+        {"Niche", "Zero", {"niche", "niche zero", "nichezero", "nz"}, {"63mm Mazzer Kony conical"}, false, 0, ""},
+        {"Niche", "Duo", {"niche duo", "duo"}, {"83mm DLC espresso flat", "83mm filter flat"}, false, 0, ""},
+        // --- Turin (64mm/83mm use Mazzer patterns) ---
+        {"Turin", "DF64 Gen 2", {"df64", "df64 gen 2", "df64 gen2", "df64 ii", "df-64", "g-iota", "solo df64"}, {"64mm flat steel", "64mm DLC flat"}, true, 64, "mazzer64"},
+        {"Turin", "DF64V Gen 2", {"df64v", "df64v gen 2", "df64v gen2", "df64 v"}, {"64mm DLC flat"}, true, 64, "mazzer64", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Turin", "CF64V", {"cf64v", "cf64"}, {"64mm DLC flat"}, true, 64, "mazzer64", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Turin", "DF83V", {"df83v", "df83 v"}, {"83mm flat steel"}, true, 83, "mazzer83", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Turin", "DF83", {"df83", "df83 gen 1"}, {"83mm flat steel"}, true, 83, "mazzer83"},
+        {"Turin", "DF54", {"df54"}, {"54mm flat steel"}, true, 54, ""},
+        // --- Weber Workshops (proprietary magnetic mount) ---
+        {"Weber Workshops", "EG-1", {"eg-1", "eg1", "weber eg-1", "weber eg1", "weber workshops eg-1"}, {"80mm CORE (DB-1) flat", "80mm ULTRA (DB-2) flat", "80mm BASE (DB-3) flat"}, true, 80, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Weber Workshops", "HG-2", {"hg-2", "hg2", "weber hg-2", "weber hg2"}, {"83mm Mazzer conical"}, false, 0, ""},
+        {"Weber Workshops", "KEY", {"weber key", "key grinder"}, {"83mm conical"}, false, 0, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        // --- Eureka ---
+        {"Eureka", "Mignon Specialita", {"specialita", "eureka specialita", "mignon specialita", "eureka mignon specialita"}, {"55mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Notte", {"notte", "eureka notte", "mignon notte", "eureka mignon notte"}, {"50mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Manuale", {"manuale", "eureka manuale", "mignon manuale"}, {"50mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon XL", {"mignon xl", "eureka xl", "eureka mignon xl"}, {"65mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Turbo", {"turbo", "eureka turbo", "mignon turbo", "eureka mignon turbo"}, {"65mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Single Dose", {"mignon single dose", "eureka single dose", "eureka sd", "mignon sd", "oro single dose"}, {"65mm Diamond Inside flat"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Silenzio", {"silenzio", "eureka silenzio", "mignon silenzio"}, {"50mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Facile", {"facile", "eureka facile", "mignon facile"}, {"50mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Zero", {"mignon zero", "eureka zero", "eureka mignon zero", "zero 65"}, {"65mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Libra", {"libra", "eureka libra", "mignon libra"}, {"55mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Perfetto", {"perfetto", "eureka perfetto", "mignon perfetto"}, {"50mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Mignon Crono", {"crono", "eureka crono", "mignon crono"}, {"50mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Atom 65", {"atom 65", "eureka atom 65", "atom65", "atom w 65"}, {"65mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Atom 75", {"atom 75", "eureka atom 75", "atom75", "atom w 75", "lucca atom"}, {"75mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Zenith 65 Neo", {"zenith", "zenith 65", "eureka zenith", "zenith 65 neo"}, {"65mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"Eureka", "Helios 80", {"helios 80", "eureka helios 80", "helios80"}, {"80mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        // --- Option-O (P64 accepts Mazzer 64mm pattern; P100/01 accept EK43 98mm) ---
+        {"Option-O", "Lagom P64", {"p64", "lagom p64", "option-o p64"}, {"64mm Mizen 64OM flat", "64mm Mizen 64ES flat", "64mm SSP High Uniformity flat", "64mm SSP Unimodal Espresso flat"}, true, 64, "mazzer64", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Option-O", "Lagom P80", {"p80", "lagom p80", "option-o p80"}, {"80mm Mizen 80OM flat"}, true, 80, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Option-O", "Lagom P100", {"p100", "lagom p100", "option-o p100"}, {"98mm Mizen 98OM flat", "98mm SSP High Uniformity flat"}, true, 98, "ek98", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Option-O", "Lagom 01", {"lagom 01", "option-o 01", "lagom01"}, {"102mm Mizen 102OM blind flat", "98mm Mizen 98OM flat", "102mm SSP 102HU blind flat"}, true, 98, "ek98", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Option-O", "Lagom Mini 2", {"lagom mini", "lagom mini 2", "option-o mini", "mini 2"}, {"48mm Mizen 48MS flat"}, false, 0, ""},
+        {"Option-O", "Lagom Casa", {"lagom casa", "option-o casa", "casa"}, {"65mm Mizen 65CL conical"}, false, 0, ""},
+        // --- Zerno (magnetic blind mount; accepts Mazzer screw-mount too, but stock burrs are blind-only) ---
+        {"Zerno", "Z1", {"zerno", "zerno z1", "z1"}, {"64mm SSP High Uniformity", "64mm SSP Multipurpose V2", "64mm SSP Unimodal Brew", "64mm SSP Cast V2 Lab Sweet", "64mm SSP Cast V3", "64mm Mazzer 233M"}, true, 64, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Zerno", "Z2", {"zerno z2", "z2"}, {"80mm Modern Espresso", "80mm Ultra Low Fines", "80mm Red Speed"}, true, 80, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        // --- Kafatek (proprietary Shuriken burrs) ---
+        {"Kafatek", "Monolith Flat", {"monolith flat", "kafatek flat", "monolith flat sdrm", "mc flat"}, {"75mm Shuriken LM flat", "75mm Shuriken SW flat", "75mm Shuriken MD flat", "75mm Shuriken CR flat"}, false, 0, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Kafatek", "Monolith Flat MAX", {"monolith flat max", "flat max", "kafatek flat max", "monolith max"}, {"98mm Shuriken LM flat", "98mm Shuriken SW flat", "98mm Shuriken MD flat", "98mm Shuriken CR flat"}, false, 0, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Kafatek", "Monolith Conical", {"monolith conical", "kafatek conical", "mc5", "mc6", "monolith mc"}, {"71mm Shurikone conical"}, false, 0, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        // --- Levercraft (accepts EK43 98mm burrs) ---
+        {"Levercraft", "Ultra", {"levercraft", "levercraft ultra", "ultra grinder"}, {"98mm SSP High Uniformity flat", "98mm SSP Low Uniformity flat"}, true, 98, "ek98", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Versalab", "M4", {"versalab", "versalab m4", "versalab m3"}, {"68mm SSP hybrid"}, false, 0, ""},
+        {"Bentwood", "Vertical 63", {"bentwood", "bentwood vertical", "bentwood v63", "vertical 63"}, {"63mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        // --- Acaia / Mazzer (Mazzer 64mm pattern) ---
+        {"Acaia", "Orbit", {"orbit", "acaia orbit"}, {"64mm Mazzer 33M flat", "64mm SSP Multipurpose flat", "64mm SSP Lab Sweet flat"}, true, 64, "mazzer64", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Mazzer", "Philos", {"philos", "mazzer philos"}, {"64mm I200D flat", "64mm I189D flat"}, true, 64, "mazzer64"},
+        {"Mazzer", "Mini", {"mazzer mini", "mini electronic", "mazzer mini e"}, {"64mm flat steel"}, false, 0, "mazzer64"},
+        {"Mazzer", "Super Jolly", {"super jolly", "mazzer super jolly", "sj", "super jolly v pro"}, {"64mm flat steel (233M)"}, true, 64, "mazzer64"},
+        {"Mazzer", "Major", {"mazzer major", "major v"}, {"83mm flat steel"}, true, 83, "mazzer83"},
+        {"Mazzer", "Kony", {"mazzer kony", "kony"}, {"63mm conical steel"}, false, 0, ""},
+        {"Mazzer", "Robur S", {"mazzer robur", "robur", "robur s"}, {"71mm conical steel"}, false, 0, ""},
+        {"Mazzer", "Kold S", {"mazzer kold", "kold", "kold s"}, {"71mm conical steel"}, false, 0, ""},
+        {"La Marzocco", "Lux D", {"lux d", "la marzocco lux", "lux grinder"}, {"61mm flat steel"}, false, 0, ""},
+        // --- Mahlkonig (EK43 = ek98 pattern; X64/E64 = mazzer64) ---
+        {"Mahlkonig", "EK43", {"ek43", "ek-43", "mahlkonig ek43"}, {"98mm flat steel"}, true, 98, "ek98"},
+        {"Mahlkonig", "E65S GbW", {"e65w", "e65s", "e65s gbw", "mahlkonig e65", "e65"}, {"65mm flat steel"}, false, 0, ""},
+        {"Mahlkonig", "E80S GbW", {"e80w", "e80s", "e80s gbw", "mahlkonig e80"}, {"80mm flat steel"}, false, 0, ""},
+        {"Mahlkonig", "X54", {"x54", "mahlkonig x54"}, {"54mm flat steel"}, false, 0, ""},
+        {"Mahlkonig", "X64 SD", {"x64", "mahlkonig x64", "x64 sd"}, {"64mm flat steel"}, false, 0, "mazzer64"},
+        {"Mahlkonig", "E64 WS", {"e64", "mahlkonig e64", "e64 ws"}, {"64mm flat steel"}, false, 0, "mazzer64"},
+        // --- Fiorenzato (Mazzer 64mm pattern) ---
+        {"Fiorenzato", "AllGround", {"allground", "fiorenzato allground", "fiorenzato"}, {"64mm Dark-T titanium coated flat"}, false, 0, "mazzer64"},
+        {"Varia", "VS3", {"vs3", "varia vs3"}, {"48mm conical stainless"}, false, 0, ""},
+        {"Varia", "VS4", {"vs4", "varia vs4"}, {"53mm Supernova conical"}, true, 53, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Varia", "VS6", {"vs6", "varia vs6"}, {"58mm Supernova flat", "63mm conical"}, true, 58, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"WPM", "ZP-1", {"zp-1", "zp1", "wpm zp-1"}, {"64mm flat steel"}, false, 0, "mazzer64"},
+        {"Baratza", "Sette 270", {"sette 270", "sette", "baratza sette", "sette 270wi"}, {"40mm conical steel"}, false, 0, ""},
+        {"Baratza", "Encore ESP", {"encore", "encore esp", "baratza encore"}, {"40mm conical steel"}, false, 0, ""},
+        {"Baratza", "Vario+", {"vario", "vario+", "baratza vario", "forte"}, {"54mm flat ceramic", "54mm flat steel"}, false, 0, ""},
+        {"Breville", "Smart Grinder Pro", {"smart grinder", "smart grinder pro", "breville smart grinder", "sage smart grinder", "bcg820"}, {"40mm conical steel"}, false, 0, ""},
+        {"Fellow", "Opus", {"opus", "fellow opus"}, {"40mm conical steel"}, false, 0, ""},
+        // --- Fellow Ode (proprietary 64mm mount, NOT Mazzer compatible) ---
+        {"Fellow", "Ode Gen 2", {"ode", "fellow ode", "ode gen 2"}, {"64mm Gen 2 Brew flat", "64mm SSP MP Red Speed flat"}, true, 64, ""},
+        {"Rancilio", "Rocky", {"rocky", "rancilio rocky"}, {"50mm flat steel"}, false, 0, ""},
+        {"Wilfa", "Uniform", {"uniform", "wilfa uniform", "wilfa svart"}, {"58mm flat steel"}, false, 0, ""},
+        {"Compak", "E5", {"compak e5"}, {"58mm flat steel"}, false, 0, ""},
+        {"Compak", "E8", {"compak e8"}, {"83mm flat steel"}, true, 83, "mazzer83"},
+        {"Compak", "PK100", {"pk100", "pk-100", "compak pk100"}, {"98mm blind flat"}, false, 0, ""},
+        {"Compak", "E10", {"compak e10"}, {"68mm conical steel"}, false, 0, ""},
+        // --- Ceado (E37S/SD = mazzer83, E37J = mazzer64) ---
+        {"Lelit", "William PL72", {"william", "lelit william", "pl72", "pl71"}, {"64mm flat steel"}, false, 0, "mazzer64"},
+        {"Ceado", "E37S", {"e37s", "ceado e37s", "ceado e37"}, {"83mm titanium flat"}, false, 0, "mazzer83"},
+        {"Ceado", "E37SD", {"e37sd", "ceado e37sd", "ceado sd"}, {"83mm OpalGlide flat"}, false, 0, "mazzer83"},
+        {"Ceado", "E37Z Hero", {"e37z", "e37z hero", "z hero", "z-hero", "ceado hero"}, {"83mm DLC flat"}, false, 0, "mazzer83", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Ceado", "E5SD", {"e5sd", "ceado e5sd", "ceado e5"}, {"64mm flat steel"}, false, 0, "mazzer64"},
+        {"Ceado", "E37J", {"e37j", "ceado e37j"}, {"64mm flat steel"}, false, 0, "mazzer64"},
+        {"Anfim", "Luna", {"anfim luna", "luna"}, {"75mm flat steel"}, false, 0, ""},
+        {"Anfim", "SP II", {"anfim sp", "anfim spii", "sp ii", "sp2"}, {"75mm titanium coated flat"}, false, 0, ""},
+        // --- Timemore (Sculptor 064 = mazzer64) ---
+        {"Timemore", "Sculptor 064S", {"sculptor 064", "timemore sculptor", "sculptor 064s"}, {"64mm flat steel"}, false, 0, "mazzer64", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Timemore", "Sculptor 078S", {"sculptor 078", "sculptor 078s"}, {"78mm flat steel"}, false, 0, "", GrinderAliases::SettingNotation::NumericWithSuffix, 0, true},
+        {"Craig Lyn", "HG-1 Prime", {"hg-1", "hg1", "craig lyn", "hg-1 prime"}, {"83mm Mazzer conical"}, false, 0, ""},
+        {"Comandante", "C40 MK4", {"comandante", "c40", "comandante c40", "c40 mk4", "c40 mk3"}, {"39mm Nitro Blade conical"}, false, 0, ""},
+        {"1Zpresso", "JX-Pro", {"jx-pro", "jx pro", "1zpresso jx", "jx"}, {"48mm conical steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 40, false},
+        {"1Zpresso", "J-Max", {"j-max", "jmax", "1zpresso j-max", "1zpresso jmax"}, {"48mm conical steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 30, false},
+        {"1Zpresso", "K-Max", {"k-max", "kmax", "1zpresso k-max", "1zpresso kmax"}, {"48mm conical steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 90, false},
+        {"1Zpresso", "K-Plus", {"k-plus", "kplus", "1zpresso k-plus", "k plus"}, {"48mm conical steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 90, false},
+        {"1Zpresso", "K-Ultra", {"k-ultra", "kultra", "1zpresso k-ultra", "k ultra"}, {"48mm conical steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"1Zpresso", "J-Ultra", {"j-ultra", "jultra", "1zpresso j-ultra", "j ultra"}, {"48mm conical steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 100, false},
+        {"1Zpresso", "Q2", {"q2", "1zpresso q2"}, {"38mm conical steel"}, false, 0, "", GrinderAliases::SettingNotation::Compound, 30, false},
+        {"Kinu", "M47", {"kinu", "kinu m47", "m47", "m47 classic", "m47 phoenix", "m47 simplicity"}, {"47mm conical steel"}, false, 0, ""},
+        {"KINGrinder", "K6", {"k6", "kingrinder k6", "king grinder k6"}, {"48mm heptagonal conical stainless"}, false, 0, ""},
+        {"KINGrinder", "K4", {"k4", "kingrinder k4", "king grinder k4"}, {"48mm titanium coated conical"}, false, 0, ""},
+        {"Timemore", "C3 ESP PRO", {"c3 esp", "c3 esp pro", "timemore c3", "chestnut c3"}, {"38mm S2C conical stainless"}, false, 0, ""},
+        {"Timemore", "Chestnut X", {"chestnut x", "timemore x", "timemore chestnut x"}, {"42mm S2C conical stainless"}, false, 0, ""},
+        {"Normcore", "V2", {"normcore", "normcore v2"}, {"38mm conical stainless"}, false, 0, ""},
+        {"Etzinger", "etz-I", {"etzinger", "etz-i", "etzi"}, {"32mm conical stainless"}, false, 0, ""},
+        {"ROK", "GrinderGC", {"rok", "rok grinder", "grindergc"}, {"48mm conical steel"}, false, 0, ""},
+        {"Hario", "Skerton Pro", {"skerton", "hario skerton", "skerton pro"}, {"38mm ceramic conical"}, false, 0, ""},
+        {"Porlex", "Mini II", {"porlex", "porlex mini"}, {"30mm ceramic conical"}, false, 0, ""},
+        {"De'Longhi", "Dedica KG521", {"delonghi", "dedica", "kg521", "delonghi dedica"}, {"35mm conical steel"}, false, 0, ""},
+        {"Macap", "M2", {"macap m2"}, {"50mm flat steel"}, false, 0, ""},
+        {"Macap", "M4", {"macap m4"}, {"58mm flat steel"}, false, 0, ""},
+        // --- Titus (accepts EK43 98mm burrs) ---
+        {"Titus Grinding", "Nautilus", {"titus", "titus nautilus", "nautilus"}, {"98mm SSP High Uniformity flat", "98mm SSP Low Uniformity flat"}, true, 98, "ek98"},
+    };
+    return entries;
+}
+
+// Case-insensitive lookup: tries each alias, longest-first for ambiguity resolution.
+// Returns found=true if the raw string matches any alias.
+inline LookupResult lookup(const QString& rawGrinderString)
+{
+    LookupResult result;
+    if (rawGrinderString.trimmed().isEmpty())
+        return result;
+
+    const QString lower = rawGrinderString.trimmed().toLower();
+    const auto& grinders = allGrinders();
+
+    // First pass: exact alias match (case-insensitive)
+    qsizetype bestLen = 0;
+    const GrinderEntry* bestMatch = nullptr;
+
+    for (const auto& entry : grinders) {
+        for (const auto& alias : entry.aliases) {
+            if (lower == alias && alias.length() > bestLen) {
+                bestLen = alias.length();
+                bestMatch = &entry;
+            }
+        }
+    }
+
+    // Second pass: check if the raw string contains an alias (for strings like "Niche Zero (modded)")
+    if (!bestMatch) {
+        for (const auto& entry : grinders) {
+            for (const auto& alias : entry.aliases) {
+                if (lower.contains(alias) && alias.length() > bestLen) {
+                    bestLen = alias.length();
+                    bestMatch = &entry;
+                }
+            }
+        }
+    }
+
+    if (bestMatch) {
+        result.brand = bestMatch->brand;
+        result.model = bestMatch->model;
+        result.stockBurrs = bestMatch->stockBurrs.isEmpty() ? QString() : bestMatch->stockBurrs.first();
+        result.burrSwappable = bestMatch->burrSwappable;
+        result.found = true;
+    }
+
+    return result;
+}
+
+// Get suggested burrs for a given brand+model.
+// Returns: stock burrs for this model first, then compatible burrs from other
+// grinders sharing the same mount pattern (e.g. "mazzer64"). Only grinders
+// with a non-empty mountPattern get cross-compatible suggestions.
+inline QStringList suggestedBurrs(const QString& brand, const QString& model)
+{
+    QStringList burrs;
+    const auto& grinders = allGrinders();
+    QString mount;
+
+    // First: stock burrs for the exact model
+    for (const auto& entry : grinders) {
+        if (entry.brand.compare(brand, Qt::CaseInsensitive) == 0 &&
+            entry.model.compare(model, Qt::CaseInsensitive) == 0) {
+            burrs << entry.stockBurrs;
+            mount = entry.mountPattern;
+            break;
+        }
+    }
+
+    // Second: compatible burrs from other grinders with the same mount pattern
+    if (!mount.isEmpty()) {
+        for (const auto& entry : grinders) {
+            if (entry.mountPattern != mount)
+                continue;
+            if (entry.brand.compare(brand, Qt::CaseInsensitive) == 0 &&
+                entry.model.compare(model, Qt::CaseInsensitive) == 0)
+                continue;
+            for (const auto& b : entry.stockBurrs) {
+                if (!burrs.contains(b))
+                    burrs << b;
+            }
+        }
+    }
+
+    return burrs;
+}
+
+// Check if a grinder model supports swappable burrs
+inline bool isBurrSwappable(const QString& brand, const QString& model)
+{
+    const auto& grinders = allGrinders();
+    for (const auto& entry : grinders) {
+        if (entry.brand.compare(brand, Qt::CaseInsensitive) == 0 &&
+            entry.model.compare(model, Qt::CaseInsensitive) == 0) {
+            return entry.burrSwappable;
+        }
+    }
+    return false;
+}
+
+// Return a compact burr geometry string for AI enrichment (e.g. "83mm flat", "63mm conical").
+// Type (flat/conical) inferred from user's burrs string first, then stock burrs.
+// Size from database burrSizeMm first, then parsed from burrs strings.
+inline QString burrGeometry(const QString& brand, const QString& model, const QString& userBurrs = QString())
+{
+    // Infer burr type (flat/conical) from a descriptive string
+    auto inferType = [](const QString& s) -> QString {
+        QString lower = s.toLower();
+        if (lower.contains("conical")) return "conical";
+        if (lower.contains("flat")) return "flat";
+        return QString();
+    };
+
+    // Infer burr size from a descriptive string (e.g. "83mm flat steel" -> 83)
+    auto inferSize = [](const QString& s) -> int {
+        static const QRegularExpression rx("(\\d{2,3})\\s*mm");
+        auto match = rx.match(s);
+        return match.hasMatch() ? match.captured(1).toInt() : 0;
+    };
+
+    // Look up the grinder entry for burrSizeMm and stock burrs
+    const GrinderEntry* entry = nullptr;
+    const auto& grinders = allGrinders();
+    for (const auto& g : grinders) {
+        if (g.brand.compare(brand, Qt::CaseInsensitive) == 0 &&
+            g.model.compare(model, Qt::CaseInsensitive) == 0) {
+            entry = &g;
+            break;
+        }
+    }
+
+    // Determine burr type: prefer user burrs, fall back to stock burrs
+    QString type;
+    if (!userBurrs.isEmpty()) type = inferType(userBurrs);
+    if (type.isEmpty() && entry && !entry->stockBurrs.isEmpty())
+        type = inferType(entry->stockBurrs.first());
+
+    // Determine size: prefer entry's burrSizeMm, fall back to parsing strings
+    int size = (entry && entry->burrSizeMm > 0) ? entry->burrSizeMm : 0;
+    if (size == 0 && !userBurrs.isEmpty()) size = inferSize(userBurrs);
+    if (size == 0 && entry && !entry->stockBurrs.isEmpty())
+        size = inferSize(entry->stockBurrs.first());
+
+    if (size > 0 && !type.isEmpty())
+        return QString("%1mm %2").arg(size).arg(type);
+    if (size > 0)
+        return QString("%1mm").arg(size);
+    if (!type.isEmpty())
+        return type;
+    return QString();
+}
+
+// Get all known brands (unique, sorted)
+inline QStringList allBrands()
+{
+    QStringList brands;
+    const auto& grinders = allGrinders();
+    for (const auto& entry : grinders) {
+        if (!brands.contains(entry.brand))
+            brands << entry.brand;
+    }
+    brands.sort(Qt::CaseInsensitive);
+    return brands;
+}
+
+// Get all known models for a brand
+inline QStringList modelsForBrand(const QString& brand)
+{
+    QStringList models;
+    const auto& grinders = allGrinders();
+    for (const auto& entry : grinders) {
+        if (entry.brand.compare(brand, Qt::CaseInsensitive) == 0)
+            models << entry.model;
+    }
+    return models;
+}
+
+// Find the registry entry for an exact brand+model (case-insensitive).
+// Returns nullptr when not found; the dialing-context payload code
+// gracefully falls back to a default-constructed entry's notation
+// (NumericWithSuffix) so unknown grinders behave like plain numeric.
+//
+// Memoized on the last (brand, model), for ONE caller: SettingsDye::
+// grinderIsClickIndexed(), which GrindRowSource.stepGrind() reaches per row on
+// the custom-grinder JS fallback. A grinder outside the registry misses, so each
+// call walks every entry — the worst case, not the cheapest, which is why
+// NEGATIVE results are cached too. A window of ±400 steps around a small value
+// puts several hundred of those in front of the picker painting.
+//
+// It is NOT justified by the 801-row loop, and an earlier version of this comment
+// said it was. stepGrinderSettingRange() resolves the grinder once for the whole
+// wheel, so the per-row path through stepGrinderSetting no longer exists — see
+// that function, which records that memoizing this lookup did nothing for the
+// loop, because the cost there was the crossings rather than the work behind them.
+// The two statements only look contradictory if this one still claims the loop.
+//
+// thread_local because dialing_blocks reaches the registry from a background
+// thread (dialing_blocks.cpp:1170). NOT the ShotServer, which an earlier draft
+// also named: it is parented to MainController and handleGrindCandidatesApi has
+// no thread wrapper, unlike its siblings in that file, so it runs on the main
+// thread. Cached pointers never dangle — allGrinders() returns a function-local
+// static by reference.
+inline const GrinderEntry* findEntry(const QString& brand, const QString& model)
+{
+    struct Memo {
+        QString brand;
+        QString model;
+        const GrinderEntry* entry = nullptr;
+        bool valid = false;
+    };
+    thread_local Memo memo;
+    if (memo.valid && memo.brand == brand && memo.model == model)
+        return memo.entry;
+
+    const GrinderEntry* found = nullptr;
+    for (const auto& e : allGrinders()) {
+        if (e.brand.compare(brand, Qt::CaseInsensitive) == 0
+            && e.model.compare(model, Qt::CaseInsensitive) == 0) {
+            found = &e;
+            break;
+        }
+    }
+    memo = Memo{brand, model, found, true};
+    return found;
+}
+
+// Convenience: resolve a raw grinder string (e.g. shot.grinderModel) to
+// the registry entry by alias, in one call. Returns nullptr when no
+// alias matches — callers should fall back to a default-constructed
+// entry (NumericWithSuffix, plain numeric).
+inline const GrinderEntry* findEntryByAlias(const QString& raw)
+{
+    const LookupResult r = lookup(raw);
+    return r.found ? findEntry(r.brand, r.model) : nullptr;
+}
+
+// Notation rules, shared by everything below:
+//   NumericWithSuffix: ^\s*(-?\d+(?:\.\d+)?)(?:\s+(\S.*))?\s*$ — leading
+//     decimal number, optional whitespace-separated annotation. Rejects
+//     trailing text starting with `+`/`-` (Eureka multi-turn with a space:
+//     "1 + 4") so structured notations never silently lose information.
+//   Compound: ^\s*(-?\d+)\s*\+\s*(\d+(?:\.\d+)?)\s*$ → linear = a·N + b.
+//     The `\s*\+\s*` allows whitespace around the `+`, so BOTH "1+4" and
+//     "1 + 4" are accepted on Compound grinders (the +/- rejection above
+//     applies only on NumericWithSuffix — on Compound the structured form
+//     wins via this branch first). Compound grinders ALSO accept plain
+//     numeric (some users record decimal positions like "0.5" on a
+//     Mignon), interpreted as a direct linear value, so we don't drop
+//     the cohort that collapses notation.
+//
+// The two regexes are defined once here so every consumer agrees on what a
+// setting looks like; a copy in any of them would be free to drift.
+namespace detail {
+inline const QRegularExpression& compoundRe()
+{
+    static const QRegularExpression re(QStringLiteral(R"(^(-?\d+)\s*\+\s*(\d+(?:\.\d+)?)$)"));
+    return re;
+}
+inline const QRegularExpression& numRe()
+{
+    static const QRegularExpression re(QStringLiteral(R"(^(-?\d+(?:\.\d+)?)(?:\s+(\S.*))?$)"));
+    return re;
+}
+}  // namespace detail
+
+// Syntactic check: could a user have RECORDED this string as their dial
+// setting? Notation-agnostic on purpose — it takes no GrinderEntry, because
+// callers that only have a setting string (adherence scoring) have no grinder
+// to look up, and the answer does not depend on one.
+//
+// This exists to tell a setting from PROSE. Models do write prose into the
+// advisor's `structuredNext.grinderSetting` — "a touch coarser than 9"
+// (GPT-5.6 Terra), "slightly coarser than 9" (GPT-5.4 mini), observed live
+// 2026-07-30 — and prose can never match a recorded setting, so scoring it as
+// a followed-or-ignored recommendation is meaningless.
+//
+// Whitespace alone does NOT mean prose: Compound notation accepts "1 + 4" as
+// readily as "1+4" (see the notation rules above), and every Eureka Mignon and
+// 1Zpresso entry in the catalog uses it. An earlier version rejected on any
+// whitespace and would have silently stopped scoring all of them. (Deliberately
+// no count here: the first attempt at this comment said "19", which was a
+// grep -c that had swept up two code references alongside the catalog rows.)
+inline bool looksLikeSetting(const QString& raw)
+{
+    const QString s = raw.trimmed();
+    if (s.isEmpty())
+        return false;
+
+    // Every accepted form must begin with a dial number, whether or not it
+    // contains whitespace. An earlier version returned true for ANY
+    // whitespace-free string, which let a bare "coarser" through as a setting
+    // — it was then scored as an ignored recommendation rather than an
+    // unusable one, the exact failure this function exists to prevent.
+    //
+    // numRe covers plain numerics ("8.25") and a number with a recorded
+    // annotation ("24 1400rpm"); compoundRe covers "1+4" and "1 + 4".
+    if (detail::numRe().match(s).hasMatch() || detail::compoundRe().match(s).hasMatch())
+        return true;
+
+    // Lettered dials ("3F", "8C") — a leading number with a short letter
+    // suffix and no whitespace. Bounded length so a word cannot qualify.
+    // NOT letter-first ("C2"): the leading-dial-number rule above admits no
+    // exception, and this regex has never matched that form despite an
+    // earlier version of this comment offering it as an example.
+    //
+    // Declared here rather than in detail:: on purpose — parseGrinderSetting()
+    // rejects lettered dials outright, so unlike numRe/compoundRe this one has
+    // no second caller to stay in step with. Lettered settings are compared
+    // downstream by exact string equality in grinderMatches().
+    static const QRegularExpression letteredRe(QStringLiteral(R"(^-?\d+(?:\.\d+)?[A-Za-z]{1,3}$)"));
+    return letteredRe.match(s).hasMatch();
+}
+
+// The comparable key for a compound setting, or an empty string if `raw` is not
+// compound. "1 + 4" and "1+4" are the same dial position, so adherence must not
+// turn on which spacing the model happened to emit.
+inline QString compoundKey(const QString& raw)
+{
+    const auto m = detail::compoundRe().match(raw.trimmed());
+    if (!m.hasMatch())
+        return {};
+    return m.captured(1) + QLatin1Char('+') + m.captured(2);
+}
+
+// The leading dial number, ignoring any recorded annotation: "24 1400rpm" → 24.
+// Returns nullopt for compound and for prose. Lets adherence compare a
+// recommended "23.5" against a recorded "23.5 1400rpm" — the variable-RPM
+// cohort commonly annotates the setting that way (see GrinderEntry above), and
+// a bare QString::toDouble() rejects the trailing text, scoring a shot the user
+// dialled exactly as asked as "ignored".
+inline std::optional<double> leadingDialNumber(const QString& raw)
+{
+    const QString s = raw.trimmed();
+    if (detail::compoundRe().match(s).hasMatch())
+        return std::nullopt;                 // compound compares via compoundKey
+    const auto m = detail::numRe().match(s);
+    if (!m.hasMatch())
+        return std::nullopt;
+    bool ok = false;
+    const double v = m.captured(1).toDouble(&ok);
+    return ok ? std::optional<double>(v) : std::nullopt;
+}
+
+// Parse a raw grinder_setting string into a linear scalar suitable for
+// arithmetic (within-batch slope, anchor + cap). Returns std::nullopt
+// for strings that cannot be interpreted as a numeric/compound dial
+// (letters, free-text, Eureka "1+4" on a non-compound grinder, structured
+// ranges) — those rows are excluded from the numeric calibration path but
+// still served by the directional path (which doesn't need parsing).
+// Notation rules are documented above the regexes.
+inline std::optional<double> parseGrinderSetting(const GrinderEntry& g,
+                                                 const QString& raw)
+{
+    const QString s = raw.trimmed();
+    if (s.isEmpty()) return std::nullopt;
+
+    if (g.notation == SettingNotation::Compound && g.positionsPerRev > 0) {
+        const auto m = detail::compoundRe().match(s);
+        if (m.hasMatch()) {
+            const double a = m.captured(1).toDouble();
+            const double b = m.captured(2).toDouble();
+            return a * g.positionsPerRev + b;
+        }
+        // fall through: accept plain numeric on compound grinders too
+    }
+
+    const auto m = detail::numRe().match(s);
+    if (!m.hasMatch()) return std::nullopt;
+    const QString suffix = m.captured(2).trimmed();
+    if (!suffix.isEmpty()
+        && (suffix.startsWith(QLatin1Char('+')) || suffix.startsWith(QLatin1Char('-'))))
+        return std::nullopt;  // "1 + 4" (multi-turn with spaces) or range
+    bool ok = false;
+    const double v = m.captured(1).toDouble(&ok);
+    return ok ? std::optional<double>(v) : std::nullopt;
+}
+
+// Format a linear scalar back into the user's own notation. For Compound
+// grinders this emits "a+b"; for plain/numeric-with-suffix grinders it
+// emits the decimal with trailing-zero stripped (the existing convention).
+// The suffix is intentionally NOT round-tripped — recommended-grind output
+// is a dial number, not a verbatim copy of a historical "24 1400rpm" cell.
+inline QString formatGrinderSetting(const GrinderEntry& g, double linear)
+{
+    if (g.notation == SettingNotation::Compound && g.positionsPerRev > 0) {
+        const int rev = static_cast<int>(std::floor(linear / g.positionsPerRev));
+        const double pos = linear - rev * g.positionsPerRev;
+        QString posStr = QString::number(pos, 'f', 1);
+        if (posStr.endsWith(QStringLiteral(".0"))) posStr.chop(2);
+        return QString::number(rev) + QStringLiteral("+") + posStr;
+    }
+    QString s = QString::number(linear, 'f', 1);
+    if (s.endsWith(QStringLiteral(".0"))) s.chop(2);
+    return s;
+}
+
+// DARK cross-grinder grind. Both return nullopt when the scale is not usable,
+// so a caller that forgets to check populated() still cannot emit a fabricated
+// micron number. The affine line through the two anchors is the same for
+// interpolation and extrapolation; linearFromMicrons is its exact inverse.
+inline std::optional<double> micronsFromLinear(const MicronScale& scale, double linear)
+{
+    if (!scale.populated()) return std::nullopt;
+    const double slope = (scale.micronB - scale.micronA) / (scale.linearB - scale.linearA);
+    return scale.micronA + slope * (linear - scale.linearA);
+}
+
+inline std::optional<double> linearFromMicrons(const MicronScale& scale, double microns)
+{
+    if (!scale.populated()) return std::nullopt;
+    // Inverse slope: distinct micron anchors are not guaranteed by populated()
+    // (two linear positions could, pathologically, read the same micron), so
+    // guard the division here rather than assuming it.
+    if (scale.micronA == scale.micronB) return std::nullopt;
+    const double inv = (scale.linearB - scale.linearA) / (scale.micronB - scale.micronA);
+    return scale.linearA + inv * (microns - scale.micronA);
+}
+
+} // namespace GrinderAliases

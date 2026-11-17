@@ -1,0 +1,230 @@
+// The language-grid delegate reads this file's ids (`addLanguagePage`, `languageGrid`);
+// Bound makes them statically resolvable. It declares its one injected role,
+// `modelData`, required in the same edit -- without that, Bound stops role injection
+// and every language card renders blank at RUNTIME, silently.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Decenza
+
+Page {
+    id: addLanguagePage
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: TranslationManager.translate("addLanguage.title", "Add Language")
+
+    objectName: "addLanguagePage"
+    background: ThemedPageBackground {}
+    property string pendingAddRequest: ""
+    readonly property bool browserHasUnsavedChanges: pendingAddRequest.length > 0
+    property string addError: ""
+
+    Connections {
+        target: LanguageService
+        function onOperationCompleted(requestId, operation, success, result, reason) {
+            if (requestId !== addLanguagePage.pendingAddRequest || operation !== "addLanguage")
+                return
+            addLanguagePage.pendingAddRequest = ""
+            if (success) {
+                if (addLanguagePage.StackView.status === StackView.Active)
+                    AppShell.backRequested()
+            } else {
+                addLanguagePage.addError = TranslationManager.translate("addLanguage.failed", "The language could not be added. Try again after checking the host connection and storage.")
+            }
+        }
+    }
+
+
+    // ISO 639-1 common languages (sorted by English name)
+    property var isoLanguages: [
+        { code: "ar", name: "Arabic", nativeName: "العربية" },
+        { code: "bg", name: "Bulgarian", nativeName: "Български" },
+        { code: "ca", name: "Catalan", nativeName: "Català" },
+        { code: "zh", name: "Chinese", nativeName: "中文" },
+        { code: "hr", name: "Croatian", nativeName: "Hrvatski" },
+        { code: "cs", name: "Czech", nativeName: "Čeština" },
+        { code: "da", name: "Danish", nativeName: "Dansk" },
+        { code: "nl", name: "Dutch", nativeName: "Nederlands" },
+        { code: "et", name: "Estonian", nativeName: "Eesti" },
+        { code: "fi", name: "Finnish", nativeName: "Suomi" },
+        { code: "fr", name: "French", nativeName: "Français" },
+        { code: "de", name: "German", nativeName: "Deutsch" },
+        { code: "el", name: "Greek", nativeName: "Ελληνικά" },
+        { code: "he", name: "Hebrew", nativeName: "עברית" },
+        { code: "hi", name: "Hindi", nativeName: "हिन्दी" },
+        { code: "hu", name: "Hungarian", nativeName: "Magyar" },
+        { code: "id", name: "Indonesian", nativeName: "Bahasa Indonesia" },
+        { code: "it", name: "Italian", nativeName: "Italiano" },
+        { code: "ja", name: "Japanese", nativeName: "日本語" },
+        { code: "ko", name: "Korean", nativeName: "한국어" },
+        { code: "lv", name: "Latvian", nativeName: "Latviešu" },
+        { code: "lt", name: "Lithuanian", nativeName: "Lietuvių" },
+        { code: "ms", name: "Malay", nativeName: "Bahasa Melayu" },
+        { code: "nb", name: "Norwegian", nativeName: "Norsk bokmål" },
+        { code: "fa", name: "Persian", nativeName: "فارسی" },
+        { code: "pl", name: "Polish", nativeName: "Polski" },
+        { code: "pt", name: "Portuguese", nativeName: "Português" },
+        { code: "ro", name: "Romanian", nativeName: "Română" },
+        { code: "ru", name: "Russian", nativeName: "Русский" },
+        { code: "sr", name: "Serbian", nativeName: "Српски" },
+        { code: "sk", name: "Slovak", nativeName: "Slovenčina" },
+        { code: "sl", name: "Slovenian", nativeName: "Slovenščina" },
+        { code: "es", name: "Spanish", nativeName: "Español" },
+        { code: "sv", name: "Swedish", nativeName: "Svenska" },
+        { code: "th", name: "Thai", nativeName: "ไทย" },
+        { code: "tr", name: "Turkish", nativeName: "Türkçe" },
+        { code: "uk", name: "Ukrainian", nativeName: "Українська" },
+        { code: "vi", name: "Vietnamese", nativeName: "Tiếng Việt" }
+    ]
+
+    function getAvailableLanguages() {
+        var available = []
+        var existing = LanguageService.availableLanguages
+        for (let i = 0; i < isoLanguages.length; i++) {
+            let lang = isoLanguages[i]
+            if (existing.indexOf(lang.code) === -1) {
+                available.push(lang)
+            }
+        }
+        return available
+    }
+
+    ColumnLayout {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: bottomBar.top
+        anchors.margins: Theme.spacingSmall
+        spacing: Theme.spacingSmall
+
+        // Header
+        Text {
+            Layout.fillWidth: true
+            text: TranslationManager.translate("addLanguage.header.tapToAdd", "Tap a language to add it")
+            font: Theme.labelFont
+            color: Theme.textSecondaryColor
+            horizontalAlignment: Text.AlignHCenter
+        }
+
+        GridView {
+            id: languageGrid
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.topMargin: Theme.spacingMedium
+            clip: true
+            cellWidth: width / 2
+            cellHeight: 72
+            model: addLanguagePage.getAvailableLanguages()
+
+            delegate: Item {
+                id: langCell
+                required property var modelData
+
+                width: languageGrid.cellWidth
+                height: languageGrid.cellHeight
+
+                Rectangle {
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(6)
+                    radius: Theme.buttonRadius
+                    color: langMouseArea.pressed ? Theme.primaryColor : Theme.cardBackgroundColor
+                    border.width: 1
+                    border.color: Theme.borderColor
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: langCell.modelData.name + ", " + langCell.modelData.nativeName
+                    Accessible.description: TranslationManager.translate("addlanguage.accessible.add", "Add") + " " + langCell.modelData.name + " " + TranslationManager.translate("language.accessible.language", "language")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: langMouseArea.clicked(null)
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.margins: Theme.scaled(10)
+                        spacing: Theme.scaled(10)
+
+                        Text {
+                            text: langCell.modelData.code.toUpperCase()
+                            font.pixelSize: Theme.scaled(14)
+                            font.family: Theme.monoFontFamily
+                            font.bold: true
+                            color: langMouseArea.pressed ? Theme.primaryContrastColor : Theme.primaryColor
+                            Layout.preferredWidth: Theme.scaled(30)
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.scaled(2)
+
+                            Text {
+                                text: langCell.modelData.name
+                                font: Theme.bodyFont
+                                color: langMouseArea.pressed ? Theme.primaryContrastColor : Theme.textColor
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+
+                            Text {
+                                text: langCell.modelData.nativeName
+                                font: Theme.labelFont
+                                color: langMouseArea.pressed ? Qt.alpha(Theme.primaryContrastColor, 0.8) : Theme.textSecondaryColor
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        id: langMouseArea
+                        anchors.fill: parent
+                        onClicked: {
+                            if (addLanguagePage.pendingAddRequest !== "") return
+                            addLanguagePage.addError = ""
+                            addLanguagePage.pendingAddRequest = LanguageService.execute("addLanguage", {
+                                code: langCell.modelData.code,
+                                displayName: langCell.modelData.name,
+                                nativeName: langCell.modelData.nativeName
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Text {
+        anchors.centerIn: parent
+        width: parent.width - Theme.spacingLarge * 2
+        visible: addLanguagePage.getAvailableLanguages().length === 0
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+        text: TranslationManager.translate("addLanguage.noneAvailable", "All offered languages are already available. Choose a language in Settings to download or edit it.")
+        font: Theme.bodyFont
+        color: Theme.textSecondaryColor
+        wrapMode: Text.Wrap
+        horizontalAlignment: Text.AlignHCenter
+    }
+
+    Text {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: bottomBar.top
+        anchors.margins: Theme.spacingSmall
+        text: addLanguagePage.addError
+        visible: text.length > 0
+        color: Theme.errorColor
+        font: Theme.bodyFont
+        wrapMode: Text.Wrap
+        Accessible.role: Accessible.AlertMessage
+        Accessible.name: text
+    }
+
+    // Bottom bar
+    BottomBar {
+        id: bottomBar
+        title: TranslationManager.translate("addLanguage.title", "Add Language")
+        onBackClicked: AppShell.backRequested()
+    }
+}

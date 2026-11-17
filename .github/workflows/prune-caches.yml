@@ -1,0 +1,603 @@
+name: Prune stale compiler caches
+
+# ccache-action / sccache write a NEW timestamp-suffixed cache entry every
+# build (GH caches are immutable, so the action can't update in place — it
+# finds the latest via prefix restore-keys). Old copies are never cleaned up,
+# so stale copies of each platform's compiler cache pile up and push the repo
+# toward GitHub's 10 GB cap, triggering LRU eviction of still-useful Qt/ccache
+# entries and causing cold builds.
+#
+# This used to be a final step inside macos-release.yml, on the assumption that
+# macOS was the slowest build so every other platform had already saved its
+# fresh cache by prune time. That stopped holding (Linux x64 now outlasts
+# macOS), and the in-build prune could never see the running build's own cache
+# (ccache-action saves in a post-job step), so it had to keep 2 copies per
+# group and still left 3 copies for any platform finishing after macOS.
+#
+# As a standalone workflow triggered when a build workflow completes — and
+# skipping while any build is still in progress or queued — every fresh cache
+# is already saved when we prune, so keeping exactly 1 copy per (prefix, ref)
+# group is safe. The last build to finish re-triggers us, so the skip never
+# strands stale entries.
+#
+# That gate applies to four of the five steps. The keep-1 dedupe step runs
+# UNGATED, and the reason is a timing one, so state it precisely: the gate does
+# not stop the cleanup from happening, it delays it past the point where the
+# damage is already done and irreversible.
+#
+# A release fires all six builds at once and each saves a SECOND copy of its
+# prefix. For the ~14 minutes until the last one finishes, the gate holds prune
+# off and the store carries every duplicate at once — over GitHub's 10 GB cap.
+# GitHub evicts to get back under it, and what it takes is the least recently
+# used LIVE entry. While the nightly kept a compiler cache that was always a
+# `ccache-sanitizers-*` entry, touched once every 24 h; the nightly builds cold
+# now, which is what returned that space. Eviction is not undone by the prune
+# that follows.
+#
+# Two evictions, two different legs, on consecutive days:
+#
+#   2026-08-20  v2.0.4 builds created 20:20, finished 20:25-20:34 (run times,
+#               not cache save times). Prune 32414785391 fired at 20:34 once
+#               the last build was done, said "No build workflows active —
+#               pruning" and collected the duplicates — but by then the store
+#               had been over cap for fourteen minutes. Next morning at 04:57
+#               the nightly's UBSAN leg restored "No cache found." and built
+#               cold: 83/878 hits (9.45%, 0 direct) against asan's 653/878
+#               (74.37%). Nothing in THIS workflow removed it — the keep-1 step
+#               only collects an entry that has a newer sibling, and the
+#               main-scope step excludes `ccache-sanitizers-*` by name. It was
+#               evicted, and the over-cap window is the only thing that evicts.
+#
+#   2026-08-21  v2.0.4 re-tagged, builds created 16:10, finishing 16:14-16:21.
+#               Store peaked at 11.10 GB across 19 entries, 2.7 GB of it four
+#               duplicate pairs (macOS 1843+1777, Android 646+622, Windows
+#               sccache 241+225, Linux arm64 77+63). Four prunes fired inside
+#               the window and all four skipped: "5 build workflow(s) still
+#               active", then 4, 3, 2. This time ASAN's 1199 MB entry was
+#               evicted and ubsan's survived; which leg pays is arbitrary. At
+#               16:30, with one build still running, the store still held
+#               9.98 GB and 3031 MB of collectable duplicates.
+#
+# Neither night had any garbage to collect: those prunes reported 0 entries on
+# superseded tags and 0 main-scoped platform entries. The cleanup was not
+# failing to find stale caches. It was standing down for the fourteen minutes
+# in which the cap was exceeded, and cleaning up afterwards.
+#
+# Keep-1 is safe ungated because it is self-limiting: it deletes only where a
+# NEWER entry of the same (prefix, ref) already exists, so a build that has not
+# saved yet leaves its prefix with a single entry and nothing is deleted for it.
+# Deleting macOS's previous copy once macOS has saved its new one cannot strand
+# a restore — and a build still running restored at its start, before this
+# workflow was even triggered. The gate's own comment justifies itself against
+# the OLD keep-2 heuristic ("it had to keep 2 copies per group"), which did need
+# to know whether a save was outstanding. Keep-1 does not.
+#
+# The other four steps stay gated. They delete on a liveness signal — a tag
+# being superseded, a branch being gone, a ref nothing seeds, a key no build
+# restores — and none of those facts is self-limiting the way "a newer copy
+# already exists" is.
+
+on:
+  # Called after each native job has saved its cache; workflow_run handles final cleanup.
+  workflow_call:
+    inputs:
+      caller:
+        description: The release job that saved a cache; each caller gets its own concurrency group
+        type: string
+        required: true
+  workflow_run:
+    workflows:
+      - 'Release all platforms'
+      # The nightly no longer keeps a compiler cache, but it still restores and
+      # can save the stable `qt-linux-v4` install on main, so it stays here and
+      # in the gate regex below.
+      - 'Nightly sanitizers'
+    types: [completed]
+  # Nearly all builds run on TAG pushes, and GitHub's docs don't clearly
+  # guarantee workflow_run fires for tag-triggered runs (no `branches:`
+  # filter here, so it should — but field reports show this edge being
+  # flaky). The daily cron is the guaranteed fallback: pruning is
+  # idempotent and takes seconds, so a redundant pass is free.
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write  # gh cache delete / gh run list
+
+concurrency:
+  # A group holds one running and one pending run, and a newer queued run CANCELS
+  # the pending one even with cancel-in-progress: false. With one shared group,
+  # release jobs finishing together cancelled each other's prune (run 40282144986,
+  # linux-arm64), which marked the whole release run cancelled. So each release
+  # run's caller gets a group of its own (github.run_id is the calling run's), and
+  # a release prune can never be replaced. The standalone triggers share one group;
+  # replacing a pending one there touches no release run. Concurrent prunes may race
+  # to delete the same entry; that only logs a warning (the delete loop below).
+  group: ${{ inputs.caller && format('prune-caches-{0}-{1}', inputs.caller, github.run_id) || 'prune-caches-standalone' }}
+  # NOT cancel-in-progress: cancelling a pass mid-delete-loop loses the space it
+  # would have reclaimed early. Each pass is ~10 s and idempotent.
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Skip while builds are running
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # If any build workflow is still queued or running, its compiler
+          # cache hasn't been saved yet — pruning now would repeat the old
+          # in-build prune's blind spot. Skip; the completion of that run
+          # fires this workflow again.
+          BUILD_WORKFLOWS='Release all platforms|Nightly sanitizers'
+          ACTIVE=$(gh run list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json workflowName,status \
+            --jq '[.[] | select((.status == "in_progress" or .status == "queued"))
+                        | .workflowName] | unique | .[]' \
+            | grep -cE "^($BUILD_WORKFLOWS)$" || true)
+          if [ "${ACTIVE:-0}" -gt 0 ]; then
+            echo "$ACTIVE build workflow(s) still active — skipping prune."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No build workflows active — pruning."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Deliberately NOT gated on steps.gate — see the header. This is the step
+      # that has to run DURING a release, because that is when the duplicates
+      # exist and when the cap is exceeded. It deletes only entries that already
+      # have a newer sibling in the same (prefix, ref) group, so it cannot take
+      # the copy a still-running build will restore from next time.
+      - name: Prune stale ccache/sccache entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Keep the newest copy of each timestamped ccache/sccache prefix,
+          # grouped per ref so a main-scoped entry survives a newer tag-push
+          # build. qt-*/openssl-* use stable keys (no timestamp suffix) and are
+          # excluded by the regex filter — they are exactly the caches we want
+          # to keep restorable. gh's built-in --jq does not accept --arg /
+          # --argjson, so pipe to real jq.
+          KEEP=1
+          TS='-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$'
+
+          # Listing checked separately from "found nothing", like the three
+          # steps below. This step now carries the load during a release, so
+          # "Reclaimed 0 MB" has to be distinguishable from "never looked".
+          if ! RAW=$(gh cache list --repo "$GITHUB_REPOSITORY" --limit 500 \
+                       --json id,key,createdAt,ref,sizeInBytes); then
+            echo "::error::Could not list caches — the keep-1 dedupe did NOT run."
+            exit 1
+          fi
+          # --limit 500 is gh's ceiling and truncation is invisible. The listing
+          # is ordered by last-accessed descending, so what falls off the end is
+          # precisely the superseded copies this step collects — it would report
+          # a clean store while the duplicates sat below the cut.
+          if [ "$(printf '%s' "$RAW" | jq length)" -ge 500 ]; then
+            echo "::warning::Cache listing hit the 500-entry limit; this dedupe may be partial."
+          fi
+          ROWS=$(printf '%s' "$RAW" | jq -r --argjson keep "$KEEP" --arg ts "$TS" '
+                   map(select(.key | test($ts)))
+                   | group_by((.key | sub($ts; "")) + "@@" + .ref)
+                   | map(sort_by(.createdAt) | reverse | .[$keep:])
+                   | flatten
+                   | .[] | "\(.id)\t\(.sizeInBytes)\t\(.key)"
+                 ')
+          if [ -z "$ROWS" ]; then
+            echo "Listed $(printf '%s' "$RAW" | jq length) caches; no duplicate (prefix, ref) groups."
+            exit 0
+          fi
+
+          # Here-string, not a pipe: the loop must run in this shell or the
+          # counters accumulate in a subshell and are discarded. That trap is
+          # already recorded on the dead-ref step below; this step had the same
+          # pipe and got away with it only because nothing read a counter.
+          freed=0
+          deleted=0
+          candidates=$(printf '%s\n' "$ROWS" | grep -c . || true)
+          while IFS=$'\t' read -r id size key; do
+                [ -n "$id" ] || continue
+                mb=$(( size / 1024 / 1024 ))
+                if err=$(gh cache delete "$id" --repo "$GITHUB_REPOSITORY" 2>&1); then
+                  echo "- deleted \`$key\` (${mb} MB) — superseded by a newer copy of the same prefix" \
+                    >> "$GITHUB_STEP_SUMMARY"
+                  freed=$(( freed + mb ))
+                  deleted=$(( deleted + 1 ))
+                else
+                  echo "::warning::Failed to delete cache $key (id $id): $err"
+                fi
+          done <<< "$ROWS"
+          echo "Reclaimed ${freed} MB from ${deleted}/${candidates} duplicate entries." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Compiler caches left behind by release tags that have SHIPPED.
+      #
+      # `!cancelled()` on this and the three steps below, not a bare skip check:
+      # the keep-1 step above is ungated and exits 1 if it cannot list the
+      # cache, and a step that fails would otherwise skip everything after it.
+      # These four collect different things and depend on nothing that step
+      # produces, so one transient `gh cache list` failure during a release must
+      # not also stand down the superseded-tag, stable-key, main-scope and dead-ref passes.
+      # `!cancelled()` rather than `always()` so a cancelled job still stops.
+      #
+      # The step above keeps one copy per (prefix, ref) and is right to. What it
+      # cannot see is that a shipped tag stops being a ref anyone builds: the
+      # release process re-tags and force-pushes the SAME tag while iterating,
+      # so that tag's cache is hot (nine v2.0.0 macOS builds in three days, each
+      # restoring the last), and then the next version takes over and the old
+      # tag's whole set goes cold at once. GitHub scopes restores to the entry's
+      # own ref, so no other tag can ever read it — cold here means unreachable,
+      # not merely stale.
+      #
+      # Measured 2026-07-28: v2.0.0 held 3045 MB — macOS 1870, iOS 467, Linux
+      # x64 457, Windows 251 — while v2.0.1 was the current release. Four
+      # entries because that is what v2.0.0 happened to leave; six workflows use
+      # the cache action and v2.0.1 left six, 1.48 GB. Either way it is ~30% of
+      # the 10 GB cap held by a tag nothing will build again, and it was pushing
+      # the nightly sanitizer job into its cold-build yield every night.
+      #
+      # The NEWEST tag is kept, and that is the whole point rather than a
+      # caveat: it is the release currently being iterated on, and collecting it
+      # would make the next re-tag rebuild from scratch. Ordering is by build
+      # time for the same reason — see the note on NEWEST below.
+      #
+      # Scoped to tag refs, and to tags older than the newest one present.
+      #
+      # This used to also require a timestamped ccache/sccache key, which left
+      # the STABLE-key entries on a shipped tag — qt-*, gradle-*, openssl-* —
+      # uncollectable by anything. They are scoped to that tag's ref like every
+      # other entry, so no future tag can read them either; the timestamp filter
+      # was about identifying compiler caches, and got read as a safety
+      # boundary. Measured on v2.0.1: 2.4 GB across six stable-key entries
+      # (qt-macos 629 MB, qt-windows 498, qt-android 475, qt-linux-arm64 397,
+      # gradle 373, openssl 24) that no step in this file would ever have
+      # touched. Nor would the deleted-branch step below — it deletes on a
+      # liveness signal, and a tag is always live.
+      #
+      # So the filter is now "tag-scoped and superseded", whatever the key
+      # shape. The newest tag is still fully protected, stable keys included:
+      # those are what make a re-tag's Qt install fast.
+      - name: Drop caches for superseded release tags
+        if: ${{ !cancelled() && steps.gate.outputs.skip == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # No TS regex here any more: this step no longer distinguishes
+          # compiler caches from stable-key ones. The other steps still need
+          # theirs and define it locally.
+
+          # Tag-scoped entries surface as refs/heads/refs/tags/X (the odd shape
+          # the deleted-branch step below skips) as well as plain refs/tags/X.
+          # The whole `refs/heads/` is what is optional — `refs/(heads/)?refs/`
+          # only matches the quirk shape and a `refs/refs/` that never occurs,
+          # so a plain refs/tags/X would silently select nothing.
+          if ! RAW=$(gh cache list --repo "$GITHUB_REPOSITORY" --limit 500 \
+                       --json id,key,ref,sizeInBytes,createdAt); then
+            echo "::error::Could not list caches — the superseded-tag prune did NOT run."
+            exit 1
+          fi
+          # --limit 500 is gh's ceiling and truncation is invisible: the listing
+          # is ordered by last-accessed descending, so what falls off the end is
+          # precisely the stale entries this step exists to collect.
+          if [ "$(printf '%s' "$RAW" | jq length)" -ge 500 ]; then
+            echo "::warning::Cache listing hit the 500-entry limit; this prune may be partial."
+          fi
+          if ! CACHES=$(printf '%s' "$RAW" | jq -r '
+                       .[]
+                       | select(.ref | test("^(refs/heads/)?refs/tags/"))
+                       | "\(.id)\t\(.ref | sub("^(refs/heads/)?refs/tags/"; ""))\t\(.sizeInBytes)\t\(.key)"
+                     '); then
+            echo "::error::Could not parse the cache listing (renamed --json field?) — the superseded-tag prune did NOT run."
+            exit 1
+          fi
+
+          # Report what was actually observed. "No tag caches" and "the listing
+          # never happened" have to look different in the log, or this step
+          # asserts a fact about the store it never read — the failure the
+          # nightly's reclaim was rewritten to stop making.
+          if [ -z "$CACHES" ]; then
+            echo "Listed $(printf '%s' "$RAW" | jq length) caches; none are tag-scoped."
+            exit 0
+          fi
+
+          # Newest by BUILD TIME, not by version sort. What this step protects is
+          # the tag currently being rebuilt, which is a question about when it
+          # last built, not about how its name sorts. `sort -V` gets both real
+          # cases wrong: it ranks a hotfix released after a higher version as
+          # older (v1.9.5 after v2.0.0) and, under GNU filevercmp, ranks
+          # v2.1.0-beta ABOVE v2.1.0, so it would keep the beta and collect the
+          # shipped tag mid-release. createdAt has neither failure and needs no
+          # assumption about the tag scheme.
+          #
+          # Self-contained on purpose: a tag whose build is still running cannot
+          # appear here anyway, because the gate step skips the whole workflow
+          # while any build is active.
+          # Computed over the SAME set the deletion loop walks. It must not be
+          # narrowed to timestamped keys while CACHES is not: on any prune where
+          # the tag entries are all stable-key — after this step has already
+          # collected the compiler caches, or on a repo whose current release
+          # has only restored (not re-saved) its Qt entry — max_by would return
+          # null, NEWEST would be the string "null", every real tag would
+          # compare unequal to it, and the loop would delete the live release's
+          # entries. Same set for both, or the protection silently inverts.
+          NEWEST=$(printf '%s' "$RAW" | jq -r '
+                     [ .[] | select(.ref | test("^(refs/heads/)?refs/tags/")) ]
+                     | max_by(.createdAt)
+                     | .ref | sub("^(refs/heads/)?refs/tags/"; "")
+                   ')
+          # CACHES is non-empty here (checked above), so NEWEST must name a tag.
+          # If it doesn't, the jq changed shape underneath us — refuse rather
+          # than treat every entry as superseded.
+          if [ -z "$NEWEST" ] || [ "$NEWEST" = "null" ]; then
+            echo "::error::Could not determine the newest tag from $(printf '%s\n' "$CACHES" | grep -c .) tag-scoped entr(y|ies) — refusing to prune."
+            exit 1
+          fi
+          CANDIDATES=$(printf '%s\n' "$CACHES" | awk -F'\t' -v n="$NEWEST" '$2 != n' | grep -c . || true)
+          echo "Newest tag with caches: $NEWEST (keeping its entries); $CANDIDATES entr(y|ies) on older tags."
+
+          freed=0
+          deleted=0
+          while IFS=$'\t' read -r id tag size key; do
+            [ -n "$id" ] || continue
+            [ "$tag" = "$NEWEST" ] && continue
+            mb=$(( size / 1024 / 1024 ))
+            if err=$(gh cache delete "$id" --repo "$GITHUB_REPOSITORY" 2>&1); then
+              echo "- deleted \`$key\` (${mb} MB) — tag $tag superseded by $NEWEST" \
+                >> "$GITHUB_STEP_SUMMARY"
+              freed=$(( freed + mb ))
+              deleted=$(( deleted + 1 ))
+            else
+              echo "::warning::Failed to delete cache $key (id $id): $err"
+            fi
+          done <<< "$CACHES"
+
+          # Attempted vs succeeded, to the step summary rather than a stdout
+          # line nobody opens: "Reclaimed 0 MB" alone reads the same whether
+          # nothing needed collecting or every delete was refused.
+          echo "Reclaimed ${freed} MB from ${deleted}/${CANDIDATES} superseded entries." \
+            >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CANDIDATES" -gt 0 ] && [ "$deleted" -eq 0 ]; then
+            echo "::error::$CANDIDATES entr(y|ies) on superseded tags and none could be deleted — nothing was reclaimed."
+            exit 1
+          fi
+
+      # Stable-key entries (qt-*, apt-*, gradle-*) that no build will restore again.
+      # No step above touches these on the newest tag or on main, so two kinds
+      # piled up there:
+      #
+      #   superseded  The key embeds a runner image or kernel version
+      #               (`linux-7.0.0-1017-azure`, `ubuntu24-20261026.354.1`), so one
+      #               build on a different host saves a second full copy. Measured
+      #               2026-11-03: a 440 MB `…1014-aws` Qt install on v2.1.0, last
+      #               used once, beside the `…1017-azure` one every build uses.
+      #               Family = the key up to its first dotted-version token; an
+      #               entry last used more than a day before its most recently used
+      #               sibling in the family is collected. Siblings share its ref, and
+      #               for a tag entry also include main's, since a tag restores from
+      #               main. Two entries a build actually uses are touched by that same
+      #               build, minutes apart.
+      #   main copy   A tag entry whose exact key `main` also holds. A tag build
+      #               falls back to `main`'s scope on a miss and saves nothing on an
+      #               exact hit, so the tag's copy only doubles the space (441 MB of
+      #               Qt Linux on 2026-11-03).
+      - name: Drop superseded and main-duplicated stable-key caches
+        if: ${{ !cancelled() && steps.gate.outputs.skip == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          TS='-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$'
+
+          if ! RAW=$(gh cache list --repo "$GITHUB_REPOSITORY" --limit 500 \
+                       --json id,key,ref,sizeInBytes,lastAccessedAt); then
+            echo "::error::Could not list caches — the stable-key prune did NOT run."
+            exit 1
+          fi
+          if [ "$(printf '%s' "$RAW" | jq length)" -ge 500 ]; then
+            echo "::warning::Cache listing hit the 500-entry limit; this prune may be partial."
+          fi
+          if ! ROWS=$(printf '%s' "$RAW" | jq -r --arg ts "$TS" '
+                   def fam: (.key | capture("^(?<f>.*?)-[^-]*[0-9]+\\.[0-9]+") | .f) // null;
+                   def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+                   [ .[] | select(.key | test($ts) | not) ] as $stable
+                   | [ $stable[] | select(.ref == "refs/heads/main") | .key ] as $mainkeys
+                   | [ $stable[] | select(fam != null) ] as $fams
+                   | ( $fams[] as $e
+                       | ($e.ref | test("^(refs/heads/)?refs/tags/")) as $tag
+                       | [ $fams[] | select(fam == ($e | fam)
+                                     and (.ref == $e.ref or ($tag and .ref == "refs/heads/main"))) ]
+                       | max_by(.lastAccessedAt | epoch) as $live
+                       | $e | select(.id != $live.id
+                                and (.lastAccessedAt | epoch) + 86400 < ($live.lastAccessedAt | epoch))
+                       | . + {why: "superseded by \($live.key) on \($live.ref)"} ),
+                     ( $stable[] | select(.ref | test("^(refs/heads/)?refs/tags/"))
+                       | select(.key as $k | $mainkeys | index($k))
+                       | . + {why: "main holds the same key"} )
+                   | "\(.id)\t\(.sizeInBytes)\t\(.key)\t\(.why)"
+                 ' | sort -u -t$'\t' -k1,1); then
+            echo "::error::Could not parse the cache listing — the stable-key prune did NOT run."
+            exit 1
+          fi
+          if [ -z "$ROWS" ]; then
+            echo "Listed $(printf '%s' "$RAW" | jq length) caches; no superseded or main-duplicated stable-key entries."
+            exit 0
+          fi
+
+          freed=0
+          deleted=0
+          candidates=$(printf '%s\n' "$ROWS" | grep -c . || true)
+          while IFS=$'\t' read -r id size key why; do
+            [ -n "$id" ] || continue
+            mb=$(( size / 1024 / 1024 ))
+            if err=$(gh cache delete "$id" --repo "$GITHUB_REPOSITORY" 2>&1); then
+              echo "- deleted \`$key\` (${mb} MB) — $why" >> "$GITHUB_STEP_SUMMARY"
+              freed=$(( freed + mb ))
+              deleted=$(( deleted + 1 ))
+            else
+              echo "::warning::Failed to delete cache $key (id $id): $err"
+            fi
+          done <<< "$ROWS"
+          echo "Reclaimed ${freed} MB from ${deleted}/${candidates} stable-key entries." \
+            >> "$GITHUB_STEP_SUMMARY"
+          if [ "$deleted" -eq 0 ]; then
+            echo "::error::$candidates stable-key entr(y|ies) to collect and none could be deleted."
+            exit 1
+          fi
+
+      # Platform compiler caches on main, which nothing seeds any more.
+      #
+      # These existed for one reason: the FIRST build of a new tag has an empty
+      # tag scope, and GitHub lets it fall back to the default branch's. They
+      # were written by warm-main-cache.yml, which dispatched all six builds on
+      # main when a release was promoted out of prerelease — an event this
+      # project usually never reaches. Four firings ever (2026-05-28, 06-17,
+      # 07-10, 07-24). That workflow is now deleted, so nothing writes these
+      # again and their hit rate only decays.
+      #
+      # Measured 2026-07-28: 953 MB — macOS 347, iOS 329, Android 119, Linux x64
+      # 70, Windows 52, Linux arm64 36. The cost of dropping them is one cold
+      # build per platform per release; every rebuild after that restores the
+      # tag's own cache, and this project re-tags repeatedly (nine v2.0.0 macOS
+      # builds in three days), so it is one build in nine, not one in one.
+      #
+      # Includes the `ccache-sanitizers-*` entries the nightly left when it
+      # stopped caching (1.75 GB on 2026-11-03). Stable-key entries (qt-*,
+      # openssl-*, gradle-*) carry no timestamp and are excluded by TS, as
+      # everywhere else here.
+      - name: Drop main-scoped platform compiler caches
+        if: ${{ !cancelled() && steps.gate.outputs.skip == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          TS='-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$'
+
+          if ! RAW=$(gh cache list --repo "$GITHUB_REPOSITORY" --limit 500 \
+                       --json id,key,ref,sizeInBytes); then
+            echo "::error::Could not list caches — the main-scope prune did NOT run."
+            exit 1
+          fi
+          ROWS=$(printf '%s' "$RAW" | jq -r --arg ts "$TS" '
+                   .[]
+                   | select(.ref == "refs/heads/main")
+                   | select(.key | test($ts))
+                   | "\(.id)\t\(.sizeInBytes)\t\(.key)"
+                 ')
+          if [ -z "$ROWS" ]; then
+            echo "Listed $(printf '%s' "$RAW" | jq length) caches; no main-scoped platform compiler caches to collect."
+            exit 0
+          fi
+
+          freed=0
+          deleted=0
+          candidates=$(printf '%s\n' "$ROWS" | grep -c . || true)
+          while IFS=$'\t' read -r id size key; do
+            [ -n "$id" ] || continue
+            mb=$(( size / 1024 / 1024 ))
+            if err=$(gh cache delete "$id" --repo "$GITHUB_REPOSITORY" 2>&1); then
+              echo "- deleted \`$key\` (${mb} MB) — main-scoped, nothing seeds these now" \
+                >> "$GITHUB_STEP_SUMMARY"
+              freed=$(( freed + mb ))
+              deleted=$(( deleted + 1 ))
+            else
+              echo "::warning::Failed to delete cache $key (id $id): $err"
+            fi
+          done <<< "$ROWS"
+          echo "Reclaimed ${freed} MB from ${deleted}/${candidates} main-scoped platform entries." \
+            >> "$GITHUB_STEP_SUMMARY"
+          if [ "$deleted" -eq 0 ]; then
+            echo "::error::$candidates main-scoped platform entr(y|ies) and none could be deleted."
+            exit 1
+          fi
+
+      # Caches for refs that no longer exist. The step above dedupes WITHIN a
+      # ref and is correct at that job, but it has no concept of a ref that has
+      # ceased to exist: every entry on a deleted branch is the newest of its
+      # (prefix, ref) group, so prune inspects them and rightly finds nothing to
+      # collapse — while the branch was deleted hours ago.
+      #
+      # Measured on 2026-07-19, hours after one feature branch was merged and
+      # deleted: 4436 MB across 12 entries on that dead branch, plus 606 MB on
+      # its merged PR's refs/pull/N/merge — 5.0 GB, HALF the 10 GB cap, held by
+      # refs nothing could ever restore from. The repo sat at 9.91/10 GB and was
+      # LRU-evicting live entries to make room for dead ones.
+      #
+      # GitHub does eventually reclaim these on its own, but "eventually" is not
+      # a schedule, and at 99% of cap the dead entries are actively pushing out
+      # the live ones. Note this is not the same failure as the timestamped
+      # pile-up above; it needed a separate fix because it has a separate cause.
+      #
+      # Deliberately conservative about what counts as dead:
+      #   - branches: only if `git ls-remote` says the ref is gone
+      #   - PRs: only if the PR is CLOSED or MERGED
+      #   - refs/tags/* and anything unrecognised: never touched HERE. The
+      #     original reason still holds for the CURRENT tag, whose cache warms
+      #     the repeated rebuilds of a release in progress. What it did not
+      #     cover is a tag that has shipped, whose set no other ref can read;
+      #     the step above collects those. The caution survives either way: this
+      #     step deletes on a liveness signal and a tag is always live, so a
+      #     misfire here would be silent.
+      - name: Drop caches for deleted branches and closed PRs
+        if: ${{ !cancelled() && steps.gate.outputs.skip == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Same shape as the step above: listing checked separately from
+          # "found nothing", and the loop fed by a here-string so `freed`
+          # survives it. It previously ran on the right of a pipe, where the
+          # counter accumulated in a subshell and was discarded — harmless while
+          # nothing read it, and a trap for whoever printed it next.
+          if ! RAW=$(gh cache list --repo "$GITHUB_REPOSITORY" --limit 500 \
+                       --json id,key,ref,sizeInBytes); then
+            echo "::error::Could not list caches — the dead-ref prune did NOT run."
+            exit 1
+          fi
+          ROWS=$(printf '%s' "$RAW" | jq -r '.[] | "\(.id)\t\(.ref)\t\(.sizeInBytes)\t\(.key)"')
+          freed=0
+          while IFS=$'\t' read -r id ref size key; do
+                [ -n "$id" ] || continue
+                dead=""
+                case "$ref" in
+                  refs/pull/*/merge)
+                    num=$(echo "$ref" | sed -E 's#refs/pull/([0-9]+)/merge#\1#')
+                    state=$(gh pr view "$num" --repo "$GITHUB_REPOSITORY" \
+                              --json state --jq .state 2>/dev/null || echo "")
+                    case "$state" in
+                      CLOSED|MERGED) dead="PR #$num is $state" ;;
+                    esac
+                    ;;
+                  refs/heads/*)
+                    branch="${ref#refs/heads/}"
+                    # A tag-scoped entry can surface as refs/heads/refs/tags/X;
+                    # ls-remote would report it missing as a branch. Skip those.
+                    case "$branch" in
+                      refs/tags/*) continue ;;
+                    esac
+                    if [ -z "$(git ls-remote --heads \
+                         "https://github.com/$GITHUB_REPOSITORY" "$branch" 2>/dev/null)" ]; then
+                      dead="branch '$branch' no longer exists"
+                    fi
+                    ;;
+                esac
+                if [ -n "$dead" ]; then
+                  mb=$(( size / 1024 / 1024 ))
+                  if err=$(gh cache delete "$id" --repo "$GITHUB_REPOSITORY" 2>&1); then
+                    echo "- deleted \`$key\` (${mb} MB) — $dead" >> "$GITHUB_STEP_SUMMARY"
+                    freed=$(( freed + mb ))
+                  else
+                    echo "::warning::Failed to delete cache $key (id $id): $err"
+                  fi
+                fi
+          done <<< "$ROWS"
+          echo "Reclaimed ${freed} MB from dead refs." >> "$GITHUB_STEP_SUMMARY"
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage" --jq \
+            '"Remaining: \(.active_caches_count) caches, \((.active_caches_size_in_bytes/1073741824)*100|round/100) GB / 10 GB cap"' \
+            >> "$GITHUB_STEP_SUMMARY" || true

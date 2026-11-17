@@ -1,0 +1,322 @@
+#include "models/portalsample.h"
+#include "core/diagnosticlogging.h"
+#include "shotprojection.h"
+#include "shotwaterresult.h"
+
+#include <QMetaType>
+#include <QDebug>
+
+namespace {
+QString joinNonEmpty(const QStringList& parts, const QString& sep)
+{
+    QStringList kept;
+    for (const QString& p : parts) {
+        const QString trimmed = p.trimmed();
+        if (!trimmed.isEmpty())
+            kept << trimmed;
+    }
+    return kept.join(sep);
+}
+}
+
+QString ShotProjection::equipmentLabel() const
+{
+    const QString grinder = joinNonEmpty({grinderBrand, grinderModel}, QStringLiteral(" "));
+    const QString basket = joinNonEmpty({basketBrand, basketModel}, QStringLiteral(" "));
+    return joinNonEmpty({grinder, basket}, QStringLiteral(" / "));
+}
+
+QVariantMap ShotProjection::toVariantMap() const
+{
+    if (!isValid()) return {};
+
+    QVariantMap m;
+    m["id"] = id;
+    m["uuid"] = uuid;
+    m["timestampIso"] = timestampIso;
+    m["profileName"] = profileName;
+    m["durationSec"] = durationSec;
+    m["finalWeightG"] = finalWeightG;
+    m["doseWeightG"] = doseWeightG;
+    m["beanBrand"] = beanBrand;
+    m["beanType"] = beanType;
+    m["enjoyment0to100"] = enjoyment0to100;
+    m["hasVisualizerUpload"] = hasVisualizerUpload;
+    m["beverageType"] = beverageType;
+    m["roastDate"] = roastDate;
+    m["roastLevel"] = roastLevel;
+    m["grinderBrand"] = grinderBrand;
+    m["grinderModel"] = grinderModel;
+    m["grinderBurrs"] = grinderBurrs;
+    m["grinderSetting"] = grinderSetting;
+    // Motor RPM is the second half of the dial-in for variable-RPM grinders.
+    // Sparse-emit (only when set) so non-RPM shots surface no rpm field — keeps
+    // legacy/manual grinders clean and matches the sparse convention used for
+    // yieldMode/stoppedBy below. This is the linchpin that carries rpm into
+    // shots_get_detail / shots_compare, the QML history row, and the clone
+    // round-trip (fromVariantMap reads it back below).
+    if (rpm > 0)
+        m["rpm"] = rpm;
+    m["rpmCapable"] = rpmCapable;
+    m["drinkTdsPct"] = drinkTdsPct;
+    m["drinkEyPct"] = drinkEyPct;
+    m["espressoNotes"] = espressoNotes;
+    m["beanNotes"] = beanNotes;
+    m["barista"] = barista;
+    m["profileNotes"] = profileNotes;
+    m["visualizerId"] = visualizerId;
+    m["visualizerUrl"] = visualizerUrl;
+    m["debugLog"] = debugLog;
+    m["temperatureOverrideC"] = temperatureOverrideC;
+    m["targetWeightG"] = targetWeightG;
+    // Yield anchor provenance (add-yield-ratio-anchor): sparse-emit — only
+    // shots pulled under a real anchor carry it; mode "none" simply omits.
+    if (yieldMode == QStringLiteral("absolute") || yieldMode == QStringLiteral("ratio")) {
+        m["yieldMode"] = yieldMode;
+        m["yieldAnchorValue"] = yieldAnchorValue;
+    }
+    // Sparse-emit, like the anchor above: shots recorded before the column
+    // existed carry no multiplier, and emitting 0 — or worse, 1.0 — would hand
+    // a consumer (an MCP client, an AI payload) a measurement nobody took.
+    // Absence means unknown.
+    if (flowCalibration > 0)
+        m["flowCalibration"] = flowCalibration;
+    // #1161: sparse-emit, matching dialing_blocks / mcptools_shots and the
+    // documented MCP contract ("omitted" when the profile ran to
+    // completion / unknown). shots_get_detail serializes through here, so
+    // an unconditional emit would surface "profileEnd"/"" and contradict
+    // the system-prompt rule that absence signals completion. The
+    // profileEnd→"" collapse on a toVariantMap/fromVariantMap round-trip
+    // is harmless: consumers treat both as "not a weight/volume/manual
+    // cutoff" and fall back to yield-vs-target.
+    if (stoppedBy == QStringLiteral("manual")
+        || stoppedBy == QStringLiteral("weight")
+        || stoppedBy == QStringLiteral("volume"))
+        m["stoppedBy"] = stoppedBy;
+    m["profileJson"] = profileJson;
+    m["profileKbId"] = profileKbId;
+    m["profileKbDerivedFrom"] = profileKbDerivedFrom;
+    // Sparse-emit: "" means unlinked (the common case) — omit rather than
+    // surface an empty field to QML/MCP consumers.
+    if (!beanBaseJson.isEmpty())
+        m["beanBaseJson"] = beanBaseJson;
+    // Coffee bag snapshot — sparse-emit like the other optional fields:
+    // pre-bag shots and unfrozen beans simply omit them.
+    if (hasBag())
+        m["bagId"] = bagId;
+    if (!frozenDate.isEmpty())
+        m["frozenDate"] = frozenDate;
+    if (!defrostDate.isEmpty())
+        m["defrostDate"] = defrostDate;
+    if (!storageHint.isEmpty())
+        m["storageHint"] = storageHint;
+    if (!openedDate.isEmpty())
+        m["openedDate"] = openedDate;
+    if (!tasteBalance.isEmpty())
+        m["tasteBalance"] = tasteBalance;
+    if (!tasteBody.isEmpty())
+        m["tasteBody"] = tasteBody;
+    // Recipe provenance (add-recipes) — sparse-emit like the bag snapshot.
+    if (recipeId > 0)
+        m["recipeId"] = recipeId;
+    if (!steamJson.isEmpty())
+        m["steamJson"] = steamJson;
+    if (!hotWaterJson.isEmpty())
+        m["hotWaterJson"] = hotWaterJson;
+    const auto waterSetting = ShotWaterResult::legacySetting(hotWaterJson);
+    if (!waterSetting.isEmpty())
+        m["hotWaterSetting"] = waterSetting;
+    const auto waterResult = ShotWaterResult::fromMap(hotWaterResult).toMap();
+    if (!waterResult.isEmpty())
+        m["hotWaterResult"] = waterResult;
+    // Recipe DISPLAY fields (history-recipe-identity) — resolved live by the
+    // list queries that join `recipes`, not shot data. Sparse: absent on a
+    // recipe-less shot and on every projection that did not join.
+    if (!recipeName.isEmpty())
+        m["recipeName"] = recipeName;
+    if (!recipeDrinkType.isEmpty())
+        m["recipeDrinkType"] = recipeDrinkType;
+    if (recipeArchived)
+        m["recipeArchived"] = recipeArchived;
+    // Preformatted local date/time, built by the list queries. Declared as a
+    // member and a Q_PROPERTY since forever but never carried through either
+    // conversion, so every consumer round-tripping a shot through a QVariantMap
+    // — the web shot list among them — silently rendered an empty date.
+    if (!dateTime.isEmpty())
+        m["dateTime"] = dateTime;
+    // Asymmetric in the other direction until now: fromVariantMap READ
+    // "timestamp" while toVariantMap never wrote it, so any round-trip through
+    // a map zeroed it — and the web card sorts on shot.timestamp.
+    m["timestamp"] = timestamp;
+    // Equipment/basket identity — declared as members AND Q_PROPERTYs since
+    // add-equipment-packages but carried by NEITHER conversion, so any consumer
+    // round-tripping a shot through a map lost all six. Same defect class as
+    // dateTime; found by comparing the header's Q_PROPERTY list against both
+    // functions rather than by anyone noticing empty fields. Sparse-emitted like
+    // the rest of the optional identity block.
+    if (!basketBrand.isEmpty())    m["basketBrand"] = basketBrand;
+    if (!basketModel.isEmpty())    m["basketModel"] = basketModel;
+    if (!puckPrep.isEmpty())       m["puckPrep"] = puckPrep;
+    if (equipmentId > 0)           m["equipmentId"] = equipmentId;
+    if (!equipmentState.isEmpty()) m["equipmentState"] = equipmentState;
+    if (!equipmentName.isEmpty())  m["equipmentName"] = equipmentName;
+
+    m["pressure"] = pressure;
+    m["flow"] = flow;
+    m["temperature"] = temperature;
+    m["temperatureMix"] = temperatureMix;
+    m["weightSource"] = weightSource;
+    m["portalMountingMode"] = portalMountingMode;
+    if (!portalSamples.isEmpty()) m["portalSamples"] = portalSamples;
+    m["resistance"] = resistance;
+    m["conductance"] = conductance;
+    m["darcyResistance"] = darcyResistance;
+    m["conductanceDerivative"] = conductanceDerivative;
+    m["waterDispensed"] = waterDispensed;
+    m["pressureGoal"] = pressureGoal;
+    m["flowGoal"] = flowGoal;
+    m["temperatureGoal"] = temperatureGoal;
+    m["temperatureMixGoal"] = temperatureMixGoal;
+    m["weight"] = weight;
+    m["weightFlowRate"] = weightFlowRate;
+
+    m["channelingDetected"] = channelingDetected;
+    m["grindIssueDetected"] = grindIssueDetected;
+    m["skipFirstFrameDetected"] = skipFirstFrameDetected;
+    m["pourTruncatedDetected"] = pourTruncatedDetected;
+
+    m["summaryLines"] = summaryLines;
+    m["detectorResults"] = detectorResults;
+    if (!portalAnalysis.isEmpty())
+        m["portalAnalysis"] = portalAnalysis;
+    if (phaseSummaries.isValid())
+        m["phaseSummaries"] = phaseSummaries;
+    m["phases"] = phases;
+    return m;
+}
+
+QJsonObject ShotProjection::toJsonObject() const
+{
+    return QJsonObject::fromVariantMap(toVariantMap());
+}
+
+ShotProjection ShotProjection::coerce(const QVariant& v)
+{
+    if (v.userType() == qMetaTypeId<ShotProjection>())
+        return v.value<ShotProjection>();
+    const QVariantMap m = v.toMap();
+    // An empty map means QML/C++ passed null/undefined or a non-map scalar — the
+    // result is a default (invalid, id=0) ShotProjection that callers reject via
+    // isValid(). Log it so a future arg-shape regression is debuggable instead of
+    // surfacing only as a generic "No shot data available". Matches the diagnostic
+    // in AIManager::coerceShot() (#1298).
+    if (m.isEmpty())
+        DIAG_WARN(STORAGE, "ShotProjection") << "coerce: empty/non-map arg (type"
+                   << v.typeName() << ") — result will be invalid";
+    return ShotProjection::fromVariantMap(m);
+}
+
+ShotProjection ShotProjection::fromVariantMap(const QVariantMap& m)
+{
+    ShotProjection p;
+    p.id = m.value("id").toLongLong();
+    p.uuid = m.value("uuid").toString();
+    p.timestamp = m.value("timestamp").toLongLong();
+    p.timestampIso = m.value("timestampIso").toString();
+    p.profileName = m.value("profileName").toString();
+    p.durationSec = m.value("durationSec").toDouble();
+    p.finalWeightG = m.value("finalWeightG").toDouble();
+    p.doseWeightG = m.value("doseWeightG").toDouble();
+    p.beanBrand = m.value("beanBrand").toString();
+    p.beanType = m.value("beanType").toString();
+    p.enjoyment0to100 = m.value("enjoyment0to100").toInt();
+    p.hasVisualizerUpload = m.value("hasVisualizerUpload").toBool();
+    p.beverageType = m.value("beverageType").toString();
+    p.roastDate = m.value("roastDate").toString();
+    p.roastLevel = m.value("roastLevel").toString();
+    p.grinderBrand = m.value("grinderBrand").toString();
+    p.grinderModel = m.value("grinderModel").toString();
+    p.grinderBurrs = m.value("grinderBurrs").toString();
+    p.grinderSetting = m.value("grinderSetting").toString();
+    p.rpm = m.value("rpm").toLongLong();  // absent (non-RPM shot) → 0
+    p.rpmCapable = m.value("rpmCapable").toBool();
+    p.drinkTdsPct = m.value("drinkTdsPct").toDouble();
+    p.drinkEyPct = m.value("drinkEyPct").toDouble();
+    p.espressoNotes = m.value("espressoNotes").toString();
+    p.beanNotes = m.value("beanNotes").toString();
+    p.barista = m.value("barista").toString();
+    p.profileNotes = m.value("profileNotes").toString();
+    p.visualizerId = m.value("visualizerId").toString();
+    p.visualizerUrl = m.value("visualizerUrl").toString();
+    p.debugLog = m.value("debugLog").toString();
+    p.temperatureOverrideC = m.value("temperatureOverrideC").toDouble();
+    p.targetWeightG = m.value("targetWeightG").toDouble();
+    p.yieldMode = m.value("yieldMode").toString();
+    p.yieldAnchorValue = m.value("yieldAnchorValue").toDouble();
+    p.flowCalibration = m.value("flowCalibration").toDouble();
+    p.stoppedBy = m.value("stoppedBy").toString();
+    p.profileJson = m.value("profileJson").toString();
+    p.profileKbId = m.value("profileKbId").toString();
+    p.profileKbDerivedFrom = m.value("profileKbDerivedFrom").toString();
+    p.beanBaseJson = m.value("beanBaseJson").toString();
+    p.bagId = m.value("bagId", -1).toLongLong();
+    p.frozenDate = m.value("frozenDate").toString();
+    p.defrostDate = m.value("defrostDate").toString();
+    p.storageHint = m.value("storageHint").toString();
+    p.openedDate = m.value("openedDate").toString();
+    p.tasteBalance = m.value("tasteBalance").toString();
+    p.tasteBody = m.value("tasteBody").toString();
+    p.recipeId = m.value("recipeId", -1).toLongLong();
+    p.recipeName = m.value("recipeName").toString();
+    p.recipeDrinkType = m.value("recipeDrinkType").toString();
+    p.recipeArchived = m.value("recipeArchived", false).toBool();
+    p.dateTime = m.value("dateTime").toString();
+    p.basketBrand = m.value("basketBrand").toString();
+    p.basketModel = m.value("basketModel").toString();
+    p.puckPrep = m.value("puckPrep").toString();
+    p.equipmentId = m.value("equipmentId", 0).toLongLong();
+    p.equipmentState = m.value("equipmentState").toString();
+    p.equipmentName = m.value("equipmentName").toString();
+    p.steamJson = m.value("steamJson").toString();
+    p.hotWaterJson = m.value("hotWaterJson").toString();
+    p.hotWaterResult = ShotWaterResult::fromMap(m.value("hotWaterResult").toMap()).toMap();
+
+    p.channelingDetected = m.value("channelingDetected").toBool();
+    p.grindIssueDetected = m.value("grindIssueDetected").toBool();
+    p.skipFirstFrameDetected = m.value("skipFirstFrameDetected").toBool();
+    p.pourTruncatedDetected = m.value("pourTruncatedDetected").toBool();
+
+    p.pressure = m.value("pressure").toList();
+    p.flow = m.value("flow").toList();
+    p.temperature = m.value("temperature").toList();
+    p.temperatureMix = m.value("temperatureMix").toList();
+    p.weightSource = m.value("weightSource").toString();
+    p.portalMountingMode = m.value("portalMountingMode").toString();
+    p.portalSamples = PortalSamples::toVariant(PortalSamples::fromVariant(m.value("portalSamples").toList()));
+    p.resistance = m.value("resistance").toList();
+    p.conductance = m.value("conductance").toList();
+    p.darcyResistance = m.value("darcyResistance").toList();
+    p.conductanceDerivative = m.value("conductanceDerivative").toList();
+    p.waterDispensed = m.value("waterDispensed").toList();
+    p.pressureGoal = m.value("pressureGoal").toList();
+    p.flowGoal = m.value("flowGoal").toList();
+    p.temperatureGoal = m.value("temperatureGoal").toList();
+    p.temperatureMixGoal = m.value("temperatureMixGoal").toList();
+    p.weight = m.value("weight").toList();
+    p.weightFlowRate = m.value("weightFlowRate").toList();
+
+    p.summaryLines = m.value("summaryLines").toList();
+    p.detectorResults = m.value("detectorResults").toMap();
+    p.portalAnalysis = m.value("portalAnalysis").toMap();
+    p.phaseSummaries = m.value("phaseSummaries");
+    p.phases = m.value("phases").toList();
+    return p;
+}
+
+void ShotProjection::registerMetaTypeConverters()
+{
+    static bool registered = false;
+    if (registered) return;
+    registered = true;
+    QMetaType::registerConverter<QVariantMap, ShotProjection>(&ShotProjection::fromVariantMap);
+}

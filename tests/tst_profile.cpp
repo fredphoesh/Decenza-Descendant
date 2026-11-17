@@ -1,0 +1,2602 @@
+#include <QtTest>
+#include <functional>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QRegularExpression>
+
+#include "profile/profile.h"
+#include "profile/profileframe.h"
+#include "profile/profilegenerator.h"
+#include "profile/profileparams.h"
+
+// Test Profile JSON/TCL parsing, frame generation, and BLE encoding.
+// Expected values derived from de1app procs. Profile is not a QObject — no friend access needed.
+
+class tst_Profile : public QObject {
+    Q_OBJECT
+
+private:
+    // Build a minimal advanced profile JSON object
+    static QJsonObject makeAdvancedProfileJson(const QString& title = "Test Profile") {
+        QJsonObject obj;
+        obj["title"] = title;
+        obj["author"] = "test";
+        obj["notes"] = "test notes";
+        obj["beverage_type"] = "espresso";
+        obj["version"] = "2";
+        obj["legacy_profile_type"] = "settings_2c";
+        obj["target_weight"] = 36.0;
+        obj["target_volume"] = 0.0;
+        obj["espresso_temperature"] = 93.0;
+        obj["maximum_pressure"] = 12.0;
+        obj["maximum_flow"] = 6.0;
+        obj["minimum_pressure"] = 0.0;
+        obj["number_of_preinfuse_frames"] = 1;
+
+        // One simple frame with nested exit. Frame temp matches top-level so the
+        // round-trip test asserts genuine preservation; mismatch behavior is
+        // covered by espressoTempNotSyncedFromFirstFrame.
+        QJsonObject frame;
+        frame["name"] = "preinfusion";
+        frame["temperature"] = 93.0;
+        frame["sensor"] = "coffee";
+        frame["pump"] = "flow";
+        frame["transition"] = "fast";
+        frame["pressure"] = 1.0;
+        frame["flow"] = 4.0;
+        frame["seconds"] = 20.0;
+        frame["volume"] = 0.0;
+
+        QJsonObject exitObj;
+        exitObj["type"] = "pressure";
+        exitObj["condition"] = "over";
+        exitObj["value"] = 4.0;
+        frame["exit"] = exitObj;
+
+        QJsonObject limiterObj;
+        limiterObj["value"] = 0.0;
+        limiterObj["range"] = 0.6;
+        frame["limiter"] = limiterObj;
+
+        QJsonArray steps;
+        steps.append(frame);
+        obj["steps"] = steps;
+
+        return obj;
+    }
+
+    // Build a frame JSON with specific exit type
+    static QJsonObject makeFrameJson(const QString& exitType, const QString& exitCondition, double exitValue) {
+        QJsonObject frame;
+        frame["name"] = "test frame";
+        frame["temperature"] = 93.0;
+        frame["sensor"] = "coffee";
+        frame["pump"] = (exitType == "flow") ? "flow" : "pressure";
+        frame["transition"] = "fast";
+        frame["pressure"] = 9.0;
+        frame["flow"] = 2.0;
+        frame["seconds"] = 30.0;
+        frame["volume"] = 0.0;
+
+        QJsonObject exitObj;
+        exitObj["type"] = exitType;
+        exitObj["condition"] = exitCondition;
+        exitObj["value"] = exitValue;
+        frame["exit"] = exitObj;
+
+        return frame;
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+
+    // ==========================================
+    // JSON Round-Trip Tests
+    // ==========================================
+
+    // The shared tolerant number parse (profileJsonToDouble): de1app /
+    // Visualizer JSON encodes numbers as strings — a raw toDouble() yields 0
+    // for them. The ProfileManager catalog scan (wizard profile tiles)
+    // shares this exact function, so its contract is pinned here.
+    void profileJsonToDoubleTolerance() {
+        QCOMPARE(profileJsonToDouble(QJsonValue(92.5)), 92.5);
+        QCOMPARE(profileJsonToDouble(QJsonValue(QStringLiteral("92.00"))), 92.0);
+        QCOMPARE(profileJsonToDouble(QJsonValue(QStringLiteral("36"))), 36.0);
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("failed to parse string"));
+        QCOMPARE(profileJsonToDouble(QJsonValue(QStringLiteral("garbage")), 7.0), 7.0);
+        QCOMPARE(profileJsonToDouble(QJsonValue(), 3.0), 3.0);
+    }
+
+    // An empty string must STILL warn here, and this test exists to keep it that
+    // way. A first cut at #1658 muted it to kill log noise; that was wrong. This
+    // function does not know which key it is reading, and most of the keys it
+    // serves have a non-zero default (nonZeroDefaultKeys() in profile.cpp), so a
+    // blanket silence turns `"target_weight":""` into 36 g with stop-at-weight
+    // ON, and `"seconds":""` into a fabricated 30-second frame — which toJson
+    // then persists as a real number. The warning is the only runtime trace.
+    void profileJsonToDoubleEmptyStringStillWarns() {
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("failed to parse string"));
+        QCOMPARE(profileJsonToDouble(QJsonValue(QStringLiteral("")), 36.0), 36.0);
+    }
+
+    // The inapplicable-setpoint case is silenced ONE level up, where the frame's
+    // pump says whether the field is used. A pressure frame's empty `flow` is
+    // de1app/Visualizer notation for "not used by this frame", and reading it is
+    // silent — init()'s failOnWarning is what enforces that here. The value is
+    // the same default the warning path would have produced.
+    void blankSetpointIsQuietOnlyWhenPumpMakesItUnused() {
+        QJsonObject pressureFrame{{"name", "pf"}, {"pump", "pressure"},
+                                  {"pressure", "9.0"}, {"flow", ""},
+                                  {"seconds", "25"}, {"temperature", "93"}};
+        const ProfileFrame pf = ProfileFrame::fromJson(pressureFrame);
+        QCOMPARE(pf.flow, 2.0);        // unchanged default, no warning
+        QCOMPARE(pf.pressure, 9.0);
+
+        // Mirror case: a flow frame's empty `pressure` is equally inapplicable.
+        QJsonObject flowFrame{{"name", "ff"}, {"pump", "flow"},
+                              {"pressure", ""}, {"flow", "2.5"},
+                              {"seconds", "25"}, {"temperature", "93"}};
+        const ProfileFrame ff = ProfileFrame::fromJson(flowFrame);
+        QCOMPARE(ff.pressure, 9.0);
+        QCOMPARE(ff.flow, 2.5);
+    }
+
+    // The other side of that gate, and the reason it is scoped to the unused
+    // field: a FLOW frame with a blank `flow` has lost its actual setpoint, and
+    // the 2.0 it falls back to is fabricated. That must stay loud.
+    void blankSetpointOnTheDrivenFieldStillWarns() {
+        QTest::ignoreMessage(QtWarningMsg,
+            QRegularExpression("failed to parse string"));
+        QJsonObject flowFrame{{"name", "ff"}, {"pump", "flow"},
+                              {"pressure", "9.0"}, {"flow", ""},
+                              {"seconds", "25"}, {"temperature", "93"}};
+        const ProfileFrame ff = ProfileFrame::fromJson(flowFrame);
+        QCOMPARE(ff.flow, 2.0);
+    }
+
+    void jsonRoundTripAdvanced() {
+        QJsonObject obj = makeAdvancedProfileJson();
+        QJsonDocument doc(obj);
+
+        Profile p = Profile::fromJson(doc);
+        QJsonDocument serialized = p.toJson();
+        Profile p2 = Profile::fromJson(serialized);
+
+        QCOMPARE(p2.title(), QString("Test Profile"));
+        QCOMPARE(p2.author(), QString("test"));
+        QCOMPARE(p2.profileNotes(), QString("test notes"));
+        QCOMPARE(p2.profileType(), QString("settings_2c"));
+        QCOMPARE(p2.targetWeight(), 36.0);
+        QCOMPARE(p2.targetVolume(), 0.0);
+        QCOMPARE(p2.espressoTemperature(), 93.0);
+        QCOMPARE(p2.steps().size(), 1);
+        QCOMPARE(p2.preinfuseFrameCount(), 1);  // Explicit value from makeAdvancedProfileJson()
+    }
+
+    void jsonLegacyFlatFieldsFallback() {
+        // Old Decenza format: profile_notes, profile_type, preinfuse_frame_count, flat exit fields
+        QJsonObject obj;
+        obj["title"] = "Legacy";
+        obj["profile_notes"] = "legacy notes";        // Not "notes"
+        obj["profile_type"] = "settings_2c";           // Not "legacy_profile_type"
+        obj["preinfuse_frame_count"] = 2;              // Not "number_of_preinfuse_frames"
+
+        QJsonObject frame;
+        frame["name"] = "test";
+        frame["temperature"] = 93.0;
+        frame["pump"] = "flow";
+        frame["flow"] = 4.0;
+        frame["seconds"] = 20.0;
+        frame["exit_if"] = true;                       // Flat field
+        frame["exit_type"] = "pressure_over";          // Flat field
+        frame["exit_pressure_over"] = 4.0;             // Flat field
+        frame["max_flow_or_pressure"] = 2.5;           // Flat limiter field
+        frame["max_flow_or_pressure_range"] = 0.8;
+
+        QJsonArray steps;
+        steps.append(frame);
+        obj["steps"] = steps;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.profileNotes(), QString("legacy notes"));
+        QCOMPARE(p.profileType(), QString("settings_2c"));
+        QCOMPARE(p.preinfuseFrameCount(), 2);
+        QCOMPARE(p.steps().size(), 1);
+        QVERIFY(p.steps()[0].exitIf);
+        QCOMPARE(p.steps()[0].exitType, QString("pressure_over"));
+        QCOMPARE(p.steps()[0].exitPressureOver, 4.0);
+        QCOMPARE(p.steps()[0].maxFlowOrPressure, 2.5);
+        QCOMPARE(p.steps()[0].maxFlowOrPressureRange, 0.8);
+    }
+
+    void jsonStringEncodedNumbers() {
+        // de1app encodes numbers as strings — jsonToDouble must handle this
+        QJsonObject obj;
+        obj["title"] = "De1App Strings";
+        obj["legacy_profile_type"] = "settings_2c";
+        obj["target_weight"] = QString("36.0");        // String, not number
+        obj["target_volume"] = QString("100");
+        obj["espresso_temperature"] = QString("93.5");
+        obj["number_of_preinfuse_frames"] = QString("2");
+
+        QJsonObject frame;
+        frame["name"] = "test";
+        frame["temperature"] = QString("93.5");
+        frame["pressure"] = QString("9.0");
+        frame["flow"] = QString("2.0");
+        frame["seconds"] = QString("30.0");
+        QJsonArray steps;
+        steps.append(frame);
+        obj["steps"] = steps;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.targetWeight(), 36.0);
+        QCOMPARE(p.targetVolume(), 100.0);
+        QCOMPARE(p.espressoTemperature(), 93.5);
+        QCOMPARE(p.preinfuseFrameCount(), 2);
+        QCOMPARE(p.steps()[0].temperature, 93.5);
+        QCOMPARE(p.steps()[0].pressure, 9.0);
+    }
+
+    // ===== espresso_temperature reconciliation against frames =====
+
+    // Build an advanced (settings_2c) profile JSON with the given top-level
+    // espresso_temperature handling and frame temps. If includeScalar is false the
+    // top-level key is omitted entirely (mirrors Visualizer's /profile?format=json).
+    static QJsonObject makeTempProfileJson(bool includeScalar, double scalar,
+                                           const QList<double>& frameTemps) {
+        QJsonObject obj;
+        obj["title"] = "Temp Profile";
+        obj["legacy_profile_type"] = "settings_2c";
+        if (includeScalar)
+            obj["espresso_temperature"] = scalar;
+        QJsonArray steps;
+        for (double t : frameTemps) {
+            QJsonObject frame;
+            frame["name"] = "f";
+            frame["temperature"] = t;
+            frame["pump"] = "flow";
+            frame["flow"] = 2.0;
+            frame["seconds"] = 10.0;
+            steps.append(frame);
+        }
+        obj["steps"] = steps;
+        return obj;
+    }
+
+    void espressoTemperatureAbsentDerivesFromFirstFrame() {
+        // Visualizer's /profile?format=json omits the top-level espresso_temperature
+        // entirely — the scalar must come from the first frame, never the bare 93.0
+        // default. (Regression guard: the obj[...] insertion side-effect previously
+        // defeated the absent-key path, so the 93.0 default leaked through.)
+        Profile p = Profile::fromJson(QJsonDocument(
+            makeTempProfileJson(/*includeScalar=*/false, 0.0, {84.0, 79.0, 52.0})));
+        QCOMPARE(p.espressoTemperature(), 84.0);
+        QVERIFY(p.espressoTemperatureHealed());
+    }
+
+    void espressoTemperatureLeakedDefaultIsRepaired() {
+        // An already-stored victim of the import bug: espresso_temperature is the
+        // bare 93.0 default sitting above an 84/79/52 profile. Re-derived from the
+        // first frame on load so it can be repaired on disk once.
+        Profile p = Profile::fromJson(QJsonDocument(
+            makeTempProfileJson(/*includeScalar=*/true, 93.0, {84.0, 79.0, 52.0})));
+        QCOMPARE(p.espressoTemperature(), 84.0);
+        QVERIFY(p.espressoTemperatureHealed());
+    }
+
+    void espressoTemperatureAuthoredAboveFramesIsAuthoritative() {
+        // Authored divergence (NOT the 93.0 default): a cool preheat frame paired
+        // with a hotter scalar. Even above the frame range it must be left alone —
+        // the semantic PR Kulitorum/Decenza#961 locked in. Only the exact-93.0-default fingerprint heals.
+        Profile p = Profile::fromJson(QJsonDocument(
+            makeTempProfileJson(/*includeScalar=*/true, 90.0, {88.0, 88.0})));
+        QCOMPARE(p.espressoTemperature(), 90.0);
+        QVERIFY(!p.espressoTemperatureHealed());
+    }
+
+    void espressoTemperatureDefaultWithinFramesIsKept() {
+        // A genuine 93°C profile: scalar is 93.0 but the frames actually reach it,
+        // so it is in range and must NOT be treated as a leaked default.
+        Profile p = Profile::fromJson(QJsonDocument(
+            makeTempProfileJson(/*includeScalar=*/true, 93.0, {90.0, 93.0, 91.0})));
+        QCOMPARE(p.espressoTemperature(), 93.0);
+        QVERIFY(!p.espressoTemperatureHealed());
+    }
+
+    void espressoTemperatureStringEncodedDefaultIsRepaired() {
+        // de1app/Visualizer serialize numbers as strings. A leaked "93.00" default
+        // must still be recognised and repaired after jsonToDouble parses it.
+        QJsonObject obj = makeTempProfileJson(/*includeScalar=*/false, 0.0, {84.0, 79.0, 52.0});
+        obj["espresso_temperature"] = QString("93.00");
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.espressoTemperature(), 84.0);
+        QVERIFY(p.espressoTemperatureHealed());
+    }
+
+    void espressoTemperatureRepairRoundTripDoesNotReheal() {
+        // The "repaired once" contract: a healed profile, serialized via toJson and
+        // reparsed, comes back with the key present and in range — so it must NOT
+        // heal again (no infinite re-write loop on disk).
+        Profile healed = Profile::fromJson(QJsonDocument(
+            makeTempProfileJson(/*includeScalar=*/true, 93.0, {84.0, 79.0, 52.0})));
+        QVERIFY(healed.espressoTemperatureHealed());
+
+        Profile reloaded = Profile::fromJson(healed.toJson());
+        QCOMPARE(reloaded.espressoTemperature(), 84.0);
+        QVERIFY(!reloaded.espressoTemperatureHealed());
+    }
+
+    // ===== Nested exit conditions (de1app v2 format) =====
+
+    void jsonNestedExitPressureOver() {
+        QJsonObject frame = makeFrameJson("pressure", "over", 3.0);
+        ProfileFrame pf = ProfileFrame::fromJson(frame);
+        QVERIFY(pf.exitIf);
+        QCOMPARE(pf.exitType, QString("pressure_over"));
+        QCOMPARE(pf.exitPressureOver, 3.0);
+    }
+
+    void jsonNestedExitPressureUnder() {
+        QJsonObject frame = makeFrameJson("pressure", "under", 2.0);
+        ProfileFrame pf = ProfileFrame::fromJson(frame);
+        QVERIFY(pf.exitIf);
+        QCOMPARE(pf.exitType, QString("pressure_under"));
+        QCOMPARE(pf.exitPressureUnder, 2.0);
+    }
+
+    void jsonNestedExitFlowOver() {
+        QJsonObject frame = makeFrameJson("flow", "over", 4.0);
+        ProfileFrame pf = ProfileFrame::fromJson(frame);
+        QVERIFY(pf.exitIf);
+        QCOMPARE(pf.exitType, QString("flow_over"));
+        QCOMPARE(pf.exitFlowOver, 4.0);
+    }
+
+    void jsonNestedExitFlowUnder() {
+        QJsonObject frame = makeFrameJson("flow", "under", 1.5);
+        ProfileFrame pf = ProfileFrame::fromJson(frame);
+        QVERIFY(pf.exitIf);
+        QCOMPARE(pf.exitType, QString("flow_under"));
+        QCOMPARE(pf.exitFlowUnder, 1.5);
+    }
+
+    void jsonWeightExitIndependent() {
+        // Weight exit is independent of the exit object — both can coexist.
+        // A frame can have exit_if=false (no machine-side exit) with weight > 0.
+        QJsonObject frame;
+        frame["name"] = "test";
+        frame["temperature"] = 93.0;
+        frame["pump"] = "pressure";
+        frame["pressure"] = 3.0;
+        frame["seconds"] = 20.0;
+        // No "exit" object → exitIf should be false
+        frame["weight"] = 4.0;  // App-side weight exit
+
+        ProfileFrame pf = ProfileFrame::fromJson(frame);
+        QVERIFY(!pf.exitIf);           // No machine-side exit
+        QCOMPARE(pf.exitWeight, 4.0);  // But weight exit IS set
+    }
+
+    void jsonLimiterNestedRoundTrip() {
+        // D-Flow pattern: limiter value=0, range=0.2 (always saved for fidelity)
+        QJsonObject frame;
+        frame["name"] = "pour";
+        frame["temperature"] = 93.0;
+        frame["pump"] = "flow";
+        frame["flow"] = 2.0;
+        frame["seconds"] = 30.0;
+
+        QJsonObject limiter;
+        limiter["value"] = 0.0;
+        limiter["range"] = 0.2;
+        frame["limiter"] = limiter;
+
+        ProfileFrame pf = ProfileFrame::fromJson(frame);
+        QCOMPARE(pf.maxFlowOrPressure, 0.0);
+        QCOMPARE(pf.maxFlowOrPressureRange, 0.2);
+
+        // Serialize back and verify limiter round-trips
+        QJsonObject serialized = pf.toJson();
+        QVERIFY(serialized.contains("limiter"));
+        QJsonObject limOut = serialized["limiter"].toObject();
+        // Canonical format string-encodes numeric values. Assert isString() before
+        // the value: a numeric QJsonValue stringifies to "", whose toDouble() is 0.0,
+        // so the zero case would otherwise pass even if encoding regressed.
+        QVERIFY(limOut["value"].isString());
+        QVERIFY(limOut["range"].isString());
+        QCOMPARE(limOut["value"].toString().toDouble(), 0.0);
+        QCOMPARE(limOut["range"].toString().toDouble(), 0.2);
+    }
+
+    // ===== PR Kulitorum/Decenza#425: preinfuseFrameCount preserved from JSON =====
+
+    void preinfuseFrameCountPreserved() {
+        QJsonObject obj = makeAdvancedProfileJson();
+        obj["number_of_preinfuse_frames"] = 2;  // Explicitly set
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.preinfuseFrameCount(), 2);    // Must NOT recompute from frames
+
+        // Round-trip
+        QJsonDocument serialized = p.toJson();
+        Profile p2 = Profile::fromJson(serialized);
+        QCOMPARE(p2.preinfuseFrameCount(), 2);
+    }
+
+    void preinfuseFrameCountExplicitOverridesAutoCount() {
+        // When number_of_preinfuse_frames is explicitly set, it overrides auto-counting.
+        // Even if the frames have different exit patterns, the explicit value wins.
+        QJsonObject obj;
+        obj["title"] = "Explicit Count";
+        obj["legacy_profile_type"] = "settings_2c";
+        obj["number_of_preinfuse_frames"] = 3;
+
+        // Only 1 frame with exit, but explicit count says 3
+        QJsonObject f0;
+        f0["name"] = "preinfusion";
+        f0["temperature"] = 88.0;
+        f0["pump"] = "flow";
+        f0["flow"] = 4.0;
+        f0["seconds"] = 20.0;
+        QJsonObject exit0;
+        exit0["type"] = "pressure";
+        exit0["condition"] = "over";
+        exit0["value"] = 4.0;
+        f0["exit"] = exit0;
+
+        QJsonObject f1;
+        f1["name"] = "pouring";
+        f1["temperature"] = 93.0;
+        f1["pump"] = "flow";
+        f1["flow"] = 2.0;
+        f1["seconds"] = 30.0;
+
+        QJsonArray steps;
+        steps.append(f0);
+        steps.append(f1);
+        obj["steps"] = steps;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.preinfuseFrameCount(), 3);  // Explicit value wins over auto-count
+    }
+
+    // ===== PR Kulitorum/Decenza#517: simple profiles derive editorType from profileType, not is_recipe_mode =====
+
+    void simpleProfileAutoFixRecipeMode() {
+        QJsonObject obj;
+        obj["title"] = "Simple Pressure";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["is_recipe_mode"] = true;  // Legacy flag — should be ignored for settings_2a
+        obj["espresso_temperature"] = 93.0;
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_hold_time"] = 10.0;
+        obj["espresso_pressure"] = 9.2;
+        obj["espresso_decline_time"] = 25.0;
+        obj["pressure_end"] = 4.0;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("pressure"));
+    }
+
+    // ===== Editor type inference from title =====
+
+    void editorTypeInferenceAFlow() {
+        QJsonObject obj = makeAdvancedProfileJson("A-Flow Medium Roast");
+        obj["is_recipe_mode"] = true;
+        // Remove editorType from recipe JSON to trigger title-based inference
+        QJsonObject recipeJson = ProfileParams().toJson();
+        recipeJson.remove("editorType");
+        obj["recipe"] = recipeJson;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("aflow"));
+        // profileParams().editorType is NOT asserted: a stored block is no longer read
+        // into ProfileParams at all. editorType() derives from the title, which is the
+        // only channel that ever carried it — no de1app profile stores one either.
+    }
+
+    void editorTypeInferenceDFlowDefault() {
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Default");
+        obj["is_recipe_mode"] = true;
+        obj["recipe"] = ProfileParams().toJson();
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("dflow"));
+    }
+
+    void editorTypeInferencePressure() {
+        QJsonObject obj;
+        obj["title"] = "My Pressure Profile";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["is_recipe_mode"] = true;  // Legacy flag — overridden by profileType
+        obj["recipe"] = ProfileParams().toJson();
+        obj["steps"] = QJsonArray();  // Empty, will be generated
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("pressure"));
+    }
+
+    // ===== editorType changes when title changes (fully derived) =====
+
+    void editorTypeChangesWithTitle() {
+        // D-Flow profile renamed → becomes advanced (matches de1app behavior)
+        QJsonObject obj = makeAdvancedProfileJson("My Morning Shot");
+        obj["recipe"] = ProfileParams().toJson();
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("advanced"));  // No D-Flow title → advanced
+    }
+
+    // ===== editorType round-trip serialization =====
+
+    void editorTypeRoundTrip() {
+        // D-Flow title → dflow, round-trip preserves it (title preserved)
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Test");
+        obj["recipe"] = ProfileParams().toJson();
+
+        Profile p1 = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p1.editorType(), QString("dflow"));
+
+        // Round-trip through toJson/fromJson
+        QJsonDocument doc = p1.toJson();
+        Profile p2 = Profile::fromJson(doc);
+        QCOMPARE(p2.editorType(), QString("dflow"));
+
+        // Verify is_recipe_mode and editor_type are NOT in the output (fully derived)
+        QJsonObject out = doc.object();
+        QVERIFY(!out.contains("is_recipe_mode"));
+        QVERIFY(!out.contains("editor_type"));
+    }
+
+    void editorTypeDeriveFromTitleNoDFlags() {
+        // de1app import: D-Flow title, no is_recipe_mode, no editor_type
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow La Pavoni");
+        // No editor_type, no is_recipe_mode — must derive from title
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("dflow"));
+    }
+
+    void editorTypeDeriveFromTitleAFlow() {
+        QJsonObject obj = makeAdvancedProfileJson("A-Flow Medium Roast");
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("aflow"));
+    }
+
+    void editorTypeDeriveSettings2b() {
+        // Pure settings_2b with no recipe flags
+        QJsonObject obj;
+        obj["title"] = "Flow Profile";
+        obj["legacy_profile_type"] = "settings_2b";
+        obj["steps"] = QJsonArray();
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("flow"));
+    }
+
+    void editorTypeAdvancedDefault() {
+        // settings_2c profile with no flags → should be "advanced"
+        QJsonObject obj = makeAdvancedProfileJson("Some Advanced Profile");
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("advanced"));
+    }
+
+    void editorTypeStarPrefixedAFlow() {
+        // Star-prefixed A-Flow title → derived as "aflow"
+        QJsonObject obj = makeAdvancedProfileJson("*A-Flow My Profile");
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("aflow"));
+    }
+
+    void regenerateFromParamsGuardAdvanced() {
+        // Advanced profile must NOT regenerate frames
+        QJsonObject obj = makeAdvancedProfileJson("My Advanced");
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        qsizetype framesBefore = p.steps().size();
+        p.regenerateFromParams();
+        QCOMPARE(p.steps().size(), framesBefore);  // Unchanged
+    }
+
+    void toJsonAdvancedNoRecipeBlock() {
+        // Advanced profile should not emit "recipe" in JSON
+        QJsonObject obj = makeAdvancedProfileJson("Advanced Profile");
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QJsonDocument doc = p.toJson();
+        QJsonObject out = doc.object();
+        QVERIFY(!out.contains("recipe"));
+        QVERIFY(!out.contains("is_recipe_mode"));
+        QVERIFY(!out.contains("editor_type"));
+    }
+
+    void toJsonDFlowDropsAStoredRecipeBlock() {
+        // A D-Flow profile that arrives WITH a block must serialize without one.
+        // The block was a cache of values re-derived from the frames on every read;
+        // it is no longer written, and `recipe` stays in kKnownProfileKeys precisely
+        // so the unknown-key passthrough drops it here instead of echoing it back.
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Test");
+        obj["recipe"] = QJsonObject{{"dose", 18}, {"fillTemperature", 88}};
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QJsonObject out = p.toJson().object();
+        QVERIFY2(!out.contains("recipe"), "a stored recipe block survived a round-trip");
+        QVERIFY(!out.contains("editor_type"));  // Never stored
+    }
+
+    // Simple profiles carry blocks too — four of the fixtures in a real user store
+    // are settings_2a/2b. Their safety argument is DIFFERENT from D-Flow/A-Flow's:
+    // nothing re-derives their parameters from frames, the block is shadowed by the
+    // de1app scalars that generate those frames. Assert that, rather than assume it.
+    void simpleProfileLosesItsBlockWithNothingElseChanging() {
+        QJsonObject obj;
+        obj["title"] = "Simple Pressure";
+        obj["author"] = "test";
+        obj["beverage_type"] = "espresso";
+        obj["version"] = "2";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["target_weight"] = 36.0;
+        obj["target_volume"] = 0.0;
+        obj["target_volume_count_start"] = 2;
+        obj["tank_temperature"] = 0.0;
+        obj["espresso_temperature"] = 92.5;
+        obj["espresso_pressure"] = 7.8;      // distinctive, not the 9.2 default
+        obj["espresso_hold_time"] = 12.0;
+        obj["espresso_decline_time"] = 22.0;
+        obj["preinfusion_time"] = 18.0;
+        obj["steps"] = QJsonArray();          // generated from the scalars
+
+        obj["recipe"] = QJsonObject{{"editorType", "pressure"}, {"dose", 18},
+                                    {"espressoPressure", 6.0}};   // contradicts the scalar
+        const Profile with = Profile::fromJson(QJsonDocument(obj));
+
+        // THE assertion. On main a settings_2a profile's editorType is "pressure", so
+        // toJsonObject re-emitted the block; this fails there and passes here.
+        QVERIFY2(!with.toJsonObject().contains("recipe"),
+                 "a simple profile's recipe block survived serialization");
+
+        // Deliberately NOT asserting that the scalars and frames are unchanged. Nothing
+        // has ever read espressoPressure out of a stored block into the Profile —
+        // ProfileParams::espressoPressure is a separate struct field consumed only by
+        // regenerateFromParams(), which fromJson never calls — so those comparisons
+        // hold on main and under any regression short of restoring block->params->
+        // frames. They read as coverage and are not. What actually protects the simple
+        // path is that getOrConvertProfileParams builds its params from the de1app
+        // scalars, which tst_profileeditorapppath covers.
+        QCOMPARE(with.espressoPressure(), 7.8);   // the scalar, never the block's 6.0
+        QVERIFY(!with.steps().isEmpty());         // frames still generated from scalars
+    }
+
+    void storedDoseIsPromotedToRecommendedDose() {
+        // `dose` was the one value in the block not reconstructed from the frames or
+        // duplicated by a top-level key, so it is carried over rather than dropped.
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Dose");
+        obj["recipe"] = QJsonObject{{"dose", 20.5}};
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QVERIFY2(p.hasRecommendedDose(), "a user-set dose was dropped with the block");
+        QCOMPARE(p.recommendedDose(), 20.5);
+    }
+
+    void defaultDoseDoesNotEnableARecommendation() {
+        // Every block ever written carries the struct default of 18, so promoting
+        // unconditionally would switch on a recommendation nobody set — on every
+        // profile that ever had a block.
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Default Dose");
+        obj["recipe"] = QJsonObject{{"dose", Profile::kDefaultRecommendedDose}};
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QVERIFY2(!p.hasRecommendedDose(),
+                 "the default dose of 18 was promoted into a real recommendation");
+    }
+
+    void anExplicitRecommendationBeatsTheBlock() {
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Explicit");
+        obj["has_recommended_dose"] = true;
+        obj["recommended_dose"] = 21.0;
+        obj["recipe"] = QJsonObject{{"dose", 16.0}};
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QVERIFY(p.hasRecommendedDose());
+        QCOMPARE(p.recommendedDose(), 21.0);   // the editor's value, not the block's
+    }
+
+    // ===== Canonical serialization shape (align-profile-json-with-reaprime) =====
+
+    void toJsonCanonicalShape() {
+        // The one canonical format: string-encoded values, ecosystem-required
+        // aliases, standard DE1 v2 metadata.
+        Profile p = Profile::fromJson(QJsonDocument(makeAdvancedProfileJson("Shape Test")));
+        QJsonObject out = p.toJsonObject();
+
+        // Numeric values are string-encoded.
+        QVERIFY(out["target_weight"].isString());
+        QVERIFY(out["espresso_temperature"].isString());
+        QVERIFY(out["steps"].toArray()[0].toObject()["pressure"].isString());
+
+        // Ecosystem-required aliases present and equal to their source keys.
+        QVERIFY(out.contains("tank_temperature"));
+        QCOMPARE(out["tank_temperature"], out["tank_desired_water_temperature"]);
+        QVERIFY(out.contains("target_volume_count_start"));
+        QCOMPARE(out["target_volume_count_start"], out["number_of_preinfuse_frames"]);
+
+        // Standard DE1 v2 metadata.
+        QCOMPARE(out["type"].toString(), QStringLiteral("advanced"));
+        QCOMPARE(out["lang"].toString(), QStringLiteral("en"));
+        QVERIFY(out.contains("hidden"));
+        QCOMPARE(out["reference_file"].toString(), QStringLiteral("Shape Test"));
+        QVERIFY(out.contains("changes_since_last_espresso"));
+    }
+
+    void toJsonSimpleProfileMaterializesSteps() {
+        // A settings_2a profile constructed with no explicit frames must still
+        // emit a non-empty steps array (Decaid rejects empty steps).
+        QJsonObject obj;
+        obj["title"] = "Simple Pressure";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_pressure"] = 9.0;
+        obj["espresso_hold_time"] = 10.0;
+        obj["espresso_decline_time"] = 25.0;
+        obj["steps"] = QJsonArray();  // explicitly empty
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QJsonObject out = p.toJsonObject();
+        QVERIFY(!out["steps"].toArray().isEmpty());
+        QCOMPARE(out["type"].toString(), QStringLiteral("pressure"));
+    }
+
+    void decaidReadabilityAcceptsCanonicalOutput() {
+        Profile p = Profile::fromJson(QJsonDocument(makeAdvancedProfileJson("Readable")));
+        const QStringList errs = Profile::decaidReadabilityErrors(p.toJsonObject());
+        QVERIFY2(errs.isEmpty(), qPrintable(errs.join(", ")));
+    }
+
+    void decaidReadabilityRejectsMissingKeys() {
+        // A profile object lacking the required keys / with empty steps must fail.
+        QJsonObject bad;
+        bad["title"] = "Bad";
+        bad["steps"] = QJsonArray();
+        const QStringList errs = Profile::decaidReadabilityErrors(bad);
+        QVERIFY(!errs.isEmpty());
+    }
+
+    void legacyRecipePressureOnSettings2c() {
+        // Legacy: is_recipe_mode=true, settings_2c, recipe.editorType=pressure
+        // With fully-derived editorType, settings_2c + non-matching title → "advanced"
+        // The recipe's editorType should be respected (unusual but valid)
+        QJsonObject obj = makeAdvancedProfileJson("Pressure Profile");
+        obj["is_recipe_mode"] = true;
+        QJsonObject recipeJson = ProfileParams().toJson();
+        recipeJson["editorType"] = "pressure";
+        obj["recipe"] = recipeJson;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        // settings_2c + title "Pressure Profile" → derived as "advanced"
+        // (legacy recipe.editorType is ignored — editorType is fully derived from content)
+        QCOMPARE(p.editorType(), QString("advanced"));
+    }
+
+    // ===== editorType with empty/unusual titles =====
+
+    void editorTypeEmptyTitle() {
+        QJsonObject obj = makeAdvancedProfileJson("");
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        // Empty title + settings_2c → "advanced"
+        QCOMPARE(p.editorType(), QString("advanced"));
+    }
+
+    void editorTypeCaseInsensitive() {
+        QJsonObject obj = makeAdvancedProfileJson("d-flow lowercase test");
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("dflow"));
+    }
+
+    void editorTypeDFlowSubstring() {
+        // Title contains "D-Flow" but not at the start → should NOT match
+        QJsonObject obj = makeAdvancedProfileJson("My D-Flow Profile");
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("advanced"));
+    }
+
+    void editorTypeNoSpuriousRecipeForPressure() {
+        // Pressure profiles (settings_2a) without explicit recipe data
+        // should NOT emit a recipe block with default DFlow params
+        QJsonObject obj;
+        obj["title"] = "My Pressure";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_temperature"] = 93.0;
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_pressure"] = 9.0;
+        obj["pressure_end"] = 6.0;
+        obj["steps"] = QJsonArray();
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("pressure"));
+
+        QJsonDocument doc = p.toJson();
+        QJsonObject out = doc.object();
+        // No recipe block (no explicit recipe data was set)
+        QVERIFY(!out.contains("recipe"));
+        QVERIFY(!out.contains("is_recipe_mode"));
+    }
+
+    // ===== Issue #1: toJson output must allow editorType derivation =====
+    // These tests verify that the JSON written by toJson() contains enough
+    // information for a consumer (like summarizeFromHistory) to derive the
+    // editor type without reading is_recipe_mode or editor_type fields.
+
+    void toJsonDFlowDerivableFromOutput() {
+        // A D-Flow profile's toJson() must include "title" starting with "D-Flow"
+        // so consumers can derive editorType without is_recipe_mode
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow / Test");
+        obj["recipe"] = ProfileParams().toJson();
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+
+        QJsonDocument doc = p.toJson();
+        QJsonObject out = doc.object();
+
+        // Derive editorType from output JSON (same logic as Profile::editorType)
+        QString title = out["title"].toString();
+        QString t = title.startsWith(QLatin1Char('*')) ? title.mid(1) : title;
+        QString derived;
+        if (t.startsWith(QStringLiteral("D-Flow"), Qt::CaseInsensitive))
+            derived = "dflow";
+        else if (t.startsWith(QStringLiteral("A-Flow"), Qt::CaseInsensitive))
+            derived = "aflow";
+        else {
+            QString pt = out["legacy_profile_type"].toString();
+            if (pt == "settings_2a") derived = "pressure";
+            else if (pt == "settings_2b") derived = "flow";
+            else derived = "advanced";
+        }
+        QCOMPARE(derived, QString("dflow"));
+    }
+
+    void toJsonPressureDerivableFromOutput() {
+        // A settings_2a profile must include legacy_profile_type in toJson output
+        QJsonObject obj;
+        obj["title"] = "My Pressure";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_temperature"] = 93.0;
+        obj["steps"] = QJsonArray();
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+
+        QJsonDocument doc = p.toJson();
+        QJsonObject out = doc.object();
+
+        // Consumer must be able to derive "pressure" from legacy_profile_type
+        QString pt = out["legacy_profile_type"].toString();
+        QCOMPARE(pt, QString("settings_2a"));
+        // profile_type key should NOT be relied on (writer uses legacy_profile_type)
+        // But legacy_profile_type MUST be present
+        QVERIFY(!pt.isEmpty());
+    }
+
+    // ===== Issue #3: simple profile round-trip profile params =====
+
+    void simpleProfileRoundTripRecipeEditorType() {
+        // A settings_2a profile that never had recipe data should NOT gain
+        // a recipe block with mismatched editorType after round-trip
+        QJsonObject obj;
+        obj["title"] = "My Pressure";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_temperature"] = 93.0;
+        obj["steps"] = QJsonArray();
+        // No recipe block — simulates a simple profile
+
+        Profile p1 = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p1.editorType(), QString("pressure"));
+
+        // Round-trip through toJson/fromJson
+        QJsonDocument doc = p1.toJson();
+        Profile p2 = Profile::fromJson(doc);
+
+        // After round-trip, profileParams.editorType must match editorType()
+        // i.e. it should be Pressure, not DFlow (the default)
+        if (doc.object().contains("recipe")) {
+            // If a recipe block was written, the editorType inside it must be correct
+            QString recipeEt = doc.object()["recipe"].toObject()["editorType"].toString();
+            QVERIFY2(recipeEt != "dflow",
+                "settings_2a profile must not have recipe.editorType=dflow after round-trip");
+        }
+        QCOMPARE(p2.editorType(), QString("pressure"));
+    }
+
+    void regenerateFromParamsDFlowRegenerates() {
+        // D-Flow profile with profile params should regenerate frames
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Test");
+        QJsonObject recipeJson = ProfileParams().toJson();
+        recipeJson["editorType"] = "dflow";
+        obj["recipe"] = recipeJson;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("dflow"));
+
+        // Set valid profile params so regeneration produces frames
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.pourFlow = 2.0;
+        params.fillTemperature = 93.0;
+        params.pourTemperature = 93.0;
+        params.targetWeight = 36.0;
+        p.setProfileParams(params);
+        p.regenerateFromParams();
+
+        // Should have regenerated frames (D-Flow produces 3 frames)
+        QVERIFY(p.steps().size() > 0);
+    }
+
+    void regenerateFromParamsPressureCountsForcedRiseAsPreinfusion() {
+        // regenerateFromParams() is the live re-edit path (profilemanager.cpp's real save
+        // path for an existing Pressure/Flow profile) — a separate call site from
+        // ProfileGenerator::createProfile() and Profile::loadFromTclString(), with its own
+        // preinfuseFrameCount recompute (profile.cpp, gated on
+        // editorType == Pressure || Flow). Must also exclude the forced-rise frame from
+        // Stop-at-Volume's pour count. Matches de1app commit 13a30463.
+        //
+        // Profile::editorType() derives from title/profileType, NOT m_profileParams — it is
+        // regenerateFromParams()'s FIRST check ("advanced" bails out before even looking at
+        // profile params), so the base profile must be settings_2a for this to reach the
+        // fixed branch at all. Using makeAdvancedProfileJson() (settings_2c) here made the
+        // whole call a silent no-op the first time this test was written — caught only
+        // because the assertion below failed against the untouched original frame.
+        QJsonObject obj = makeAdvancedProfileJson("Pressure Regenerate Test");
+        obj["legacy_profile_type"] = "settings_2a";
+        QJsonObject recipeJson = ProfileParams().toJson();
+        recipeJson["editorType"] = "pressure";
+        obj["recipe"] = recipeJson;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.editorType(), QString("pressure"));
+
+        ProfileParams params;
+        params.editorType = EditorType::Pressure;
+        params.preinfusionTime = 5.0;
+        params.preinfusionFlowRate = 4.0;
+        params.preinfusionStopPressure = 4.0;
+        params.holdTime = 10.0;          // > 3s: generates a forced-rise frame
+        params.espressoPressure = 9.2;
+        params.simpleDeclineTime = 25.0;
+        params.pressureEnd = 4.0;
+        p.setProfileParams(params);
+        p.regenerateFromParams();
+
+        QVERIFY(p.steps().size() > 0);
+        // 1 leading preinfusion frame + 1 forced-rise frame before Hold.
+        QCOMPARE(p.preinfuseFrameCount(), 2);
+    }
+
+    // ===== Title strips leading star (de1app modified indicator) =====
+
+    void titleStripsStar() {
+        QJsonObject obj = makeAdvancedProfileJson("*D-Flow Default");
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.title(), QString("D-Flow Default"));
+    }
+
+    void titleNoStarUnchanged() {
+        QJsonObject obj = makeAdvancedProfileJson("D-Flow Default");
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.title(), QString("D-Flow Default"));
+    }
+
+    // ===== Espresso temperature sync =====
+
+    void espressoTempNotSyncedFromFirstFrame() {
+        // Regression guard for #968 / PR Kulitorum/Decenza#961: fromJson must NOT rewrite the
+        // top-level espresso_temperature from steps[0].temperature when both
+        // are present. The mismatch is intentional on D-Flow/A-Flow profiles
+        // (cooler group preheat target paired with a hotter preinfusion ramp).
+        QJsonObject obj = makeAdvancedProfileJson();
+        obj["espresso_temperature"] = 90.0;
+        QJsonArray steps = obj["steps"].toArray();
+        QJsonObject frame = steps[0].toObject();
+        frame["temperature"] = 88.0;
+        steps.replace(0, frame);
+        obj["steps"] = steps;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.espressoTemperature(), 90.0);  // top-level preserved
+        QCOMPARE(p.steps()[0].temperature, 88.0); // frame preserved
+    }
+
+    void espressoTempNoSyncForSimple() {
+        // For simple profiles (settings_2a/2b), espresso_temperature stays authoritative
+        QJsonObject obj;
+        obj["title"] = "Simple";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_temperature"] = 90.0;
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_hold_time"] = 10.0;
+        obj["espresso_pressure"] = 9.2;
+        obj["espresso_decline_time"] = 25.0;
+        obj["pressure_end"] = 4.0;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.espressoTemperature(), 90.0);  // NOT synced from frames
+    }
+
+    // ==========================================
+    // TCL Import Tests
+    // ==========================================
+
+    void tclFrameParsing() {
+        // Parse a single de1app TCL frame string
+        QString tcl = "{name {preinfusion} temperature 88.0 sensor coffee "
+                      "pump flow transition fast pressure 1.0 flow 4.0 "
+                      "seconds 20.0 volume 0.0 exit_if 1 exit_type pressure_over "
+                      "exit_pressure_over 4.0 exit_pressure_under 0.0 "
+                      "exit_flow_over 6.0 exit_flow_under 0.0 "
+                      "max_flow_or_pressure 0.0 max_flow_or_pressure_range 0.6 "
+                      "weight 0.0 popup {}}";
+
+        ProfileFrame pf = ProfileFrame::fromTclList(tcl);
+        QCOMPARE(pf.name, QString("preinfusion"));
+        QCOMPARE(pf.temperature, 88.0);
+        QCOMPARE(pf.sensor, QString("coffee"));
+        QCOMPARE(pf.pump, QString("flow"));
+        QCOMPARE(pf.transition, QString("fast"));
+        QCOMPARE(pf.pressure, 1.0);
+        QCOMPARE(pf.flow, 4.0);
+        QCOMPARE(pf.seconds, 20.0);
+        QCOMPARE(pf.volume, 0.0);
+        QVERIFY(pf.exitIf);
+        QCOMPARE(pf.exitType, QString("pressure_over"));
+        QCOMPARE(pf.exitPressureOver, 4.0);
+        QCOMPARE(pf.exitFlowOver, 6.0);
+        QCOMPARE(pf.maxFlowOrPressure, 0.0);
+        QCOMPARE(pf.maxFlowOrPressureRange, 0.6);
+    }
+
+    void tclBracedValues() {
+        // Braced values: name with spaces
+        QString tcl = "{name {rise and hold} temperature 93.0 pump pressure "
+                      "pressure 9.0 flow 2.0 seconds 30.0 volume 0.0 "
+                      "exit_if 0 transition fast sensor coffee}";
+
+        ProfileFrame pf = ProfileFrame::fromTclList(tcl);
+        QCOMPARE(pf.name, QString("rise and hold"));
+    }
+
+    void tclTransitionSlowToSmooth() {
+        // de1app uses "slow" which maps to "smooth" in Decenza
+        QString tcl = "{name decline temperature 93.0 pump pressure "
+                      "pressure 4.0 flow 2.0 seconds 25.0 volume 0.0 "
+                      "exit_if 0 transition slow sensor coffee}";
+
+        ProfileFrame pf = ProfileFrame::fromTclList(tcl);
+        QCOMPARE(pf.transition, QString("smooth"));
+    }
+
+    void tclWeightIndependentOfExitIf() {
+        // Weight exit is independent of exit_if (de1app behavior)
+        // exit_if 0 means no machine-side exit, but weight > 0 means app-side weight exit
+        QString tcl = "{name {infuse} temperature 93.0 pump pressure "
+                      "pressure 3.0 flow 8.0 seconds 20.0 volume 100.0 "
+                      "exit_if 0 weight 4.0 transition fast sensor coffee}";
+
+        ProfileFrame pf = ProfileFrame::fromTclList(tcl);
+        QVERIFY(!pf.exitIf);           // Machine-side exit is OFF
+        QCOMPARE(pf.exitWeight, 4.0);  // App-side weight exit IS set
+    }
+
+    void tclRoundTrip() {
+        // Create a frame, serialize to TCL, parse back, compare
+        ProfileFrame original;
+        original.name = "rise and hold";
+        original.temperature = 93.0;
+        original.sensor = "coffee";
+        original.pump = "pressure";
+        original.transition = "smooth";
+        original.pressure = 9.0;
+        original.flow = 2.0;
+        original.seconds = 30.0;
+        original.volume = 0.0;
+        original.exitIf = true;
+        original.exitType = "pressure_over";
+        original.exitPressureOver = 4.0;
+        original.maxFlowOrPressure = 6.0;
+        original.maxFlowOrPressureRange = 1.0;
+        original.exitWeight = 3.5;
+
+        QString tcl = original.toTclList();
+        ProfileFrame parsed = ProfileFrame::fromTclList(tcl);
+
+        QCOMPARE(parsed.name, original.name);
+        QCOMPARE(parsed.temperature, original.temperature);
+        QCOMPARE(parsed.sensor, original.sensor);
+        QCOMPARE(parsed.pump, original.pump);
+        QCOMPARE(parsed.transition, original.transition);
+        QCOMPARE(parsed.pressure, original.pressure);
+        QCOMPARE(parsed.flow, original.flow);
+        QCOMPARE(parsed.seconds, original.seconds);
+        QVERIFY(parsed.exitIf);
+        QCOMPARE(parsed.exitType, original.exitType);
+        QCOMPARE(parsed.exitPressureOver, original.exitPressureOver);
+        QCOMPARE(parsed.maxFlowOrPressure, original.maxFlowOrPressure);
+        QCOMPARE(parsed.exitWeight, original.exitWeight);
+    }
+
+    // ==========================================
+    // Simple Profile Frame Generation
+    // (de1app pressure_to_advanced_list / flow_to_advanced_list)
+    // ==========================================
+
+    void pressureProfileFrameGeneration() {
+        // settings_2a with holdTime > 3: expect preinfusion + forced rise + hold + decline
+        // de1app: pressure_to_advanced_list()
+        QJsonObject obj;
+        obj["title"] = "Pressure Test";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_temperature"] = 93.0;
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_hold_time"] = 10.0;     // > 3s: generates forced rise + hold
+        obj["espresso_pressure"] = 9.2;
+        obj["espresso_decline_time"] = 25.0;
+        obj["pressure_end"] = 4.0;
+        obj["maximum_flow"] = 6.0;
+        obj["maximum_flow_range_default"] = 1.0;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+
+        // Expected: preinfusion(flow,exit) + forced_rise(pressure,3s) + hold(pressure,7s) + decline(pressure,smooth)
+        QCOMPARE(p.steps().size(), 4);
+
+        // Frame 0: preinfusion (flow pump, exit_pressure_over)
+        // de1app profile.tcl pressure_to_advanced_list: single preinfusion frame
+        // with exit_flow_over 6 (when no temp stepping)
+        QCOMPARE(p.steps()[0].pump, QString("flow"));
+        QVERIFY(p.steps()[0].exitIf);
+        QCOMPARE(p.steps()[0].exitType, QString("pressure_over"));
+        QCOMPARE(p.steps()[0].exitPressureOver, 4.0);
+        QCOMPARE(p.steps()[0].flow, 4.0);
+        QCOMPARE(p.steps()[0].seconds, 5.0);
+        QCOMPARE(p.steps()[0].exitFlowOver, 6.0);  // de1app: exit_flow_over 6
+
+        // Frame 1: forced rise (pressure pump, 3s)
+        QCOMPARE(p.steps()[1].name, ProfileFrame::kForcedRiseName);
+        QCOMPARE(p.steps()[1].pump, QString("pressure"));
+        QCOMPARE(p.steps()[1].pressure, 9.2);
+        QCOMPARE(p.steps()[1].seconds, 3.0);
+        QVERIFY(!p.steps()[1].exitIf);
+        QCOMPARE(p.steps()[1].maxFlowOrPressure, 6.0);  // limited now, not 0
+
+        // Frame 2: hold (pressure pump, remaining time)
+        QCOMPARE(p.steps()[2].pump, QString("pressure"));
+        QCOMPARE(p.steps()[2].pressure, 9.2);
+        QCOMPARE(p.steps()[2].seconds, 7.0);  // 10 - 3 = 7
+        QCOMPARE(p.steps()[2].maxFlowOrPressure, 6.0);  // Limiter active
+
+        // Frame 3: decline (pressure pump, smooth transition)
+        QCOMPARE(p.steps()[3].pump, QString("pressure"));
+        QCOMPARE(p.steps()[3].transition, QString("smooth"));
+        QCOMPARE(p.steps()[3].pressure, 4.0);   // pressureEnd
+        QCOMPARE(p.steps()[3].seconds, 25.0);
+
+        // The forced-rise frame fills headspace before any coffee pours, so it must be
+        // excluded from Stop-at-Volume's pour count: preinfusion(1) + forced_rise(1).
+        // Matches de1app commit 13a30463.
+        QCOMPARE(p.preinfuseFrameCount(), 2);
+    }
+
+    void pressureProfileShortHold() {
+        // de1app edge case: holdTime <= 3, declineTime > 3 → forced rise in decline
+        QJsonObject obj;
+        obj["title"] = "Short Hold";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_hold_time"] = 2.0;      // <= 3s: no forced rise before hold
+        obj["espresso_pressure"] = 9.2;
+        obj["espresso_decline_time"] = 20.0;   // > 3s: forced rise before decline
+        obj["pressure_end"] = 4.0;
+        obj["maximum_flow"] = 6.0;
+        obj["maximum_flow_range_default"] = 1.0;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+
+        // Expected: preinfusion + hold(2s) + forced_rise(3s) + decline(17s)
+        QCOMPARE(p.steps().size(), 4);
+
+        // Frame 1: hold (short, no forced rise before it)
+        QCOMPARE(p.steps()[1].pump, QString("pressure"));
+        QCOMPARE(p.steps()[1].seconds, 2.0);
+
+        // Frame 2: forced rise (inserted before decline because hold was short)
+        QCOMPARE(p.steps()[2].seconds, 3.0);
+        QVERIFY(!p.steps()[2].exitIf);
+
+        // Frame 3: decline (time reduced by 3s for forced rise)
+        QCOMPARE(p.steps()[3].transition, QString("smooth"));
+        QCOMPARE(p.steps()[3].seconds, 17.0);  // 20 - 3 = 17
+
+        // The forced-rise-before-decline frame also fills headspace, not the cup:
+        // preinfusion(1) + forced_rise(1). Matches de1app commit 13a30463.
+        QCOMPARE(p.preinfuseFrameCount(), 2);
+    }
+
+    // ==========================================
+    // Default pressure flow limit
+    // (de1app apply_default_flow_limit_to_pressure_steps)
+    // ==========================================
+
+    // Builds an advanced profile whose steps are exactly `steps`.
+    static Profile advancedProfileWith(const QList<ProfileFrame>& steps) {
+        Profile p;
+        p.setTitle("Limit Test");
+        p.setProfileType("settings_2c2");
+        p.setSteps(steps);
+        return p;
+    }
+
+    static ProfileFrame pressureStep(double limiter) {
+        ProfileFrame f;
+        f.name = "hold";
+        f.pump = "pressure";
+        f.pressure = 9.0;
+        f.seconds = 20.0;
+        f.maxFlowOrPressure = limiter;
+        f.maxFlowOrPressureRange = 0.0;
+        return f;
+    }
+
+    void unlimitedPressureStepGetsTheDefaultFlowLimit() {
+        Profile p = advancedProfileWith({pressureStep(0.0)});
+        // A non-default range, so the assertion below distinguishes "took the profile's
+        // range" from "hard-coded 1.0" — Profile's own default for that member IS 1.0,
+        // so the two are indistinguishable at the default.
+        p.setMaximumFlowRangeDefault(0.4);
+        QCOMPARE(p.applyDefaultPressureFlowLimit(), 1);
+        QCOMPARE(p.steps()[0].maxFlowOrPressure, Profile::kDefaultPressureFlowLimit);
+        // A limiter with no range engages instantly.
+        QCOMPARE(p.steps()[0].maxFlowOrPressureRange, 0.4);
+    }
+
+    void explicitPressureLimitSurvivesNormalization() {
+        Profile p = advancedProfileWith({pressureStep(2.5)});
+        QCOMPARE(p.applyDefaultPressureFlowLimit(), 0);
+        QCOMPARE(p.steps()[0].maxFlowOrPressure, 2.5);
+    }
+
+    void flowStepKeepsItsOffPressureLimit() {
+        // Capping here would silently add an 8 bar ceiling to every unlimited flow step.
+        ProfileFrame f;
+        f.name = "pour";
+        f.pump = "flow";
+        f.flow = 2.0;
+        f.maxFlowOrPressure = 0.0;
+        Profile p = advancedProfileWith({f});
+        QCOMPARE(p.applyDefaultPressureFlowLimit(), 0);
+        QCOMPARE(p.steps()[0].maxFlowOrPressure, 0.0);
+    }
+
+    void simplePressureProfileDefaultsItsScalarAndItsFrames() {
+        // settings_2a's flow limit is the scalar maximum_flow, and regenerateSimpleFrames()
+        // rebuilds the frames from it — so the scalar has to be defaulted too, or the next
+        // regeneration restores the unlimited frames.
+        QJsonObject obj;
+        obj["title"] = "Unlimited Pressure";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_temperature"] = 93.0;
+        obj["preinfusion_time"] = 5.0;
+        obj["espresso_hold_time"] = 10.0;
+        obj["espresso_pressure"] = 9.0;
+        obj["espresso_decline_time"] = 20.0;
+        obj["maximum_flow"] = 0.0;  // "off"
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.maximumFlow(), 0.0);
+
+        QVERIFY(p.applyDefaultPressureFlowLimit() > 0);
+        QCOMPARE(p.maximumFlow(), Profile::kDefaultPressureFlowLimit);
+
+        p.regenerateSimpleFrames();
+        int pressureFrames = 0;
+        for (const ProfileFrame& f : p.steps()) {
+            if (f.pump != QLatin1String("pressure")) continue;
+            pressureFrames++;
+            QCOMPARE(f.maxFlowOrPressure, Profile::kDefaultPressureFlowLimit);
+        }
+        // Or the loop body never runs and this passes on an empty frame list.
+        QVERIFY2(pressureFrames >= 2, "expected forced-rise + hold + decline");
+    }
+
+    void simplePressureScalarSurvivesARegenerateOnItsOwn() {
+        // The frame walk cannot mask the scalar branch here: the stored frames already
+        // carry a limiter, so only the scalar default can be what survives regeneration.
+        // Without that branch, regenerateSimpleFrames() rebuilds from maximum_flow == 0
+        // and every frame comes back unlimited.
+        QJsonObject obj;
+        obj["title"] = "Limited Frames, Unlimited Scalar";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["espresso_temperature"] = 93.0;
+        obj["espresso_hold_time"] = 10.0;
+        obj["espresso_pressure"] = 9.0;
+        obj["espresso_decline_time"] = 20.0;
+        obj["maximum_flow"] = 0.0;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        p.regenerateSimpleFrames();
+        QList<ProfileFrame> limited = p.steps();
+        for (ProfileFrame& f : limited) f.maxFlowOrPressure = 5.0;
+        p.setSteps(limited);
+
+        QCOMPARE(p.applyDefaultPressureFlowLimit(), 1);  // scalar only; no frame touched
+        p.regenerateSimpleFrames();
+        for (const ProfileFrame& f : p.steps()) {
+            if (f.pump != QLatin1String("pressure")) continue;
+            QCOMPARE(f.maxFlowOrPressure, Profile::kDefaultPressureFlowLimit);
+        }
+    }
+
+    void forcedRiseIsCountedUnderEitherName() {
+        // Profiles written before de1app renamed the frame carry the legacy name; both
+        // must be excluded from Stop-at-Volume's pour count.
+        ProfileFrame legacy;
+        legacy.name = ProfileFrame::kForcedRiseWithoutLimitName;
+        legacy.pump = "pressure";
+        ProfileFrame current;
+        current.name = ProfileFrame::kForcedRiseName;
+        current.pump = "pressure";
+
+        QCOMPARE(Profile::countPreinfuseFramesWithForcedRise({legacy}), 1);
+        QCOMPARE(Profile::countPreinfuseFramesWithForcedRise({current}), 1);
+        QCOMPARE(Profile::countPreinfuseFramesWithForcedRise({legacy, current}), 2);
+    }
+
+    void flowProfileDeclineGating() {
+        // de1app flow_to_advanced_list profile.tcl line 301:
+        //   if {$temp_advanced(espresso_hold_time) > 0} { set decline ... }
+        // Decline is gated by hold time, NOT decline time.
+        QJsonObject obj;
+        obj["title"] = "Flow No Hold";
+        obj["legacy_profile_type"] = "settings_2b";
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_hold_time"] = 0.0;          // Zero hold time
+        obj["flow_profile_hold"] = 2.0;
+        obj["espresso_decline_time"] = 17.0;       // Non-zero, but hold is 0
+        obj["flow_profile_decline"] = 1.2;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+
+        // de1app: only preinfusion frame — no hold, no decline
+        QCOMPARE(p.steps().size(), 1);
+        QCOMPARE(p.steps()[0].pump, QString("flow"));
+    }
+
+    void flowProfileWithHoldDe1appOracle() {
+        // de1app flow_to_advanced_list: full flow profile with hold + decline
+        // Verify field-by-field against de1app Tcl source
+        QJsonObject obj;
+        obj["title"] = "Flow Oracle";
+        obj["legacy_profile_type"] = "settings_2b";
+        obj["espresso_temperature"] = 93.0;
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_hold_time"] = 8.0;
+        obj["flow_profile_hold"] = 2.0;
+        obj["espresso_decline_time"] = 17.0;
+        obj["flow_profile_decline"] = 1.2;
+        obj["maximum_pressure"] = 9.0;
+        obj["maximum_pressure_range_default"] = 0.9;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+
+        // de1app: preinfusion + hold + decline = 3 frames (no forced rise for flow profiles)
+        QCOMPARE(p.steps().size(), 3);
+
+        // Frame 0: preinfusion
+        // de1app flow_to_advanced_list: exit_flow_over 0 (NOT 6 like pressure profiles)
+        QCOMPARE(p.steps()[0].pump, QString("flow"));
+        QVERIFY(p.steps()[0].exitIf);
+        QCOMPARE(p.steps()[0].exitType, QString("pressure_over"));
+        QCOMPARE(p.steps()[0].exitPressureOver, 4.0);
+        QCOMPARE(p.steps()[0].exitFlowOver, 0.0);  // de1app: exit_flow_over 0 for flow profiles
+
+        // Frame 1: hold
+        // de1app: exit_flow_over 6, flow pump, fast transition
+        QCOMPARE(p.steps()[1].pump, QString("flow"));
+        QCOMPARE(p.steps()[1].flow, 2.0);
+        QCOMPARE(p.steps()[1].seconds, 8.0);
+        QCOMPARE(p.steps()[1].exitFlowOver, 6.0);  // de1app: exit_flow_over 6
+        QCOMPARE(p.steps()[1].maxFlowOrPressure, 9.0);  // Pressure limiter
+
+        // Frame 2: decline
+        // de1app: exit_flow_over 0, smooth transition
+        QCOMPARE(p.steps()[2].pump, QString("flow"));
+        QCOMPARE(p.steps()[2].transition, QString("smooth"));
+        QCOMPARE(p.steps()[2].flow, 1.2);
+        QCOMPARE(p.steps()[2].seconds, 17.0);
+        QCOMPARE(p.steps()[2].exitFlowOver, 0.0);  // de1app: exit_flow_over 0 on decline
+        QCOMPARE(p.steps()[2].maxFlowOrPressure, 9.0);  // Pressure limiter
+    }
+
+    // Builds the minimum simple-profile JSON these de1app-parity tests need.
+    static QJsonObject simpleProfileJson(const QString& type, bool tempSteps,
+                                         double preinfusionTime, double espressoTemperature) {
+        QJsonObject obj;
+        obj["title"] = "de1app parity";
+        obj["legacy_profile_type"] = type;
+        obj["temp_steps_enabled"] = tempSteps;
+        obj["preinfusion_time"] = preinfusionTime;
+        obj["preinfusion_flow_rate"] = 7.5;
+        obj["preinfusion_stop_pressure"] = 3.8;
+        obj["espresso_hold_time"] = 12.0;
+        obj["espresso_pressure"] = 7.8;
+        obj["espresso_decline_time"] = 0.0;
+        obj["pressure_end"] = 5.0;
+        obj["flow_profile_hold"] = 2.2;
+        obj["flow_profile_decline"] = 1.4;
+        obj["espresso_temperature"] = espressoTemperature;
+        return obj;
+    }
+
+    void tempSteppingEmitsBoostFrameEvenAtZeroPreinfusion_data() {
+        QTest::addColumn<QString>("type");
+        QTest::addColumn<QString>("boostName");
+        // de1app names this frame DIFFERENTLY in its two builders.
+        QTest::newRow("settings_2a") << "settings_2a" << "preinfusion temp boost";
+        QTest::newRow("settings_2b") << "settings_2b" << "preinfusion boost";
+    }
+
+    void tempSteppingEmitsBoostFrameEvenAtZeroPreinfusion() {
+        // de1app sets first_frame_len to temp_bump_time_seconds UNCONDITIONALLY
+        // when stepping is on, and emits each preinfusion frame on its own `> 0`
+        // test (profile.tcl:19-56 and :212-275). So preinfusion_time 0 still
+        // yields a 2-second boost frame and no second preinfusion frame.
+        //
+        // Gating the block on `preinfusionTime > 0` dropped it: de1app brews 3
+        // frames for Steam_only and "e61 classic at 9 bar", we brewed 2.
+        QFETCH(QString, type);
+        QFETCH(QString, boostName);
+
+        const Profile p = Profile::fromJson(QJsonDocument(
+            simpleProfileJson(type, /*tempSteps=*/true, /*preinfusionTime=*/0.0, 91.0)));
+
+        QVERIFY(!p.steps().isEmpty());
+        QCOMPARE(p.steps().first().name, boostName);
+        QCOMPARE(p.steps().first().seconds, 2.0);
+        QCOMPARE(p.steps().first().pump, QStringLiteral("flow"));
+        QCOMPARE(p.steps().first().flow, 7.5);
+        QVERIFY(p.steps().first().exitIf);
+        // preinfusion_time 0 means second_frame_len is 0, so there is no
+        // follow-on "preinfusion" frame — only the boost.
+        for (qsizetype i = 1; i < p.steps().size(); ++i)
+            QVERIFY2(p.steps().at(i).name != QStringLiteral("preinfusion"),
+                     "a second preinfusion frame was emitted at preinfusion_time 0");
+        // espresso_hold_time is 12.0 here (see simpleProfileJson), so settings_2a also
+        // generates a forced-rise frame, which must be excluded from Stop-at-Volume's
+        // pour count: boost(1) + forced_rise(1) = 2. Matches de1app commit 13a30463.
+        // settings_2b never generates a forced-rise frame, so its count stays at 1.
+        QCOMPARE(p.preinfuseFrameCount(), type == QStringLiteral("settings_2a") ? 2 : 1);
+    }
+
+    void tempSteppingOffRunsEveryFrameAtEspressoTemperature() {
+        // de1app overwrites all four presets with espresso_temperature when
+        // stepping is off (profile.tcl:28-33). Collapsing onto preset[0] instead
+        // is what made two built-ins brew at 88 °C where de1app brews 92/94.
+        QJsonObject obj = simpleProfileJson("settings_2a", /*tempSteps=*/false, 10.0, 94.0);
+        QJsonArray temps;                     // deliberately non-uniform AND wrong
+        temps.append(85.0); temps.append(88.0); temps.append(93.0); temps.append(90.0);
+        obj["temperature_presets"] = temps;
+
+        const Profile p = Profile::fromJson(QJsonDocument(obj));
+        QVERIFY(!p.steps().isEmpty());
+        for (const ProfileFrame& f : p.steps())
+            QVERIFY2(qFuzzyCompare(f.temperature, 94.0),
+                     qPrintable(QString("frame '%1' at %2 °C, expected espresso_temperature 94")
+                                    .arg(f.name).arg(f.temperature)));
+    }
+
+    void loadAndReactivateProduceTheSameFrames() {
+        // fromJson() and regenerateSimpleFrames() must agree: the first builds
+        // the frames a profile loads with, the second the ones it re-activates
+        // with, and a difference between them is a difference in what the DE1 is
+        // handed for the same profile. They were separate copies of the
+        // generator dispatch, and when de1app's stepping-off rule moved out of
+        // the generators only one copy got it.
+        QJsonObject obj = simpleProfileJson("settings_2a", /*tempSteps=*/false, 10.0, 94.0);
+        QJsonArray temps;
+        temps.append(85.0); temps.append(88.0); temps.append(93.0); temps.append(90.0);
+        obj["temperature_presets"] = temps;
+
+        Profile loaded = Profile::fromJson(QJsonDocument(obj));
+        const QVector<ProfileFrame> onLoad = loaded.steps();
+        QVERIFY(!onLoad.isEmpty());
+
+        loaded.regenerateSimpleFrames();
+        QCOMPARE(loaded.steps().size(), onLoad.size());
+        for (qsizetype i = 0; i < onLoad.size(); ++i) {
+            QCOMPARE(loaded.steps().at(i).name, onLoad.at(i).name);
+            QCOMPARE(loaded.steps().at(i).temperature, onLoad.at(i).temperature);
+            QCOMPARE(loaded.steps().at(i).seconds, onLoad.at(i).seconds);
+        }
+    }
+
+    void absentTemperaturePresetsMeanEspressoTemperature() {
+        // 7 of the 89 stock .tcl files carry no espresso_temperature_0..3.
+        // de1app's value there is espresso_temperature in all four slots, not a
+        // house ladder. Covers the JSON fallback, which no shipped or legacy
+        // file exercises (they all carry the array).
+        QJsonObject obj = simpleProfileJson("settings_2a", /*tempSteps=*/true, 10.0, 92.0);
+        obj.remove("temperature_presets");
+
+        const Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.temperaturePresets(), QVector<double>({92.0, 92.0, 92.0, 92.0}));
+        for (const ProfileFrame& f : p.steps())
+            QCOMPARE(f.temperature, 92.0);
+    }
+
+    void tempSteppingPressure() {
+        // Temp stepping: preinfusion splits into boost(2s,temp0) + main(remaining,temp1)
+        // de1app: espresso_temperature_steps_list / temp_bump_time_seconds=2
+        QJsonObject obj;
+        obj["title"] = "Temp Stepping";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["temp_steps_enabled"] = true;
+        obj["preinfusion_time"] = 5.0;
+        obj["preinfusion_flow_rate"] = 4.0;
+        obj["preinfusion_stop_pressure"] = 4.0;
+        obj["espresso_hold_time"] = 10.0;
+        obj["espresso_pressure"] = 9.2;
+        obj["espresso_decline_time"] = 25.0;
+        obj["pressure_end"] = 4.0;
+        obj["maximum_flow"] = 6.0;
+
+        QJsonArray temps;
+        temps.append(85.0);  // temp0: boost
+        temps.append(88.0);  // temp1: preinfusion
+        temps.append(93.0);  // temp2: hold
+        temps.append(90.0);  // temp3: decline
+        obj["temperature_presets"] = temps;
+
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+
+        // Expected: boost(2s,85C) + preinfusion(3s,88C) + forced_rise(3s,93C) + hold(7s,93C) + decline(25s,90C)
+        QCOMPARE(p.steps().size(), 5);
+
+        // Frame 0: temp boost at 85C (2s)
+        // de1app profile.tcl: exit_flow_over 0 (no flow exit during temp boost)
+        QCOMPARE(p.steps()[0].temperature, 85.0);
+        QCOMPARE(p.steps()[0].seconds, 2.0);
+        QCOMPARE(p.steps()[0].exitFlowOver, 0.0);  // de1app: exit_flow_over 0
+
+        // Frame 1: preinfusion at 88C (3s remaining)
+        // de1app profile.tcl: exit_flow_over 6 (flow exit on main preinfusion frame)
+        QCOMPARE(p.steps()[1].temperature, 88.0);
+        QCOMPARE(p.steps()[1].seconds, 3.0);
+        QCOMPARE(p.steps()[1].exitFlowOver, 6.0);  // de1app: exit_flow_over 6
+
+        // Frame 2: forced rise at 93C
+        QCOMPARE(p.steps()[2].temperature, 93.0);
+
+        // Frame 4: decline at 90C
+        // de1app: exit_flow_over 6 on decline
+        QCOMPARE(p.steps()[4].temperature, 90.0);
+        QCOMPARE(p.steps()[4].exitFlowOver, 6.0);  // de1app: exit_flow_over 6
+
+        // 2 leading preinfusion frames (boost + main, both exitIf==true) + 1 forced-rise.
+        // Matches de1app commit 13a30463.
+        QCOMPARE(p.preinfuseFrameCount(), 3);
+    }
+
+    void emptyFrameFallback() {
+        // All times zero → single empty frame (safety net)
+        QJsonObject obj;
+        obj["title"] = "Empty";
+        obj["legacy_profile_type"] = "settings_2a";
+        obj["preinfusion_time"] = 0.0;
+        obj["espresso_hold_time"] = 0.0;
+        obj["espresso_decline_time"] = 0.0;
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("all time parameters are zero"));
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QCOMPARE(p.steps().size(), 1);
+        QCOMPARE(p.steps()[0].name, QString("empty"));
+    }
+
+    // ==========================================
+    // computeFlags (de1app calculate_frame_flag)
+    // ==========================================
+
+    void flagsPressureNoExit() {
+        ProfileFrame pf;
+        pf.pump = "pressure";
+        pf.exitIf = false;
+        pf.transition = "fast";
+        pf.sensor = "coffee";
+
+        // de1app: IgnoreLimit only (0x40)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x40));
+    }
+
+    void flagsFlowNoExit() {
+        ProfileFrame pf;
+        pf.pump = "flow";
+        pf.exitIf = false;
+        pf.transition = "fast";
+        pf.sensor = "coffee";
+
+        // de1app: CtrlF | IgnoreLimit (0x01 | 0x40 = 0x41)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x41));
+    }
+
+    void flagsFlowPressureOver() {
+        ProfileFrame pf;
+        pf.pump = "flow";
+        pf.exitIf = true;
+        pf.exitType = "pressure_over";
+        pf.transition = "fast";
+        pf.sensor = "coffee";
+
+        // CtrlF | DoCompare | DC_GT | IgnoreLimit (0x01 | 0x02 | 0x04 | 0x40 = 0x47)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x47));
+    }
+
+    void flagsPressureUnder() {
+        ProfileFrame pf;
+        pf.pump = "pressure";
+        pf.exitIf = true;
+        pf.exitType = "pressure_under";
+        pf.transition = "fast";
+        pf.sensor = "coffee";
+
+        // DoCompare | IgnoreLimit (0x02 | 0x40 = 0x42)
+        // DC_GT=0 (less than), DC_CompF=0 (pressure)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x42));
+    }
+
+    void flagsFlowUnder() {
+        ProfileFrame pf;
+        pf.pump = "flow";
+        pf.exitIf = true;
+        pf.exitType = "flow_under";
+        pf.transition = "fast";
+        pf.sensor = "coffee";
+
+        // CtrlF | DoCompare | DC_CompF | IgnoreLimit (0x01 | 0x02 | 0x08 | 0x40 = 0x4B)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x4B));
+    }
+
+    void flagsFlowOver() {
+        ProfileFrame pf;
+        pf.pump = "pressure";
+        pf.exitIf = true;
+        pf.exitType = "flow_over";
+        pf.transition = "fast";
+        pf.sensor = "coffee";
+
+        // DoCompare | DC_GT | DC_CompF | IgnoreLimit (0x02 | 0x04 | 0x08 | 0x40 = 0x4E)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x4E));
+    }
+
+    void flagsSmoothTransition() {
+        ProfileFrame pf;
+        pf.pump = "pressure";
+        pf.exitIf = false;
+        pf.transition = "smooth";
+        pf.sensor = "coffee";
+
+        // Interpolate | IgnoreLimit (0x20 | 0x40 = 0x60)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x60));
+    }
+
+    void flagsWaterSensor() {
+        ProfileFrame pf;
+        pf.pump = "pressure";
+        pf.exitIf = false;
+        pf.transition = "fast";
+        pf.sensor = "water";
+
+        // TMixTemp | IgnoreLimit (0x10 | 0x40 = 0x50)
+        QCOMPARE(pf.computeFlags(), uint8_t(0x50));
+    }
+
+    // ==========================================
+    // getSetVal / getTriggerVal
+    // ==========================================
+
+    void getSetValFlow() {
+        ProfileFrame pf;
+        pf.pump = "flow";
+        pf.flow = 2.5;
+        pf.pressure = 9.0;
+        QCOMPARE(pf.getSetVal(), 2.5);
+    }
+
+    void getSetValPressure() {
+        ProfileFrame pf;
+        pf.pump = "pressure";
+        pf.flow = 2.5;
+        pf.pressure = 9.0;
+        QCOMPARE(pf.getSetVal(), 9.0);
+    }
+
+    void getTriggerValEachType() {
+        ProfileFrame pf;
+        pf.exitIf = true;
+
+        pf.exitType = "pressure_over";
+        pf.exitPressureOver = 3.0;
+        QCOMPARE(pf.getTriggerVal(), 3.0);
+
+        pf.exitType = "pressure_under";
+        pf.exitPressureUnder = 2.0;
+        QCOMPARE(pf.getTriggerVal(), 2.0);
+
+        pf.exitType = "flow_over";
+        pf.exitFlowOver = 4.0;
+        QCOMPARE(pf.getTriggerVal(), 4.0);
+
+        pf.exitType = "flow_under";
+        pf.exitFlowUnder = 1.5;
+        QCOMPARE(pf.getTriggerVal(), 1.5);
+    }
+
+    void getTriggerValNoExit() {
+        ProfileFrame pf;
+        pf.exitIf = false;
+        pf.exitType = "pressure_over";
+        pf.exitPressureOver = 99.0;
+        QCOMPARE(pf.getTriggerVal(), 0.0);  // exitIf=false → 0
+    }
+
+    void withSetpointImmutability() {
+        ProfileFrame original;
+        original.pump = "flow";
+        original.flow = 2.0;
+        original.pressure = 9.0;
+        original.temperature = 93.0;
+
+        ProfileFrame copy = original.withSetpoint(3.5, 88.0);
+        QCOMPARE(copy.flow, 3.5);
+        QCOMPARE(copy.temperature, 88.0);
+
+        // Original unchanged
+        QCOMPARE(original.flow, 2.0);
+        QCOMPARE(original.temperature, 93.0);
+    }
+
+    // ==========================================
+    // D-Flow frame generation (de1app dflow_generate_frames)
+    // ==========================================
+
+    void dflowDefaultFrameCount() {
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        QList<ProfileFrame> frames = ProfileGenerator::generateFrames(params);
+        QCOMPARE(frames.size(), 3);  // Always: Filling, Infusing, Pouring
+    }
+
+    void dflowFrameNames() {
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        QList<ProfileFrame> frames = ProfileGenerator::generateFrames(params);
+        QCOMPARE(frames[0].name, QString("Filling"));
+        QCOMPARE(frames[1].name, QString("Infusing"));
+        QCOMPARE(frames[2].name, QString("Pouring"));
+    }
+
+    void dflowFillExitFormula() {
+        // de1app upstream D_Flow_Espresso_Profile/plugin.tcl (Damian-AU/D_Flow_Espresso_Profile):
+        //   if pressure < 2.8: exit_pressure_over = pressure
+        //   else: exit_pressure_over = round_to_one_digits((pressure / 2) + 0.6)
+        //   if exit_pressure_over < 1.2: exit_pressure_over = 1.2
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.infusePressure = 3.0;  // >= 2.8 → formula path
+
+        QList<ProfileFrame> frames = ProfileGenerator::generateFrames(params);
+        // (3.0/2 + 0.6) = 2.1
+        QCOMPARE(frames[0].exitPressureOver, 2.1);
+    }
+
+    void dflowFillExitClamp() {
+        // de1app upstream: minimum exit pressure is 1.2
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.infusePressure = 0.5;  // < 2.8 → use directly → 0.5 < 1.2 → clamp
+
+        QList<ProfileFrame> frames = ProfileGenerator::generateFrames(params);
+        QCOMPARE(frames[0].exitPressureOver, 1.2);
+    }
+
+    // de1app oracle: D-Flow fill exit pressure across the formula boundary
+    void dflowFillExitDe1appOracle_data() {
+        QTest::addColumn<double>("infusePressure");
+        QTest::addColumn<double>("expected");
+
+        // de1app upstream formula (Damian-AU/D_Flow_Espresso_Profile):
+        //   p < 2.8: exitP = p (clamped to min 1.2)
+        //   p >= 2.8: exitP = round_to_one_digits((p/2) + 0.6) (clamped to min 1.2)
+        QTest::newRow("p=0.5 below min")  << 0.5  << 1.2;  // 0.5 → clamp to 1.2
+        QTest::newRow("p=1.0 below 2.8")  << 1.0  << 1.2;  // 1.0 → clamp to 1.2
+        QTest::newRow("p=2.0 below 2.8")  << 2.0  << 2.0;  // 2.0 direct
+        QTest::newRow("p=2.7 below 2.8")  << 2.7  << 2.7;  // 2.7 direct (just below threshold)
+        QTest::newRow("p=2.8 at boundary") << 2.8  << 2.0;  // (2.8/2+0.6) = 2.0
+        QTest::newRow("p=3.0 standard")   << 3.0  << 2.1;  // (3.0/2+0.6) = 2.1
+        QTest::newRow("p=4.0")            << 4.0  << 2.6;  // (4.0/2+0.6) = 2.6
+        QTest::newRow("p=6.0")            << 6.0  << 3.6;  // (6.0/2+0.6) = 3.6
+        QTest::newRow("p=8.0")            << 8.0  << 4.6;  // (8.0/2+0.6) = 4.6
+    }
+
+    void dflowFillExitDe1appOracle() {
+        QFETCH(double, infusePressure);
+        QFETCH(double, expected);
+
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.infusePressure = infusePressure;
+
+        QList<ProfileFrame> frames = ProfileGenerator::generateFrames(params);
+        QVERIFY2(qAbs(frames[0].exitPressureOver - expected) < 0.01,
+                 qPrintable(QString("Expected %1 but got %2 for infusePressure=%3")
+                            .arg(expected).arg(frames[0].exitPressureOver).arg(infusePressure)));
+    }
+
+    void dflowInfuseDisabled() {
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.infuseTime = 0.0;
+
+        QList<ProfileFrame> frames = ProfileGenerator::generateFrames(params);
+        QCOMPARE(frames.size(), 3);       // Still 3 frames
+        QCOMPARE(frames[1].seconds, 0.0); // Infuse frame has 0 seconds (machine skips it)
+    }
+
+    void dflowPourFrameIsFlow() {
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.pourFlow = 2.5;
+        params.pourPressure = 9.0;
+
+        QList<ProfileFrame> frames = ProfileGenerator::generateFrames(params);
+        // Pour frame: flow pump with pressure limiter
+        QCOMPARE(frames[2].pump, QString("flow"));
+        QCOMPARE(frames[2].flow, 2.5);
+        QCOMPARE(frames[2].maxFlowOrPressure, 9.0);  // Pressure cap
+    }
+
+    // ==========================================
+    // ProfileGenerator: createProfile metadata
+    // ==========================================
+
+    void createProfilePressureType() {
+        ProfileParams params;
+        params.editorType = EditorType::Pressure;
+        Profile p = ProfileGenerator::createProfile(params, "My Pressure");
+        QCOMPARE(p.profileType(), QString("settings_2a"));
+        QCOMPARE(p.editorType(), QString("pressure"));
+    }
+
+    void createProfileFlowType() {
+        ProfileParams params;
+        params.editorType = EditorType::Flow;
+        Profile p = ProfileGenerator::createProfile(params, "My Flow");
+        QCOMPARE(p.profileType(), QString("settings_2b"));
+    }
+
+    void createProfileDFlowType() {
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        Profile p = ProfileGenerator::createProfile(params, "D-Flow / My Profile");
+        QCOMPARE(p.profileType(), QString("settings_2c"));
+        QCOMPARE(p.editorType(), QString("dflow"));
+    }
+
+    void createProfilePreservesProfileParams() {
+        ProfileParams params;
+        params.editorType = EditorType::DFlow;
+        params.targetWeight = 42.0;
+        params.pourFlow = 3.0;
+
+        Profile p = ProfileGenerator::createProfile(params, "D-Flow / Test");
+        QCOMPARE(p.editorType(), QString("dflow"));
+        QCOMPARE(p.profileParams().targetWeight, 42.0);
+        QCOMPARE(p.profileParams().pourFlow, 3.0);
+    }
+
+    // ==========================================
+    // BLE Header/Frame Bytes
+    // ==========================================
+
+    void headerBytesLength() {
+        QJsonObject obj = makeAdvancedProfileJson();
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QByteArray header = p.toHeaderBytes();
+        QCOMPARE(header.size(), 5);
+    }
+
+    void headerBytesVersion() {
+        QJsonObject obj = makeAdvancedProfileJson();
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QByteArray header = p.toHeaderBytes();
+        QCOMPARE(uint8_t(header[0]), uint8_t(1));  // HeaderV = 1
+    }
+
+    void frameBytesCount() {
+        QJsonObject obj = makeAdvancedProfileJson();
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QList<QByteArray> frames = p.toFrameBytes();
+        // 1 frame + possible extension frames + 1 tail frame
+        QVERIFY(frames.size() >= 2);  // At minimum: 1 frame + 1 tail
+    }
+
+    void frameBytesSize() {
+        QJsonObject obj = makeAdvancedProfileJson();
+        Profile p = Profile::fromJson(QJsonDocument(obj));
+        QList<QByteArray> frames = p.toFrameBytes();
+        // Each frame is 8 bytes
+        for (const QByteArray& frame : frames) {
+            QCOMPARE(frame.size(), 8);
+        }
+    }
+
+    // ==========================================
+    // ProfileFrame JSON round-trip (all fields)
+    // ==========================================
+
+    void profileFrameFullRoundTrip() {
+        ProfileFrame original;
+        original.name = "test frame";
+        original.temperature = 88.5;
+        original.sensor = "water";
+        original.pump = "flow";
+        original.transition = "smooth";
+        original.pressure = 3.0;
+        original.flow = 4.5;
+        original.seconds = 15.0;
+        original.volume = 100.0;
+        original.exitIf = true;
+        original.exitType = "pressure_over";
+        original.exitPressureOver = 4.0;
+        original.exitWeight = 5.0;
+        original.maxFlowOrPressure = 6.0;
+        original.maxFlowOrPressureRange = 0.8;
+        original.popup = "$weight";
+
+        QJsonObject json = original.toJson();
+        ProfileFrame parsed = ProfileFrame::fromJson(json);
+
+        QCOMPARE(parsed.name, original.name);
+        QCOMPARE(parsed.temperature, original.temperature);
+        QCOMPARE(parsed.sensor, original.sensor);
+        QCOMPARE(parsed.pump, original.pump);
+        QCOMPARE(parsed.transition, original.transition);
+        QCOMPARE(parsed.pressure, original.pressure);
+        QCOMPARE(parsed.flow, original.flow);
+        QCOMPARE(parsed.seconds, original.seconds);
+        QCOMPARE(parsed.volume, original.volume);
+        QCOMPARE(parsed.exitIf, original.exitIf);
+        QCOMPARE(parsed.exitType, original.exitType);
+        QCOMPARE(parsed.exitPressureOver, original.exitPressureOver);
+        QCOMPARE(parsed.exitWeight, original.exitWeight);
+        QCOMPARE(parsed.maxFlowOrPressure, original.maxFlowOrPressure);
+        QCOMPARE(parsed.maxFlowOrPressureRange, original.maxFlowOrPressureRange);
+        QCOMPARE(parsed.popup, original.popup);
+    }
+
+    // === Profile shape (capability: profile-shape-equivalence) ===
+    //
+    // shapeSignature() decides whether a user's re-tuned copy of a
+    // documented profile is still the same extraction SHAPE, which is what
+    // lets the KB's suppression flags (flow_trend_ok, channeling_expected)
+    // reach it. Getting this wrong in the loose direction tells a user their
+    // by-design curve is a fault; in the strict direction it silently drops
+    // the flags. Both failures are silent in production, so they are pinned
+    // here.
+
+    // Two frames: a flow preinfusion with a pressure-over exit, then a
+    // pressure hold. Every magnitude is a named argument so a test can move
+    // exactly one and assert the consequence.
+    static Profile makeShapeProfile(double temp = 92.0,
+                                    double pressure = 9.0,
+                                    double flow = 4.0,
+                                    double seconds0 = 10.0,
+                                    double exitWeight = 0.0,
+                                    double volume = 100.0,
+                                    const QString& pump0 = QStringLiteral("flow"),
+                                    const QString& transition1 = QStringLiteral("smooth"),
+                                    bool exitIf0 = true,
+                                    int frames = 2,
+                                    const QString& beverage = QStringLiteral("espresso"))
+    {
+        Profile p;
+        p.setTitle(QStringLiteral("Shape Fixture"));
+        p.setBeverageType(beverage);
+        QList<ProfileFrame> steps;
+        ProfileFrame f0;
+        f0.name = QStringLiteral("preinfusion");
+        f0.pump = pump0;
+        f0.sensor = QStringLiteral("coffee");
+        f0.transition = QStringLiteral("fast");
+        f0.temperature = temp;
+        f0.flow = flow;
+        f0.pressure = pressure;
+        f0.seconds = seconds0;
+        f0.volume = volume;
+        f0.exitWeight = exitWeight;
+        f0.exitIf = exitIf0;
+        f0.exitType = QStringLiteral("pressure_over");
+        f0.exitPressureOver = 4.0;
+        steps << f0;
+        if (frames > 1) {
+            ProfileFrame f1;
+            f1.name = QStringLiteral("hold");
+            f1.pump = QStringLiteral("pressure");
+            f1.sensor = QStringLiteral("coffee");
+            f1.transition = transition1;
+            f1.temperature = temp;
+            f1.pressure = pressure;
+            f1.seconds = 25.0;
+            f1.volume = volume;
+            steps << f1;
+        }
+        p.setSteps(steps);
+        return p;
+    }
+
+    // The case the capability exists for: a user copies a documented profile
+    // and changes only what dialling in changes.
+    void shape_dialInVariablesDoNotChangeTheShape_data() {
+        QTest::addColumn<Profile>("variant");
+
+        QTest::newRow("temperature")  << makeShapeProfile(/*temp=*/88.0);
+        QTest::newRow("pressure")     << makeShapeProfile(92.0, /*pressure=*/6.0);
+        QTest::newRow("flow")         << makeShapeProfile(92.0, 9.0, /*flow=*/2.0);
+        QTest::newRow("exit weight")  << makeShapeProfile(92.0, 9.0, 4.0, 10.0, /*exitWeight=*/36.0);
+        QTest::newRow("volume")       << makeShapeProfile(92.0, 9.0, 4.0, 10.0, 0.0, /*volume=*/50.0);
+        QTest::newRow("all at once")  << makeShapeProfile(84.0, 6.0, 1.5, 10.0, 40.0, 20.0);
+    }
+
+    void shape_dialInVariablesDoNotChangeTheShape() {
+        QFETCH(Profile, variant);
+        const Profile base = makeShapeProfile();
+        QCOMPARE(variant.shapeSignature(), base.shapeSignature());
+    }
+
+    // The strict direction: anything that changes what the curve DOES is a
+    // different shape, at any magnitude.
+    void shape_structuralEditsChangeTheShape_data() {
+        QTest::addColumn<Profile>("variant");
+
+        QTest::newRow("frame removed")
+            << makeShapeProfile(92.0, 9.0, 4.0, 10.0, 0.0, 100.0,
+                                QStringLiteral("flow"), QStringLiteral("smooth"), true, /*frames=*/1);
+        QTest::newRow("pump mode")
+            << makeShapeProfile(92.0, 9.0, 4.0, 10.0, 0.0, 100.0, /*pump0=*/QStringLiteral("pressure"));
+        QTest::newRow("transition")
+            << makeShapeProfile(92.0, 9.0, 4.0, 10.0, 0.0, 100.0,
+                                QStringLiteral("flow"), /*transition1=*/QStringLiteral("fast"));
+        QTest::newRow("exit removed")
+            << makeShapeProfile(92.0, 9.0, 4.0, 10.0, 0.0, 100.0,
+                                QStringLiteral("flow"), QStringLiteral("smooth"), /*exitIf0=*/false);
+        QTest::newRow("beverage type")
+            << makeShapeProfile(92.0, 9.0, 4.0, 10.0, 0.0, 100.0,
+                                QStringLiteral("flow"), QStringLiteral("smooth"), true, 2,
+                                /*beverage=*/QStringLiteral("filter"));
+    }
+
+    void shape_structuralEditsChangeTheShape() {
+        QFETCH(Profile, variant);
+        const Profile base = makeShapeProfile();
+        QVERIFY2(variant.shapeSignature() != base.shapeSignature(),
+                 qPrintable(QStringLiteral("both signed as %1").arg(base.shapeSignature())));
+    }
+
+    // Frame durations ARE part of the shape. Measured justification: dropping
+    // them from the key puts 23 of 95 shipped profiles into ambiguous buckets
+    // instead of 6, collapsing D-Flow/Q and D-Flow/La-Pavoni into D-Flow —
+    // exactly the separation #1198 exists to protect.
+    void shape_frameDurationsArePartOfTheShape() {
+        const Profile base = makeShapeProfile();
+        const Profile longer = makeShapeProfile(92.0, 9.0, 4.0, /*seconds0=*/14.0);
+        QVERIFY(longer.shapeSignature() != base.shapeSignature());
+
+        // ...but serialization rounding must not split a profile from itself.
+        const Profile jittered = makeShapeProfile(92.0, 9.0, 4.0, /*seconds0=*/10.03);
+        QCOMPARE(jittered.shapeSignature(), base.shapeSignature());
+    }
+
+    // A frameless profile signs as EMPTY, which every caller must read as
+    // "matches nothing" rather than as a value two frameless profiles share.
+    // This is the whole of what the deleted sameShape() helper enforced that
+    // string comparison does not; symmetry and reflexivity were never worth
+    // asserting about operator==.
+    void shape_aFramelessProfileHasNoSignature() {
+        const Profile empty;
+        QVERIFY(empty.shapeSignature().isEmpty());
+        QVERIFY(!makeShapeProfile().shapeSignature().isEmpty());
+    }
+
+    // functionallyEqual() is the STRICTER import-de-duplication predicate and
+    // this change must not have moved it. It had no test at all before this
+    // one, so these also serve as its first pin — including the two
+    // subtleties its implementation depends on.
+    void functionallyEqual_unchangedByShapeWork() {
+        const Profile base = makeShapeProfile();
+        QVERIFY(Profile::functionallyEqual(base, makeShapeProfile()));
+
+        // Exact equality implies same shape. The converse must NOT hold —
+        // if it did, shape would have collapsed into equality and the whole
+        // point (a re-tuned profile still matches) would be lost.
+        const Profile retuned = makeShapeProfile(/*temp=*/88.0);
+        QVERIFY(!Profile::functionallyEqual(base, retuned));
+        QCOMPARE(retuned.shapeSignature(), base.shapeSignature());
+
+        // Empty-step guard, the same one shapeSignature() applies.
+        const Profile empty;
+        QVERIFY(!Profile::functionallyEqual(empty, empty));
+    }
+
+    // === Profile field deltas (change: summarize-profile-changes-from-builtin) ===
+    //
+    // One traversal now feeds two audiences: the developer report that gates
+    // TCL import parity, and the user-facing dial-in block. These assert the
+    // boundary between them, because the compiler cannot.
+
+    // Mutate one frame of a fixture and hand back the profile.
+    static Profile withFrame(Profile p, int index,
+                             const std::function<void(ProfileFrame&)>& edit)
+    {
+        QList<ProfileFrame> steps = p.steps();
+        edit(steps[index]);
+        p.setSteps(steps);
+        return p;
+    }
+
+    // The developer report's TEXT, not merely its emptiness. tst_tclimport
+    // asserts only that it comes back empty, which catches a field appearing or
+    // vanishing but says nothing about how a difference renders — so a format
+    // change would pass every gate while breaking profile_sync's output.
+    void frameDiffReport_renderedTextIsPinned()
+    {
+        const Profile a = makeShapeProfile();
+        Profile b = withFrame(makeShapeProfile(), 0, [](ProfileFrame& f) {
+            f.flow = 2.5;
+            f.exitPressureOver = 6.0;
+        });
+        b = withFrame(b, 1, [](ProfileFrame& f) { f.temperature = 88.0; });
+
+        QCOMPARE(Profile::frameDiffReport(a, b),
+                 QStringLiteral("  FRAME[0] flow: A=4 B=2.5\n"
+                                "  FRAME[0] exitPressureOver: A=4 B=6\n"
+                                "  FRAME[1] temperature: A=92 B=88\n"));
+    }
+
+    // The limiter RANGE is developer-only, so it reaches the user through
+    // nothing — but it still reaches the TCL parity gate, and fieldDeltas is
+    // the only thing that can hide it from there. It carries a continuous unit
+    // (bar or mL/s, whichever the frame's pump does not drive) and the shipped
+    // set authors it at 0.2, 0.9, 1.0, 1.5, 2.5, 3.0 and 3.5 — so typing it as
+    // an integral "count", whose 0.5 tolerance swallows a 0.3 change, silently
+    // loosened a gate that had compared at 0.1 since it was written. Pinned at
+    // a delta between the two: 0.3 is invisible at 0.5 and reported at 0.1.
+    void frameDiffReport_aSubHalfLimiterRangeChangeStillReachesTheParityGate()
+    {
+        const Profile base = makeShapeProfile();
+        const Profile user = withFrame(makeShapeProfile(), 0, [](ProfileFrame& f) {
+            f.maxFlowOrPressureRange += 0.3;
+        });
+
+        QVERIFY2(Profile::frameDiffReport(base, user)
+                     .contains(QStringLiteral("FRAME[0] maxFlowOrPressureRange")),
+                 "a 0.3 limiter-range change must not be filtered out before the gate sees it");
+        QVERIFY2(Profile::dialInDeltas(base, user).isEmpty(),
+                 "the limiter range is a control-loop constant, never a dial-in row");
+    }
+
+    // Frame 0 is flow-driven, so its pressure value is one the machine never
+    // applies. The parity gate still wants it; a user must not be shown it.
+    void dialInDeltas_theInactiveAxisIsDeveloperOnly()
+    {
+        const Profile base = makeShapeProfile();
+        const Profile user = withFrame(makeShapeProfile(), 0,
+                                       [](ProfileFrame& f) { f.pressure = 6.0; });
+
+        QVERIFY(Profile::frameDiffReport(base, user).contains(QStringLiteral("FRAME[0] pressure")));
+        QVERIFY(Profile::dialInDeltas(base, user).isEmpty());
+    }
+
+    // Frame 0 exits on pressure_over. de1app TCL leaves the other three
+    // thresholds carrying junk, so only the matching one may be reported.
+    void dialInDeltas_onlyTheMatchingExitThresholdIsReported()
+    {
+        const Profile base = makeShapeProfile();
+        const Profile user = withFrame(makeShapeProfile(), 0, [](ProfileFrame& f) {
+            f.exitPressureOver = 6.0;
+            f.exitFlowUnder = 1.5;
+        });
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("exitPressureOver"));
+        QCOMPARE(rows.first().oldValue, 4.0);
+        QCOMPARE(rows.first().newValue, 6.0);
+    }
+
+    // A renamed frame is a real signal to a user and is NOT an import defect,
+    // so it must reach the dial-in rows and must not reach the parity gate.
+    void dialInDeltas_aRenamedFrameIsUserFacingOnly()
+    {
+        const Profile base = makeShapeProfile();
+        const Profile user = withFrame(makeShapeProfile(), 1, [](ProfileFrame& f) {
+            f.name = QStringLiteral("pour");
+        });
+
+        QVERIFY(Profile::frameDiffReport(base, user).isEmpty());
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("name"));
+        QVERIFY(!rows.first().numeric);
+        QCOMPARE(rows.first().oldText, QStringLiteral("hold"));
+        QCOMPARE(rows.first().newText, QStringLiteral("pour"));
+        QCOMPARE(rows.first().frameIndex, 1);
+    }
+
+    // Shape fields cannot differ once the block's shape gate is met, so a
+    // dial-in row for one would be dead code that only ever misleads.
+    void dialInDeltas_shapeFieldsNeverReachTheUser()
+    {
+        const Profile base = makeShapeProfile();
+        // seconds IS a shape field, so under the gate it cannot differ at all.
+        // popup and the limiter RANGE are the dev-only fields that genuinely
+        // CAN differ between two same-shape profiles, so they are the ones this
+        // assertion has to cover to mean anything.
+        const Profile user = withFrame(makeShapeProfile(), 0, [](ProfileFrame& f) {
+            f.seconds = 18.0;
+            f.popup = QStringLiteral("swirl now");
+            f.maxFlowOrPressureRange = 1.4;
+        });
+
+        const QString report = Profile::frameDiffReport(base, user);
+        QVERIFY(report.contains(QStringLiteral("seconds")));
+        QVERIFY(report.contains(QStringLiteral("popup")));
+        QVERIFY(report.contains(QStringLiteral("maxFlowOrPressureRange")));
+        QVERIFY(Profile::dialInDeltas(base, user).isEmpty());
+    }
+
+    // Profile-level dial-in values are user-facing only: widening the parity
+    // gate to a yield difference would reject imports that are perfectly
+    // portable.
+    void dialInDeltas_profileLevelValuesAreUserFacingOnly()
+    {
+        const Profile base = makeShapeProfile();
+        Profile user = makeShapeProfile();
+        user.setTargetWeight(base.targetWeight() + 6.0);
+
+        QVERIFY(Profile::frameDiffReport(base, user).isEmpty());
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("targetWeight"));
+        QCOMPARE(rows.first().frameIndex, -1);
+    }
+
+    // Raising a two-frame profile's temperature is ONE edit. Reporting it once
+    // per frame is longer and less true.
+    void dialInDeltas_aChangeOnEveryFrameCollapsesToOneRow()
+    {
+        const Profile base = makeShapeProfile();
+        const Profile user = makeShapeProfile(/*temp=*/88.0);
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("temperature"));
+        QCOMPARE(rows.first().frameIndex, -1);
+        QVERIFY(rows.first().frameName.isEmpty());
+        QCOMPARE(rows.first().oldValue, 92.0);
+        QCOMPARE(rows.first().newValue, 88.0);
+    }
+
+    // ...but a change on SOME frames is genuinely several edits and keeps its
+    // frame numbers. This is the boundary the collapse rule must not cross.
+    void dialInDeltas_aChangeOnSomeFramesKeepsItsFrameNumbers()
+    {
+        const Profile base = makeShapeProfile();
+        const Profile user = withFrame(makeShapeProfile(), 1,
+                                       [](ProfileFrame& f) { f.temperature = 88.0; });
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("temperature"));
+        QCOMPARE(rows.first().frameIndex, 1);
+        QCOMPARE(rows.first().frameName, QStringLiteral("hold"));
+    }
+
+    // A yield change of one editor step (0.1 g) must be REPORTED. The inherited
+    // 0.1 tolerance was `<=`, so 36.0 -> 36.1 g landed exactly on the boundary,
+    // was dropped, and — because "unchanged" is "no rows" — rendered as
+    // "Unchanged copy of X" for a profile the user had just changed.
+    void dialInDeltas_oneEditorStepOfYieldIsReported()
+    {
+        const Profile base = makeShapeProfile();
+        Profile user = makeShapeProfile();
+        user.setTargetWeight(base.targetWeight() + 0.1);
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("targetWeight"));
+    }
+
+    // ...while the developer report keeps its looser 0.1, because that one
+    // absorbs TCL-vs-JSON serialization noise for an import-parity check. The
+    // two tolerances must not collapse into one.
+    void frameDiffReport_keepsItsLooserToleranceWhileDialInTightens()
+    {
+        const Profile base = makeShapeProfile();
+        const Profile user = withFrame(makeShapeProfile(), 0,
+                                       [](ProfileFrame& f) { f.flow += 0.05; });
+
+        QVERIFY(Profile::frameDiffReport(base, user).isEmpty());
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("flow"));
+    }
+
+    // The espresso temperature is AUTHORED, not derived from the frames — the
+    // top-level scalar stays authoritative and may legitimately differ from
+    // steps[0] (PR Kulitorum/Decenza#961, the D-Flow/A-Flow built-ins). Omitting it made a copy
+    // whose only change was the group preheat render as "unchanged".
+    void dialInDeltas_theAuthoredBrewTemperatureIsItsOwnRow()
+    {
+        const Profile base = makeShapeProfile();
+        Profile user = makeShapeProfile();
+        user.setEspressoTemperature(base.espressoTemperature() - 3.0);
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("espressoTemperature"));
+        QCOMPARE(rows.first().unit, QStringLiteral("celsius"));
+        QCOMPARE(rows.first().frameIndex, -1);
+    }
+
+    // fromJson repairs a leaked 93.0 `espresso_temperature` by re-deriving it
+    // from the first frame, and flags that it did. A repaired value was never
+    // authored, so a difference against it describes OUR repair — the user
+    // would be told they changed a brew temperature they never touched.
+    void dialInDeltas_aHealedBrewTemperatureIsNotReportedAsAnEdit()
+    {
+        QJsonObject o = makeShapeProfile().toJson().object();
+        // 93.0 exactly, and outside the frames' 92.0 — the leaked-default
+        // fingerprint fromJson heals.
+        o[QStringLiteral("espresso_temperature")] = QStringLiteral("93.00");
+        const Profile healed = Profile::fromJson(QJsonDocument(o));
+        QVERIFY2(healed.espressoTemperatureHealed(),
+                 "fixture precondition: this JSON must trip the heal, or the test cannot fail");
+        QCOMPARE(healed.espressoTemperature(), 92.0);
+
+        Profile authored = makeShapeProfile();
+        authored.setEspressoTemperature(85.0);
+        QVERIFY(!authored.espressoTemperatureHealed());
+
+        // 7 °C apart, and silent — because one side of the comparison is ours.
+        QVERIFY(Profile::dialInDeltas(healed, authored).isEmpty());
+        QVERIFY(Profile::dialInDeltas(authored, healed).isEmpty());
+    }
+
+    // The limiter is a max FLOW on a pressure-driven frame and a max PRESSURE on
+    // a flow-driven one. The fixture is mixed-pump (frame 0 flow, frame 1
+    // pressure), as are 69 of the 100 bundled profiles, so collapsing on `kind`
+    // alone merged two physically different quantities into one row wearing the
+    // first frame's unit.
+    void dialInDeltas_theLimiterDoesNotCollapseAcrossPumpModes()
+    {
+        Profile base = makeShapeProfile();
+        Profile user = makeShapeProfile();
+        for (Profile* p : { &base, &user }) {
+            QList<ProfileFrame> steps = p->steps();
+            for (ProfileFrame& f : steps)
+                f.maxFlowOrPressure = (p == &base) ? 2.0 : 3.0;
+            p->setSteps(steps);
+        }
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, user);
+        // Two rows, one per pump mode, each keeping its frame number and its own
+        // unit — never one collapsed row.
+        QCOMPARE(rows.size(), 2);
+        for (const ProfileFieldDelta& d : rows)
+            QCOMPARE(d.kind, QStringLiteral("maxFlowOrPressure"));
+        QVERIFY(rows.at(0).unit != rows.at(1).unit);
+        QVERIFY(rows.at(0).frameIndex >= 0 && rows.at(1).frameIndex >= 0);
+    }
+
+    // `unit` is the one field a surface cannot infer, and nothing asserted it.
+    // Transposing two of the profile-level lines, or flipping the limiter's
+    // ternary, is a one-character defect that renders a flow limit as bar.
+    void dialInDeltas_everyRowCarriesTheRightUnit_data()
+    {
+        QTest::addColumn<QString>("kind");
+        QTest::addColumn<QString>("unit");
+        QTest::addColumn<Profile>("user");
+
+        auto tweak = [](const std::function<void(Profile&)>& edit) {
+            Profile p = makeShapeProfile();
+            edit(p);
+            return p;
+        };
+
+        QTest::newRow("targetWeight") << "targetWeight" << "g"
+            << tweak([](Profile& p) { p.setTargetWeight(p.targetWeight() + 5); });
+        QTest::newRow("targetVolume") << "targetVolume" << "ml"
+            << tweak([](Profile& p) { p.setTargetVolume(p.targetVolume() + 5); });
+        QTest::newRow("maximumPressure") << "maximumPressure" << "bar"
+            << tweak([](Profile& p) { p.setMaximumPressure(p.maximumPressure() + 1); });
+        QTest::newRow("maximumFlow") << "maximumFlow" << "mlPerSec"
+            << tweak([](Profile& p) { p.setMaximumFlow(p.maximumFlow() + 1); });
+        QTest::newRow("brewTemperature") << "espressoTemperature" << "celsius"
+            << tweak([](Profile& p) { p.setEspressoTemperature(p.espressoTemperature() - 2); });
+        QTest::newRow("tankTemperature") << "tankTemperature" << "celsiusTank"
+            << tweak([](Profile& p) {
+                   p.setTankDesiredWaterTemperature(p.tankDesiredWaterTemperature() + 5);
+               });
+        // Frame 0 is flow-driven, so ITS limiter caps pressure.
+        QTest::newRow("limiterOnFlowFrame") << "maxFlowOrPressure" << "bar"
+            << withFrame(makeShapeProfile(), 0, [](ProfileFrame& f) { f.maxFlowOrPressure = 7.0; });
+        // Frame 1 is pressure-driven, so ITS limiter caps flow.
+        QTest::newRow("limiterOnPressureFrame") << "maxFlowOrPressure" << "mlPerSec"
+            << withFrame(makeShapeProfile(), 1, [](ProfileFrame& f) { f.maxFlowOrPressure = 7.0; });
+    }
+
+    // The tank token exists so it can be LOOSER than the frame/espresso one.
+    // A single token shared by both would have to pick one tolerance, and
+    // whichever it picked would be wrong for the other half: 0.05 hides three
+    // hundredths of a brew-temperature edit, 0.005 reports a tank difference
+    // that a ProfileJson round-trip invented at the first decimal.
+    void dialInDeltas_theTankTemperatureIsComparedMoreLoosely()
+    {
+        const Profile base = makeShapeProfile();
+
+        Profile tankNudged = base;
+        tankNudged.setTankDesiredWaterTemperature(base.tankDesiredWaterTemperature() + 0.03);
+        QCOMPARE(Profile::dialInDeltas(base, tankNudged).size(), 0);
+
+        const Profile frameNudged = withFrame(base, 0, [](ProfileFrame& f) {
+            f.temperature += 0.03;
+        });
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(base, frameNudged);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, QStringLiteral("temperature"));
+        QCOMPARE(rows.first().unit, QStringLiteral("celsius"));
+    }
+
+    void dialInDeltas_everyRowCarriesTheRightUnit()
+    {
+        QFETCH(QString, kind);
+        QFETCH(QString, unit);
+        QFETCH(Profile, user);
+
+        const QVector<ProfileFieldDelta> rows = Profile::dialInDeltas(makeShapeProfile(), user);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.first().kind, kind);
+        QCOMPARE(rows.first().unit, unit);
+    }
+
+    // === beverageBucket (rebuild-profile-picker, profile-picker chip mapping) ====
+
+    void beverageBucket_data() {
+        QTest::addColumn<QString>("beverageType");
+        QTest::addColumn<QString>("expected");
+
+        QTest::newRow("espresso") << "espresso" << "espresso";
+        QTest::newRow("empty") << "" << "espresso";
+        QTest::newRow("unknown") << "some-future-type" << "espresso";
+        QTest::newRow("filter") << "filter" << "filter";
+        QTest::newRow("pourover") << "pourover" << "filter";
+        QTest::newRow("tea") << "tea" << "tea";
+        QTest::newRow("tea_portafilter") << "tea_portafilter" << "tea";
+        QTest::newRow("cleaning") << "cleaning" << "maintenance";
+        QTest::newRow("descale") << "descale" << "maintenance";
+        QTest::newRow("calibrate") << "calibrate" << "maintenance";
+        QTest::newRow("manual") << "manual" << "maintenance";
+        // Normalized: trimmed + lowercased, like beverageGroup()/isMaintenanceBeverageType().
+        QTest::newRow("mixedCaseAndSpace") << "  Pourover  " << "filter";
+        QTest::newRow("legacyBracedPourover") << "{pourover}" << "filter";
+        QTest::newRow("legacyBracedTea") << "{tea_portafilter}" << "tea";
+        QTest::newRow("legacyBracedCalibration") << "{calibrate}" << "maintenance";
+        QTest::newRow("legacyBracedWhitespace") << " { Tea_Portafilter } " << "tea";
+    }
+
+    void beverageBucket() {
+        QFETCH(QString, beverageType);
+        QFETCH(QString, expected);
+        QCOMPARE(Profile::beverageBucket(beverageType), expected);
+    }
+
+    // === inferBeverageType (rebuild-profile-picker, profile-import-beverage-inference) ==
+    //
+    // ProfileFrame carries no Q_DECLARE_METATYPE, so a QList<ProfileFrame> data
+    // column is not an option — QTest::addColumn<T> needs a registered metatype.
+    // Title-only (keyword) cases use a _data() table; shape cases, which need
+    // real frames, are one plain test building its own local ProfileFrame lists.
+
+    static ProfileFrame makeFrame(const QString& pump, double pressure,
+                                   double maxFlowOrPressure, double temperature) {
+        ProfileFrame f;
+        f.pump = pump;
+        f.pressure = pressure;
+        f.maxFlowOrPressure = maxFlowOrPressure;
+        f.temperature = temperature;
+        return f;
+    }
+
+    void inferBeverageType_titleKeywords_data() {
+        QTest::addColumn<QString>("title");
+        QTest::addColumn<QString>("expected");
+
+        // Keyword wins over shape: checked with no frames at all, so an espresso
+        // shape default cannot be the reason the right answer comes back.
+        QTest::newRow("keywordWinsOverShape_tea") << "Cold Brew Tea" << "tea_portafilter";
+        QTest::newRow("cleanKeyword") << "Backflush Cycle" << "cleaning";
+        QTest::newRow("calibrateKeyword") << "Calibrate Scale" << "calibrate";
+        QTest::newRow("pourKeyword") << "V60 Profile" << "pourover";
+        QTest::newRow("noKeywordNoFrames_defaultsEspresso") << "Mystery Profile" << "espresso";
+        // "tea" only as a whole word: "Steady" and "Steam" must not read as tea.
+        QTest::newRow("teaSubstringIsNotTea") << "Steady 9 bar" << "espresso";
+        QTest::newRow("teaWholeWord") << "Black Tea 85" << "tea_portafilter";
+    }
+
+    void inferBeverageType_titleKeywords() {
+        QFETCH(QString, title);
+        QFETCH(QString, expected);
+        QCOMPARE(Profile::inferBeverageType(title, {}), expected);
+    }
+
+    void inferBeverageType_shape() {
+        // Low pressure, no keyword: every step under 2 bar -> pourover.
+        const QList<ProfileFrame> lowPressure = {
+            makeFrame("pressure", 1.5, 0.0, 92.0),
+            makeFrame("pressure", 2.0, 0.0, 90.0),
+        };
+        QCOMPARE(Profile::inferBeverageType("Slow Long", lowPressure), QStringLiteral("pourover"));
+
+        // Flow-driven step: the LIMITER (maxFlowOrPressure), not the flow
+        // setpoint, is what counts as its pressure per the spec.
+        ProfileFrame flowStep;
+        flowStep.pump = "flow";
+        flowStep.flow = 8.0;
+        flowStep.maxFlowOrPressure = 1.0;
+        flowStep.temperature = 92.0;
+        QCOMPARE(Profile::inferBeverageType("Flow Thing", {flowStep}), QStringLiteral("pourover"));
+
+        // Limiter 0 on a flow step means IgnoreLimit (unlimited), not 0 bar:
+        // no pressure evidence, so a hot unlimited flow step stays espresso.
+        ProfileFrame unlimitedFlow;
+        unlimitedFlow.pump = "flow";
+        unlimitedFlow.flow = 2.0;
+        unlimitedFlow.maxFlowOrPressure = 0.0;
+        unlimitedFlow.temperature = 93.0;
+        QCOMPARE(Profile::inferBeverageType("Flow Thing", {unlimitedFlow}), QStringLiteral("espresso"));
+
+        // Cold step -> pourover regardless of pressure.
+        const QList<ProfileFrame> coldStep = { makeFrame("pressure", 9.0, 0.0, 22.0) };
+        QCOMPARE(Profile::inferBeverageType("Cold Something", coldStep), QStringLiteral("pourover"));
+
+        // No keyword, high pressure, no cold step -> espresso (the explicit-tag
+        // scenario in the spec checks the same shape stays espresso when tagged).
+        const QList<ProfileFrame> hotHighPressure = { makeFrame("pressure", 9.0, 0.0, 93.0) };
+        QCOMPARE(Profile::inferBeverageType("Community Blend", hotHighPressure), QStringLiteral("espresso"));
+    }
+
+};
+
+QTEST_GUILESS_MAIN(tst_Profile)
+#include "tst_profile.moc"

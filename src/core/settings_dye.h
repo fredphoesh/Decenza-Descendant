@@ -1,0 +1,506 @@
+#pragma once
+
+#include <QObject>
+#include <QHash>
+#include "appsettings.h"
+#include <QString>
+#include <QStringList>
+#include <QVariantMap>
+
+class CoffeeBagStorage;
+class EquipmentStorage;
+// Forward-declared rather than including grinderaliases.h: only the private
+// stepFromParsed() helper names it, and the header comment above is explicit
+// that this file exists to keep settings.h's include footprint small.
+namespace GrinderAliases { struct GrinderEntry; }
+
+// DYE (Describe Your Espresso) metadata. Split from Settings to keep
+// settings.h's transitive-include footprint small.
+//
+// There is deliberately no enjoyment field here, and none may be added. A
+// rating belongs to one shot and only ever comes from a person, so it is
+// written to that shot's row (the `enjoyment` column) at the moment the person
+// supplies it — by the post-shot review page or the AI taste intake, both via
+// the shot-update path. A freshly saved shot is unrated because nothing
+// assigns the field at all (ShotMetadata::espressoEnjoyment defaults to 0).
+//
+// It was once a sticky setting fed by a "default shot rating", so every
+// freshly pulled shot arrived pre-rated and the taste intake never appeared.
+// Removing the default (PR Kulitorum/Decenza#1561) left the sticky field behind, still read at
+// save time and reset only afterwards, so the last value it ever held leaked
+// onto one further shot per upgrading user.
+//
+// Note this prohibition is specific to ratings, not a claim that the class is
+// free of the pattern: dyeShotNotes is persisted and snapshotted onto whatever
+// shot completes next by the same mechanism, and dyeDrinkTds/dyeDrinkEy do the
+// same from memory. Those are tolerated because a person types them in the
+// context of the shot they are about to pull, and nothing else writes them —
+// which is exactly what stopped being true for enjoyment once a *setting* fed
+// it. If anything ever feeds those fields automatically, they become this bug.
+//
+// dyeDrinkWeight is the field that already failed that test, and it is worth
+// naming here rather than leaving the list looking complete. It is written
+// automatically after every shot (setDyeDrinkWeight in MainController's save
+// callback), so it always holds a yield belonging to some earlier shot. It was
+// read at metadata-build time and shipped to Visualizer, which reported the
+// PREVIOUS shot's yield while the app displayed the correct one. The fix was
+// not to reset it more carefully but to stop a per-shot measurement travelling
+// through sticky state at all: ShotMetadata no longer carries a drink weight,
+// and the yield reaches the uploader only as an explicit argument. The setting
+// survives because the review page and MCP still legitimately read and write
+// it — but nothing on a save path may read it again.
+//
+// Bean model (bean-bag-inventory): selecting a bag copies its bean identity and
+// dose/yield defaults into the dye/* cache (applyActiveBag), and bean-identity
+// and dose setters write back to the bag row on a background thread. Grinder
+// identity and the grind dial belong to the active equipment package, not the
+// bag.
+class SettingsDye : public QObject {
+    Q_OBJECT
+
+public:
+    // Which of the three standing sources supplies the dose for the next shot
+    // (dose-source-precedence). The ladder is recipe → bag → profile, the same
+    // one yield-anchor defines for the yield, and it is resolved HERE rather
+    // than left to emerge from the order in which the profile-load, bag-select
+    // and recipe-activate signals happen to arrive — which is exactly how it
+    // used to work, and why a profile load or a bag apply could silently
+    // overwrite a dose that outranked it.
+    enum class DoseOwner { Recipe, Bag, Profile };
+    Q_ENUM(DoseOwner)
+
+private:
+    // DYE metadata - sticky fields
+    Q_PROPERTY(QString dyeBeanBrand READ dyeBeanBrand WRITE setDyeBeanBrand NOTIFY dyeBeanBrandChanged FINAL)
+    Q_PROPERTY(QString dyeBeanType READ dyeBeanType WRITE setDyeBeanType NOTIFY dyeBeanTypeChanged FINAL)
+    Q_PROPERTY(QString dyeRoastDate READ dyeRoastDate WRITE setDyeRoastDate NOTIFY dyeRoastDateChanged FINAL)
+    Q_PROPERTY(QString dyeRoastLevel READ dyeRoastLevel WRITE setDyeRoastLevel NOTIFY dyeRoastLevelChanged FINAL)
+    Q_PROPERTY(QString dyeGrinderBrand READ dyeGrinderBrand WRITE setDyeGrinderBrand NOTIFY dyeGrinderBrandChanged FINAL)
+    Q_PROPERTY(QString dyeGrinderModel READ dyeGrinderModel WRITE setDyeGrinderModel NOTIFY dyeGrinderModelChanged FINAL)
+    Q_PROPERTY(QString dyeGrinderBurrs READ dyeGrinderBurrs WRITE setDyeGrinderBurrs NOTIFY dyeGrinderBurrsChanged FINAL)
+    // Active package's display name (read-only; defaults to "{brand} {model}").
+    // UI shows this instead of the raw grinder identity (add-equipment-packages).
+    Q_PROPERTY(QString dyeEquipmentName READ dyeEquipmentName NOTIFY dyeEquipmentNameChanged FINAL)
+    // Active package's basket identity (read-only; empty when none). Basket is
+    // part of the package identity, not a per-shot dial, so these are resolved
+    // from the active package like dyeEquipmentName (add-basket-equipment).
+    Q_PROPERTY(QString dyeBasketBrand READ dyeBasketBrand NOTIFY dyeBasketChanged FINAL)
+    Q_PROPERTY(QString dyeBasketModel READ dyeBasketModel NOTIFY dyeBasketChanged FINAL)
+    // Active package's puck-prep canonical flag string (e.g. "shaker,wdt"; empty =
+    // none), resolved from the active package (add-puckprep-equipment). The Edit
+    // Equipment form prefills its checkboxes from this when adding new gear.
+    Q_PROPERTY(QString dyePuckPrepCanonical READ dyePuckPrepCanonical NOTIFY dyePuckPrepChanged FINAL)
+    // One-line registry summary of the active basket (wall/flow/precision/dose),
+    // empty for none or a custom off-registry basket.
+    Q_PROPERTY(QString dyeBasketSummary READ dyeBasketSummary NOTIFY dyeBasketChanged FINAL)
+    Q_PROPERTY(QString dyeGrinderSetting READ dyeGrinderSetting WRITE setDyeGrinderSetting NOTIFY dyeGrinderSettingChanged FINAL)
+    // Grinder rpm dial-in (add-equipment-packages); shown only when the active
+    // package's grinder is rpmCapable. 0 = unset.
+    Q_PROPERTY(int dyeGrinderRpm READ dyeGrinderRpm WRITE setDyeGrinderRpm NOTIFY dyeGrinderRpmChanged FINAL)
+    // The active equipment package id (the grinder the next shot is ground on).
+    // Switching it applies the package's grinder identity + last dial.
+    Q_PROPERTY(qint64 activeEquipmentId READ activeEquipmentId WRITE setActiveEquipmentId NOTIFY activeEquipmentIdChanged FINAL)
+    Q_PROPERTY(double dyeBeanWeight READ dyeBeanWeight WRITE setDyeBeanWeight NOTIFY dyeBeanWeightChanged FINAL)
+    Q_PROPERTY(double dyeDrinkWeight READ dyeDrinkWeight WRITE setDyeDrinkWeight NOTIFY dyeDrinkWeightChanged FINAL)
+    Q_PROPERTY(double dyeDrinkTds READ dyeDrinkTds WRITE setDyeDrinkTds NOTIFY dyeDrinkTdsChanged FINAL)
+    Q_PROPERTY(double dyeDrinkEy READ dyeDrinkEy WRITE setDyeDrinkEy NOTIFY dyeDrinkEyChanged FINAL)
+    Q_PROPERTY(QString dyeShotNotes READ dyeShotNotes WRITE setDyeShotNotes NOTIFY dyeShotNotesChanged FINAL)
+    Q_PROPERTY(QString dyeBarista READ dyeBarista WRITE setDyeBarista NOTIFY dyeBaristaChanged FINAL)
+    Q_PROPERTY(QString dyeShotDateTime READ dyeShotDateTime WRITE setDyeShotDateTime NOTIFY dyeShotDateTimeChanged FINAL)
+
+    // Bean Base (Loffee Labs) link state — sticky like the bean fields.
+    // dyeBeanBaseId empty = unlinked (the free-text-only path most beans use).
+    // dyeBeanBaseData holds the full cached entry as one compact-JSON blob;
+    // consumers (shot snapshot, Visualizer upload, AI advisor) read it as a
+    // unit, so it is deliberately NOT split into per-attribute properties.
+    Q_PROPERTY(QString dyeBeanBaseId READ dyeBeanBaseId WRITE setDyeBeanBaseId NOTIFY dyeBeanBaseIdChanged FINAL)
+    Q_PROPERTY(QString dyeBeanBaseData READ dyeBeanBaseData WRITE setDyeBeanBaseData NOTIFY dyeBeanBaseDataChanged FINAL)
+
+    // The active coffee bag (DB row id in coffee_bags), -1 = no bag selected.
+    // Setting it loads the bag and applies its fields to the dye cache.
+    Q_PROPERTY(int activeBagId READ activeBagId WRITE setActiveBagId NOTIFY activeBagIdChanged FINAL)
+    // The active recipe (DB row id in recipes), -1 = none (add-recipes). Only
+    // the persisted id lives here — activation, write-through stamping, and
+    // deactivate-on-ingredient-swap are MainController's job (the recipe layer
+    // sits above the settings façade, unlike bags whose fields ARE dye state).
+    Q_PROPERTY(int activeRecipeId READ activeRecipeId WRITE setActiveRecipeId NOTIFY activeRecipeIdChanged FINAL)
+    // The recipe pinned to auto-load (recipe-auto-load), -1 = none. Mutually
+    // exclusive with SettingsApp::autoLoadProfileFilename — setting either one
+    // clears the other; the cross-clear is wired in Settings (the façade that
+    // owns both sub-objects), not here, so this class stays ignorant of
+    // SettingsApp. Shares SettingsApp::autoLoadRevertMinutes with the profile
+    // side rather than having its own timeout.
+    Q_PROPERTY(int autoLoadRecipeId READ autoLoadRecipeId WRITE setAutoLoadRecipeId NOTIFY autoLoadRecipeIdChanged FINAL)
+    // Lifecycle fields of the active bag, mirrored for QML display and the
+    // shot snapshot (read-only here; edited via CoffeeBagStorage).
+    Q_PROPERTY(QString activeBagFrozenDate READ activeBagFrozenDate NOTIFY activeBagChanged FINAL)
+    Q_PROPERTY(QString activeBagDefrostDate READ activeBagDefrostDate NOTIFY activeBagChanged FINAL)
+    // Non-frozen storage lifecycle (bean-freshness-followup): storage category
+    // and opened date of the active bag.
+    Q_PROPERTY(QString activeBagStorageHint READ activeBagStorageHint NOTIFY activeBagChanged FINAL)
+    Q_PROPERTY(QString activeBagOpenedDate READ activeBagOpenedDate NOTIFY activeBagChanged FINAL)
+    // The active bag's own yield spec (add-yield-ratio-anchor). QML-visible:
+    // Brew Settings reads them for the Update Bag button's enable-gate and
+    // for Clear's baseline, so they MUST be properties — a plain getter reads
+    // as `undefined` in QML and silently defeats both.
+    Q_PROPERTY(double activeBagYieldValue READ activeBagYieldValue NOTIFY activeBagYieldSpecChanged FINAL)
+    Q_PROPERTY(QString activeBagYieldMode READ activeBagYieldMode NOTIFY activeBagYieldSpecChanged FINAL)
+
+public:
+    explicit SettingsDye(QObject* parent = nullptr);
+
+    // Non-owning; attached by main.cpp once ShotHistoryStorage has run the
+    // migrations. Loads the active bag into the dye cache and subscribes to
+    // bag updates so external edits (bag edit dialog, Next Portion, dose
+    // stamp) refresh the cache.
+    void setBagStorage(CoffeeBagStorage* storage);
+
+    // Non-owning; attached by MainController after storage init. The dye
+    // grinder identity is resolved through the active package
+    // (dye/activeEquipmentId).
+    void setEquipmentStorage(EquipmentStorage* storage);
+    // The live storage instance, for a caller that wrote to the database on its
+    // own connection and now has to tell the app (see
+    // notifyPackagesChangedExternally). Null until setEquipmentStorage runs.
+    EquipmentStorage* equipmentStorage() const { return m_equipmentStorage; }
+
+    // DYE metadata
+    QString dyeBeanBrand() const;
+    void setDyeBeanBrand(const QString& value);
+
+    QString dyeBeanType() const;
+    void setDyeBeanType(const QString& value);
+
+    QString dyeRoastDate() const;
+    void setDyeRoastDate(const QString& value);
+
+    QString dyeRoastLevel() const;
+    void setDyeRoastLevel(const QString& value);
+
+    QString dyeGrinderBrand() const;
+    void setDyeGrinderBrand(const QString& value);
+
+    QString dyeGrinderModel() const;
+    void setDyeGrinderModel(const QString& value);
+
+    QString dyeGrinderBurrs() const;
+    void setDyeGrinderBurrs(const QString& value);
+
+    QString dyeEquipmentName() const { return m_dyeEquipmentName; }
+
+    // The best available grinder identity for matching (Bean Search): the structured
+    // dye grinder fields as "{brand} {model}" when a model is set, else the active
+    // package's display name (e.g. "eureka Mignon"), else empty. Phase-2 read
+    // dyeGrinderModel directly, which is empty for equipment-package users whose
+    // package carries only a name, so grinder matching / grind / Apply-grind were
+    // dead for them.
+    QString dyeEffectiveGrinder() const;
+
+    QString dyeBasketBrand() const { return m_dyeBasketBrand; }
+    QString dyeBasketModel() const { return m_dyeBasketModel; }
+    QString dyeBasketSummary() const { return m_dyeBasketSummary; }
+    QString dyePuckPrepCanonical() const { return m_dyePuckPrepCanonical; }
+
+    QString dyeGrinderSetting() const;
+    void setDyeGrinderSetting(const QString& value);
+
+    int dyeGrinderRpm() const;
+    void setDyeGrinderRpm(int value);
+
+    qint64 activeEquipmentId() const;
+    void setActiveEquipmentId(qint64 id);
+
+    // User-facing equipment switch: adopt the package's grinder identity and its
+    // last dial (grind setting + rpm). `pkg` is a
+    // package map from EquipmentStorage (id, grinderBrand/Model/Burrs,
+    // lastGrindSetting, lastRpm).
+    Q_INVOKABLE void switchToEquipment(const QVariantMap& pkg);
+
+    // True when the grinder identity is rpm-adjustable (registry variableRpm, or
+    // a custom grinder not in the registry). Drives the rpm field's visibility in
+    // Brew Settings.
+    Q_INVOKABLE bool grinderRpmCapable(const QString& brand, const QString& model) const;
+
+    Q_INVOKABLE QStringList suggestedBurrs(const QString& brand, const QString& model) const;
+    Q_INVOKABLE bool isBurrSwappable(const QString& brand, const QString& model) const;
+    Q_INVOKABLE QStringList knownGrinderBrands() const;
+    Q_INVOKABLE QStringList knownGrinderModels(const QString& brand) const;
+
+    // Step a registry grinder's dial `deltaUnits` linear units from `current`,
+    // via the catalog's notation-aware PARSE (findEntry → parseGrinderSetting →
+    // arithmetic). Handles BOTH plain-numeric AND Compound "a+b" rotation
+    // grinders (Eureka Mignon/Atom/Helios, 1Zpresso) — the same parse math the
+    // AI dialing block uses (dialing_blocks.cpp). Output notation follows the
+    // CURRENT value's form: a compound "a+b" input renders via formatGrinderSetting
+    // (carry-borrow), while a plain-numeric input keeps `decimals` places so a
+    // sub-0.5 quick-select step (e.g. 0.25) isn't truncated to the AI-dialing
+    // convention's single decimal. Returns "" for a grinder not in the registry,
+    // a value the catalog can't parse, or — click-indexed (Compound) grinders
+    // only — a candidate below the dial floor (< 0), so the caller keeps its own
+    // letter / plain-numeric / history fallback. Plain-numeric grinders step
+    // below zero freely: a stepless collar's zero is a user-set calibration
+    // reference (Niche Zero) and finer-than-zero is a real dial position.
+    Q_INVOKABLE QString stepGrinderSetting(const QString& brand, const QString& model,
+                                           const QString& current, double deltaUnits,
+                                           int decimals = 1) const;
+
+    // Batch form: one call for a whole wheel of candidates, n running fromN..toN
+    // with a delta of n * stepUnits. Entry i is what stepGrinderSetting would
+    // return for n = fromN + i, empty strings included — the caller falls back
+    // per row on an empty, so they carry meaning and are not collapsed.
+    //
+    // Exists because the grind picker made 801 of these calls per open and the
+    // crossings, not the work behind them, were the cost. See the definition.
+    Q_INVOKABLE QStringList stepGrinderSettingRange(const QString& brand, const QString& model,
+                                                    const QString& current, double stepUnits,
+                                                    int fromN, int toN,
+                                                    int decimals = 1) const;
+
+    // True when the grinder's registry notation is click-indexed (Compound,
+    // e.g. Eureka Mignon "a+b", 1Zpresso). Callers whose own numeric stepping
+    // runs after stepGrinderSetting's "" fall-through use this to keep skipping
+    // negative candidates for such grinders — a negative linear position is
+    // meaningless on click-indexed hardware however the value is written —
+    // without also blocking stepless collars (replace-grind-inputs-with-picker).
+    Q_INVOKABLE bool grinderIsClickIndexed(const QString& brand, const QString& model) const;
+
+    // Basket registry bridges for the vendor-first picker (add-basket-equipment).
+    Q_INVOKABLE QStringList knownBasketBrands() const;
+    Q_INVOKABLE QStringList knownBasketModels(const QString& brand) const;
+    // Differentiator subtitle for a basket model row (registry summary), e.g.
+    // "58mm, straight-wall, precision, open flow, 17-19g". Empty for a custom basket.
+    Q_INVOKABLE QString basketModelSummary(const QString& brand, const QString& model) const;
+
+    double dyeBeanWeight() const;
+    void setDyeBeanWeight(double value);
+
+    double dyeDrinkWeight() const;
+    void setDyeDrinkWeight(double value);
+
+    double dyeDrinkTds() const;
+    void setDyeDrinkTds(double value);
+
+    double dyeDrinkEy() const;
+    void setDyeDrinkEy(double value);
+
+    QString dyeShotNotes() const;
+    void setDyeShotNotes(const QString& value);
+
+    QString dyeBarista() const;
+    void setDyeBarista(const QString& value);
+
+    QString dyeShotDateTime() const;
+    void setDyeShotDateTime(const QString& value);
+
+    QString dyeBeanBaseId() const;
+    void setDyeBeanBaseId(const QString& value);
+
+    QString dyeBeanBaseData() const;
+    void setDyeBeanBaseData(const QString& value);
+
+    // Convenience: clear all Bean Base link fields (Unlink action). Writes
+    // through to the active bag like any other bean-field edit.
+    Q_INVOKABLE void clearBeanBaseLink();
+
+    // Active bag
+    int activeBagId() const;
+    void setActiveBagId(int bagId);
+    // Select a bag WITHOUT copying its stored fields into the dye cache —
+    // for callers about to apply field values of their own (loading a
+    // historical shot's setup, where the shot's dose should win over the
+    // bag's; the subsequent setters write through, so the bag adopts it).
+    // Lifecycle display fields still refresh.
+    Q_INVOKABLE void setActiveBagKeepFields(int bagId);
+    // Publish an already-approved review patch without bag/package write-through.
+    // The owner must suppress recipe and brew-reset observers around this call.
+    bool applyShotReviewPatch(const QVariantMap& patch, const QVariantMap& committedBag);
+    QString activeBagFrozenDate() const { return m_activeBagFrozenDate; }
+    QString activeBagDefrostDate() const { return m_activeBagDefrostDate; }
+    QString activeBagStorageHint() const { return m_activeBagStorageHint; }
+    QString activeBagOpenedDate() const { return m_activeBagOpenedDate; }
+
+    // Active recipe (add-recipes). Persisted id only — see the Q_PROPERTY note.
+    int activeRecipeId() const;
+    void setActiveRecipeId(int recipeId);
+    // The active recipe together with the dose it designs — set as ONE call so
+    // the ladder can never name one recipe while holding another's dose. That
+    // pairing is the whole invariant; splitting it into two setters is what let
+    // the id advance while the cache lagged. 0 = the recipe designs no dose, so
+    // the ladder falls through to the bag.
+    //
+    // Called from every path that learns the active recipe's dose: activation
+    // (applyActivatedRecipe), the startup restore and external-edit re-read
+    // (the recipeReady handler), and the dial-in stamp. SettingsDye caches it
+    // rather than reaching up into MainController, which owns the recipe map —
+    // mirroring how m_activeBagYieldValue caches the bag's yield spec.
+    void setActiveRecipe(int recipeId, double doseG);
+    double activeRecipeDose() const { return m_activeRecipeDoseG; }
+
+    // Which source supplies the dose for the next shot (dose-source-precedence).
+    // Every writer of dyeBeanWeight that represents a STANDING source — the
+    // profile's recommended dose, the bag's stored dose — gates itself on this.
+    // A shot replay is not a standing source and does not consult it (it does
+    // still MOVE the ladder, because its write-through makes the replayed dose
+    // genuinely the bag's and the stamp makes it the recipe's).
+    DoseOwner doseOwner() const;
+
+    // Whether the ladder can be answered at all: true once every SET rung has
+    // had its row read. Both rows load on a storage worker, so between
+    // selecting a bag/recipe and its row arriving doseOwner() would answer
+    // "profile" for a session another source owns — and the profile's write is
+    // the destructive one (it write-throughs to the bag and stamps the recipe).
+    // A source that is not set is resolved vacuously.
+    bool doseLadderResolved() const;
+
+    // Auto-load recipe (recipe-auto-load). See the Q_PROPERTY note above for
+    // the mutual-exclusion contract with SettingsApp::autoLoadProfileFilename.
+    int autoLoadRecipeId() const;
+    void setAutoLoadRecipeId(int recipeId);
+
+    // The active bag's own yield spec (add-yield-ratio-anchor): {value, mode}
+    // with mode "none" | "absolute" | "ratio". mode "none" = the bag designs
+    // no yield and the ladder falls through to the profile. Applied to the
+    // session anchor on a user bean switch when no recipe is active (see
+    // applyActiveBag + the MainController guard).
+    double activeBagYieldValue() const { return m_activeBagYieldValue; }
+    QString activeBagYieldMode() const { return m_activeBagYieldMode; }
+    // Persist a yield spec to the active bag — the "Update Bag" button's
+    // write, and the ONLY path a yield reaches the bag (the old Brew
+    // Settings OK write-through and the per-shot stamp are gone: the yield
+    // anchor is intent, button-protected; dial-in stays automatic).
+    Q_INVOKABLE void persistYieldSpecToBag(double value, const QString& mode);
+
+    // Invalidate cached DYE values so the next getter re-reads from QSettings.
+    // Called by Settings::factoryReset() after wiping the store. Also zeros
+    // the session-scratch TDS/EY since they don't live in QSettings.
+    void invalidateCache() {
+        m_dyeCacheInitialized = false;
+        m_dyeDrinkTds = 0.0;
+        m_dyeDrinkEy = 0.0;
+    }
+
+signals:
+    void dyeBeanBrandChanged();
+    void dyeBeanTypeChanged();
+    void dyeRoastDateChanged();
+    void dyeRoastLevelChanged();
+    void dyeGrinderBrandChanged();
+    void dyeGrinderModelChanged();
+    void dyeGrinderBurrsChanged();
+    void dyeEquipmentNameChanged();
+    void dyeBasketChanged();
+    void dyePuckPrepChanged();
+    void dyeGrinderSettingChanged();
+    void dyeGrinderRpmChanged();
+    void activeEquipmentIdChanged();
+    void dyeBeanWeightChanged();
+    void dyeDrinkWeightChanged();
+    void dyeDrinkTdsChanged();
+    void dyeDrinkEyChanged();
+    void dyeShotNotesChanged();
+    void dyeBaristaChanged();
+    void dyeShotDateTimeChanged();
+    void dyeBeanBaseIdChanged();
+    void dyeBeanBaseDataChanged();
+    void activeBagIdChanged();
+    void activeBagChanged();
+    void activeRecipeIdChanged();
+    void autoLoadRecipeIdChanged();
+    // Emitted only from applyActiveBag (a user bean switch, not a keep-fields
+    // historical/favorite load) carrying the new bag's yield spec. The
+    // MainController applies it to the session anchor after the switch's
+    // clear-to-profile-default reset — GATED on no recipe being active (the
+    // ladder: recipe outranks bag) — so a bag with an anchor turns the idle
+    // brew-settings widget yellow and a bag without one stays at the default.
+    void activeBagYieldSpecApplied(double value, const QString& mode);
+    // The cached spec CHANGED — including on paths that deliberately do not
+    // re-arm the session (the keep-fields refresh) and on the Update Bag
+    // write. Drives the Q_PROPERTY NOTIFY above and MainController's
+    // brewBaselineChanged, so the Brew Settings baseline/button can never
+    // read a stale bag spec.
+    void activeBagYieldSpecChanged();
+
+private:
+    // Shared core of stepGrinderSetting and stepGrinderSettingRange — the
+    // per-delta rules, once the grinder and current value are resolved.
+    static QString stepFromParsed(const GrinderAliases::GrinderEntry& entry,
+                                  double linear, const QString& current,
+                                  double deltaUnits, int decimals);
+
+
+    void ensureDyeCacheLoaded() const;
+    // Apply bean identity and available dose/yield defaults on a bag switch.
+    // A same-bag reload only refreshes the caches — see m_appliedBagId.
+    void applyActiveBag(const QVariantMap& bag);
+    void applyBagRow(qint64 bagId, const QVariantMap& bag);
+    void refreshBagCaches(const QVariantMap& bag);
+    // Queue an async write of one field to the active bag (no-op while
+    // applyActiveBag is running or when no bag/storage is attached).
+    void writeThroughToBag(const QString& field, const QVariant& value);
+    // Queue an async write of one field to the active equipment package (no-op
+    // while applyActiveBag is running or when no package/storage is attached).
+    void writeThroughToActivePackage(const QString& field, const QVariant& value);
+    // Refresh the grinder-identity display cache from a resolved package map.
+    void applyEquipmentIdentity(const QVariantMap& pkg);
+
+    mutable AppSettings m_settings;
+    CoffeeBagStorage* m_bagStorage = nullptr;    // Non-owning; attached post-init.
+    EquipmentStorage* m_equipmentStorage = nullptr; // Non-owning; attached post-init.
+
+    bool m_applyingBag = false;  // Suppress write-through echo during applyActiveBag
+    bool m_keepFieldsOnNextApply = false;  // setActiveBagKeepFields: next bagReady only refreshes lifecycle
+    int m_reviewProtectedBagId = -1; // Ignore pre-publication bag reads for a review selection.
+    QVariantMap m_reviewProtectedBag;
+    void refreshReviewProtectedBag(qint64 bagId);
+    void applyReviewProtectedBagUpdate(qint64 bagId, const QVariantMap& bag);
+    int m_pendingSelfWrites = 0; // Outstanding write-throughs whose bagUpdated echo to skip
+    QHash<qint64, int> m_committedBagUpdateRows; // Matches committed-row events to bagUpdateFinished
+    // The bag whose row was last applied; -1 once a switch is requested. A row
+    // for another id applies as a switch. A reload of the SAME bag — the
+    // post-shot dose stamp, a bag-dialog or MCP edit — only refreshes the
+    // caches: it neither re-arms the bag's yield over the session anchor nor
+    // moves the active equipment (#1960).
+    int m_appliedBagId = -1;
+    QString m_activeBagFrozenDate;
+    QString m_activeBagDefrostDate;
+    QString m_activeBagStorageHint;
+    QString m_activeBagOpenedDate;
+    double m_activeBagYieldValue = 0;      // active bag's yield spec value (0 = unset)
+    QString m_activeBagYieldMode = QStringLiteral("none");
+    // Dose ladder caches (dose-source-precedence). 0 = that source designs no
+    // dose, so the ladder falls through to the next rung. Runtime caches, not
+    // persisted — the ids are, and each rung's dose is re-read from its row on
+    // the way back up.
+    //
+    // The `Resolved` flag beside each is what makes the un-persisted half safe:
+    // it is false from the moment an id is set until that row actually arrives,
+    // and doseLadderResolved() refuses to answer the ladder in between. They
+    // start false and are only CONSULTED for a rung whose id is set, so the ids
+    // restored from QSettings at construction — whose rows are still on the
+    // worker — correctly read as unresolved without any constructor wiring.
+    double m_activeBagDoseG = 0;
+    bool m_activeBagDoseResolved = false;
+    double m_activeRecipeDoseG = 0;
+    bool m_activeRecipeDoseResolved = false;
+
+    // Cached DYE values (avoid QSettings::value() → CFPreferences on every QML binding read)
+    mutable QString m_dyeGrinderBrandCache;
+    mutable QString m_dyeGrinderModelCache;
+    mutable QString m_dyeGrinderBurrsCache;
+    QString m_dyeEquipmentName;  // active package display name (resolved, not persisted)
+    QString m_dyeBasketBrand;    // active package basket identity (resolved, not persisted)
+    QString m_dyeBasketModel;
+    QString m_dyeBasketSummary;  // registry summary of the active basket (resolved)
+    QString m_dyePuckPrepCanonical;  // active package puck-prep canonical string (resolved)
+    mutable QString m_dyeGrinderSettingCache;
+    mutable int m_dyeGrinderRpmCache = 0;
+    mutable double m_dyeBeanWeightCache = 18.0;
+    mutable double m_dyeDrinkWeightCache = 36.0;
+    mutable bool m_dyeCacheInitialized = false;
+
+    // Per-shot refractometer values. Held in memory only, never persisted —
+    // a stale TDS from a previous app session has no business showing up on
+    // the next shot. The shot record is the source of truth post-save.
+    double m_dyeDrinkTds = 0.0;
+    double m_dyeDrinkEy = 0.0;
+};

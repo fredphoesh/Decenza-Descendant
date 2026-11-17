@@ -1,0 +1,511 @@
+// The flat-map shot-marker and top-profile Repeater delegates read this file's `root`
+// id and its projection helpers; Bound makes them statically resolvable. Each declares
+// its one injected role, `modelData`, required in the same edit -- without that, Bound
+// stops role injection and every marker loses its position at RUNTIME, silently.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import Decenza
+
+Item {
+    id: root
+
+    property bool running: true
+    property bool widgetMode: false  // When true: no overlays, smaller dots
+    property real topContentInset: 0  // Space reserved for the caller's info overlays.
+    // Fall back to flat when Quick3D unavailable
+    property string mapShape: (!Settings.app.hasQuick3D && ScreensaverService.state.shotMapShape === "globe")
+                              ? "flat" : ScreensaverService.state.shotMapShape
+    property string mapTexture: ScreensaverService.state.shotMapTexture  // "dark", "bright", "satellite"
+    property bool showClock: widgetMode ? false : ScreensaverService.state.shotMapShowClock
+    property bool showProfiles: widgetMode ? false : ScreensaverService.state.shotMapShowProfiles
+    property bool showTerminator: widgetMode ? false : ScreensaverService.state.shotMapShowTerminator
+
+    // Test mode - show user's location with a marker
+    property bool testMode: false
+    property real testLatitude: 0
+    property real testLongitude: 0
+
+    // Shot data from API
+    property var shots: []
+    property var topProfiles: []
+    property int shotCount: 0
+
+    // Map bounds (Web Mercator projection stretched to 2:1)
+    readonly property real mapMinLat: -85
+    readonly property real mapMaxLat: 85
+    readonly property real mapMinLon: -180
+    readonly property real mapMaxLon: 180
+
+    // Globe rotation
+    property real globeRotation: 0
+
+    // Globe sphere radius
+    readonly property real globeRadius: 150
+
+    Component.onCompleted: {
+        WebDebugLogger.debug("Screensaver", "ShotMapScreensaver", ["Started, shape:", mapShape, "texture:", mapTexture].map(String).join(" "))
+        applyShotMapData(ScreensaverService.state.shotMapData)
+        ScreensaverService.refreshShotMap()
+    }
+
+    Connections {
+        target: ScreensaverService.state
+        function onShotMapDataChanged() { root.applyShotMapData(ScreensaverService.state.shotMapData) }
+    }
+
+    // Globe rotation animation
+    NumberAnimation on globeRotation {
+        running: root.running && root.visible && root.mapShape === "globe"
+        from: 0
+        to: 360
+        duration: 120000  // 2 minutes per rotation
+        loops: Animation.Infinite
+    }
+
+    function fetchShots() {
+        ScreensaverService.refreshShotMap()
+    }
+
+    function applyShotMapData(data) {
+        if (!data || !data.shots)
+            return
+        shots = Array.from(data.shots || [])
+        topProfiles = Array.from(data.top_profiles || [])
+        shotCount = shots.length
+        WebDebugLogger.debug("Screensaver", "ShotMapScreensaver", ["Loaded", shots.length, "shots,", topProfiles.length, "profiles"].map(String).join(" "))
+    }
+
+    // Convert latitude to Web Mercator Y (normalized 0-1)
+    function latToMercatorY(lat) {
+        lat = Math.max(-85, Math.min(85, lat))
+        var latRad = lat * Math.PI / 180
+        var mercN = Math.log(Math.tan(Math.PI / 4 + latRad / 2))
+        var maxMercN = Math.log(Math.tan(Math.PI / 4 + 85 * Math.PI / 180 / 2))
+        return (maxMercN - mercN) / (2 * maxMercN)
+    }
+
+    // Convert lat/lon to screen coordinates (Web Mercator projection) - for flat map
+    function latLonToXY(lat, lon) {
+        var x = (lon - mapMinLon) / (mapMaxLon - mapMinLon) * width
+        var y = latToMercatorY(lat) * height
+        return { x: x, y: y, visible: true }
+    }
+
+    // Convert lat/lon to 3D sphere coordinates (static, rotation handled by parent Node)
+    function latLonTo3D(lat, lon, radius) {
+        // Offset latitude to match texture position (empirical adjustment)
+        var adjustedLat = lat - 22
+        var latRad = adjustedLat * Math.PI / 180
+        var lonRad = lon * Math.PI / 180
+
+        // Standard spherical coordinates (Y-up)
+        var x = radius * Math.cos(latRad) * Math.sin(lonRad)
+        var y = radius * Math.sin(latRad)
+        var z = radius * Math.cos(latRad) * Math.cos(lonRad)
+
+        return { x: x, y: y, z: z }
+    }
+
+    // Calculate opacity based on age in hours (fade over 24 hours)
+    function getOpacityFromAge(ageHours) {
+        return Math.max(0.2, 1 - (ageHours / 24))
+    }
+
+    // Texture source based on mapTexture selection (reactive property binding)
+    readonly property string textureSource: {
+        if (mapTexture === "satellite") return MapAssets.imageBase + "earth_day.jpg"
+        if (mapTexture === "bright") return MapAssets.imageBase + "earth_bright.png"
+        return MapAssets.imageBase + "earth_night.png"
+    }
+
+    // Background
+    Rectangle {
+        anchors.fill: parent
+        color: "#0a0a12"
+    }
+
+    // ==================== FLAT MAP VIEW ====================
+    Item {
+        id: flatMapView
+        anchors.fill: parent
+        visible: root.mapShape === "flat"
+
+        // Map image background
+        Image {
+            id: mapImage
+            anchors.fill: parent
+            fillMode: Image.Stretch
+            source: root.textureSource
+            visible: status === Image.Ready
+        }
+
+        // Fallback grid if images not loaded
+        Canvas {
+            id: mapCanvas
+            anchors.fill: parent
+            visible: mapImage.status !== Image.Ready
+
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                ctx.strokeStyle = "#1a2a3a"
+                ctx.lineWidth = 1
+
+                for (let lon = -180; lon <= 180; lon += 30) {
+                    let pos = root.latLonToXY(0, lon)
+                    ctx.beginPath()
+                    ctx.moveTo(pos.x, 0)
+                    ctx.lineTo(pos.x, height)
+                    ctx.stroke()
+                }
+
+                for (let lat = -60; lat <= 75; lat += 15) {
+                    let pos2 = root.latLonToXY(lat, 0)
+                    ctx.beginPath()
+                    ctx.moveTo(0, pos2.y)
+                    ctx.lineTo(width, pos2.y)
+                    ctx.stroke()
+                }
+            }
+        }
+
+        // Dark overlay for non-bright modes to make markers pop
+        Rectangle {
+            anchors.fill: parent
+            color: "#000000"
+            opacity: root.mapTexture === "bright" ? 0 : 0.3
+            visible: mapImage.status === Image.Ready
+        }
+
+        // Day-night terminator overlay
+        Canvas {
+            id: terminatorCanvas
+            anchors.fill: parent
+            visible: root.showTerminator
+            opacity: root.mapTexture === "bright" ? 0.35 : 0.45
+
+            property date currentTime: new Date()
+
+            Timer {
+                interval: 60000
+                running: root.running && root.visible && root.mapShape === "flat"
+                repeat: true
+                onTriggered: {
+                    terminatorCanvas.currentTime = new Date()
+                    terminatorCanvas.requestPaint()
+                }
+            }
+
+            onCurrentTimeChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+
+                // Solar position calculation (J2000.0 epoch)
+                var jd = currentTime.getTime() / 86400000 + 2440587.5
+                var n = jd - 2451545.0
+
+                var L = (280.460 + 0.9856474 * n) % 360
+                var g = ((357.528 + 0.9856003 * n) % 360) * Math.PI / 180
+                var lambda = L + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)
+                var epsilon = 23.439 - 0.0000004 * n
+
+                var declination = Math.asin(
+                    Math.sin(epsilon * Math.PI / 180) * Math.sin(lambda * Math.PI / 180)
+                ) * 180 / Math.PI
+
+                var gmst = (18.697374558 + 24.06570982441908 * n) % 24
+                var ra = Math.atan2(
+                    Math.cos(epsilon * Math.PI / 180) * Math.sin(lambda * Math.PI / 180),
+                    Math.cos(lambda * Math.PI / 180)
+                ) * 180 / Math.PI / 15
+                var hourAngle = (gmst - ra) * 15
+
+                var decRad = declination * Math.PI / 180
+
+                // Generate terminator points using our Mercator projection
+                ctx.beginPath()
+
+                var firstPoint = true
+                for (let lon = -180; lon <= 180; lon += 2) {
+                    let ha = (hourAngle + lon) * Math.PI / 180
+                    let lat
+                    if (Math.abs(declination) < 0.001) {
+                        lat = Math.atan(-Math.cos(ha) / 0.001) * 180 / Math.PI
+                    } else {
+                        lat = Math.atan(-Math.cos(ha) / Math.tan(decRad)) * 180 / Math.PI
+                    }
+                    lat = Math.max(-85, Math.min(85, lat))
+
+                    let pos = root.latLonToXY(lat, lon)
+                    if (firstPoint) {
+                        ctx.moveTo(pos.x, pos.y)
+                        firstPoint = false
+                    } else {
+                        ctx.lineTo(pos.x, pos.y)
+                    }
+                }
+
+                // Close polygon via polar night pole
+                var polarNightLat = declination >= 0 ? -85 : 85
+                var bottomRight = root.latLonToXY(polarNightLat, 180)
+                var bottomLeft = root.latLonToXY(polarNightLat, -180)
+                ctx.lineTo(bottomRight.x, bottomRight.y)
+                ctx.lineTo(bottomLeft.x, bottomLeft.y)
+                ctx.closePath()
+
+                ctx.fillStyle = "#000022"
+                ctx.fill()
+            }
+        }
+
+        // Shot markers (flat map)
+        Repeater {
+            model: root.shots
+
+            Item {
+                id: flatShotMarker
+                required property var modelData
+
+                property var pos: root.latLonToXY(flatShotMarker.modelData.lat, flatShotMarker.modelData.lon)
+                property real ageHours: flatShotMarker.modelData.age || 0
+                property real shotOpacity: root.getOpacityFromAge(ageHours)
+                property bool isNew: ageHours < 1
+                property real newness: isNew ? (1 - ageHours) : 0
+
+                x: pos.x - width / 2
+                y: pos.y - height / 2
+                width: (root.widgetMode ? 3 : 8) * 2.5
+                height: width
+                visible: pos.visible
+                opacity: shotOpacity
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: parent.width
+                    height: width
+                    radius: width / 2
+                    color: root.mapTexture === "bright" ? "#ff6b35" : "#4a9eff"
+                    opacity: 0.3 + 0.4 * flatShotMarker.newness
+
+                    SequentialAnimation on scale {
+                        running: flatShotMarker.isNew && !root.widgetMode
+                        loops: Animation.Infinite
+                        NumberAnimation { from: 1; to: 1 + flatShotMarker.newness; duration: 500; easing.type: Easing.OutQuad }
+                        NumberAnimation { from: 1 + flatShotMarker.newness; to: 1; duration: 500; easing.type: Easing.InQuad }
+                    }
+                }
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: root.widgetMode ? 3 : 8
+                    height: width
+                    radius: width / 2
+                    color: root.mapTexture === "bright" ? "#ff8c5a" : "#7abdff"
+                }
+            }
+        }
+
+        // Test mode marker (flat)
+        Item {
+            id: flatTestMarker
+            visible: root.testMode && root.testLatitude !== 0 && root.testLongitude !== 0
+            property var pos: root.latLonToXY(root.testLatitude, root.testLongitude)
+            x: pos.x - width / 2
+            y: pos.y - height / 2
+            width: 40
+            height: 40
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: 60
+                height: 60
+                radius: 30
+                color: "#22ff6b35"
+                border.color: "#ff6b35"
+                border.width: 2
+
+                SequentialAnimation on scale {
+                    running: flatTestMarker.visible
+                    loops: Animation.Infinite
+                    NumberAnimation { from: 0.5; to: 1.5; duration: 1000; easing.type: Easing.OutQuad }
+                    NumberAnimation { from: 1.5; to: 0.5; duration: 1000; easing.type: Easing.InQuad }
+                }
+
+                SequentialAnimation on opacity {
+                    running: flatTestMarker.visible
+                    loops: Animation.Infinite
+                    NumberAnimation { from: 1; to: 0.3; duration: 1000 }
+                    NumberAnimation { from: 0.3; to: 1; duration: 1000 }
+                }
+            }
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: 16
+                height: 16
+                radius: 8
+                color: "#ff6b35"
+                border.color: "#ffffff"
+                border.width: 2
+            }
+
+            Rectangle {
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.top: parent.bottom
+                anchors.topMargin: 5
+                width: flatYouLabel.width + 10
+                height: flatYouLabel.height + 4
+                radius: 4
+                color: "#ff6b35"
+
+                Text {
+                    id: flatYouLabel
+                    anchors.centerIn: parent
+                    text: TranslationManager.translate("shotMap.you", "YOU")
+                    color: "#ffffff"
+                    font.pixelSize: Theme.scaled(10)
+                    font.bold: true
+                    font.family: Theme.bodyFont.family
+                }
+            }
+        }
+    }
+
+    // ==================== 3D GLOBE VIEW (loaded only when Quick3D available) ====================
+    Loader {
+        id: globeLoader
+        anchors.fill: parent
+        active: Settings.app.hasQuick3D && root.mapShape === "globe"
+        visible: root.mapShape === "globe"
+        // By URL: ShotMapGlobe is only in the module when Quick3D is.
+        source: Qt.resolvedUrl("ShotMapGlobe.qml")
+        Binding { target: globeLoader.item; property: "shots"; value: root.shots }
+        Binding { target: globeLoader.item; property: "mapTexture"; value: root.mapTexture }
+        Binding { target: globeLoader.item; property: "textureSource"; value: root.textureSource }
+        Binding { target: globeLoader.item; property: "globeRotation"; value: root.globeRotation }
+        Binding { target: globeLoader.item; property: "globeRadius"; value: root.globeRadius }
+        Binding { target: globeLoader.item; property: "testMode"; value: root.testMode }
+        Binding { target: globeLoader.item; property: "testLatitude"; value: root.testLatitude }
+        Binding { target: globeLoader.item; property: "testLongitude"; value: root.testLongitude }
+        Binding { target: globeLoader.item; property: "widgetMode"; value: root.widgetMode }
+    }
+
+    // ==================== OVERLAYS (shared for both views) ====================
+
+    // Clock display (top center)
+    Text {
+        id: shotMapClock
+
+        anchors.top: parent.top
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.topMargin: 30
+        text: Theme.clockTime(shotMapClock.currentTime)
+        color: root.mapTexture === "bright" ? "#ffffff" : "#aabbcc"
+        font.pixelSize: Theme.scaled(48)
+        font.bold: true
+        font.family: Theme.bodyFont.family
+        opacity: 0.9
+        visible: root.showClock && !root.testMode
+
+        property date currentTime: new Date()
+
+        Timer {
+            interval: 1000
+            running: root.showClock && root.visible
+            repeat: true
+            // shotMapClock, not `parent`: Timer is a QObject with no parent of its own, so
+            // unqualified `parent` resolved to the FILE root's parent and the clock never
+            // ticked. Same defect as ScreensaverPage.qml.
+            onTriggered: shotMapClock.currentTime = new Date()
+        }
+    }
+
+    // Top profiles display (top right)
+    Column {
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.margins: 30
+        anchors.topMargin: Math.max(30, root.topContentInset)
+        spacing: 8
+        opacity: 0.85
+        visible: root.showProfiles && root.topProfiles.length > 0 && !root.testMode
+
+        Text {
+            text: TranslationManager.translate("shotMap.topProfiles", "Top Profiles")
+            color: root.mapTexture === "bright" ? "#ffffff" : "#8899aa"
+            font.pixelSize: Theme.scaled(14)
+            font.bold: true
+            font.family: Theme.bodyFont.family
+        }
+
+        Repeater {
+            model: root.topProfiles
+
+            Row {
+                id: profileRow
+                required property var modelData
+
+                spacing: 8
+
+                Text {
+                    text: profileRow.modelData.name
+                          || TranslationManager.translate("common.unknown", "Unknown")
+                    color: root.mapTexture === "bright" ? "#dddddd" : "#667788"
+                    font.pixelSize: Theme.scaled(12)
+                    font.family: Theme.bodyFont.family
+                    width: 150
+                    elide: Text.ElideRight
+                }
+
+                Text {
+                    text: "(" + (profileRow.modelData.count || 0) + ")"
+                    color: root.mapTexture === "bright" ? "#aaaaaa" : "#556677"
+                    font.pixelSize: Theme.scaled(11)
+                    font.family: Theme.bodyFont.family
+                }
+            }
+        }
+    }
+
+    // Stats overlay (bottom left)
+    Column {
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.margins: 30
+        spacing: 10
+        opacity: 0.8
+        visible: !root.widgetMode
+
+        Text {
+            text: TranslationManager.translate("shotMap.shotsLast24h", "%1 shots in the last 24 hours")
+                  .arg(root.shotCount)
+            color: root.mapTexture === "bright" ? "#ffffff" : "#8899aa"
+            font.pixelSize: Theme.scaled(16)
+            font.family: Theme.bodyFont.family
+        }
+
+        Text {
+            text: "decenza.coffee"
+            color: root.mapTexture === "bright" ? "#aaaaaa" : "#556677"
+            font.pixelSize: Theme.scaled(12)
+            font.family: Theme.bodyFont.family
+        }
+    }
+
+    // Touch to exit hint
+    Text {
+        anchors.bottom: parent.bottom
+        anchors.right: parent.right
+        anchors.margins: 30
+        text: TranslationManager.translate("shotMap.touchToExit", "Touch to exit")
+        color: "#444455"
+        font.pixelSize: Theme.scaled(11)
+        font.family: Theme.bodyFont.family
+        visible: !root.testMode && !root.widgetMode
+    }
+}

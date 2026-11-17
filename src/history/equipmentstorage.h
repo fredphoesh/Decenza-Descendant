@@ -1,0 +1,474 @@
+#pragma once
+
+#include <QObject>
+#include <QHash>
+#include <QString>
+#include <QVariantList>
+#include <QVariantMap>
+#include <QVector>
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <optional>
+
+#include <QtQmlIntegration/qqmlintegration.h>
+class QSqlDatabase;
+class QSqlQuery;
+class SerialDbWorker;
+
+// An equipment item: one typed component of a package. The kinds today are
+// "grinder", the optional "basket" (add-basket-equipment), and the optional
+// "puckprep" (add-puckprep-equipment); future kinds (tamper, …) are new rows with
+// a different `kind` and their own `attrs` payload — no schema migration (openspec
+// change add-equipment-packages). Shared fields every kind has (kind/brand/model)
+// are real columns; kind-specific fields live in the `attrs` JSON blob. For a
+// grinder, attrs = { "burrs": "..." }; `burrs` below is a convenience view of that
+// blob, (de)serialized on load/save, not its own column. `rpmCapable` is never
+// stored — it is re-derived from the grinder registry on every read (see
+// grinderItemFromQueryRow), so a registry correction reaches existing packages
+// without a migration. A basket has NO kind-specific attrs:
+// its identity is brand+model and every spec is derived from BasketAliases at read
+// time. A puckprep item stores its canonical flag string (PuckPrep::canonical) in
+// the `model` column and an empty attrs blob; its flags + derived `distribution`
+// are reconstructed from that string at read time (see core/puckprep.h).
+struct EquipmentItem {
+    qint64 id = 0;
+    qint64 packageId = 0;
+    QString kind = QStringLiteral("grinder");
+    QString brand;
+    QString model;
+
+    // Grinder-kind attrs. `burrs` is mirrored into/out of the `attrs` JSON column;
+    // `rpmCapable` is derived from the registry on read. A basket leaves both unset.
+    QString burrs;
+    bool rpmCapable = false;
+
+    bool isValid() const { return id > 0; }
+    // Serialize the kind-specific members into the attrs JSON string.
+    QString attrsJson() const;
+    // Populate the kind-specific members from an attrs JSON string.
+    void setAttrsFromJson(const QString& json);
+};
+
+// An equipment package: the switchable container selected by
+// dye/activeEquipmentId (and snapshotted in shots.equipment_id). It owns zero or
+// more EquipmentItems — at most one grinder, OPTIONAL since
+// add-recipe-wizard-tea (a basket-only tea setup is a grinder-less package:
+// display name falls back to the basket identity, grind/rpm surfaces stay
+// absent). The package also carries the "last dial" memory — switching to a
+// package applies it to the live grind setting / rpm (dye/grinderSetting,
+// dye/grinderRpm).
+struct EquipmentPackage {
+    qint64 id = 0;
+
+    QString name;            // optional; UI falls back to "{brand} {model}"
+    bool inInventory = true; // soft-delete: removed packages keep their row
+
+    // Grinder-scoped dial memory (applied on equipment switch).
+    QString lastGrindSetting;
+    qint64 lastRpm = 0;      // 0 = unset
+
+    qint64 lastUsedEpoch = 0; // MRU ordering (bumped on selection / shot save)
+
+    // Copy-on-write lineage: when an identity edit forks a new package, the old
+    // one is soft-deleted (inInventory=0) and points here at the fork's id. 0 =
+    // not superseded. Powers "older version" display + dial-history-across-edits.
+    qint64 supersededBy = 0;
+
+    bool isValid() const { return id > 0; }
+    QVariantMap toVariantMap() const;
+    static EquipmentPackage fromVariantMap(const QVariantMap& map);
+};
+
+// A package's optional grind-calibration anchors (add-grinder-ugs-calibration):
+// two of its own shots, 0 = unset. Deliberately not EquipmentPackage members, so
+// an insert, a copy-on-write fork or the generic field update can never copy or
+// set them — only the dedicated helpers below write these columns.
+struct CalibrationAnchors {
+    qint64 fineShotId = 0;
+    qint64 coarseShotId = 0;
+};
+
+// A package plus its resolved grinder item, optional basket item, and shot
+// count, for the inventory list. shotCount is a per-query aggregate
+// (shots.equipment_id), not a package field — it drives the card's
+// delete-vs-remove action exactly like InventoryBag. `basket` is invalid
+// (id == 0) when the package has no basket.
+struct EquipmentPackageView {
+    EquipmentPackage package;
+    EquipmentItem grinder;
+    EquipmentItem basket;
+    EquipmentItem puckPrep;  // invalid (id == 0) when the package has no puck prep
+    qint64 shotCount = 0;
+    // Flatten package + grinder identity + basket identity/derived specs +
+    // puck-prep flags/derived distribution (+ shotCount) into one map for QML/MCP.
+    QVariantMap toVariantMap() const;
+};
+
+// The six identity components an edit can enrich. See
+// EquipmentStorage::isEnrichmentOf.
+//
+// `hasGrinder` is the presence of a grinder ROW, not whether its fields are set:
+// a package with no grinder item is deliberately grinder-less (a basket-only tea
+// setup) and giving it one is a real identity change, while a grinder row with
+// blank fields is missing data. The loaders return a default-constructed item
+// either way, so only the row's validity separates them.
+struct PackageIdentity {
+    bool hasGrinder = false;
+    QString grinderBrand;
+    QString grinderModel;
+    QString burrs;
+    QString basketBrand;
+    QString basketModel;
+    QString puckPrep;   // canonical flag string
+};
+
+// Outcome of mergePackagesStatic: what moved, and why it refused when it did.
+// `error` is a stable machine-readable token (empty on success) so every caller
+// words the refusal itself rather than parsing prose.
+struct EquipmentMergeResult {
+    bool ok = false;
+    qint64 shotsMoved = 0;
+    qint64 recipesMoved = 0;
+    QString error;  // "", "samePackage", "sourceNotFound", "targetNotFound", "sqlFailed"
+};
+
+// SQLite-backed equipment storage in the shot history database
+// (equipment_packages + equipment_items tables, created by ShotHistoryStorage
+// migration 22). Async request* methods run DB work on a QThread::create()
+// background thread and deliver results via signals — the CoffeeBagStorage
+// pattern. The *Static helpers are synchronous, take a caller-provided
+// connection, and are shared with the migration, device import, and tests.
+class EquipmentStorage : public QObject {
+    Q_OBJECT
+
+    // Compile-time QML registration, so qmllint, qmlcachegen and the language server can
+    // follow MainController's property through to this class. A runtime qmlRegister* call is
+    // invisible to all three. Full rationale in src/controllers/maincontroller.h.
+    QML_ELEMENT
+    QML_UNCREATABLE("EquipmentStorage is created in C++ and reached via MainController")
+
+    // PuckPrep::flagLabels() for QML: [{key, labelKey, label}] in display order, the
+    // one list every puck-prep checkbox row and summary is built from.
+    Q_PROPERTY(QVariantList puckPrepFlags READ puckPrepFlags CONSTANT)
+
+public:
+    using InventoryCompletion = std::function<void(bool success, const QVariantList& packages,
+                                                   const QString& failureReason)>;
+    using PackageReadCompletion = std::function<void(qint64 packageId, bool success,
+                                                     const QVariantMap& package,
+                                                     const QString& failureReason)>;
+    using PackageUpdateCompletion =
+        std::function<void(qint64 requestedId, qint64 resultingId, bool success,
+                           const QString& failureReason)>;
+    using PackageCreateCompletion = std::function<void(qint64 packageId,
+                                                       const QVariantMap& package)>;
+    using PackageDeleteCompletion = std::function<void(qint64 packageId, bool success)>;
+
+    explicit EquipmentStorage(QObject* parent = nullptr);
+    ~EquipmentStorage();
+
+    void initialize(const QString& dbPath);
+    QString databasePath() const { return m_dbPath; }
+    static QVariantList puckPrepFlags();
+
+    // True when no background CRUD work is queued, running, or waiting to
+    // deliver its result — see ShotHistoryStorage::isDbWorkIdle() for the full
+    // rationale (same shape, same worker type).
+    bool isDbWorkIdle() const;
+
+    // Async queries — results via signals.
+    Q_INVOKABLE void requestInventory();                       // inventoryReady() or inventoryFailed()
+    void requestInventoryWithCompletion(QObject* context, InventoryCompletion completion);
+    Q_INVOKABLE void requestPackage(qint64 packageId);         // packageReady() or packageFailed()
+    void requestPackageWithCompletion(qint64 packageId, QObject* context,
+                                      PackageReadCompletion completion);
+    // Archived = removed by the user (inInventory 0, no supersededBy); forks are not listed.
+    Q_INVOKABLE void requestArchived();                        // archivedReady() or archivedFailed()
+    void requestArchivedWithCompletion(QObject* context, InventoryCompletion completion);
+
+    // Announce that packages changed underneath the app — for a writer that did
+    // NOT go through this object's async methods and so emitted nothing itself.
+    // The MCP equipment tools are that case: they write on their own withTempDb
+    // connection, and without this the Equipment page keeps showing a package the
+    // merge deleted, which the user can then still tap (selecting a dangling
+    // package id — the orphaning the merge exists to undo).
+    // Call on the GUI thread, after the write has committed.
+    void notifyPackagesChangedExternally() { emit packagesChanged(); }
+
+    // Async writes — all emit packagesChanged() on success.
+    // The map carries package fields plus grinder identity (brand/model/burrs);
+    // rpmCapable is derived from the registry, not taken from the map.
+    Q_INVOKABLE void requestCreatePackage(const QVariantMap& package);     // packageCreated()
+    // Request-correlated completion for HTTP clients. The legacy packageCreated
+    // signal is suppressed for this request so unrelated listeners cannot
+    // mistake a remote completion for their own pending save.
+    void requestCreatePackageWithCompletion(const QVariantMap& package, QObject* context,
+                                            PackageCreateCompletion completion);
+    Q_INVOKABLE void requestUpdatePackage(qint64 packageId, const QVariantMap& fields); // packageUpdated()
+    // C++ request-scoped completion for HTTP callers. Existing QML callers keep
+    // using requestUpdatePackage() and the packageUpdated/packageUpdateFailed signals;
+    // this path calls only its completion for terminal status, while still emitting
+    // packageSuperseded/packagesChanged so native caches follow successful edits.
+    void requestUpdatePackageWithCompletion(qint64 packageId, const QVariantMap& fields,
+                                            QObject* context,
+                                            PackageUpdateCompletion completion,
+                                            std::optional<QString> expectedName = std::nullopt,
+                                            std::optional<QVariantMap> expectedEditable = std::nullopt);
+    Q_INVOKABLE void requestMarkRemoved(qint64 packageId);                 // archive (packageUpdated)
+    // Back into inventory. Refused for a forked package ("notArchived"):
+    // packageUpdateFailed, then packageUpdated(id, false).
+    Q_INVOKABLE void requestRestorePackage(qint64 packageId);
+    void requestRestorePackageWithCompletion(qint64 packageId, QObject* context,
+                                             PackageUpdateCompletion completion);
+    Q_INVOKABLE void requestTouchLastUsed(qint64 packageId);              // bump MRU (no signal)
+    // Deletes only when no shot, recipe or superseded_by references the package; emits
+    // packageDeleted(packageId, success) — success false when references exist.
+    Q_INVOKABLE void requestDeletePackage(qint64 packageId);
+    void requestDeletePackageWithCompletion(qint64 packageId, QObject* context,
+                                            PackageDeleteCompletion completion);
+
+    // --- Synchronous static helpers (caller provides the connection) ---
+
+    static bool ensureTablesStatic(QSqlDatabase& db);
+
+    static qint64 insertPackageStatic(QSqlDatabase& db, const EquipmentPackage& pkg);
+    static qint64 insertItemStatic(QSqlDatabase& db, const EquipmentItem& item);
+    // Create a package, its single grinder item, and (optionally) a basket item in
+    // one call; returns the new package id (-1 on failure). rpmCapable is derived
+    // from the registry. An empty basketBrand+basketModel creates a grinder-only
+    // package. pkg is taken by value: a name is persisted at creation (defaults to
+    // "{brand} {model}") so it survives identity edits / copy-on-write.
+    static qint64 createPackageWithGrinderStatic(QSqlDatabase& db, EquipmentPackage pkg,
+                                                 const QString& brand, const QString& model,
+                                                 const QString& burrs,
+                                                 const QString& basketBrand = QString(),
+                                                 const QString& basketModel = QString(),
+                                                 const QString& puckPrep = QString());
+
+    // The create rule every surface shares: an in-inventory package with the same
+    // full identity is returned instead of duplicated (*reused), and a name another
+    // active package holds is refused. Returns the package id, or -1 with
+    // *failReason "nameInUse" / "insertFailed"; *view is filled on success.
+    static qint64 createPackageStatic(QSqlDatabase& db, const QVariantMap& packageMap,
+                                      EquipmentPackageView* view, QString* failReason,
+                                      bool* reused = nullptr);
+    static EquipmentPackage loadPackageStatic(QSqlDatabase& db, qint64 packageId);
+    // The in-inventory package `packageId` lives on as: itself, or the end of its
+    // superseded_by chain (an identity edit forks it, or merges it into another).
+    // 0 when the chain ends at a removed or missing package.
+    static qint64 currentPackageIdStatic(QSqlDatabase& db, qint64 packageId);
+    static EquipmentItem loadGrinderItemStatic(QSqlDatabase& db, qint64 packageId);
+    // The package's basket item, or an invalid item (id == 0) when none.
+    static EquipmentItem loadBasketItemStatic(QSqlDatabase& db, qint64 packageId);
+    // The package's puckprep item (canonical flag string in `model`), or an invalid
+    // item (id == 0) when none.
+    static EquipmentItem loadPuckPrepItemStatic(QSqlDatabase& db, qint64 packageId);
+    static QVector<EquipmentPackageView> loadInventoryStatic(QSqlDatabase& db);
+    static QVector<EquipmentPackageView> loadArchivedStatic(QSqlDatabase& db);
+    // Return an archived package to inventory; false with *failReason ("notArchived",
+    // "sqlFailed") when it does not. No name check: the unique-name rule applies to
+    // renames only, and derived names ("Niche Zero") repeat by design.
+    static bool restorePackageStatic(QSqlDatabase& db, qint64 packageId,
+                                     QString* failReason = nullptr);
+
+    static bool updatePackageFieldsStatic(QSqlDatabase& db, qint64 packageId,
+                                          const QVariantMap& fields);
+    static QVariantMap editableSnapshotStatic(QSqlDatabase& db, qint64 packageId);
+    // Update the package's grinder item identity; re-derives rpmCapable for the
+    // new brand/model. No-op-safe when the package has no grinder item.
+    static bool updateGrinderItemStatic(QSqlDatabase& db, qint64 packageId,
+                                        const QString& brand, const QString& model,
+                                        const QString& burrs);
+    // Set the package's basket identity: update the existing basket item, insert
+    // one when none exists, or delete it when brand+model are both empty (the
+    // "no basket" state). No grinder analogue — a package's basket is optional.
+    // Returns true on success OR when no change is needed (basket already in the
+    // desired state); false ONLY on a genuine SQL failure, so a caller inside a
+    // transaction can roll back on a real error without tripping on a benign no-op.
+    static bool setBasketItemStatic(QSqlDatabase& db, qint64 packageId,
+                                    const QString& brand, const QString& model);
+    // Set the package's puck-prep identity from a canonical flag string
+    // (PuckPrep::canonical): update the existing puckprep item, insert one when
+    // none exists, or delete it when the string is empty ("no puck prep"). Same
+    // return contract as setBasketItemStatic — false ONLY on a genuine SQL failure.
+    static bool setPuckPrepItemStatic(QSqlDatabase& db, qint64 packageId,
+                                      const QString& puckPrep);
+
+    // Apply a grinder+basket+puckprep identity edit honoring copy-on-write
+    // immutability + merge, and return the package id the caller should now treat
+    // as active:
+    //   - identity unchanged                      -> same id (no-op)
+    //   - another in-inventory package matches     -> merge: repoint this
+    //       package's recipes to it, delete this package if unused else soft-delete
+    //       it with superseded_by -> that id
+    //   - package unused (no shots)                -> edit in place -> same id
+    //   - every differing component was EMPTY      -> edit in place -> same id
+    //       (enrichment: filling in gear the package always had, not a swap)
+    //   - package used (>=1 shot)                  -> fork a new package (copies
+    //       name + last dial), repoint recipes, soft-delete old (superseded_by) -> new id
+    // Identity is the full (grinder brand/model/burrs + basket brand/model +
+    // puckprep canonical flag string) tuple; "no basket" / "no puck prep" are
+    // distinct values. Recipes are repointed here (shots never are: they
+    // keep the gear they were pulled with); the active-equipment selection is the
+    // caller's to update from the returned id.
+    static qint64 supersedeOrEditStatic(QSqlDatabase& db, qint64 packageId,
+                                        const QString& brand, const QString& model,
+                                        const QString& burrs,
+                                        const QString& basketBrand, const QString& basketModel,
+                                        const QString& puckPrep,
+                                        bool transactionAlreadyOpen = false);
+    // Grinder-only convenience: edit the grinder identity while PRESERVING the
+    // package's current basket + puck prep. Thin wrapper over supersedeOrEditStatic
+    // used by callers that don't touch them (MCP grinder edit, tests).
+    static qint64 supersedeOrEditGrinderStatic(QSqlDatabase& db, qint64 packageId,
+                                               const QString& brand, const QString& model,
+                                               const QString& burrs);
+
+    // Fold `sourceId` into `targetId` and delete the source: every shot and
+    // recipe pointing at the source is repointed at the target, lineage pointers
+    // that named the source name the target instead, and a retired target is
+    // brought back into inventory (the package that ends up holding the history
+    // has to be selectable).
+    //
+    // This is the REPAIR for a package split that should never have happened —
+    // the copy-on-write fork is what makes such a split possible, and before the
+    // enrichment rule (supersedeOrEditStatic) merely typing in the burrs you
+    // always had produced one (#1713). It is destructive and NOT the inverse of a
+    // fork: the source's identity is gone afterwards, and its shots then claim
+    // the target's gear. Callers must have the user name both packages.
+    //
+    // Unlike the merge branch inside supersedeOrEditStatic — which matches on
+    // identity, only considers in-inventory candidates, and leaves the source's
+    // shots behind — this takes two explicit ids, accepts a RETIRED source or
+    // target (that is the normal case when undoing a fork), and moves everything.
+    static EquipmentMergeResult mergePackagesStatic(QSqlDatabase& db, qint64 sourceId, qint64 targetId);
+
+    // The merge body without a transaction of its own, for a caller that already
+    // owns one (mergePackagesStatic — DbWriteTxn refuses to nest, and
+    // adopting an outer transaction would let a rejection leave partial writes
+    // staged in it). Returns with `ok` false and the writes NOT undone; the
+    // caller's rollback is what cleans up.
+    static EquipmentMergeResult mergePackagesUnlockedStatic(QSqlDatabase& db, qint64 sourceId, qint64 targetId);
+
+    // Shared id/existence checks for both merge entry points. Returns a result
+    // whose `error` is empty when the pair is mergeable.
+    static EquipmentMergeResult validateMergeStatic(QSqlDatabase& db, qint64 sourceId, qint64 targetId);
+
+    // Did `after` only ADD information to `before`? True when every component
+    // whose value differs was EMPTY on `before` and carries a value on `after`.
+    //
+    // Deliberately asymmetric: empty -> value is enrichment, value -> different
+    // value and value -> empty are real identity changes. Puck prep compares whole
+    // canonical strings, so adding a technique to an existing routine is a change.
+    static bool isEnrichmentOf(const PackageIdentity& before, const PackageIdentity& after);
+
+    // Find an existing in-inventory package whose full identity matches
+    // (case-insensitive grinder brand+model+burrs AND basket brand+model AND
+    // puckprep canonical string, where empty params match a package lacking that
+    // component), or 0 if none. Used by the migration and create/edit flows to
+    // dedup on identity (NOT on grind/rpm).
+    static qint64 findPackageByGrinderIdentityStatic(QSqlDatabase& db, const QString& brand,
+                                                     const QString& model, const QString& burrs,
+                                                     qint64 excludeId = 0,
+                                                     const QString& basketBrand = QString(),
+                                                     const QString& basketModel = QString(),
+                                                     const QString& puckPrep = QString(),
+                                                     bool includeArchived = false,
+                                                     bool* lookupOk = nullptr);
+
+    // The id of an IN-INVENTORY package whose name matches `name` (trimmed,
+    // case-insensitive), excluding `excludeId`, or 0. Backs the active-name
+    // uniqueness guard (block-duplicate-active-names). A blank name never matches.
+    static qint64 findPackageByNameStatic(QSqlDatabase& db, const QString& name,
+                                          qint64 excludeId = 0, bool* lookupOk = nullptr);
+
+    // rpmCapable for a grinder identity: the registry's variableRpm when the
+    // brand/model matches an alias, else true (a custom grinder shows the rpm
+    // field). Applied on every grinder-item read so the rule lives in one place.
+    static bool deriveRpmCapable(const QString& brand, const QString& model);
+
+    // Device-transfer import (add-equipment-packages task 2.8). Imports
+    // equipment_packages + equipment_items from srcDb into destDb with new ids,
+    // filling outIdMap[srcPackageId] = destPackageId so the caller can remap
+    // shots.equipment_id and recipes.equipment_id. superseded_by is remapped
+    // through the same map after all packages are inserted. In merge mode an
+    // in-inventory source package whose grinder identity already exists in dest
+    // maps to that existing package WITHOUT copying a duplicate package/items;
+    // superseded (historical) packages always import as new rows. A source with
+    // no equipment tables yields an empty map and returns true. Runs inside the
+    // caller's destDb transaction; assumes the equipment tables exist in dest.
+    static bool importEquipmentStatic(QSqlDatabase& srcDb, QSqlDatabase& destDb, bool merge,
+                                      QHash<qint64, qint64>& outIdMap);
+
+    // Calibration anchors. `side` is "fine" or "coarse"; a shotId of 0 clears it.
+    // Callers run at the current schema. Merge and import are the two paths that can
+    // meet a database without the columns (an imported database), and they check.
+    static CalibrationAnchors loadCalibrationAnchorsStatic(QSqlDatabase& db, qint64 packageId);
+    static bool setCalibrationAnchorStatic(QSqlDatabase& db, qint64 packageId,
+                                           const QString& side, qint64 shotId);
+
+    // Device transfer, run after the shot import: carries each source package's
+    // anchors to its destination package through both id maps, filling only sides
+    // the destination has unset. A source without the columns imports nothing.
+    static bool importCalibrationAnchorsStatic(QSqlDatabase& srcDb, QSqlDatabase& destDb,
+                                               const QHash<qint64, qint64>& packageIdMap,
+                                               const QHash<qint64, qint64>& shotIdMap);
+
+signals:
+    void inventoryReady(const QVariantList& packages);
+    void archivedReady(const QVariantList& packages);
+    void archivedFailed(const QString& reason);
+    void inventoryFailed(const QString& reason);
+    void packageReady(qint64 packageId, const QVariantMap& package); // empty if not found
+    void packageFailed(qint64 packageId, const QString& reason);
+    void packageCreated(qint64 packageId, const QVariantMap& package); // id -1 on failure
+    void packageUpdated(qint64 packageId, bool success);
+    // Emitted immediately BEFORE packageUpdated(id, false) when the update failed
+    // for a reason the caller can act on — currently only "nameInUse"
+    // (block-duplicate-active-names). Additive: packageUpdated stays the terminal
+    // status every caller waits on; this only lets a surface report WHY, so the
+    // app, MCP and ShotServer can each name the SAME cause for a rename collision.
+    // The cause code and the emission ordering are what is shared — the wording of
+    // each surface's message is its own (a REST body and an inline form label do
+    // not read alike).
+    void packageUpdateFailed(qint64 packageId, const QString& reason);
+    void packageDeleted(qint64 packageId, bool success);
+    // An update forked or merged `fromId` into `toId` (recipes moved with it).
+    // Emitted immediately BEFORE packageUpdated(toId, true).
+    void packageSuperseded(qint64 fromId, qint64 toId);
+    void packagesChanged();
+
+private:
+    void requestInventoryInternal(QObject* context, InventoryCompletion completion,
+                                  bool emitLegacySignals, bool archived = false);
+    void requestRestorePackageInternal(qint64 packageId, QObject* context,
+                                       PackageUpdateCompletion completion, bool emitLegacySignals);
+    void requestPackageInternal(qint64 packageId, QObject* context,
+                                PackageReadCompletion completion, bool emitLegacySignals);
+    void requestUpdatePackageImpl(qint64 packageId, const QVariantMap& fields,
+                                   QObject* completionContext,
+                                   PackageUpdateCompletion completion,
+                                   std::optional<QString> expectedName,
+                                   std::optional<QVariantMap> expectedEditable,
+                                   bool emitLegacyCompletionSignals);
+    void requestCreatePackageImpl(const QVariantMap& packageMap, QObject* completionContext,
+                                  PackageCreateCompletion completion,
+                                  bool emitLegacyCompletionSignals);
+    void requestDeletePackageImpl(qint64 packageId, QObject* completionContext,
+                                  PackageDeleteCompletion completion,
+                                  bool emitLegacyCompletionSignals);
+
+    // Run `work(db)` on a background thread, then `done(dbOpened)` on the main
+    // thread. Read callers must skip their "Ready" emission when dbOpened is
+    // false (open failure → empty result that must not be read as not-found).
+    void runAsync(const QString& connPrefix,
+                  std::function<void(QSqlDatabase&)> work,
+                  std::function<void(bool dbOpened)> done);
+
+    QString m_dbPath;
+    std::shared_ptr<std::atomic<bool>> m_destroyed = std::make_shared<std::atomic<bool>>(false);
+    // Serializes all background DB work onto one FIFO worker thread so successive
+    // writes to the same row apply in submission order (see SerialDbWorker).
+    std::unique_ptr<SerialDbWorker> m_dbWorker;
+};

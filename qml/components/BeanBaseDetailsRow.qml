@@ -1,0 +1,113 @@
+// Bound: the details popup's inline Component reads `root`, and unbound ids resolve only in
+// their own component (qtdeclarative qqmljsscopesbyid_p.h:326-333). No delegates here.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Layouts
+import Decenza
+
+// Compact Bean Base summary: bag thumbnail + "origin · variety · process"
+// one-liner + tap-to-open-details. Zero footprint when the blob is empty —
+// unlinked beans and legacy shots render nothing. Mounted on BeanInfoPage,
+// and PostShotReviewPage, each feeding its own blob source.
+Item {
+    id: root
+
+    property string beanBaseJson: ""
+    readonly property var bean: {
+        if (!beanBaseJson || beanBaseJson.length === 0) return ({})
+        try { return JSON.parse(beanBaseJson) } catch (e) { return ({}) }
+    }
+    readonly property bool hasData: bean.id !== undefined && bean.id !== ""
+
+    readonly property var _summaryParts: {
+        var parts = []
+        if (bean.origin) parts.push(bean.origin)
+        if (bean.variety) parts.push(bean.variety)
+        if (bean.process) parts.push(bean.process)
+        return parts
+    }
+    readonly property string summaryLine: _summaryParts.join("  ·  ")
+    // Display form: styled bold-dot separator, user data HTML-escaped by the helper.
+    readonly property string summaryLineRich: Theme.joinWithBullet(_summaryParts)
+
+    visible: hasData
+    implicitHeight: hasData ? Math.max(thumb.height, summaryColumn.implicitHeight) : 0
+    implicitWidth: rowLayout.implicitWidth
+
+    RowLayout {
+        id: rowLayout
+        anchors.fill: parent
+        spacing: Theme.scaled(10)
+        // Intrinsically tied to hasData, not just the root's `visible`: a host
+        // may override root.visible (e.g. a recipe-gate), and without this the
+        // fallback text would paint into the zero-height (!hasData) box.
+        visible: root.hasData
+
+        // Bag thumbnail — collapses when missing or failing to load
+        Image {
+            id: thumb
+            Layout.preferredWidth: status === Image.Ready ? Theme.scaled(44) : 0
+            Layout.preferredHeight: Theme.scaled(44)
+            visible: status === Image.Ready
+            source: root.bean.image !== undefined ? root.bean.image : ""
+            fillMode: Image.PreserveAspectCrop
+            asynchronous: true
+            Accessible.ignored: true
+        }
+
+        ColumnLayout {
+            id: summaryColumn
+            Layout.fillWidth: true
+            spacing: Theme.scaled(1)
+
+            Text {
+                Layout.fillWidth: true
+                // Both branches must be HTML-safe: this is StyledText, so whatever lands here
+                // is parsed as markup. summaryLineRich is escaped by joinWithBullet; the
+                // translated fallback is escaped here.
+                //
+                // Not theoretical for a translated string. Community translations are fetched
+                // from the backend and merged automatically, and uploading one is
+                // unauthenticated — so this value is attacker-influenceable, unlike the bean
+                // data above it. StyledText renders <img>, which the emoji pipeline relies on
+                // (Theme.replaceEmojiWithImg), so an unescaped remote img here would be fetched
+                // by every user of that language on opening this row. Escaping is the cheap end
+                // of that; the backend side was reviewed separately and accepted as-is.
+                text: root.summaryLine.length > 0
+                    ? root.summaryLineRich
+                    : Theme.escapeHtml(TranslationManager.translate("beanbase.row.linked", "Linked to Bean Base"))
+                textFormat: Text.StyledText
+                color: Theme.textColor
+                font.pixelSize: Theme.scaled(12)
+                elide: Text.ElideRight
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: TranslationManager.translate("beanbase.row.tapForDetails", "Tap for bean details")
+                color: Theme.textSecondaryColor
+                font.pixelSize: Theme.scaled(10)
+                elide: Text.ElideRight
+            }
+        }
+    }
+
+    AccessibleMouseArea {
+        anchors.fill: parent
+        enabled: root.hasData   // no dead tap target when there's nothing to open
+        accessibleName: TranslationManager.translate("beanbase.row.accessible", "Bean details from Bean Base. Opens details dialog")
+        accessibleItem: root
+        onAccessibleClicked: (detailsLoader.ensure() as BeanBaseDetailsPopup)?.open()
+    }
+
+    // Built on first open: the row is on every shot review, the details rarely opened (#1976).
+    OnDemandLoader {
+        id: detailsLoader
+        sourceComponent: Component {
+            BeanBaseDetailsPopup {
+                beanBaseJson: root.beanBaseJson
+            }
+        }
+    }
+}

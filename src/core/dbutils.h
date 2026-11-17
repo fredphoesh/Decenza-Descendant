@@ -1,0 +1,432 @@
+#pragma once
+
+#include "core/diagnosticlogging.h"
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QThread>
+#include <QObject>
+#include <QString>
+#include <QVariant>
+#include <QDebug>
+
+#include "core/storagelogging.h"
+
+#include <atomic>
+#include <functional>
+#include <memory>
+
+// An unset (zero) or meaningless negative measurement is stored as NULL, not 0.
+inline QVariant nullIfZero(double v) {
+    return v > 0 ? QVariant(v) : QVariant();
+}
+
+// True when a statement failed because someone else holds the lock rather than
+// for a reason retrying cannot fix. This is what separates "wait and try again"
+// from "give up": a constraint violation must never be retried.
+//
+// The TEXT match is the primary detector, not a backstop — do not delete it as
+// "fragile string matching". Qt enables SQLite's EXTENDED result codes by default
+// (qsql_sqlite.cpp, `useExtendedResultCodes`, cleared only by a connect option
+// this app never sets), and the failure this whole helper exists to catch — the
+// WAL read→write upgrade — reports SQLITE_BUSY_SNAPSHOT = 517, not 5. So
+// nativeErrorCode() is "517" and the numeric checks below miss it entirely; what
+// catches it is sqlite3_errmsg's "database is locked". The numeric checks cover
+// the plain SQLITE_BUSY (5) / SQLITE_LOCKED (6) cases and driver paths that
+// report no text. QSqlError::text() is the database message with Qt's driver text
+// appended.
+inline bool isSqliteLockError(const QSqlError& e) {
+    const QString code = e.nativeErrorCode();
+    return code == QLatin1String("5") || code == QLatin1String("6")
+        || e.text().contains(QLatin1String("locked"), Qt::CaseInsensitive)
+        || e.text().contains(QLatin1String("busy"), Qt::CaseInsensitive);
+}
+
+// Owns a write transaction for its scope: rolls back on any exit that is not an
+// explicit commit(). Construct with DbWriteTxn::begin() and check ok().
+//
+// Use this, NOT QSqlDatabase::transaction(), for any transaction that reads
+// before it writes. Qt's SQLite driver issues a plain DEFERRED BEGIN (see
+// QSQLiteDriver::beginTransaction()), which takes a read lock for the first
+// SELECT and then has to UPGRADE it for the first write — and if another
+// connection wrote in between, SQLite fails that upgrade IMMEDIATELY rather than
+// waiting out busy_timeout. (In WAL, which this database uses, the read snapshot
+// is stale and waiting could never succeed, so the busy handler is not consulted
+// at all.) The PRAGMA busy_timeout that withTempDb sets is simply not reached, so
+// the write fails on the first brush with contention.
+//
+// That is not theoretical here: four storages (shots, bags, equipment, recipes)
+// share shots.db, each on its own worker thread, so their writes overlap by
+// design — ordering is guaranteed per storage, not globally. It cost a real
+// recipe save twice in a three-day log ("database is locked", and a "Couldn't
+// save to the recipe" banner) before this existed.
+//
+// begin() issues BEGIN IMMEDIATE, which takes the write lock up front. That is
+// what lets busy_timeout absorb the contention, and it concentrates the
+// contention in begin(): no other writer can exist once the lock is held, so the
+// body never has to retry the read→write upgrade. COMMIT is the one statement
+// that can still come back busy (see the commit retry in
+// ShotHistoryStorage::saveShotStatic, which keeps its own hand-rolled loop
+// because it retries the whole INSERT, not just the begin) — so check commit().
+//
+// WHY A GUARD and not a status code: the obligation is "terminate this exactly
+// once, and only if you started it". As a returned enum that was caller
+// discipline, and it was already wrong at one of four sites within a day —
+// shot import checked for one failure value and fell through on the others,
+// running the whole body with no transaction, which silently turned its
+// rollbacks into no-ops. Here an early return, a missed branch and a thrown
+// exception all roll back, and a discarded guard is a compile error.
+//
+// A nested begin (a caller that already opened a transaction) is a FAILURE here,
+// not something to adopt. Adopting would mean an inner rejection path leaves its
+// partial writes staged in the outer transaction — the caller's rollback is not
+// ours to perform, and not performing one is how a half-applied identity edit
+// would reach a commit. Prefer restructuring so a transaction has one owner.
+//
+// PRECONDITION: no statement may be active on `db`. An unfinished QSqlQuery holds
+// a read transaction open, and SQLite skips the busy handler while the connection
+// sits in one — so BEGIN IMMEDIATE fails instantly and every retry fails the same
+// way, however idle the database is. A SELECT that returned rows and was not
+// stepped to exhaustion counts: call QSqlQuery::finish() first. (COUNT(*) always
+// returns a row, so a count probe ALWAYS needs it.)
+//
+// COST: each failed attempt can itself wait the full busy_timeout (5 s via
+// withTempDb) before returning, so the default bounds the wait at roughly 10 s of
+// a blocked worker thread, not the ~50 ms the backoff suggests. Callers on the
+// GUI thread should pass attempts = 1.
+class [[nodiscard]] DbWriteTxn {
+public:
+    // Takes the write lock, retrying while another writer holds it. Check ok().
+    static DbWriteTxn begin(QSqlDatabase& db, const char* what, int attempts = 2) {
+        QSqlQuery q(db);
+        for (int attempt = 1; ; ++attempt) {
+            if (q.exec(QStringLiteral("BEGIN IMMEDIATE")))
+                return DbWriteTxn(db);
+            const QSqlError err = q.lastError();
+            if (!isSqliteLockError(err)) {
+                // A caller that already opened a transaction gets "cannot start a
+                // transaction within a transaction" — a SQLITE_ERROR with no
+                // distinct result code, so the message is the only signal there is.
+                if (err.text().contains(QLatin1String("within a transaction"), Qt::CaseInsensitive))
+                    DIAG_WARN(STORAGE, "DbWriteTxn") << what
+                               << "is nested inside a transaction owned by an outer frame";
+                else
+                    DIAG_WARN(STORAGE, "DbWriteTxn") << what << "failed to begin:" << err.text();
+                return DbWriteTxn();
+            }
+            if (attempt >= attempts) {
+                DIAG_WARN(STORAGE, "DbWriteTxn") << what << "could not take the write lock after"
+                           << attempts << "attempts:" << err.text();
+                DbWriteTxn failed;
+                failed.m_lockTimedOut = true;
+                return failed;
+            }
+            // Backoff on top of the busy_timeout each attempt already waited out:
+            // a backstop for a writer held past it.
+            QThread::msleep(static_cast<unsigned long>(50 * attempt));
+        }
+    }
+
+    ~DbWriteTxn() {
+        // A failing rollback here means the transaction we thought we owned was
+        // already terminated by someone else — in practice, a caller that
+        // committed with the raw QSqlDatabase::commit() instead of commit()
+        // below, which leaves this guard armed. That happened at two sites
+        // within a day of the class existing, silently, because the return was
+        // discarded. Logging it makes the next occurrence fail loudly instead:
+        // the test suite runs with QTest::failOnWarning(), so any storage test
+        // touching such a path now breaks, at every present and future site,
+        // without anyone having to write a test for it.
+        //
+        // It also catches the genuinely dangerous case: on a long-lived
+        // connection a failed ROLLBACK leaves the write transaction open, and
+        // every later write on that connection silently joins it.
+        if (m_db && !m_db->rollback())
+            DIAG_WARN(STORAGE, "DbWriteTxn") << "ROLLBACK failed — the transaction was already ended by "
+                          "someone else (a raw db.commit()?), or is still open:"
+                       << m_db->lastError().text();
+    }
+
+    DbWriteTxn(DbWriteTxn&& other) noexcept
+        : m_db(other.m_db), m_lockTimedOut(other.m_lockTimedOut),
+          m_commitError(std::move(other.m_commitError)) { other.m_db = nullptr; }
+    DbWriteTxn(const DbWriteTxn&) = delete;
+    DbWriteTxn& operator=(const DbWriteTxn&) = delete;
+    DbWriteTxn& operator=(DbWriteTxn&&) = delete;
+
+    // True when we hold a transaction. False means nothing was started and the
+    // caller must abandon the work — never proceed unwrapped.
+    bool ok() const { return m_db != nullptr; }
+
+    // True when ok() is false BECAUSE another writer held the lock, as opposed to
+    // a nested begin or a real error. The one failure a user can act on ("try
+    // again"), so surfaces that show a message want to distinguish it.
+    bool lockTimedOut() const { return m_lockTimedOut; }
+
+    // Commits and releases. False if the COMMIT failed (the transaction is rolled
+    // back in that case) or if we never held one. After this the guard is inert,
+    // so the destructor does nothing.
+    bool commit() {
+        if (!m_db) {
+            m_commitError = QStringLiteral("no transaction was held");
+            return false;
+        }
+        QSqlDatabase* db = m_db;
+        m_db = nullptr;
+        if (db->commit())
+            return true;
+        // Capture now. A SUCCESSFUL rollback leaves lastError() alone — Qt's
+        // driver only calls setLastError on failure — but a FAILING one
+        // overwrites it, and it fails exactly when SQLite has already unwound
+        // the transaction ("cannot rollback - no transaction is active"). In
+        // that case a caller logging db.lastError() would name the rollback
+        // instead of the commit, which is the case worth diagnosing.
+        m_commitError = db->lastError().text();
+        db->rollback();
+        return false;
+    }
+
+    // Why the last commit() failed. Always set when commit() returns false,
+    // including when the guard held no transaction. Empty after a success.
+    QString commitError() const { return m_commitError; }
+
+private:
+    DbWriteTxn() = default;
+    explicit DbWriteTxn(QSqlDatabase& db) : m_db(&db) {}
+
+    QSqlDatabase* m_db = nullptr;  // non-null = we own an open transaction
+    bool m_lockTimedOut = false;
+    QString m_commitError;
+};
+
+// Opens a temporary QSQLITE connection, runs `work(db)`, then removes the connection.
+// Sets PRAGMA busy_timeout and foreign_keys. Returns true if the DB opened successfully.
+// Thread-safe: each call uses a unique connection name based on the current thread ID.
+template<typename Work>
+static bool withTempDb(const QString& dbPath, const QString& connPrefix, Work&& work) {
+    const QString connName = connPrefix + QString("_%1")
+        .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16);
+    bool opened = false;
+    // The removal has to survive `work` throwing. Without this it sat as a plain
+    // statement after the block, so an exception escaping `work` would skip it
+    // and strand the connection — and with it the SQLite file descriptor — for
+    // the life of the process. No caller throws today (there is not one `throw`
+    // in src/), so this is defence against std::bad_alloc and against the first
+    // caller that does, not a fix for a live bug.
+    //
+    // Declared BEFORE the scope that holds `db` so it destructs AFTER it. If a
+    // QSqlDatabase copy is still alive, QSqlDatabasePrivate::invalidateDb warns
+    // "connection is still in use, all queries will cease to work" and calls
+    // disable(), which DELETES the driver (qsqldatabase.cpp:139-147 and 217-223,
+    // Qt 6.11.1). So the descriptor is released either way — what the surviving
+    // copy loses is the ability to run a query, silently. Getting the order right
+    // is about not breaking a live copy, not about leaking the fd.
+    //
+    // What this does NOT cover, so nobody reads it as a descriptor guarantee:
+    //   - Shutdown. removeDatabase() begins with CHECK_QCOREAPPLICATION
+    //     (qsqldatabase.cpp:26-30) and returns after a warning if the
+    //     QCoreApplication is already gone — a storage worker finishing after
+    //     that point removes nothing. This is exception safety, not shutdown
+    //     safety.
+    //   - A copy outliving the call. If `work` stashes the QSqlDatabase or a
+    //     live QSqlQuery, removal drops the dictionary entry while the surviving
+    //     copy keeps the driver and its SQLite handle open.
+    struct ConnectionRemover {
+        QString name;
+        ~ConnectionRemover() { QSqlDatabase::removeDatabase(name); }
+    } remover{connName};
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE", connName);
+        db.setDatabaseName(dbPath);
+        if (!db.open()) {
+            DIAG_WARN(STORAGE, "dbutils") << "withTempDb: DB open failed for" << connPrefix << ":" << db.lastError().text();
+        } else {
+            QSqlQuery(db).exec("PRAGMA busy_timeout = 5000");
+            QSqlQuery(db).exec("PRAGMA foreign_keys = ON");
+            opened = true;
+            work(db);
+        }
+    }
+    return opened;
+}
+
+// Runs background DB work on a SINGLE long-lived worker thread, in submission
+// (FIFO) order. This is the ordering guarantee a fresh-thread-per-request scheme
+// does NOT give: there, two writes to the same row dispatched close together are
+// run by independent threads and the OS scheduler can execute the older one last,
+// silently clobbering the newer value (the equipment/bag dual-write reorder this
+// helper was introduced to fix). SQLite's write lock serializes commits, but not
+// in submission order — so the ordering has to be enforced before the lock.
+//
+// One worker per owning storage. The thread is created lazily on first use and
+// torn down in the destructor. post()/run() (and thus the lazy first-use) must
+// always be called from the SAME thread — the owner's — because they mutate
+// m_thread/m_context without synchronization; a debug Q_ASSERT enforces this.
+// Results are delivered on `receiver`'s thread, which need not be that thread.
+class SerialDbWorker {
+public:
+    explicit SerialDbWorker(const QString& name = QStringLiteral("SerialDbWorker"))
+        : m_name(name) {}
+    ~SerialDbWorker() {
+        if (!m_thread)
+            return;
+        // Report the discard below, not just document it. This was a documented
+        // property with no signal anywhere it happened — a queued write (a shot's
+        // edited notes/rating, a Visualizer id) silently vanishes if the owner is
+        // destroyed before the worker drains, with no error, no warning, and the
+        // caller left thinking either outcome occurred. A caller that must not
+        // lose queued work should wait on isIdle() before destroying the owner;
+        // this warning is the backstop for the one that didn't.
+        if (const int pending = m_outstanding->load(std::memory_order_acquire); pending > 0) {
+            STORAGE_WARN_STDERR("Worker", QString(
+                "\"%1\" destroyed with %2 DB task(s) still queued - those writes are "
+                "being discarded").arg(m_name).arg(pending));
+        }
+        m_thread->quit();
+        m_thread->wait();
+        // The thread's event loop has stopped, so nothing else touches m_context;
+        // deleting it from here (a different thread than it lived on) is safe.
+        delete m_context;
+        delete m_thread;
+    }
+    SerialDbWorker(const SerialDbWorker&) = delete;
+    SerialDbWorker& operator=(const SerialDbWorker&) = delete;
+
+    // Post an arbitrary task to the worker thread (FIFO). The task runs on the
+    // worker thread and is responsible for opening its own DB connection (via
+    // withTempDb) and marshaling any result back to its owner's thread itself
+    // (e.g. QMetaObject::invokeMethod(receiver, ..., Qt::QueuedConnection)). For
+    // callers whose work receives a ready db handle, prefer run() below.
+    void post(std::function<void()> task) {
+        ensureStarted();
+        m_outstanding->fetch_add(1, std::memory_order_relaxed);
+        // Captures the COUNTER, not `this`. A queued lambda can outlive this
+        // worker — see m_outstanding's declaration for the use-after-free that
+        // capturing `this` here caused.
+        QMetaObject::invokeMethod(m_context,
+            [counter = m_outstanding, ownedTask = std::move(task)]() mutable {
+                ownedTask();
+                counter->fetch_sub(1, std::memory_order_release);
+            }, Qt::QueuedConnection);
+    }
+
+    // Nothing submitted through this worker is still queued or running.
+    //
+    // Exists so a caller that must not proceed until the DB work has actually
+    // finished can WAIT ON THAT, rather than on a duration. tst_mcptools_write had
+    // five copies of `for (i < 20) { processEvents(); msleep(25); }` after
+    // storage.close() — a 500 ms guess at how long a background write takes, which
+    // is precisely the "timers as guards" anti-pattern CLAUDE.md forbids: it breaks
+    // on a slow or loaded machine, and under the parallel ASan+UBSan test run it
+    // did, intermittently, while passing on its own and on retry.
+    //
+    // For run(), idle additionally means the `done` callback has been delivered on
+    // the receiver's thread — the full round trip — because that callback is what a
+    // caller is usually waiting for. For a bare post(), the task marshals its own
+    // result and this can only cover the task body.
+    //
+    // Note what the destructor does NOT do: ~SerialDbWorker quit()s, which DISCARDS
+    // queued-but-unstarted tasks. So "wait for idle" and "destroy and join" are not
+    // interchangeable — only the former guarantees the work happened.
+    bool isIdle() const { return m_outstanding->load(std::memory_order_acquire) == 0; }
+
+    // Identifies which storage's worker this is in a thread dump.
+    QString name() const { return m_name; }
+
+    // Post `work(db)` to the worker thread (FIFO), then deliver `done(dbOpened)`
+    // back on `receiver`'s thread via a queued call. `dbOpened` is false when the
+    // connection could not be opened — in which case `work` never ran and any
+    // captured result is empty/default. Note `dbOpened == true` means only that
+    // the connection opened and `work` ran, NOT that `work` succeeded — a write
+    // caller still reports its own success/failure from inside `work`. Read callers MUST gate their "Ready"
+    // emission on `dbOpened`: delivering an empty result on an open *failure* is
+    // indistinguishable from a genuine not-found, and a consumer that treats
+    // empty as "row vanished" (e.g. SettingsDye clearing the active bag) would
+    // wipe valid state on a transient DB hiccup. Write callers can ignore it —
+    // their work already tracks success and reports a terminal status either way.
+    // `destroyed` guards delivery if the owner is torn down while in flight.
+    void run(const QString& dbPath, const QString& connPrefix,
+             std::function<void(QSqlDatabase&)> work,
+             std::function<void(bool dbOpened)> done,
+             QObject* receiver,
+             std::shared_ptr<std::atomic<bool>> destroyed) {
+        // Keeps isIdle() false until the `done` callback has been delivered, not
+        // merely until the DB work finished. A shared_ptr with a decrementing
+        // deleter rather than an explicit release, because this chain has four
+        // exits — work completed, owner destroyed mid-flight, owner destroyed
+        // before delivery, and the receiver dying so the queued lambda is dropped
+        // undelivered — and only the last copy going away catches all four. An
+        // explicit decrement would leak the count on whichever path someone
+        // forgot, and a leaked count makes isIdle() never true, i.e. a waiter
+        // hangs until its timeout.
+        auto ticket = roundTripTicket();
+        post([dbPath, connPrefix, ownedWork = std::move(work), ownedDone = std::move(done),
+              receiver, destroyed, ticket]() mutable {
+            const bool dbOpened = withTempDb(dbPath, connPrefix, [&](QSqlDatabase& db) { ownedWork(db); });
+            if (!dbOpened)
+                DIAG_WARN(STORAGE, "SerialDbWorker") << "failed to open DB for" << connPrefix;
+            if (destroyed->load())
+                return;
+            QMetaObject::invokeMethod(receiver,
+                [finish = std::move(ownedDone), dbOpened, destroyed, ticket]() {
+                    if (destroyed->load())
+                        return;
+                    finish(dbOpened);
+                }, Qt::QueuedConnection);
+        });
+    }
+
+private:
+    // One outstanding-work unit, released when the last copy of the returned
+    // handle is destroyed. The null pointer is deliberate — the handle carries no
+    // value, only the lifetime; std::shared_ptr still runs the deleter for a null
+    // pointer when the use count reaches zero.
+    std::shared_ptr<void> roundTripTicket() {
+        m_outstanding->fetch_add(1, std::memory_order_relaxed);
+        // Captures the counter, NOT `this`. This deleter runs from whichever
+        // context destroys the last lambda holding the ticket, and one of those
+        // contexts is ~QObject purging undelivered events AFTER the worker is
+        // already gone. See m_outstanding.
+        return std::shared_ptr<void>(nullptr, [counter = m_outstanding](void*) {
+            counter->fetch_sub(1, std::memory_order_release);
+        });
+    }
+
+    void ensureStarted() {
+        // m_thread/m_context are touched here and in post() without a lock, so
+        // every call must come from the one owner thread (see class comment).
+        Q_ASSERT(!m_ownerThread || m_ownerThread == QThread::currentThread());
+        if (m_thread)
+            return;
+        m_ownerThread = QThread::currentThread();
+        m_thread = new QThread;
+        m_thread->setObjectName(m_name);
+        m_context = new QObject;          // event-loop affinity = the worker thread
+        m_context->moveToThread(m_thread);
+        m_thread->start();
+    }
+
+    QString m_name;
+    QThread* m_ownerThread = nullptr;  // thread that first used this worker
+    QThread* m_thread = nullptr;
+    QObject* m_context = nullptr;
+    // Submitted-but-not-yet-finished units. Atomic because it is touched from the
+    // owner thread (submit), the worker thread (task end) and the receiver thread
+    // (delivery).
+    //
+    // Held by shared_ptr, and NOT a plain member, because it must outlive this
+    // object. Queued lambdas hold a reference to it, and a lambda can be destroyed
+    // after the worker is gone: ~CoffeeBagStorage (and ~ShotHistoryStorage) reset
+    // the worker in the destructor BODY, then the QObject base destructor runs
+    // QCoreApplication::removePostedEvents, which deletes any still-queued
+    // QMetaCallEvent and with it the lambda holding the ticket. Its deleter then
+    // decrements — after the free.
+    //
+    // A first version captured `this` in that deleter and ASan caught it exactly
+    // there: a use-after-free write in tst_coffeebags, from
+    // removePostedEvents -> ~QMetaCallEvent -> ~shared_ptr -> fetch_sub on the
+    // destroyed worker. It aborted the whole test binary rather than failing a
+    // case, which is why the run reported "fatal" and no assertion.
+    std::shared_ptr<std::atomic<int>> m_outstanding =
+        std::make_shared<std::atomic<int>>(0);
+};

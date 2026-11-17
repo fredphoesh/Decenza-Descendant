@@ -1,0 +1,260 @@
+name: Nightly sanitizers
+
+# Runs the test suite under AddressSanitizer and UndefinedBehaviorSanitizer once
+# a night on main, as two independent builds.
+#
+# Why nightly and not per-pull-request. A pre-merge version of this existed
+# briefly and was removed. The evidence for removing it is worth keeping: three
+# detectors (UBSan, ASan, -Wall -Wextra) were run for the first time over eight
+# months of previously unexamined code — the moment when a new tool's harvest
+# should be at its largest — and they found no pre-existing runtime defects at
+# all. The only two failures the PR job ever produced were problems it created
+# itself (a vptr typeinfo link break from enabling UBSan, and a clang-only flag
+# that GCC rejected). A near-empty first harvest is evidence the codebase is
+# clean on these axes, which makes the expected future yield low as well, and a
+# low-yield detector does not earn a place on the critical path of every push.
+#
+# It still earns a nightly slot: cost here is idle CI time nobody waits on, and
+# a regression gets caught within a day instead of at a release tag.
+#
+# What this does NOT cover, so nobody reads a green night as more than it is:
+#   - One platform (Linux x64). #1558, the build break that motivated all of
+#     this, was inside #ifdef Q_OS_IOS and would not be caught here.
+#   - Only code the test suite executes. Coverage is unmeasured.
+#   - Data races. ThreadSanitizer is unusable against an uninstrumented Qt —
+#     measured at 10,194 reports, 94% of them false positives from Qt's own
+#     queued-connection machinery. See docs/CLAUDE_MD/TESTING.md.
+#
+# Compiler diagnostics are deliberately NOT here. -Wall -Wextra -Werror runs in
+# every build, on every developer's machine, which is where a warning should be
+# found — not in a log read once a day.
+#
+# Expect the first ASan runs to surface leaks at exit; LeakSanitizer is on by
+# default on Linux and Qt/QML exit paths are noisy. Those are findings to fix or
+# file, never to silence for a green night. The one exception on record, and the
+# bar it had to clear, live in tests/lsan-suppressions.txt -- that file carries
+# the evidence, the cost and the removal criterion, and this comment carries no
+# copy of them so the two cannot drift apart.
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+# No compiler cache. Nobody waits on this job, and its two ccache entries
+# (1.75 GB on 2026-11-03) held space the release builds need: a release saves a
+# fresh compiler cache per job before pruning the old one, and that transient
+# has to fit under the 10 GB cap. Every night builds cold, with the PCH on.
+permissions:
+  contents: read
+
+# Per ref, so a dispatch on one branch cannot cancel another branch's run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitize:
+    runs-on: ubuntu-24.04
+    # A cold-cache ASan Build step took 85.5 min (run 40116941813); 90 left no margin.
+    timeout-minutes: 120
+
+    strategy:
+      # Independent builds, one per sanitizer. fail-fast off because a finding
+      # from one sanitizer says nothing about the other, and cancelling the
+      # survivor would throw away the half of the night's signal that still works.
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: ubsan
+            cmake_flag: -DENABLE_UBSAN=ON
+          - sanitizer: asan
+            cmake_flag: -DENABLE_ASAN=ON
+
+    name: ${{ matrix.sanitizer }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/install-linux-packages
+
+      - name: Select Qt modules (app desktop)
+        id: qt_modules
+        shell: bash
+        run: |
+          list="$(bash scripts/qt_modules.sh app desktop)"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.12.0'
+          target: 'desktop'
+          arch: 'linux_gcc_64'
+          install-deps: false  # install-linux-packages installs Qt's dependencies too.
+          modules: ${{ steps.qt_modules.outputs.list }}
+          cache: true
+          cache-key-prefix: 'qt-linux-v4'
+
+      - name: Configure CMake
+        env:
+          SANITIZER_FLAG: ${{ matrix.cmake_flag }}
+        run: |
+          mkdir -p build
+          cd build
+          # PCH on (the CMake default on Linux): with no compiler cache it costs
+          # no hits, and it is pure speed on a cold build, as on macOS.
+          "$QT_ROOT_DIR/bin/qt-cmake" .. -G Ninja \
+            -DDECENZA_WEB_BUNDLE_MODE=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTS=ON \
+            "$SANITIZER_FLAG"
+
+      # Only tests execute under sanitizers. Registration/lint checks depend on
+      # the native metadata/copy targets, not the app executable; Wasm is OFF.
+      # This avoids compiling the app and all of its QML in both sanitizer legs.
+      - name: Build
+        run: |
+          cd build
+          # -k 0: report every target that fails, not just the first. A GCC-only
+          # link failure has no local repro, so one run must name them all.
+          ninja -k 0 -j"$(nproc)" build_tests
+
+      # The QML diagnostics gate — the ratchet over qml-diagnostics-baseline.json,
+      # whose per-file ceilings may fall and never rise. It lives here rather than
+      # on a PR because nothing on GitHub builds a PR, and a ratchet with no
+      # witness is not a ratchet.
+      #
+      # Native module metadata and staged QML come from decenza_qml_metadata,
+      # which build_tests already requests. Lint does not require an app link.
+      #
+      # ubsan leg only. The lint reads QML sources and generated type info, neither
+      # of which a sanitizer flag touches, so the second leg could only ever report
+      # the identical result twice.
+      - name: QML diagnostics gate
+        if: matrix.sanitizer == 'ubsan'
+        run: |
+          cd build
+          # CMake omits qmllint_check entirely when it cannot find qmllint next to
+          # Qt's bin/ — a runtime-only Qt install lacks it. Fail loudly rather than
+          # let `ninja` no-op: a gate that silently does not exist is precisely the
+          # green-while-blind failure this gate was written to end. (Whether
+          # install-qt-action ships qmllint on Linux was never confirmed; this step
+          # is what answers that, on the first night it runs.)
+          if ! ninja -t targets all | grep -q '^qmllint_check:'; then
+            echo "::error::qmllint_check target absent — qmllint was not found next to Qt's bin/ at configure time, so the QML diagnostics gate did NOT run."
+            exit 1
+          fi
+          # One mode, whole tree. The released qmllint used to be OOM-killed on
+          # qml/components/layout/items/CustomItem.qml, so CI ran with a skip flag and
+          # checked 221 of 222 files; Qt 6.11.2 fixes that (Gerrit 757430) and the skip
+          # mechanism was deleted with the upgrade. The gate prints the analysed count
+          # on the same line as its verdict — read it.
+          ninja qmllint_check
+
+      - name: Run tests under sanitizer
+        env:
+          # All three option sets are exported unconditionally; each sanitizer
+          # reads only its own variables, so the inactive ones are inert.
+          # halt_on_error matters: UBSan's default is report-and-continue, so
+          # without it a run can print undefined behaviour and still exit 0.
+          # (-fno-sanitize-recover=all in CMakeLists.txt already forces this;
+          # the variable is belt-and-braces.)
+          QT_QPA_PLATFORM: offscreen
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          ASAN_OPTIONS: print_stacktrace=1:detect_leaks=1
+          # Leak suppressions live in LSAN_OPTIONS, not ASAN_OPTIONS -- putting
+          # `suppressions=` on the latter silently does nothing for leaks.
+          #
+          # print_suppressions=1 is explicit rather than functional: it already
+          # defaults to true in sanitizer_common. It does NOT by itself make a
+          # matched suppression visible here, because `ctest --output-on-failure`
+          # below prints a test's output only when that test FAILS -- and a
+          # successfully suppressed leak is exactly the case where it passes. The
+          # Summarise step reads Testing/Temporary/LastTest.log for that reason;
+          # ctest writes every test's output there regardless. Do NOT reach for
+          # log_path= instead: it redirects ALL sanitizer output and would move
+          # the ERROR: lines out from under the finding greps below.
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan-suppressions.txt:print_suppressions=1
+        run: |
+          # A mechanism that cannot assert its own effect is the failure mode
+          # this workflow exists to avoid -- see the qmllint_check gate above.
+          #
+          # This check is load-bearing, not belt-and-braces. LSan reads the
+          # suppressions file LAZILY -- only when it has a leak to check -- so a
+          # wrong path is SILENT on every clean night and only speaks up on the
+          # rare night a leak occurs, where it reads as the suppression having
+          # failed rather than as a bad path. Measured on ASan/glibc 2.39:
+          #
+          #   leaking binary,     bad path -> "failed to read suppressions
+          #                                    file '<path>'", exit 1
+          #   non-leaking binary, bad path -> no output, exit 0
+          #
+          # An earlier version of this comment claimed LSan Die()s at startup so
+          # a bad path could not go unnoticed. That is wrong, and it is exactly
+          # the assumption that would have justified deleting this check.
+          test -f "$GITHUB_WORKSPACE/tests/lsan-suppressions.txt" || {
+            echo "::error::LSan suppressions file missing at the path LSAN_OPTIONS names"
+            exit 1
+          }
+          cd build
+          set -o pipefail
+          # --repeat until-pass:3 absorbs the rare timing flake in the two
+          # clock-cadence tests (tst_settling, tst_decentscalewifi) under CPU
+          # contention. A real failure still fails all 3 attempts.
+          ctest --output-on-failure -j"$(nproc)" --repeat until-pass:3 2>&1 | tee ctest.log
+
+      - name: Summarise
+        if: always()
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          LOG=build/ctest.log
+          # Set when a sanitizer report is present in the log, regardless of
+          # ctest's exit code — see the exit at the end of this step.
+          FOUND=0
+          {
+            echo "## Nightly $SANITIZER"
+            if [ ! -f "$LOG" ]; then
+              echo "Failed before the test step (configure or build)."
+            elif grep -qE "(sanitizer|asan)_canary.*(Failed|\*\*\*)" "$LOG"; then
+              echo "**Canary failed — instrumentation is not in effect.** Every other"
+              echo "result in this run is worth less than it looks, including the passes."
+            elif grep -qE "ERROR: (Address|Leak)Sanitizer|SUMMARY: UndefinedBehaviorSanitizer" "$LOG"; then
+              FOUND=1
+              echo "**Sanitizer finding(s):**"
+              echo '```'
+              grep -E "ERROR: (Address|Leak)Sanitizer.*|runtime error:.*|SUMMARY: UndefinedBehaviorSanitizer.*" "$LOG" | sort -u | head -40
+              echo '```'
+            else
+              echo "No sanitizer findings."
+            fi
+            # A used suppression is a subtraction from this night's signal, so
+            # say so rather than letting it pass as an unqualified clean run. Not
+            # a failure: the entry is there on purpose. LastTest.log, not $LOG --
+            # see the LSAN_OPTIONS comment for why ctest.log cannot carry this.
+            SUPP=build/Testing/Temporary/LastTest.log
+            if [ -f "$SUPP" ] && grep -q "Suppressions used:" "$SUPP"; then
+              echo ""
+              echo "**Leak suppression(s) matched** (see tests/lsan-suppressions.txt):"
+              echo '```'
+              grep -A3 "Suppressions used:" "$SUPP" | grep -vE '^--$' | sort -u | head -20
+              echo '```'
+            fi
+            grep -E "^[0-9]+% tests passed" "$LOG" 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail the job on a finding even when ctest exited 0.
+          #
+          # --repeat until-pass:3 exists for the two clock-cadence tests, but it
+          # applies to the whole suite: an intermittent use-after-free or
+          # data-dependent UB that reproduces on 1 of 3 attempts passes on retry
+          # and ctest exits 0 — while this very summary prints the report from
+          # the failed attempt. A green tick over a summary reading "Sanitizer
+          # finding(s)" is the worst of both, and nightlies are read by the tick.
+          if [ "$FOUND" -eq 1 ]; then
+            echo "::error::Sanitizer finding present in the log; failing the job even though ctest may have passed on retry."
+            exit 1
+          fi

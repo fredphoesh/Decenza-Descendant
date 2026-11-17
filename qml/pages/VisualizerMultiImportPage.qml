@@ -1,0 +1,990 @@
+// The shared-shot list delegate reads this file's ids (`multiImportPage`, `shotList`);
+// Bound makes them statically resolvable. It declares both injected roles it uses,
+// `modelData` and `index`, required in the same edit -- without that, Bound stops role
+// injection and every shot row renders blank at RUNTIME, silently.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import QtQuick.Layouts
+import Decenza
+
+T.Page {
+    id: multiImportPage
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: TranslationManager.translate("visualizerImport.pageTitle", "Import Shared Profiles")
+    // Drafts remain client-local, but the shared browser shell must be able to
+    // protect typed share codes, rename prompts, and imports awaiting a host
+    // response before navigating away or unloading the page.
+    readonly property bool browserHasUnsavedChanges:
+        (showCodeInput && codeInput.text.length > 0)
+        || showRenameDialog
+        || activeImportRequestId.length > 0
+        || (duplicateResolver.visible
+            && (duplicateResolver.resolutionPending || duplicateResolver.showNameInput))
+
+    objectName: "visualizerMultiImportPage"
+    background: ThemedPageBackground {}
+
+    property bool fetchAfterReady: false
+    property string activeImportRequestId: ""
+    Component.onDestruction: {
+        if (activeImportRequestId.length > 0)
+            VisualizerProfileImportService.cancelPending(activeImportRequestId)
+    }
+    Component.onCompleted: {
+        // Auto-fetch shared profiles once the host facade is connected.
+        if (VisualizerProfileImportService.ready)
+            VisualizerProfileImportService.fetchSharedShots()
+        else
+            fetchAfterReady = true
+    }
+
+    property var selectedShot: null
+    property bool showCodeInput: false
+    property int selectionVersion: 0  // Increment to force binding updates
+    property var importedIds: ({})  // Track profiles imported in this session
+
+    // Rename dialog for D profiles
+    property bool showRenameDialog: false
+    property string renameProfileId: ""
+    property string renameProfileTitle: ""
+
+    function showRenameForBuiltIn(shot) {
+        renameProfileId = shot.id
+        renameProfileTitle = shot.profile_title + " " + TranslationManager.translate("visualizerImport.copySuffix", "(copy)")
+        showRenameDialog = true
+        renameInput.text = renameProfileTitle
+        renameInput.forceActiveFocus()
+    }
+
+    function importProfile(shot) {
+        // Import immediately by shot ID
+        renameProfileId = shot.id  // Track for marking as imported on success
+        activeImportRequestId = VisualizerProfileImportService.importFromShotId(shot.id)
+    }
+
+    // Source badge colors (matching ProfileSelectorPage)
+    function sourceColor(source) {
+        if (source === "B") return Theme.sourceBadgeBlueColor  // Blue for Built-in/Decent
+        if (source === "D") return Theme.sourceBadgeGreenColor  // Green for Downloaded/Visualizer
+        return Theme.sourceBadgeOrangeColor  // Orange for User
+    }
+
+    function sourceLetter(source) {
+        if (source === "B") return "D"  // Decent
+        if (source === "D") return "V"  // Visualizer
+        return "U"  // User
+    }
+
+    Connections {
+        target: VisualizerProfileImportService
+
+        function onReadyChanged() {
+            if (multiImportPage.fetchAfterReady && VisualizerProfileImportService.ready) {
+                multiImportPage.fetchAfterReady = false
+                VisualizerProfileImportService.fetchSharedShots()
+            }
+        }
+
+        function onSharedShotsChanged() {
+            multiImportPage.selectedShot = null
+            // Don't clear importedIds - keep tracking what was imported this session
+            multiImportPage.selectionVersion++  // Force UI rebind to show updated checkmarks
+        }
+
+        function onDuplicateFound(requestId, profileTitle) {
+            if (requestId === multiImportPage.activeImportRequestId)
+                duplicateResolver.present(requestId, profileTitle)
+        }
+
+        function onOperationCompleted(requestId, operation, success, result, reason) {
+            if (requestId !== multiImportPage.activeImportRequestId)
+                return
+            multiImportPage.activeImportRequestId = ""
+            if (success) {
+                duplicateResolver.dismiss()
+                if (multiImportPage.renameProfileId !== "") {
+                    multiImportPage.importedIds[multiImportPage.renameProfileId] = true
+                    multiImportPage.selectionVersion++
+                    multiImportPage.renameProfileId = ""
+                }
+                resultText.text = TranslationManager.translate("visualizerImport.imported", "Imported:")
+                    + " " + (result.title || "")
+                resultText.color = Theme.successColor
+                resultText.visible = true
+                resultTimer.restart()
+            } else if (reason !== "cancelled") {
+                if (duplicateResolver.visible)
+                    duplicateResolver.errorMessage = reason
+                resultText.text = TranslationManager.translate("visualizerImport.error", "Error:")
+                    + " " + reason
+                resultText.color = Theme.errorColor
+                resultText.visible = true
+                resultTimer.restart()
+            }
+        }
+
+    }
+
+    VisualizerDuplicateResolver { id: duplicateResolver }
+
+    Timer {
+        id: resultTimer
+        interval: 5000
+        onTriggered: resultText.visible = false
+    }
+
+    ColumnLayout {
+        anchors.fill: parent
+        anchors.topMargin: Theme.pageTopMargin
+        anchors.bottomMargin: Theme.bottomBarHeight
+        anchors.leftMargin: Theme.spacingMedium
+        anchors.rightMargin: Theme.spacingMedium
+        spacing: Theme.spacingMedium
+
+        // Result message
+        Text {
+            id: resultText
+            Layout.fillWidth: true
+            visible: false
+            color: Theme.successColor
+            font: Theme.bodyFont
+            horizontalAlignment: Text.AlignHCenter
+        }
+
+        // Instructions (shown when no shots loaded)
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: instructionsCol.height + Theme.scaled(30)
+            color: Theme.cardBackgroundColor
+            radius: Theme.scaled(8)
+            visible: VisualizerProfileImportService.sharedShots.length === 0 &&
+                     !VisualizerProfileImportService.fetching
+
+            Column {
+                id: instructionsCol
+                anchors.centerIn: parent
+                width: parent.width - Theme.scaled(40)
+                spacing: Theme.spacingMedium
+
+                Text {
+                    text: TranslationManager.translate("visualizerImport.heading", "Import Multiple Profiles from Visualizer")
+                    color: Theme.textColor
+                    font: Theme.headingFont
+                    anchors.horizontalCenter: parent.horizontalCenter
+                }
+
+                Text {
+                    text: TranslationManager.translate("visualizerImport.description", "This feature lets you import profiles from shots you've shared on visualizer.coffee in the last hour.")
+                    color: Theme.textSecondaryColor
+                    font: Theme.bodyFont
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: Theme.scaled(1)
+                    color: Theme.textSecondaryColor
+                    opacity: 0.3
+                }
+
+                Text {
+                    text: TranslationManager.translate("visualizerImport.howToUse", "How to use:")
+                    color: Theme.textColor
+                    font.bold: true
+                    font.pixelSize: Theme.bodyFont.pixelSize
+                }
+
+                Text {
+                    text: TranslationManager.translate("visualizerImport.step1", "1. Go to visualizer.coffee and find shots with profiles you want")
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                }
+
+                Text {
+                    text: TranslationManager.translate("visualizerImport.step2", "2. Click the 'Share' button on each shot (creates a temporary share link)")
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                }
+
+                Text {
+                    text: TranslationManager.translate("visualizerImport.step3", "3. Come back here and tap 'Fetch Shared Profiles'")
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                }
+
+                Text {
+                    text: TranslationManager.translate("visualizerImport.step4", "4. Select which profiles to import and tap 'Import Selected'")
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                }
+            }
+        }
+
+        // Action buttons row
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Theme.scaled(50)
+            spacing: Theme.spacingMedium
+
+            // Loading indicator
+            BusyIndicator {
+                running: VisualizerProfileImportService.fetching
+                Layout.preferredWidth: Theme.scaled(30)
+                Layout.preferredHeight: Theme.scaled(30)
+                visible: running
+            }
+
+            Text {
+                text: VisualizerProfileImportService.fetching ? TranslationManager.translate("visualizerImport.loading", "Loading profiles...") : ""
+                color: Theme.textSecondaryColor
+                font: Theme.bodyFont
+                visible: VisualizerProfileImportService.fetching
+            }
+
+            Item { Layout.fillWidth: true }
+
+            // Refresh button
+            AccessibleButton {
+                id: refreshButton
+                text: TranslationManager.translate("visualizerImport.refresh", "Refresh")
+                accessibleName: TranslationManager.translate("visualizerMultiImport.refreshSharedShots", "Refresh shared shots list from visualizer")
+                Layout.preferredWidth: Theme.scaled(100)
+                Layout.preferredHeight: Theme.scaled(40)
+                enabled: VisualizerProfileImportService.ready && !VisualizerProfileImportService.fetching &&
+                         !VisualizerProfileImportService.importing
+                visible: !multiImportPage.showCodeInput
+
+                onClicked: VisualizerProfileImportService.fetchSharedShots()
+
+                background: Rectangle {
+                    radius: Theme.scaled(6)
+                    color: Theme.surfaceColor
+                    border.color: refreshButton.enabled ? Theme.primaryColor : Theme.textSecondaryColor
+                    border.width: 1
+                }
+
+                contentItem: Text {
+                    text: refreshButton.text
+                    color: refreshButton.enabled ? Theme.primaryColor : Theme.textSecondaryColor
+                    font: Theme.captionFont
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
+            // Add by code button / input
+            Row {
+                spacing: Theme.spacingSmall
+                visible: !VisualizerProfileImportService.fetching
+
+                AccessibleButton {
+                    id: addByCodeButton
+                    text: TranslationManager.translate("visualizerImport.addByCode", "Add by Code")
+                    accessibleName: TranslationManager.translate("visualizerMultiImport.enterShareCode", "Enter a 4-character share code to import a profile")
+                    primary: true
+                    width: Theme.scaled(120)
+                    height: Theme.scaled(40)
+                    visible: !multiImportPage.showCodeInput
+
+                    onClicked: {
+                        multiImportPage.showCodeInput = true
+                        codeInput.text = ""
+                        codeInput.forceActiveFocus()
+                    }
+                }
+
+                // Code input field (shown when Add by Code is clicked)
+                Row {
+                    spacing: Theme.spacingSmall
+                    visible: multiImportPage.showCodeInput
+
+                    StyledTextField {
+                        id: codeInput
+                        width: Theme.scaled(80)
+                        height: Theme.scaled(40)
+                        font.pixelSize: Theme.scaled(16)
+                        horizontalAlignment: Text.AlignHCenter
+                        maximumLength: 4
+                        placeholder: TranslationManager.translate("visualizerImport.codePlaceholder", "CODE")
+                        accessibleName: TranslationManager.translate("visualizerImport.shareCode", "Share code")
+                        inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+
+                        onTextChanged: {
+                            var upper = text.toUpperCase()
+                            if (text !== upper) text = upper
+                        }
+
+                        Keys.onReturnPressed: {
+                            if (text.length === 4) {
+                                multiImportPage.activeImportRequestId = VisualizerProfileImportService.importFromShareCode(text)
+                                multiImportPage.showCodeInput = false
+                            }
+                        }
+                        Keys.onEscapePressed: multiImportPage.showCodeInput = false
+                    }
+
+                    AccessibleButton {
+                        text: TranslationManager.translate("visualizerImport.add", "Add")
+                        accessibleName: TranslationManager.translate("visualizerMultiImport.importByCode", "Import profile using entered share code")
+                        primary: true
+                        width: Theme.scaled(60)
+                        height: Theme.scaled(40)
+                        enabled: VisualizerProfileImportService.ready && codeInput.text.length === 4 && !VisualizerProfileImportService.importing
+
+                        onClicked: {
+                            Keyboard.commit()
+                            multiImportPage.activeImportRequestId = VisualizerProfileImportService.importFromShareCode(codeInput.text)
+                            multiImportPage.showCodeInput = false
+                        }
+                    }
+
+                    AccessibleButton {
+                        text: TranslationManager.translate("visualizerImport.cancel", "Cancel")
+                        accessibleName: TranslationManager.translate("visualizerMultiImport.cancelShareCode", "Cancel entering share code")
+                        width: Theme.scaled(60)
+                        height: Theme.scaled(40)
+
+                        onClicked: multiImportPage.showCodeInput = false
+                    }
+                }
+            }
+        }
+
+        // Main content: list on left, details on right
+        Item {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            visible: VisualizerProfileImportService.sharedShots.length > 0
+
+            RowLayout {
+                anchors.fill: parent
+                spacing: Theme.spacingMedium
+
+                // Profile list
+                Rectangle {
+                    Layout.preferredWidth: parent.width * 0.45
+                    Layout.fillHeight: true
+                    color: Theme.cardBackgroundColor
+                    radius: Theme.scaled(8)
+
+                    Column {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingSmall
+                        spacing: Theme.scaled(0)
+
+                        // Header with select all
+                        RowLayout {
+                            width: parent.width
+                            height: Theme.scaled(40)
+
+                            Text {
+                                text: TranslationManager.translate("visualizerImport.sharedProfiles", "Shared Profiles") + " (" + VisualizerProfileImportService.sharedShots.length + ")"
+                                color: Theme.textColor
+                                font: Theme.bodyFont
+                                Layout.fillWidth: true
+                            }
+
+                            Text {
+                                text: TranslationManager.translate("visualizerImport.tapToImport", "Tap ☆ to import")
+                                color: Theme.textSecondaryColor
+                                font: Theme.captionFont
+                            }
+                        }
+
+                        Text {
+                            width: parent.width
+                            visible: VisualizerProfileImportService.sharedShotsTruncated
+                            text: TranslationManager.translate(
+                                "visualizerImport.listTruncated",
+                                "Some shared profiles are not shown because the list is too large.")
+                            color: Theme.textSecondaryColor
+                            wrapMode: Text.Wrap
+                        }
+
+                        Rectangle {
+                            width: parent.width
+                            height: Theme.scaled(1)
+                            color: Theme.textSecondaryColor
+                            opacity: 0.3
+                        }
+
+                        ListView {
+                            id: shotList
+                            width: parent.width
+                            height: parent.height - Theme.scaled(45)
+                            clip: true
+                            model: VisualizerProfileImportService.sharedShots
+
+                            delegate: Rectangle {
+                                id: shotDelegate
+                                required property var modelData
+                                required property int index
+
+                                width: shotList.width
+                                height: Math.max(Theme.scaled(60), vizContentRow.implicitHeight + Theme.spacingSmall * 2)
+                                color: multiImportPage.selectedShot === shotDelegate.modelData ? Theme.primaryColor.darker(1.5) :
+                                       (shotDelegate.index % 2 === 0 ? "transparent" : Theme.backgroundColor)
+
+                                // Include selectionVersion to force re-evaluation when imports change
+                                property bool isImported: multiImportPage.selectionVersion >= 0 && multiImportPage.importedIds[shotDelegate.modelData.id] === true
+
+                                RowLayout {
+                                    id: vizContentRow
+                                    anchors.fill: parent
+                                    anchors.margins: Theme.spacingSmall
+                                    spacing: Theme.spacingSmall
+
+                                    // Import star or status indicator
+                                    Rectangle {
+                                        Layout.preferredWidth: Theme.scaled(36)
+                                        Layout.preferredHeight: Theme.scaled(36)
+                                        color: "transparent"
+
+                                        property bool isBuiltIn: shotDelegate.modelData.source === "B"
+                                        property bool isIdentical: shotDelegate.modelData.identical === true
+                                        property bool isInvalid: shotDelegate.modelData.invalid === true
+
+                                        // Can click to import:
+                                        // - Invalid profiles: no
+                                        // - New profiles: yes (import immediately)
+                                        // - Built-in with different frames: yes (shows rename dialog)
+                                        // - Already imported this session: no
+                                        // - Identical: no
+                                        property bool canImport: {
+                                            if (isInvalid) return false  // Invalid profile
+                                            if (shotDelegate.isImported) return false  // Already imported
+                                            if (isIdentical) return false  // Already have same frames
+                                            return true  // New or different = can import
+                                        }
+
+                                        Accessible.role: Accessible.Button
+                                        Accessible.name: {
+                                            if (isInvalid) return TranslationManager.translate("visualizer.import.invalid", "Invalid profile")
+                                            if (!canImport) return TranslationManager.translate("visualizer.import.alreadyimported", "Already imported")
+                                            return TranslationManager.translate("visualizer.import.importprofile", "Import profile")
+                                        }
+                                        Accessible.focusable: true
+                                        Accessible.onPressAction: importStarArea.clicked(null)
+
+                                        // Red X for invalid profiles
+                                        Rectangle {
+                                            anchors.centerIn: parent
+                                            width: Theme.scaled(24)
+                                            height: Theme.scaled(24)
+                                            radius: Theme.scaled(12)
+                                            color: Theme.errorColor
+                                            visible: parent.isInvalid
+                                            Accessible.ignored: true
+
+                                            ColoredIcon {
+                                                anchors.centerIn: parent
+                                                source: "qrc:/icons/cross.svg"
+                                                iconWidth: Theme.scaled(12)
+                                                iconHeight: Theme.scaled(12)
+                                                iconColor: Theme.primaryContrastColor
+                                                Accessible.ignored: true
+                                            }
+                                        }
+
+                                        // Checkmark for identical or already imported
+                                        ColoredIcon {
+                                            anchors.centerIn: parent
+                                            source: "qrc:/icons/tick.svg"
+                                            iconWidth: Theme.scaled(18)
+                                            iconHeight: Theme.scaled(18)
+                                            iconColor: Theme.successColor
+                                            visible: !parent.isInvalid && !parent.canImport
+                                        }
+
+                                        // Star for importable profiles
+                                        ColoredIcon {
+                                            anchors.centerIn: parent
+                                            source: "qrc:/icons/star-outline.svg"
+                                            iconWidth: Theme.scaled(20)
+                                            iconHeight: Theme.scaled(20)
+                                            iconColor: Theme.textSecondaryColor
+                                            visible: parent.canImport && !VisualizerProfileImportService.importing
+                                        }
+
+                                        // Loading indicator when importing
+                                        BusyIndicator {
+                                            anchors.centerIn: parent
+                                            width: Theme.scaled(24)
+                                            height: Theme.scaled(24)
+                                            running: VisualizerProfileImportService.importing && multiImportPage.renameProfileId === shotDelegate.modelData.id
+                                            visible: running
+                                        }
+
+                                        MouseArea {
+                                            id: importStarArea
+                                            anchors.fill: parent
+                                            enabled: VisualizerProfileImportService.ready && parent.canImport && !VisualizerProfileImportService.importing
+                                            onClicked: {
+                                                if (parent.isBuiltIn && shotDelegate.modelData.exists) {
+                                                    // D profile with different frames - show rename dialog
+                                                    multiImportPage.showRenameForBuiltIn(shotDelegate.modelData)
+                                                } else {
+                                                    // Import immediately
+                                                    multiImportPage.importProfile(shotDelegate.modelData)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Profile info
+                                    Column {
+                                        Layout.fillWidth: true
+                                        spacing: Theme.scaled(2)
+
+                                        Text {
+                                            text: shotDelegate.modelData.profile_title || TranslationManager.translate("visualizerImport.unknownProfile", "Unknown Profile")
+                                            color: Theme.textColor
+                                            font: Theme.bodyFont
+                                            elide: Text.ElideRight
+                                            width: parent.width
+                                        }
+
+                                        Text {
+                                            text: (shotDelegate.modelData.bean_brand ? shotDelegate.modelData.bean_brand + " " : "") +
+                                                  (shotDelegate.modelData.bean_type || "")
+                                            color: Theme.textSecondaryColor
+                                            font: Theme.captionFont
+                                            elide: Text.ElideRight
+                                            width: parent.width
+                                            visible: shotDelegate.modelData.bean_brand || shotDelegate.modelData.bean_type
+                                        }
+                                    }
+
+                                    // Status badge
+                                    Rectangle {
+                                        visible: shotDelegate.modelData.exists
+                                        Layout.preferredWidth: Theme.scaled(24)
+                                        Layout.preferredHeight: Theme.scaled(24)
+                                        radius: Theme.scaled(12)
+                                        color: multiImportPage.sourceColor(shotDelegate.modelData.source)
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: multiImportPage.sourceLetter(shotDelegate.modelData.source)
+                                            color: Theme.primaryContrastColor
+                                            font.pixelSize: Theme.scaled(12)
+                                            font.bold: true
+                                        }
+                                    }
+                                }
+
+                                // The row is the only way to select a shot; without these a
+                                // screen reader cannot reach it. The deselect target further
+                                // down already carries the same set.
+                                Accessible.role: Accessible.Button
+                                Accessible.name: shotDelegate.modelData.profile_title
+                                                 || TranslationManager.translate("visualizerImport.unknownProfile", "Unknown Profile")
+                                Accessible.focusable: true
+                                Accessible.checkable: true
+                                Accessible.checked: multiImportPage.selectedShot === shotDelegate.modelData
+                                Accessible.onPressAction: shotSelectArea.clicked(null)
+
+                                MouseArea {
+                                    id: shotSelectArea
+                                    anchors.fill: parent
+                                    anchors.leftMargin: Theme.scaled(40)  // Don't overlap star
+                                    onClicked: {
+                                        // Toggle selection - clicking again deselects
+                                        if (multiImportPage.selectedShot === shotDelegate.modelData) {
+                                            multiImportPage.selectedShot = null
+                                        } else {
+                                            multiImportPage.selectedShot = shotDelegate.modelData
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Details panel
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    color: Theme.cardBackgroundColor
+                    radius: Theme.scaled(8)
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("visualizer.import.deselect", "Deselect shot")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: detailsDeselectArea.clicked(null)
+
+                    // Click anywhere in details panel to deselect and show legend
+                    MouseArea {
+                        id: detailsDeselectArea
+                        anchors.fill: parent
+                        onClicked: multiImportPage.selectedShot = null
+                    }
+
+                    Column {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingMedium
+                        spacing: Theme.spacingMedium
+                        visible: multiImportPage.selectedShot !== null
+
+                        Text {
+                            text: multiImportPage.selectedShot ? multiImportPage.selectedShot.profile_title : ""
+                            color: Theme.textColor
+                            font: Theme.headingFont
+                            wrapMode: Text.Wrap
+                            width: parent.width
+                        }
+
+                        Rectangle {
+                            width: parent.width
+                            height: Theme.scaled(1)
+                            color: Theme.textSecondaryColor
+                            opacity: 0.3
+                        }
+
+                        GridLayout {
+                            columns: 2
+                            columnSpacing: Theme.spacingMedium
+                            rowSpacing: Theme.spacingSmall
+                            width: parent.width
+
+                            Text { text: TranslationManager.translate("visualizerImport.status", "Status:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: {
+                                    if (!multiImportPage.selectedShot) return ""
+                                    if (multiImportPage.selectedShot.invalid) return multiImportPage.selectedShot.invalidReason || TranslationManager.translate("visualizerImport.invalidProfile", "Invalid profile")
+                                    if (multiImportPage.selectedShot.identical) return TranslationManager.translate("visualizerImport.identicalProfile", "You have this profile already, with the same frames")
+                                    if (!multiImportPage.selectedShot.exists) return TranslationManager.translate("visualizerImport.newProfile", "New profile")
+                                    if (multiImportPage.selectedShot.source === "B") return TranslationManager.translate("visualizerImport.builtInDifferent", "Built-in with different frames (will import as copy)")
+                                    return TranslationManager.translate("visualizerImport.alreadyDownloaded", "Already downloaded (different frames)")
+                                }
+                                color: {
+                                    if (!multiImportPage.selectedShot) return Theme.textColor
+                                    if (multiImportPage.selectedShot.invalid) return Theme.errorColor
+                                    if (multiImportPage.selectedShot.identical) return Theme.successColor
+                                    if (!multiImportPage.selectedShot.exists) return Theme.successColor
+                                    return multiImportPage.sourceColor(multiImportPage.selectedShot.source)
+                                }
+                                font: Theme.captionFont
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+
+                            Text { text: TranslationManager.translate("visualizerImport.author", "Author:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: multiImportPage.selectedShot ? multiImportPage.selectedShot.user_name : ""
+                                color: Theme.textColor
+                                font: Theme.captionFont
+                            }
+
+                            Text { text: TranslationManager.translate("visualizerImport.beans", "Beans:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: multiImportPage.selectedShot ? ((multiImportPage.selectedShot.bean_brand || "") + " " + (multiImportPage.selectedShot.bean_type || "")).trim() : ""
+                                color: Theme.textColor
+                                font: Theme.captionFont
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+
+                            Text { text: TranslationManager.translate("visualizerImport.dose", "Dose:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: multiImportPage.selectedShot && multiImportPage.selectedShot.bean_weight ? multiImportPage.selectedShot.bean_weight + "g" : "-"
+                                color: Theme.textColor
+                                font: Theme.captionFont
+                            }
+
+                            Text { text: TranslationManager.translate("visualizerImport.yield", "Yield:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: multiImportPage.selectedShot && multiImportPage.selectedShot.drink_weight ? multiImportPage.selectedShot.drink_weight + "g" : "-"
+                                color: Theme.textColor
+                                font: Theme.captionFont
+                            }
+
+                            Text { text: TranslationManager.translate("visualizerImport.duration", "Duration:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: multiImportPage.selectedShot ? Math.round(multiImportPage.selectedShot.duration) + "s" : "-"
+                                color: Theme.textColor
+                                font: Theme.captionFont
+                            }
+
+                            Text { text: TranslationManager.translate("visualizerImport.grinder", "Grinder:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: multiImportPage.selectedShot && (multiImportPage.selectedShot.grinder_model || multiImportPage.selectedShot.grinder_setting) ?
+                                      (multiImportPage.selectedShot.grinder_model || "") +
+                                      (multiImportPage.selectedShot.grinder_model && multiImportPage.selectedShot.grinder_setting ? " @ " : "") +
+                                      (multiImportPage.selectedShot.grinder_setting || "") : "-"
+                                color: Theme.textColor
+                                font: Theme.captionFont
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+
+                            Text { text: TranslationManager.translate("visualizerImport.shotTime", "Shot time:"); color: Theme.textSecondaryColor; font: Theme.captionFont }
+                            Text {
+                                text: multiImportPage.selectedShot && multiImportPage.selectedShot.start_time ?
+                                      new Date(multiImportPage.selectedShot.start_time).toLocaleString(Qt.locale(), Settings.app.use12HourTime ? "MMM d, yyyy h:mm AP" : "MMM d, yyyy HH:mm") : "-"
+                                color: Theme.textColor
+                                font: Theme.captionFont
+                            }
+                        }
+                    }
+
+                    // Empty state - show icon legend
+                    Column {
+                        anchors.centerIn: parent
+                        width: parent.width - Theme.scaled(40)
+                        spacing: Theme.spacingMedium
+                        visible: multiImportPage.selectedShot === null
+
+                        Text {
+                            text: TranslationManager.translate("visualizerImport.selectProfile", "Select a profile to see details")
+                            color: Theme.textSecondaryColor
+                            font: Theme.bodyFont
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+
+                        Rectangle {
+                            width: parent.width * 0.6
+                            height: Theme.scaled(1)
+                            color: Theme.textSecondaryColor
+                            opacity: 0.3
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+
+                        Text {
+                            text: TranslationManager.translate("visualizerImport.iconLegend", "Icon Legend")
+                            color: Theme.textColor
+                            font.bold: true
+                            font.pixelSize: Theme.bodyFont.pixelSize
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+
+                        Column {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            spacing: Theme.spacingSmall
+
+                            Row {
+                                spacing: Theme.spacingSmall
+                                Rectangle {
+                                    width: Theme.scaled(24)
+                                    height: Theme.scaled(24)
+                                    radius: Theme.scaled(12)
+                                    color: Theme.sourceBadgeBlueColor
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "D"
+                                        color: Theme.primaryContrastColor
+                                        font.pixelSize: Theme.scaled(12)
+                                        font.bold: true
+                                    }
+                                }
+                                Text {
+                                    text: TranslationManager.translate("visualizerImport.legendBuiltIn", "Built-in with different frames (tap to rename & import)")
+                                    color: Theme.textSecondaryColor
+                                    font: Theme.captionFont
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            Row {
+                                spacing: Theme.spacingSmall
+                                Rectangle {
+                                    width: Theme.scaled(24)
+                                    height: Theme.scaled(24)
+                                    radius: Theme.scaled(12)
+                                    color: Theme.sourceBadgeGreenColor
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "V"
+                                        color: Theme.primaryContrastColor
+                                        font.pixelSize: Theme.scaled(12)
+                                        font.bold: true
+                                    }
+                                }
+                                Text {
+                                    text: TranslationManager.translate("visualizerImport.legendDownloaded", "Downloaded profile (tap to update)")
+                                    color: Theme.textSecondaryColor
+                                    font: Theme.captionFont
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            Row {
+                                spacing: Theme.spacingSmall
+                                ColoredIcon {
+                                    source: "qrc:/icons/tick.svg"
+                                    iconWidth: Theme.scaled(18)
+                                    iconHeight: Theme.scaled(18)
+                                    iconColor: Theme.successColor
+                                    width: Theme.scaled(24)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Text {
+                                    text: TranslationManager.translate("visualizer.legend.alreadyimported", "Already imported (same frames)")
+                                    color: Theme.textSecondaryColor
+                                    font: Theme.captionFont
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            Row {
+                                spacing: Theme.spacingSmall
+                                ColoredIcon {
+                                    source: "qrc:/icons/star-outline.svg"
+                                    iconWidth: Theme.scaled(18)
+                                    iconHeight: Theme.scaled(18)
+                                    iconColor: Theme.textSecondaryColor
+                                    width: Theme.scaled(24)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Text {
+                                    text: TranslationManager.translate("visualizer.legend.taptoimport", "Tap to import")
+                                    color: Theme.textSecondaryColor
+                                    font: Theme.captionFont
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            Row {
+                                spacing: Theme.spacingSmall
+                                Rectangle {
+                                    width: Theme.scaled(24)
+                                    height: Theme.scaled(24)
+                                    radius: Theme.scaled(12)
+                                    color: Theme.errorColor
+                                    Accessible.ignored: true
+                                    ColoredIcon {
+                                        anchors.centerIn: parent
+                                        source: "qrc:/icons/cross.svg"
+                                        iconWidth: Theme.scaled(12)
+                                        iconHeight: Theme.scaled(12)
+                                        iconColor: Theme.primaryContrastColor
+                                        Accessible.ignored: true
+                                    }
+                                }
+                                Text {
+                                    text: TranslationManager.translate("visualizerImport.legendInvalid", "Invalid profile (cannot import)")
+                                    color: Theme.textSecondaryColor
+                                    font: Theme.captionFont
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: TranslationManager.translate("visualizerImport.overwriteNote", "V profiles will be overwritten when re-imported")
+                            color: Theme.textSecondaryColor
+                            font: Theme.captionFont
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            topPadding: Theme.spacingSmall
+                            wrapMode: Text.Wrap
+                            width: parent.width
+                            horizontalAlignment: Text.AlignHCenter
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    // Rename dialog - flat bar at top for keyboard compatibility
+    Rectangle {
+        id: renameBar
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.topMargin: Theme.pageTopMargin
+        height: visible ? Theme.scaled(60) : 0
+        color: Theme.cardBackgroundColor
+        visible: multiImportPage.showRenameDialog
+        z: 100
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Theme.spacingMedium
+            anchors.rightMargin: Theme.spacingMedium
+            spacing: Theme.spacingSmall
+
+            Text {
+                text: TranslationManager.translate("visualizerImport.saveAs", "Save as:")
+                color: Theme.textColor
+                font: Theme.bodyFont
+            }
+
+            StyledTextField {
+                id: renameInput
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(44)
+                selectByMouse: true
+                inputMethodHints: Qt.ImhNoAutoUppercase
+                placeholder: TranslationManager.translate("visualizerImport.profileName", "Profile name")
+                accessibleName: TranslationManager.translate("visualizerImport.profileName", "Profile name")
+
+                Keys.onReturnPressed: {
+                    if (text.trim().length > 0) {
+                        Keyboard.hide()
+                        renameInput.focus = false
+                        multiImportPage.activeImportRequestId = VisualizerProfileImportService.importFromShotIdWithName(multiImportPage.renameProfileId, text.trim())
+                        multiImportPage.showRenameDialog = false
+                    }
+                }
+                Keys.onEscapePressed: {
+                    Keyboard.hide()
+                    multiImportPage.showRenameDialog = false
+                }
+            }
+
+            AccessibleButton {
+                text: TranslationManager.translate("visualizerImport.import", "Import")
+                accessibleName: TranslationManager.translate("visualizerMultiImport.importWithNewName", "Import profile with the new name")
+                primary: true
+                Layout.preferredWidth: Theme.scaled(80)
+                Layout.preferredHeight: Theme.scaled(44)
+                enabled: VisualizerProfileImportService.ready && renameInput.text.trim().length > 0
+
+                onClicked: {
+                    Keyboard.commit()
+                    Keyboard.hide()
+                    renameInput.focus = false
+                    multiImportPage.activeImportRequestId = VisualizerProfileImportService.importFromShotIdWithName(multiImportPage.renameProfileId, renameInput.text.trim())
+                    multiImportPage.showRenameDialog = false
+                }
+            }
+
+            AccessibleButton {
+                text: TranslationManager.translate("visualizerImport.cancel", "Cancel")
+                accessibleName: TranslationManager.translate("visualizerMultiImport.cancelRenaming", "Cancel renaming and close dialog")
+                Layout.preferredWidth: Theme.scaled(80)
+                Layout.preferredHeight: Theme.scaled(44)
+
+                onClicked: {
+                    Keyboard.hide()
+                    renameInput.focus = false
+                    multiImportPage.showRenameDialog = false
+                }
+            }
+        }
+    }
+
+    // Bottom bar
+    BottomBar {
+        title: TranslationManager.translate("visualizerImport.visualizer", "Visualizer")
+        rightText: TranslationManager.translate("visualizerImport.tapToImport", "Tap ☆ to import")
+        onBackClicked: AppShell.backRequested()
+    }
+}

@@ -1,0 +1,196 @@
+// `Overlay.modal` takes a Component, so `root` is not statically resolvable inside it
+// without this pragma. This file declares no delegate and no injected model role, so
+// nothing here needs a `required property`.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Decenza
+
+DecenzaDialog {
+    id: root
+    parent: Overlay.overlay
+    x: (parent.width - width) / 2
+    y: (parent.height - height) / 2 - Theme.scaled(80)  // Lift up to clear pills/finger
+    width: Math.min(parent.width * 0.9, Theme.scaled(600))
+    height: Math.min(parent.height * 0.5, Theme.scaled(400))
+    modal: true
+    padding: 0
+
+    // Profile to preview
+    property string profileFilename: ""
+    property string profileName: ""
+
+    // Loaded profile data
+    property var profileData: null
+    property string _detailRequestId: ""
+
+    onAboutToShow: {
+        if (profileFilename) {
+            profileData = null
+            profileGraph.frames = []
+            _detailRequestId = ProfileService.requestProfileDetail(profileFilename)
+        }
+    }
+
+    Connections {
+        target: ProfileService
+        function onProfileDetailReady(requestId, filename, detail, reason) {
+            if (requestId !== root._detailRequestId || filename !== root.profileFilename)
+                return
+            root._detailRequestId = ""
+            root.profileData = reason === "" ? detail : null
+            profileGraph.frames = root.profileData && root.profileData.steps
+                ? root.profileData.steps : []
+        }
+    }
+
+    onAboutToHide: {
+        profileData = null
+        profileGraph.frames = []
+        _detailRequestId = ""
+    }
+
+    background: Rectangle {
+        color: Theme.surfaceColor
+        radius: Theme.cardRadius
+        border.width: 1
+        border.color: Theme.borderColor
+    }
+
+    contentItem: ColumnLayout {
+        spacing: 0
+
+        // Header with profile name, info button, and close button
+        Item {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Theme.scaled(50)
+
+            Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.scaled(16)
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.right: moreInfoButton.left
+                anchors.rightMargin: Theme.scaled(8)
+                text: root.profileName || (root.profileData ? root.profileData.title : "")
+                font: Theme.titleFont
+                color: Theme.textColor
+                elide: Text.ElideRight
+            }
+
+            // "More Info" button - navigates to ProfileInfoPage
+            Rectangle {
+                id: moreInfoButton
+                anchors.right: closeButton.left
+                anchors.rightMargin: Theme.scaled(4)
+                anchors.verticalCenter: parent.verticalCenter
+                width: moreInfoText.implicitWidth + Theme.scaled(16)
+                height: Theme.scaled(32)
+                radius: Theme.scaled(6)
+                color: moreInfoMouseArea.pressed ? Qt.darker(Theme.primaryColor, 1.2) :
+                       moreInfoMouseArea.containsMouse ? Theme.primaryColor : Qt.lighter(Theme.primaryColor, 1.1)
+
+                Accessible.role: Accessible.Button
+                Accessible.name: TranslationManager.translate("profilepreview.moreInfo", "More Info")
+                Accessible.focusable: true
+                Accessible.onPressAction: moreInfoMouseArea.clicked(null)
+
+                Text {
+                    id: moreInfoText
+                    anchors.centerIn: parent
+                    text: TranslationManager.translate("profilepreview.moreInfo", "More Info")
+                    font.pixelSize: Theme.scaled(13)
+                    font.bold: true
+                    color: Theme.primaryContrastColor
+                    Accessible.ignored: true
+                }
+
+                MouseArea {
+                    id: moreInfoMouseArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        root.close()
+                        AppShell.profileInfoRequested(root.profileFilename, root.profileName)
+                    }
+                }
+            }
+
+            // Close button
+            Rectangle {
+                id: closeButton
+                anchors.right: parent.right
+                anchors.rightMargin: Theme.scaled(8)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Theme.scaled(36)
+                height: Theme.scaled(36)
+                radius: width / 2
+                color: closeMouseArea.pressed ? Qt.darker(Theme.surfaceColor, 1.2) : "transparent"
+                Accessible.role: Accessible.Button
+                Accessible.name: TranslationManager.translate("common.accessibility.closePreview", "Close preview")
+                Accessible.focusable: true
+                Accessible.onPressAction: closeMouseArea.clicked(null)
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "✕"
+                    font.pixelSize: Theme.scaled(20)
+                    color: Theme.textSecondaryColor
+                    Accessible.ignored: true
+                }
+
+                MouseArea {
+                    id: closeMouseArea
+                    anchors.fill: parent
+                    Accessible.ignored: true
+                    onClicked: root.close()
+                }
+            }
+
+            Rectangle {
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 1
+                color: Theme.borderColor
+            }
+        }
+
+        // Profile graph
+        Item {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.margins: Theme.scaled(8)
+
+            ProfileGraph {
+                id: profileGraph
+                anchors.fill: parent
+                frames: []
+                selectedFrameIndex: -1  // No selection in preview mode
+                targetWeight: root.profileData ? (root.profileData.target_weight || 0) : 0
+                targetVolume: root.profileData ? (root.profileData.target_volume || 0) : 0
+            }
+
+            // No data message
+            Text {
+                anchors.centerIn: parent
+                visible: !root.profileData || !root.profileData.steps || root.profileData.steps.length === 0
+                text: TranslationManager.translate("profilePreview.noProfileData", "No profile data")
+                font: Theme.bodyFont
+                color: Theme.textSecondaryColor
+            }
+        }
+    }
+
+    // Close on background click
+    Overlay.modal: Rectangle {
+        color: Qt.rgba(0, 0, 0, 0.5)
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: root.close()
+        }
+    }
+}

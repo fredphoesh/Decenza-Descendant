@@ -1,0 +1,264 @@
+## CI/CD (GitHub Actions)
+
+CI runs at two moments: a **nightly sanitizer job** on `main`, and **all platforms build** when a `v*` tag is pushed. The same release workflow can be dispatched manually with `platforms=all` or a comma/space-separated list (no version bump or uploads by default).
+
+Build workflows cancel an older run for the same ref. Cache pruning never cancels: each release run's prune for a platform has its own group (`prune-caches-<platform>-<run_id>`), so release prunes run concurrently and none can be replaced, while the standalone triggers (completion, daily, manual) share `prune-caches-standalone`. Concurrent prunes can race to delete the same entry; a failed delete only logs a warning. App artifacts use 1-day retention with overwrite, so only the latest artifact per platform exists at any time. Dependabot (`.github/dependabot.yml`) checks weekly for Actions dependency updates.
+
+### Workflows
+
+All release jobs live in `.github/workflows/release.yml`.
+
+| Platform | Job | Runner | Output |
+|----------|-----|--------|--------|
+| Android | `build-android` | ubuntu-24.04 | Signed APK |
+| iOS | `build-ios` | macos-26 | IPA → App Store |
+| macOS | `build-macos` | macos-26 | Signed + notarized DMG |
+| Windows | `build-windows` | windows-latest | Inno Setup installer |
+| Linux | `build-linux` | ubuntu-24.04 | AppImage |
+| Linux ARM64 | `build-linux-arm64` | ubuntu-24.04-arm | AppImage (aarch64) |
+
+Both Apple jobs select Xcode's toolchain and install clang shims through `.github/actions/setup-xcode` (pinned to 26.4.1), while Ninja compiles the app. Every Ninja platform job snapshots QML objects before late embedding and requires their timestamps/sizes to remain unchanged afterward. iOS uses `ios/inject_widget_extension.rb` with the Ninja-built `.app` to create a small Xcode project for asset catalogs, the shared Swift widget, signing, archiving and IPA export. It compiles no Decenza C++ or QML. The archived executable and dSYM must match Ninja's UUID, and signatures and widget presence are checked. macOS additionally verifies every packaged resource under both arm64 and x86_64 before deployment/signing.
+
+`release.yml` is the single tag/manual entry point. The `platforms` input accepts `all`, `wasm` for the producer alone, or a comma/space-separated list such as `android,linux`; invalid selections fail before SDK setup. One Wasm job and the selected native jobs start in parallel after selection. Ninja native jobs compile with embedding deferred, then `.github/actions/finish-webclient` waits for that run's Wasm job, downloads `matched-wasm-bundle`, and requires manifest/hash/package verification before completing the link and packaging. The HTTP reader detects the packaged resource at runtime and bundle resources have a separate static carrier, so final embedding compiles no existing native C++ or QML units. Android performs its final deployment build after verification; iOS generates its packaging-only Xcode project after the final Ninja link.
+
+Publishing runs require the maintainer-created GitHub Release in `plan`, before parallel builds; missing releases and asset-upload failures fail the workflow. All jobs use the same commit and tag-only version-code bump. The Wasm producer uses Qt 6.12.0, Emscripten 5.0.5 and stock Multimedia/Remote Objects modules; no mutable release-name artifact lookup is used. Existing native compiler-cache keys, cold-build controls and Windows LF checkout are preserved. Cache pruning runs after each native job's post-actions, independently of other native jobs, with final gated cleanup after the release workflow completes.
+
+Wasm uses the shared compiler-cache action with a **512M** cap for both stock Qt module compilation and the application: a cold build with the modules occupied about 425 MB, the app alone about 50 MB. Verbose per-phase statistics expose cleanup pressure and hits. `EM_COMPILER_WRAPPER=ccache` wraps the underlying Clang invocation. Qt modules retain precompiled headers with ccache's documented Clang PCH settings; each build phase fails if ccache records no cacheable calls. The Wasm host tools install the Linux job's exact Qt (`app desktop`, `qt-linux-v4`), so both restore one entry; the Wasm SDK has its own folder with `gcc_64` symlinked to that host, so its cache holds only the SDK. macOS remains uncached.
+
+Stock Qt Multimedia/Remote Objects installs are packaged as a versioned archive with a SHA-256 checksum, toolchain/recipe manifest and Qt license notices. Successful Wasm jobs reuse exact-recipe packages from this branch, main or release-tag builds, skipping source downloads and module compilation; misses retain ccache. Packages have 90-day artifact retention, are renewed unchanged only after app/QML verification, and keep the newest two copies per recipe. The 200 MiB install-size cap bounds package growth. Artifact storage is separate from the 10 GiB Actions cache quota. Explicit cold dispatches skip package reuse.
+
+The Wasm caches always save, with no repository-budget check: every native package waits on the Wasm bundle, so its cache is on the critical path of the whole release. An explicit cold-build input still disables compiler restores and saves. Keep-one pruning runs after the Wasm cache save.
+
+QML inventory validation uses each target's own generated manifest: the Wasm job checks its manifest before uploading, and native tests always check the native manifest. Local paired builds also check the adjacent Wasm manifest when present. The deployment artifact contains runtime assets only, so native CI does not require another job's build-tree metadata.
+
+This is experimental beta packaging. The configured path still needs a successful build-only dispatch on each platform and installed-package checks before it counts as CI or delivery evidence. Manual dispatch retains the existing test-only defaults and does not bump the version code.
+
+On tag push: the producer and all native jobs use the same bumped version code and build. All upload to the GitHub Release; iOS also uploads to App Store Connect, and its release `.ipa` is App Store-signed, so it installs only through TestFlight. On `workflow_dispatch`: build only, no version bump, no upload (unless explicitly opted in).
+
+### Nightly sanitizers (`nightly-sanitizers.yml`)
+
+Runs at 04:23 UTC on `main` (plus `workflow_dispatch`): two independent Linux x64 builds, one under **UBSan** and one under **ASan**, each running the full `ctest` suite. Uploads nothing, never touches `versioncode.txt`, never interacts with a Release. It keeps **no compiler cache**, so every night builds cold with the PCH on: nobody waits on it, and its 1.75 GB of ccache entries were space the release builds need under the 10 GB cap.
+
+This native test job explicitly sets `DECENZA_WEB_BUNDLE_MODE=OFF`. Normal local builds default to LOCAL and require the one-time Wasm SDK setup; release workflows require their matching PREBUILT artifact.
+
+**There is deliberately no pull-request gate that BUILDS anything.** A `pre-merge.yml` existed briefly and was removed, and the reason is worth keeping.
+
+(Read that as scoped to builds, which is what the argument below is about. This line used to say "no pull-request gate" flat out, and both `TESTING.md` and `CLAUDE.md` grew their own copies of the flat version — which is how a build-free per-PR check that had been running for months got treated as nonexistent, and a PR merged with its own red run. `text-invariants.yml` runs on every PR touching the surfaces in its `paths:` list. It is not *required*, so nothing blocks the merge button; read the run.) Three detectors (UBSan, ASan, `-Wall -Wextra`) were run for the first time across eight months of previously unexamined code — the moment a new tool's harvest should be largest — and they surfaced **no pre-existing runtime defects**. The only two failures that job ever produced were problems it introduced itself. A near-empty first harvest is evidence the codebase is clean on those axes, so the expected future yield is low too, and a low-yield detector does not belong on the critical path of every push. It costs ~3 minutes per push plus cache budget; nightly costs idle CI nobody waits on and still catches a regression within a day.
+
+The full test suite is already run locally before every pull request, so tests are gated by process rather than by CI.
+
+**What a green night does not mean:** one platform (Linux x64) — the break fixed by PR Kulitorum/Decenza#1558 was inside `#ifdef Q_OS_IOS` and would not be caught here; only code the test suite executes, and coverage is unmeasured; and nothing about data races, since ThreadSanitizer is unusable against an uninstrumented Qt (see `TESTING.md`).
+
+**Compiler diagnostics are not in CI at all, by design.** `-Wall -Wextra -Werror` is on in every build, so a warning is an error on the developer's own machine — which is where it should be found, not in a log read once a day.
+
+**Six-platform evidence rule for promoting a diagnostic to `-Werror`.** Before adding any `-Werror=<name>`, show a green build on all six platforms (Windows, macOS, iOS, Android, Linux x64, Linux arm64). This exists because `-Werror=unused-result` (PR Kulitorum/Decenza#1553) was verified on macOS and Android only, then broke the iOS release build on code inside `#ifdef Q_OS_IOS`. Platform-guarded code is invisible to every platform that does not compile it, so evidence from a subset is not evidence.
+
+**Compiler enforcement has an annotation boundary — a clean build is not a clean codebase.** `-Werror=unused-result` caught a discarded `SecRandomCopyBytes` result because Apple annotates it `warn_unused_result`; the identical defect on the OpenSSL path — a discarded `RAND_bytes`, compiled by five of six platforms — produced no diagnostic at all, because OpenSSL does not annotate it. Where a checked result is deliberately ignored, write `(void)call();` with a comment saying why.
+
+Nightly sanitizer builds explicitly disable Wasm packaging and build only the
+test target. Registration and lint consume `decenza_qml_metadata` (generated
+registry plus staged QML), rather than compiling/linking the unused native app.
+Measured costs and dependency-graph counts are in `BUILD_PERFORMANCE.md`.
+
+### Cross-platform verification is on demand
+
+**There is no scheduled six-platform build.** One existed (`nightly-platforms.yml`, 02:11 UTC) and was removed within a day of shipping, because it would have been **slower than what already happens**. Over the 14 days to 2026-07-19 each platform workflow ran 37-48 times (Linux 48, iOS 42, arm64 43, Windows 37, macOS 37) — about three builds per platform per day, from near-daily pre-releases against the rolling `v2.0.0` beta. A nightly would have compiled each platform at a third of that rate.
+
+Do not read the cadence off the version-tag list: those land every 1-2 weeks and understate the real build frequency by an order of magnitude. The pre-release runs are what actually compile the six platforms.
+
+**What this means in practice:** platform-guarded code (`#ifdef Q_OS_IOS` and friends) is compiled by the next pre-release of that platform, usually the same day. If you don't want to wait, dispatch that platform build-only — commands below.
+
+**`use_cache`** is a shared `workflow_dispatch` input, default `true`, used by the five native jobs with compiler caches. macOS keeps no caches at all (compiler, Qt or OpenSSL): nobody waits on it, and its ~2.6 GB was a quarter of the 10 GB store. Passing `false` gives a genuinely cold build — useful when you want to prove a build from scratch rather than through a cache, at the cost of writing a fresh timestamped generation into a cache store already near the 10 GB cap. The guard is `github.event_name != 'workflow_dispatch' || inputs.use_cache`, so a **tag push always caches**; without the event check, `inputs` is empty on a tag push and every release would silently go cold. The Qt install cache is unaffected — it is a stable-keyed download, not a compiler cache.
+
+**Cache pruning:** `prune-caches.yml` is called after each native job has saved its cache, and is triggered when the release or sanitizer workflow completes, with a daily fallback. Keep-one deduplication runs during builds; cleanup based on live refs waits until no build workflow is active. It:
+
+1. **Deletes all but the newest timestamped ccache/sccache entry per (prefix, ref).** Stable-keyed `qt-*`/`apt-*`/`gradle-*` caches are left to step 2.
+2. **Deletes stable-key entries no build restores** (gated). An entry whose key differs from a sibling only after its first dotted version (a runner image or kernel, e.g. `…1014-aws` beside `…1017-azure`) is dropped once that sibling has been used a day later than it, siblings being on the same ref or, for a tag entry, on `main`; and a tag entry whose exact key `main` also holds is dropped, since the tag falls back to `main`'s copy. Measured 2026-11-03: 0.95 GB of the 9.13 GB store.
+3. **Deletes caches whose ref no longer exists** — deleted branches and closed/merged PRs. This is a *different* problem from stale generations and needed its own fix: every entry on a dead branch is the newest of its group, so step 1 inspects them and correctly finds nothing to collapse. Measured 2026-07-19, hours after one branch was merged and deleted: **5.0 GB — half the 10 GB cap — held by a deleted branch and its merged PR**, while the repo sat at 9.91/10 GB LRU-evicting live entries. Conservative by design: tags are never touched, and a branch is only considered dead when `git ls-remote` says so. This keeps the repo's cache store (10 GB GitHub cap) from filling with stale compiler-cache generations; it replaced the old KEEP=2 prune step inside the former macOS workflow, which ran before late-finishing builds (and macOS itself) had saved their fresh caches.
+
+### Quick commands
+```bash
+# Test selected platforms or all (no upload or version bump)
+gh workflow run release.yml --repo Kulitorum/Decenza --ref <branch> -f platforms=android,linux
+gh workflow run release.yml --repo Kulitorum/Decenza --ref <branch> -f platforms=all
+
+# Check build status
+gh run list --repo Kulitorum/Decenza --limit 5
+
+# Watch live logs
+gh run watch --repo Kulitorum/Decenza
+
+# View failed logs
+gh run view --repo Kulitorum/Decenza --log-failed
+```
+
+### Release all platforms at once
+See "Publishing Releases" section below for the full process. In short:
+```bash
+# 1. Create the GitHub Release FIRST (so CI finds it)
+gh release create vX.Y.Z --title "Decenza vX.Y.Z" --prerelease --notes "..."
+# 2. Then push the tag to trigger all 6 builds
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+### GitHub Secrets
+
+**Android:**
+- `ANDROID_KEYSTORE_BASE64` — Base64-encoded `.jks` keystore
+- `ANDROID_KEYSTORE_PASSWORD` — Keystore password
+
+**iOS:**
+- `P12_CERTIFICATE_BASE64`, `P12_PASSWORD` — iPhone Distribution certificate
+- `PROVISIONING_PROFILE_BASE64`, `PROVISIONING_PROFILE_NAME` — App Store profile
+- `KEYCHAIN_PASSWORD` — Temporary keychain password
+- `APPLE_TEAM_ID` — Apple Developer Team ID
+- `APP_STORE_CONNECT_API_KEY_ID`, `APP_STORE_CONNECT_API_ISSUER_ID`, `APP_STORE_CONNECT_API_KEY_BASE64` — App Store upload
+
+**macOS:**
+- `MACOS_DEVELOPER_ID_P12_BASE64`, `MACOS_DEVELOPER_ID_P12_PASSWORD` — Developer ID cert
+- `APPLE_ID`, `APPLE_ID_APP_PASSWORD` — For notarization
+
+### Platform notes
+- iOS bundle ID: `io.github.kulitorum.decenza` (differs from Android: `io.github.kulitorum.decenza_de1`)
+- iOS signing credentials expire yearly — see `docs/IOS_CI_FOR_CLAUDE.md` for renewal
+- iOS tag-push builds upload to App Store Connect automatically (available in TestFlight). Manual `workflow_dispatch` builds default to `upload_to_appstore=false` (test only). App Store submission remains a manual step in App Store Connect. See `docs/IOS_TESTFLIGHT_SETUP.md` for setup instructions.
+- Android signing is Qt's own (`QT_ANDROID_SIGN_APK` plus `QT_ANDROID_KEYSTORE_*` env vars) and the workflow renames the signed APK to `Decenza_<version>.apk` — see `PLATFORM_BUILD.md`
+
+## Publishing Releases
+
+### Prerequisites
+- GitHub CLI (`gh`) installed: `winget install GitHub.cli`
+- Authenticated: `gh auth login`
+
+### Release Process
+
+**IMPORTANT: Always use tag pushes to build releases.** Never use `workflow_dispatch` for release builds — it skips version code bumps and causes duplicate upload errors (especially iOS App Store). The `workflow_dispatch` trigger is only for test builds that don't upload anywhere.
+
+**IMPORTANT**: Release notes should only include **user-experience changes** (new features, UI changes, bug fixes users would notice). Skip internal changes like code refactoring, developer tools, translation system improvements, or debug logging changes. Use sectioned format: `### New Features`, `### Improvements`, `### Bug Fixes`.
+
+#### Step 1: Review changes since last release
+```bash
+gh release list --limit 5
+git log <previous-tag>..HEAD --oneline
+```
+
+#### Step 2: Create the GitHub Release FIRST (before pushing the tag)
+**You must create the release before pushing the tag.** If the release doesn't exist when CI runs, behavior varies: Android and Linux workflows auto-create a non-prerelease with auto-generated notes (losing your custom notes and prerelease flag), while macOS and Windows silently skip the upload (artifacts lost). Creating it first ensures all platforms upload correctly with your release notes and prerelease flag.
+
+The `Build: XXXX` line is injected automatically by CI after the Android build completes. Do NOT add it manually.
+
+For beta/prerelease builds, add `--prerelease` flag. Users with "Beta updates" enabled in Settings will get these. Omit `--prerelease` for stable releases.
+
+```bash
+gh release create vX.Y.Z \
+  --title "Decenza vX.Y.Z" \
+  --prerelease \
+  --notes "$(cat <<'EOF'
+## Changes
+
+### New Features
+- Feature 1 (from commit messages)
+- Feature 2
+
+### Improvements
+- Improvement 1
+
+### Bug Fixes
+- Fix 1
+- Fix 2
+
+## Installation
+
+**Direct APK download:** https://github.com/Kulitorum/Decenza/releases/download/vX.Y.Z/Decenza_X.Y.Z.apk
+
+Install on your Android device (allow unknown sources).
+EOF
+)"
+```
+
+#### Step 3: Push the tag to trigger builds
+```bash
+# IMPORTANT: Verify local main is synced with origin BEFORE tagging.
+# Stale tracking branches or failed pulls can leave HEAD on the wrong commit.
+git fetch origin && git reset --hard origin/main
+git rev-parse HEAD  # Verify this matches the expected commit
+
+git tag vX.Y.Z
+git rev-parse vX.Y.Z  # Must match HEAD above
+git push origin vX.Y.Z
+```
+
+This triggers all 6 platform builds simultaneously. Each workflow will:
+- Bump the version code
+- Build the binary
+- Upload the artifact to the existing GitHub Release
+- Android workflow commits the bumped version code back to main
+- Android workflow injects `Build: XXXX` into the release notes
+- iOS workflow uploads to App Store Connect, and attaches `Decenza_v<version>_ios.ipa` to the release
+
+**Compiler caches are tag-scoped.** GitHub Actions cache *restore* is ref-scoped — a build can only restore from its own ref or `main`, and it can only ever *write* into its own. Because a release is iterated by re-tagging at HEAD and force-pushing, the same tag ref builds many times (nine v2.0.0 macOS builds over three days in July 2026), and each rebuild restores the previous one's cache. That tag-scoped cache is the one doing the work.
+
+The **first** build of a new tag has an empty tag scope and so builds cold. A `warm-main-cache.yml` workflow used to cover that gap by dispatching all 6 builds on `main` when a release was promoted out of pre-release (issue #1213), but that event is rarely reached here — four firings in three months — so `main`'s copies decayed while still costing ~950 MB. It was removed in July 2026 and `prune-caches.yml` now collects main-scoped platform compiler caches. One cold build per platform per release, out of roughly nine.
+
+Untouched by that: `main`-scoped **Qt SDK and gradle** caches, which use stable keys and are restored by every run; they are pruned only when superseded (step 2 above).
+
+#### Updating an existing pre-release
+To rebuild an existing pre-release at the current HEAD:
+```bash
+# IMPORTANT: Verify local main is synced with origin BEFORE tagging.
+git fetch origin && git reset --hard origin/main
+git rev-parse HEAD  # Verify this matches the expected commit
+
+# Delete old tag and recreate at HEAD
+git tag -d vX.Y.Z
+git push origin :refs/tags/vX.Y.Z
+git tag vX.Y.Z
+git rev-parse vX.Y.Z  # Must match HEAD above
+git push origin vX.Y.Z
+
+# IMPORTANT: Deleting the remote tag automatically converts the release to a draft.
+# You MUST run this after pushing the new tag to restore it as a visible pre-release:
+gh release edit vX.Y.Z --draft=false --prerelease
+```
+**Note:** Do NOT delete the GitHub Release — only the tag. The release persists and CI will upload new artifacts to it. Draft releases are invisible to users and the auto-update system, so the `--draft=false` step is mandatory.
+
+### Updating Release Notes
+```bash
+gh release edit vX.Y.Z --notes "$(cat <<'EOF'
+Updated notes here...
+EOF
+)"
+```
+
+### Auto-Update System
+- **Check interval**: Every 60 minutes (configurable in Settings → Updates)
+- **Version detection**: Compares display version (`X.Y.Z`) first, then build number when the versions are equal. **Equal is the normal case, not the edge case** — the display version rolls, so a dozen builds can ship under one `vX.Y.Z` and each gets its own build number. `v2.0.3` covered builds 3533, 3534 and 3535 in three days. For those, the build number is the only thing that distinguishes a new release from the running one.
+- **Build number source**: Parsed from release notes using pattern `Build: XXXX` (or `Build XXXX`). Notes carrying no such line mean **no build number**, and the check goes blind until the next poll rather than guessing one — there is nowhere else to read it from. The tag and the asset filename both carry the display version (`v2.0.3`, `Decenza_2.0.3.apk`), which has no relation to `versioncode.txt`. Only `release.yml` writes the line, so the blind window spans the tag push to that job finishing — once per build, and a release gets many beta builds.
+- **Beta channel**: Users opt-in via Settings → Updates → "Beta updates". Prereleases are only shown to opted-in users.
+- **Platforms**: Android auto-downloads APK; iOS directs to App Store; desktop shows release page
+
+### Updating a pre-release with new commits
+When adding commits to an existing pre-release (same version, new builds):
+```bash
+# 1. Update the release notes
+gh release edit vX.Y.Z --notes "..."
+# 2. Move the tag to HEAD and force-push to trigger all 6 builds
+git tag -f vX.Y.Z HEAD && git push origin vX.Y.Z --force
+```
+Both steps are required — updating release notes alone does NOT trigger builds. The tag must be moved to include the new commits, and the force-push is what triggers CI.
+
+### Promoting a pre-release to stable
+When promoting a pre-release to a full release, you must also set it as "latest" — GitHub does not do this automatically:
+```bash
+gh release edit vX.Y.Z --prerelease=false --latest
+```
+Without `--latest`, the previous stable release remains the "latest" and the auto-update system won't see the new version. Note: promoting does NOT re-trigger the release builds — the artifacts from the pre-release tag push are already attached. It fires the `release: released` event, which nothing listens for any more (`warm-main-cache.yml` did, and was removed — see "Compiler caches are tag-scoped" above).
+
+### Notes
+- **Always use tag pushes** — never `workflow_dispatch` — for release builds
+- **Always review `git log <prev-release>..HEAD`** to include all changes in release notes
+- `Build: XXXX` is injected automatically by CI — do not add manually
+- Always include direct APK link in release notes (old browsers can't see Assets section)
+- Android is distributed by sideloading the APK only. Decenza is **not on Google Play**, so Play's target-API deadlines never drive an SDK change; the target SDK follows Qt's default.
+- No AAB is produced: it is a Play upload format, not something users can install.

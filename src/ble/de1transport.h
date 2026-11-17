@@ -1,0 +1,192 @@
+#pragma once
+
+#include <QObject>
+#include <QBluetoothUuid>
+#include <QByteArray>
+#include <QList>
+#include <QString>
+
+/**
+ * Abstract transport interface for DE1 communication.
+ *
+ * This abstraction allows DE1Device to communicate over different transports:
+ * - BleTransport: Uses QLowEnergyController (BLE over Bluetooth)
+ * - SerialTransport: Uses QSerialPort (USB-C wired connection)
+ *
+ * Both transports use QBluetoothUuid to identify characteristics. BLE uses
+ * them natively; SerialTransport maps them to single-letter codes internally.
+ *
+ * Data payloads are QByteArray in both cases - the binary protocol is identical
+ * regardless of physical transport.
+ */
+class DE1Transport : public QObject {
+    Q_OBJECT
+
+public:
+    explicit DE1Transport(QObject* parent = nullptr) : QObject(parent) {}
+    ~DE1Transport() override = default;
+
+    /**
+     * Write data to a characteristic.
+     * Implementations may queue writes (BLE) or send immediately (serial).
+     */
+    virtual void write(const QBluetoothUuid& uuid, const QByteArray& data) = 0;
+
+    /**
+     * Write data ahead of anything else this transport has waiting.
+     * Used for time-critical operations like stop-at-weight (SAW) and
+     * ensureChargerOn (app suspend). Default implementation delegates to
+     * write(); the BLE transport puts the write at the FRONT of the shared
+     * GATT queue.
+     *
+     * Urgency is position, not a bypass: an urgent write still waits for
+     * whatever operation is currently outstanding, on this device or any
+     * other. Nothing can preempt an in-flight GATT operation — the platform
+     * has already accepted it — so a "bypass" was never available to be lost.
+     * Does not clear the queue; callers that need to clear pending commands
+     * (SAW, sleep) do so explicitly before calling this.
+     */
+    virtual void writeUrgent(const QBluetoothUuid& uuid, const QByteArray& data) {
+        write(uuid, data);
+    }
+
+    /**
+     * Read data from a characteristic.
+     * Result arrives via dataReceived() signal.
+     */
+    virtual void read(const QBluetoothUuid& uuid) = 0;
+
+    /**
+     * Subscribe to notifications for a single characteristic.
+     * Subsequent value changes arrive via dataReceived() signal.
+     */
+    virtual void subscribe(const QBluetoothUuid& uuid) = 0;
+
+    /**
+     * Subscribe to all DE1 notification characteristics.
+     * Convenience method that subscribes to STATE_INFO, SHOT_SAMPLE,
+     * WATER_LEVELS, READ_FROM_MMR, and TEMPERATURES.
+     */
+    virtual void subscribeAll() = 0;
+
+    /**
+     * Disconnect from the device and release resources.
+     * Emits disconnected() when complete.
+     */
+    virtual void disconnect() = 0;
+
+    /**
+     * Clear any pending command queue and return the number of commands
+     * that were dropped. Called before urgent operations (SAW stop, sleep)
+     * to prevent stale commands from interfering. A connect still being set
+     * up keeps its setup. Transports without queuing return 0. The count
+     * lets DE1Device skip invalidating its per-register MMR dedup cache when
+     * nothing was actually dropped (the cache is only at risk when a queued
+     * write never reached the wire).
+     */
+    virtual qsizetype clearQueue() { return 0; }
+
+    /**
+     * Discard pending commands targeting any of the given characteristics and
+     * return how many were dropped. Unlike clearQueue(), this leaves unrelated
+     * pending work alone: it exists so an operation that has been superseded,
+     * or has terminally failed, can withdraw its OWN remaining writes without
+     * throwing away writes nothing has superseded.
+     *
+     * Only queued commands are affected. A write already in flight is not
+     * withdrawn — it is on the wire or being retried, and cancelling it would
+     * leave m_writePending state inconsistent for no gain.
+     *
+     * Transports without queuing return 0.
+     */
+    virtual qsizetype discardQueued(const QList<QBluetoothUuid>&) { return 0; }
+
+    /**
+     * Check if the transport is currently connected.
+     */
+    virtual bool isConnected() const = 0;
+
+    /**
+     * Human-readable transport name for logging and UI display.
+     * E.g., "BLE" or "USB Serial".
+     */
+    virtual QString transportName() const = 0;
+
+signals:
+    /**
+     * Emitted when the transport connection is established and ready for I/O.
+     */
+    void connected();
+
+    /**
+     * Emitted when the transport connection is lost or closed.
+     */
+    void disconnected();
+
+    /**
+     * Emitted when data is received from a characteristic (notification or read response).
+     * @param uuid The characteristic that produced the data.
+     * @param data The raw binary payload.
+     */
+    void dataReceived(const QBluetoothUuid& uuid, const QByteArray& data);
+
+    /**
+     * Emitted when a write is abandoned after exhausting its retries.
+     *
+     * Carries the payload, not just the characteristic, because the device
+     * layer is the only place that can decode what was lost — and it must,
+     * for two reasons. The log line at the transport can only say "20 bytes to
+     * a005", which does not tell a reader which setting failed to reach the
+     * machine. And any device-layer cache recording "the DE1 now holds this
+     * value" is wrong the moment a write is abandoned; left uncorrected, the
+     * next identical write is elided as unchanged and the loss becomes
+     * permanent rather than transient.
+     */
+    void writeAbandoned(const QBluetoothUuid& uuid, const QByteArray& data);
+
+    /**
+     * Emitted when a write operation completes successfully.
+     * @param uuid The characteristic that was written.
+     * @param data The data that was written.
+     */
+    void writeComplete(const QBluetoothUuid& uuid, const QByteArray& data);
+
+    /**
+     * Emitted when a transport error occurs. Surfaced to the user as a modal
+     * (via BLEManager), so only for errors that need user awareness or action.
+     * Write-retry exhaustion is deliberately NOT routed here — it marks a dead
+     * link that the reconnect ladder handles, and is reported via de1LinkFault
+     * instead (#1423). Controller errors are excluded wholesale for the same
+     * reason: they describe a link that went away — a DE1 switched off, out of
+     * range, or dropped by the OS under BLE contention — which the ladder brings
+     * back, and the only message they could produce ("Connection error") tells
+     * the user nothing they can act on (#1093, #1658).
+     * @param message Human-readable error description.
+     */
+    void errorOccurred(const QString& message);
+
+    /**
+     * Emitted when the command queue is empty and no write is pending.
+     * Used at app exit to know when sleep commands have been sent.
+     */
+    void queueDrained();
+
+    /**
+     * Emitted on a DE1-link transport fault: a write that failed after all
+     * retries ("write-failed"), a connection-class controller error on a link
+     * that had connected ("controller-error"), the same error on an attempt
+     * that never connected ("connect-failed" — also what a switched-off DE1
+     * produces), or a connected link delivering no notifications
+     * ("zombie-link"). A single transient write retry is deliberately NOT
+     * emitted (it is normal on healthy hardware and produced false positives).
+     * Scale-agnostic — this layer has no scale knowledge; the consumers decide
+     * what a kind means to them.
+     */
+    void de1LinkFault(const QString& kind);
+
+    /**
+     * Emitted for debug/diagnostic logging.
+     * @param message Log text to be captured by ShotDebugLogger.
+     */
+    void logMessage(const QString& message);
+};

@@ -1,0 +1,1368 @@
+#include <QtTest>
+#include <QSignalSpy>
+#include <QRegularExpression>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QTemporaryDir>
+
+#include "history/equipmentstorage.h"
+#include "history/coffeebagstorage.h"
+#include "core/puckprep.h"
+#include "shotrowfixtures.h"
+
+// Equipment packages: the grind/rpm split heuristic, rpmCapable derivation,
+// package CRUD and identity dedup (add-equipment-packages).
+
+using ShotRowFixtures::withRawDb;
+
+// Minimal shots table carrying just the columns the migration reads/writes.
+static void createMinimalShots(QSqlDatabase& db) {
+    QSqlQuery(db).exec(R"(
+        CREATE TABLE shots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            grinder_brand TEXT, grinder_model TEXT, grinder_burrs TEXT,
+            grinder_setting TEXT, equipment_id INTEGER, rpm INTEGER
+        )
+    )");
+}
+
+static qint64 insertShot(QSqlDatabase& db, const QString& brand, const QString& model,
+                         const QString& burrs, const QString& setting) {
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO shots (grinder_brand, grinder_model, grinder_burrs, grinder_setting) "
+              "VALUES (?, ?, ?, ?)");
+    q.addBindValue(brand); q.addBindValue(model); q.addBindValue(burrs); q.addBindValue(setting);
+    q.exec();
+    return q.lastInsertId().toLongLong();
+}
+
+class tst_Equipment : public QObject {
+    Q_OBJECT
+
+private:
+    QTemporaryDir m_dir;
+    int m_seq = 0;
+    QString freshDbPath() { return m_dir.filePath(QString("eq_%1.db").arg(++m_seq)); }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    // --- rpmCapable derivation ---
+    void rpmCapable() {
+        // Registry variableRpm grinder.
+        QVERIFY(EquipmentStorage::deriveRpmCapable("Turin", "DF83V"));
+        // Registry non-variable grinder.
+        QVERIFY(!EquipmentStorage::deriveRpmCapable("Niche", "Zero"));
+        // Custom grinder not in the registry -> shown (true).
+        QVERIFY(EquipmentStorage::deriveRpmCapable("Acme", "Imaginary 9000"));
+        // Varia VS6 shipped with the flag unset because its `true` was
+        // burrSwappable, not variableRpm; a user reported no RPM field.
+        QVERIFY(EquipmentStorage::deriveRpmCapable("Varia", "VS6"));
+        // Hand grinder / grind-by-weight ("W") models are fixed-speed.
+        QVERIFY(!EquipmentStorage::deriveRpmCapable("Weber Workshops", "HG-2"));
+        QVERIFY(!EquipmentStorage::deriveRpmCapable("Mahlkonig", "E65S GbW"));
+    }
+
+    // rpmCapable is a registry fact, re-derived on read: a stale value in an
+    // older row's attrs blob must not win over a corrected catalog flag.
+    void rpmCapableIgnoresStoredAttr() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_rpm_stale", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage pkg;
+            const qint64 id = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Varia", "VS6", "58mm Supernova flat");
+            QVERIFY(id > 0);
+            QSqlQuery q(db);
+            q.prepare("UPDATE equipment_items SET attrs = ? WHERE package_id = ? AND kind = 'grinder'");
+            q.addBindValue(QString("{\"burrs\":\"58mm Supernova flat\",\"rpmCapable\":false}"));
+            q.addBindValue(id);
+            QVERIFY(q.exec());
+
+            const EquipmentItem g = EquipmentStorage::loadGrinderItemStatic(db, id);
+            QVERIFY(g.isValid());
+            QCOMPARE(g.burrs, QString("58mm Supernova flat"));
+            QVERIFY(g.rpmCapable);
+        });
+    }
+
+    void asyncReadsReportOpenFailuresWithoutInventingEmptyResults() {
+        EquipmentStorage bad;
+        bad.initialize(m_dir.filePath(QStringLiteral("missing/equipment.db")));
+        QSignalSpy inventoryReady(&bad, &EquipmentStorage::inventoryReady);
+        QSignalSpy inventoryFailed(&bad, &EquipmentStorage::inventoryFailed);
+        QSignalSpy packageReady(&bad, &EquipmentStorage::packageReady);
+        QSignalSpy packageFailed(&bad, &EquipmentStorage::packageFailed);
+
+        // Each failed open produces the low-level open warning and the worker's
+        // failure summary; these are expected while the explicit failure signals
+        // are the read API's terminal result.
+        for (int i = 0; i < 2; ++i)
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("withTempDb: DB open failed"));
+        for (int i = 0; i < 2; ++i)
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("SerialDbWorker.*failed to open DB"));
+        bad.requestInventory();
+        bad.requestPackage(42);
+
+        QTRY_COMPARE_WITH_TIMEOUT(inventoryFailed.size(), 1, 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(packageFailed.size(), 1, 15000);
+        QCOMPARE(inventoryReady.size(), 0);
+        QCOMPARE(packageReady.size(), 0);
+        QCOMPARE(inventoryFailed.first().first().toString(),
+                 QStringLiteral("Could not open equipment database"));
+        QCOMPARE(packageFailed.first().at(0).toLongLong(), 42);
+        QCOMPARE(packageFailed.first().at(1).toString(),
+                 QStringLiteral("Could not open equipment database"));
+
+        // An opened database with no such row remains a genuine not-found result.
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_read_failure_empty", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+        });
+        EquipmentStorage valid;
+        valid.initialize(path);
+        QSignalSpy validReady(&valid, &EquipmentStorage::packageReady);
+        QSignalSpy validFailed(&valid, &EquipmentStorage::packageFailed);
+        valid.requestPackage(42);
+        QTRY_COMPARE_WITH_TIMEOUT(validReady.size(), 1, 15000);
+        QCOMPARE(validFailed.size(), 0);
+        QCOMPARE(validReady.first().at(0).toLongLong(), 42);
+        QVERIFY(validReady.first().at(1).toMap().isEmpty());
+    }
+
+    void requestScopedInventoryCompletionsRemainIndependent()
+    {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_request_scoped_inventory", [](QSqlDatabase& db) {
+            createMinimalShots(db);
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+        });
+        EquipmentStorage storage;
+        storage.initialize(path);
+        QSignalSpy legacyReady(&storage, &EquipmentStorage::inventoryReady);
+        QStringList completed;
+        storage.requestInventoryWithCompletion(this,
+            [&completed](bool success, const QVariantList&, const QString&) {
+                if (success)
+                    completed.append(QStringLiteral("first"));
+            });
+        storage.requestInventoryWithCompletion(this,
+            [&completed](bool success, const QVariantList&, const QString&) {
+                if (success)
+                    completed.append(QStringLiteral("second"));
+            });
+
+        QTRY_COMPARE_WITH_TIMEOUT(completed.size(), 2, 15000);
+        QCOMPARE(completed, QStringList({QStringLiteral("first"), QStringLiteral("second")}));
+        QCOMPARE(legacyReady.size(), 0);
+    }
+
+    // --- package create + load ---
+    void createAndLoadPackage() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_create", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage pkg;
+            pkg.lastGrindSetting = "24";
+            pkg.lastRpm = 1400;
+            const qint64 id = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Turin", "DF83V", "83mm flat steel");
+            QVERIFY(id > 0);
+
+            const EquipmentPackage loaded = EquipmentStorage::loadPackageStatic(db, id);
+            QVERIFY(loaded.isValid());
+            QCOMPARE(loaded.lastGrindSetting, QString("24"));
+            QCOMPARE(loaded.lastRpm, (qint64)1400);
+
+            const EquipmentItem grinder = EquipmentStorage::loadGrinderItemStatic(db, id);
+            QVERIFY(grinder.isValid());
+            QCOMPARE(grinder.brand, QString("Turin"));
+            QCOMPARE(grinder.model, QString("DF83V"));
+            QCOMPARE(grinder.burrs, QString("83mm flat steel"));
+            QVERIFY(grinder.rpmCapable);  // DF83V is variableRpm
+        });
+    }
+
+    // --- grinder-less (basket-only) packages: tea setups (add-recipe-wizard-tea) ---
+    void basketOnlyPackage() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_teabasket", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage pkg;
+            const qint64 id = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "", "", "", "Decent", "Tea Basket");
+            QVERIFY(id > 0);
+
+            // No grinder item row; display name fell back to the basket.
+            QVERIFY(!EquipmentStorage::loadGrinderItemStatic(db, id).isValid());
+            const EquipmentItem basket = EquipmentStorage::loadBasketItemStatic(db, id);
+            QVERIFY(basket.isValid());
+            QCOMPARE(basket.brand, QString("Decent"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, id).name,
+                     QString("Decent Tea Basket"));
+
+            // Dedup matches the grinder-less identity (empty grinder + basket)…
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(
+                         db, "", "", "", 0, "decent", "tea basket"), id);
+            // …and does NOT match a different basket or a grinder-carrying query.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(
+                         db, "", "", "", 0, "VST", "18g"), (qint64)0);
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(
+                         db, "Niche", "Zero", "", 0, "Decent", "Tea Basket"), (qint64)0);
+
+            // In-place identity edit works with no grinder row (unused package):
+            // changing the basket keeps the same id and stays grinder-less.
+            const qint64 edited = EquipmentStorage::supersedeOrEditStatic(
+                db, id, "", "", "", "Weber", "Unibasket 18g", "");
+            QCOMPARE(edited, id);
+            QCOMPARE(EquipmentStorage::loadBasketItemStatic(db, id).brand, QString("Weber"));
+            QVERIFY(!EquipmentStorage::loadGrinderItemStatic(db, id).isValid());
+
+            // Adding a grinder to a grinder-less package inserts the item.
+            const qint64 withGrinder = EquipmentStorage::supersedeOrEditStatic(
+                db, id, "Niche", "Zero", "63mm conical", "Weber", "Unibasket 18g", "");
+            QCOMPARE(withGrinder, id);
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, id).brand, QString("Niche"));
+        });
+    }
+
+    // --- identity dedup lookup ---
+    void identityDedup() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_dedup", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage pkg;
+            const qint64 id = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Niche", "Zero", "63mm conical");
+            QVERIFY(id > 0);
+            // Case-insensitive identity match.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "niche", "zero", "63mm conical"), id);
+            // Different burrs -> no match.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Niche", "Zero", "other"), (qint64)0);
+            // Unknown grinder -> no match.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "X", "Y", ""), (qint64)0);
+        });
+    }
+
+    // --- active-name uniqueness lookup (block-duplicate-active-names) ---
+    // Two in-inventory packages may not share a name; a name freed by removing a
+    // package from inventory becomes reusable. Comparison is trimmed and
+    // case-insensitive, and excludes the package being edited.
+    void activeNameUniqueness() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_namedup", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a;
+            a.name = "Espresso setup";
+            const qint64 idA = EquipmentStorage::createPackageWithGrinderStatic(
+                db, a, "Niche", "Zero", "63mm conical");
+            QVERIFY(idA > 0);
+
+            // Exact, case-insensitive and whitespace-insensitive matches all hit.
+            QCOMPARE(EquipmentStorage::findPackageByNameStatic(db, "Espresso setup"), idA);
+            QCOMPARE(EquipmentStorage::findPackageByNameStatic(db, "  espresso SETUP  "), idA);
+            // A different name does not.
+            QCOMPARE(EquipmentStorage::findPackageByNameStatic(db, "Filter setup"), (qint64)0);
+            // A blank name is derived from brand+model and never collides.
+            QCOMPARE(EquipmentStorage::findPackageByNameStatic(db, ""), (qint64)0);
+            QCOMPARE(EquipmentStorage::findPackageByNameStatic(db, "   "), (qint64)0);
+            // The package being edited is excluded, so renaming it to a casing
+            // variant of its own name is allowed.
+            QCOMPARE(EquipmentStorage::findPackageByNameStatic(db, "espresso setup", idA), (qint64)0);
+
+            // Removing it from inventory frees the name for reuse.
+            QVERIFY(EquipmentStorage::updatePackageFieldsStatic(db, idA, {{"inInventory", false}}));
+            QCOMPARE(EquipmentStorage::findPackageByNameStatic(db, "Espresso setup"), (qint64)0);
+        });
+    }
+
+    // --- active-name uniqueness through the async request* paths ---
+
+    // Re-saving a package under the name it ALREADY has must succeed, even when
+    // another in-inventory package shares that name. Blank names are derived and
+    // persisted at creation ("{brand} {model}"), so same-grinder/different-basket
+    // packages legitimately collide; a guard testing the submitted name alone
+    // locked the user out of editing gear they never named.
+    void unchangedDerivedNameStillSaves() {
+        const QString path = freshDbPath();
+        qint64 idA = 0, idB = 0;
+        withRawDb(path, "eq_pre", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a, b;   // both blank -> both derive "Niche Zero"
+            idA = EquipmentStorage::createPackageWithGrinderStatic(
+                db, a, "Niche", "Zero", "63mm conical", "Decent", "18g Ridged", "shaker");
+            idB = EquipmentStorage::createPackageWithGrinderStatic(
+                db, b, "Niche", "Zero", "63mm conical", "Decent", "18g Ridged", "shaker,rdt");
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, idA).name, QString("Niche Zero"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, idB).name, QString("Niche Zero"));
+        });
+        QVERIFY(idA > 0 && idB > 0 && idA != idB);
+
+        EquipmentStorage storage;
+        storage.initialize(path);
+        {   // Editing one, resubmitting its own derived name -> allowed.
+            QSignalSpy spy(&storage, &EquipmentStorage::packageUpdated);
+            storage.requestUpdatePackage(idB, {{"name", "Niche Zero"}, {"lastGrindSetting", "8.25"}});
+            QTRY_COMPARE(spy.count(), 1);
+            QCOMPARE(spy.at(0).at(1).toBool(), true);
+        }
+        withRawDb(path, "eq_pre2", [&](QSqlDatabase& db) {
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, idB).lastGrindSetting, QString("8.25"));
+        });
+    }
+
+    // A rename into a collision is refused BEFORE anything is written: no fork,
+    // no supersede, no field applied, and the reason precedes the terminal status.
+    void rejectedRenameIsCleanNoOp() {
+        const QString path = freshDbPath();
+        qint64 idA = 0, idB = 0;
+        withRawDb(path, "eq_rename", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a; a.name = "Espresso setup";
+            EquipmentPackage b; b.name = "Filter setup";
+            idA = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Niche", "Zero", "63mm conical");
+            idB = EquipmentStorage::createPackageWithGrinderStatic(db, b, "Turin", "DF83V", "83mm flat");
+        });
+        QVERIFY(idA > 0 && idB > 0);
+
+        EquipmentStorage storage;
+        storage.initialize(path);
+        QStringList order;
+        connect(&storage, &EquipmentStorage::packageUpdateFailed, this,
+                [&order](qint64, const QString& r) { order << ("failed:" + r); });
+        connect(&storage, &EquipmentStorage::packageUpdated, this,
+                [&order](qint64, bool ok) { order << (ok ? "updated:true" : "updated:false"); });
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("rejecting rename of package"));
+        QSignalSpy spy(&storage, &EquipmentStorage::packageUpdated);
+        // Rename onto A's name AND edit the identity in the same patch.
+        storage.requestUpdatePackage(idB, {{"name", "Espresso setup"}, {"grinderModel", "DF64"}});
+        QTRY_COMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toLongLong(), idB);   // no fork id
+        QCOMPARE(spy.at(0).at(1).toBool(), false);
+        QCOMPARE(order, QStringList({"failed:nameInUse", "updated:false"}));
+
+        withRawDb(path, "eq_rename2", [&](QSqlDatabase& db) {
+            const EquipmentPackage b = EquipmentStorage::loadPackageStatic(db, idB);
+            QCOMPARE(b.name, QString("Filter setup"));      // name untouched
+            QVERIFY(b.inInventory);                          // not retired by a supersede
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, idB).model, QString("DF83V"));
+            QSqlQuery q(db);
+            QVERIFY(q.exec("SELECT COUNT(*) FROM equipment_packages"));
+            QVERIFY(q.next());
+            QCOMPARE(q.value(0).toInt(), 2);                 // no new row minted
+        });
+    }
+
+    // Request-scoped completions remain correlated while writes for multiple
+    // packages share the serial worker. A stale same-name edit must not overwrite
+    // the first queued rename.
+    void requestScopedUpdateCompletionAndExpectedNameConflict() {
+        const QString path = freshDbPath();
+        qint64 idA = 0, idB = 0;
+        withRawDb(path, "eq_request_completion", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a; a.name = "A original";
+            EquipmentPackage b; b.name = "B original";
+            idA = EquipmentStorage::createPackageWithGrinderStatic(
+                db, a, "Niche", "Zero", "63mm conical");
+            idB = EquipmentStorage::createPackageWithGrinderStatic(
+                db, b, "Turin", "DF83V", "83mm flat");
+        });
+        QVERIFY(idA > 0 && idB > 0);
+
+        struct Completion {
+            qint64 requestedId;
+            qint64 resultingId;
+            bool success;
+            QString reason;
+        };
+        QVector<Completion> results;
+        EquipmentStorage storage;
+        storage.initialize(path);
+        auto record = [&results](qint64 requested, qint64 resulting, bool success,
+                                 const QString& reason) {
+            results.append({requested, resulting, success, reason});
+        };
+
+        storage.requestUpdatePackageWithCompletion(
+            idA, {{"name", "A first"}}, this, record, QString("A original"));
+        storage.requestUpdatePackageWithCompletion(
+            idB, {{"name", "B renamed"}}, this, record, QString("B original"));
+        storage.requestUpdatePackageWithCompletion(
+            idA, {{"name", "A stale overwrite"}}, this, record, QString("A original"));
+
+        QTRY_COMPARE(results.size(), 3);
+        QCOMPARE(results.at(0).requestedId, idA);
+        QCOMPARE(results.at(0).resultingId, idA);
+        QVERIFY(results.at(0).success);
+        QVERIFY(results.at(0).reason.isEmpty());
+        QCOMPARE(results.at(1).requestedId, idB);
+        QCOMPARE(results.at(1).resultingId, idB);
+        QVERIFY(results.at(1).success);
+        QCOMPARE(results.at(2).requestedId, idA);
+        QCOMPARE(results.at(2).resultingId, idA);
+        QVERIFY(!results.at(2).success);
+        QCOMPARE(results.at(2).reason, QString("expectedNameConflict"));
+
+        withRawDb(path, "eq_request_completion_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, idA).name, QString("A first"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, idB).name, QString("B renamed"));
+        });
+    }
+
+    // Identity updates can fork a package when a shot references it. The request
+    // callback reports both IDs so an HTTP caller can direct later edits to the
+    // actual package created by copy-on-write.
+    void requestScopedUpdateCompletionReportsForkId() {
+        const QString path = freshDbPath();
+        qint64 originalId = 0;
+        withRawDb(path, "eq_request_fork", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            createMinimalShots(db);
+            EquipmentPackage pkg; pkg.name = "Used grinder";
+            originalId = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, "Turin", "DF83V", "83mm flat steel");
+            QVERIFY(originalId > 0);
+            const qint64 shotId = insertShot(db, "Turin", "DF83V", "83mm flat steel", "8");
+            QSqlQuery q(db);
+            q.prepare("UPDATE shots SET equipment_id = ? WHERE id = ?");
+            q.addBindValue(originalId);
+            q.addBindValue(shotId);
+            QVERIFY(q.exec());
+        });
+        QVERIFY(originalId > 0);
+
+        EquipmentStorage storage;
+        storage.initialize(path);
+        bool completed = false;
+        qint64 requestedId = 0, resultingId = 0;
+        bool success = false;
+        QString reason;
+        storage.requestUpdatePackageWithCompletion(
+            originalId, {{"grinderBurrs", "83mm DLC flat"}}, this,
+            [&](qint64 requested, qint64 resulting, bool ok, const QString& why) {
+                requestedId = requested;
+                resultingId = resulting;
+                success = ok;
+                reason = why;
+                completed = true;
+            });
+
+        QTRY_VERIFY(completed);
+        QCOMPARE(requestedId, originalId);
+        QVERIFY(success);
+        QVERIFY(reason.isEmpty());
+        QVERIFY(resultingId > 0);
+        QVERIFY(resultingId != originalId);
+        withRawDb(path, "eq_request_fork_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, originalId).supersededBy,
+                     resultingId);
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, resultingId).burrs,
+                     QString("83mm DLC flat"));
+        });
+    }
+
+    void requestScopedCreateDeleteAndEditableSnapshotGuard() {
+        const QString path = freshDbPath();
+        qint64 packageId = 0;
+        withRawDb(path, "eq_scoped_crud_cas", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            EquipmentPackage pkg;
+            pkg.name = "Basket setup";
+            packageId = EquipmentStorage::createPackageWithGrinderStatic(
+                db, pkg, QString(), QString(), QString(), "IMS", "Big Bang", "wdt");
+            QVERIFY(packageId > 0);
+        });
+
+        EquipmentStorage storage;
+        storage.initialize(path);
+        QVariantMap originalSnapshot;
+        withRawDb(path, "eq_scoped_crud_cas_snapshot", [&](QSqlDatabase& db) {
+            originalSnapshot = EquipmentStorage::editableSnapshotStatic(db, packageId);
+        });
+        QCOMPARE(originalSnapshot.size(), 7);
+
+        struct Result { bool success; QString reason; };
+        QVector<Result> results;
+        auto completion = [&results](qint64, qint64, bool success, const QString& reason) {
+            results.append({success, reason});
+        };
+        storage.requestUpdatePackageWithCompletion(
+            packageId, {{"name", "Basket setup renamed"}}, this, completion,
+            std::nullopt, originalSnapshot);
+        storage.requestUpdatePackageWithCompletion(
+            packageId, {{"name", "Stale overwrite"}}, this, completion,
+            std::nullopt, originalSnapshot);
+        QTRY_COMPARE(results.size(), 2);
+        QVERIFY(results.at(0).success);
+        QVERIFY(results.at(0).reason.isEmpty());
+        QVERIFY(!results.at(1).success);
+        QCOMPARE(results.at(1).reason, QString("expectedEditableConflict"));
+        QVariantMap malformedSnapshot = originalSnapshot;
+        malformedSnapshot.insert(QStringLiteral("lastUsedEpoch"), 123);
+        storage.requestUpdatePackageWithCompletion(
+            packageId, {{QStringLiteral("name"), QStringLiteral("Malformed snapshot edit")}},
+            this, completion, std::nullopt, malformedSnapshot);
+        QTRY_COMPARE(results.size(), 3);
+        QVERIFY(!results.at(2).success);
+        QCOMPARE(results.at(2).reason, QStringLiteral("invalidPrecondition"));
+        withRawDb(path, "eq_scoped_crud_cas_verify", [&](QSqlDatabase& db) {
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, packageId).name,
+                     QString("Basket setup renamed"));
+        });
+
+        QSignalSpy legacyCreateSpy(&storage, &EquipmentStorage::packageCreated);
+        QSignalSpy legacyDeleteSpy(&storage, &EquipmentStorage::packageDeleted);
+        bool createCompleted = false;
+        bool deleteCompleted = false;
+        storage.requestCreatePackageWithCompletion(
+            {{"name", "Create scoped basket"}, {"basketBrand", "IMS"},
+             {"basketModel", "Competition"}}, this,
+            [&](qint64 id, const QVariantMap& package) {
+                QVERIFY(id > 0);
+                QVERIFY(!package.isEmpty());
+                createCompleted = true;
+                storage.requestDeletePackageWithCompletion(id, this,
+                    [&deleteCompleted, id](qint64 deletedId, bool success) {
+                        QCOMPARE(deletedId, id);
+                        deleteCompleted = success;
+                    });
+            });
+        QTRY_VERIFY(createCompleted);
+        QTRY_VERIFY(deleteCompleted);
+        QCOMPARE(legacyCreateSpy.count(), 0);
+        QCOMPARE(legacyDeleteSpy.count(), 0);
+    }
+
+    void referencedPackageDeleteGuardPreservesThePackage() {
+        const QString path = freshDbPath();
+        qint64 packageId = 0;
+        withRawDb(path, "eq_delete_reference_guard", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            EquipmentPackage package;
+            package.name = QStringLiteral("Referenced grinder");
+            packageId = EquipmentStorage::createPackageWithGrinderStatic(
+                db, package, QStringLiteral("Turin"), QStringLiteral("DF83V"),
+                QStringLiteral("83mm flat steel"));
+            QVERIFY(packageId > 0);
+            QSqlQuery shot(db);
+            shot.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+            shot.addBindValue(packageId);
+            QVERIFY(shot.exec());
+        });
+
+        EquipmentStorage storage;
+        storage.initialize(path);
+        QSignalSpy deleted(&storage, &EquipmentStorage::packageDeleted);
+        QTest::ignoreMessage(QtWarningMsg,
+                             QRegularExpression("refusing to delete package.*with references"));
+        storage.requestDeletePackage(packageId);
+        QTRY_COMPARE(deleted.size(), 1);
+        QCOMPARE(deleted.first().at(0).toLongLong(), packageId);
+        QVERIFY(!deleted.first().at(1).toBool());
+        withRawDb(path, "eq_delete_reference_guard_verify", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::loadPackageStatic(db, packageId).isValid());
+        });
+    }
+
+    // --- copy-on-write immutability + merge on identity edit ---
+    void copyOnWriteAndMerge() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_cow", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+
+            auto shotEq = [&](qint64 id) {
+                QSqlQuery q(db); q.prepare("SELECT equipment_id FROM shots WHERE id=?");
+                q.addBindValue(id); q.exec(); q.next(); return q.value(0).toLongLong();
+            };
+            auto addShot = [&](qint64 eq) {
+                QSqlQuery q(db);
+                q.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+                q.addBindValue(eq); q.exec(); return q.lastInsertId().toLongLong();
+            };
+
+            // Package P, used by a shot.
+            EquipmentPackage base;
+            const qint64 P = EquipmentStorage::createPackageWithGrinderStatic(db, base, "Turin", "DF83V", "83mm flat steel");
+            const qint64 shot = addShot(P);
+
+            // Edit burrs on a USED package -> fork (copy-on-write).
+            const qint64 fork = EquipmentStorage::supersedeOrEditGrinderStatic(db, P, "Turin", "DF83V", "83mm DLC flat");
+            QVERIFY(fork > 0 && fork != P);
+            // Old P retired + lineage; new fork current.
+            const EquipmentPackage oldP = EquipmentStorage::loadPackageStatic(db, P);
+            QVERIFY(!oldP.inInventory);
+            QCOMPARE(oldP.supersededBy, fork);
+            QCOMPARE(oldP.name, QString("Turin DF83V"));  // name persisted
+            const EquipmentPackage newP = EquipmentStorage::loadPackageStatic(db, fork);
+            QCOMPARE(newP.name, QString("Turin DF83V"));  // name preserved on fork
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, fork).burrs, QString("83mm DLC flat"));
+            // The shot stays on the old package (history).
+            QCOMPARE(shotEq(shot), P);
+
+            // Unchanged identity -> no-op (no new fork).
+            QCOMPARE(EquipmentStorage::supersedeOrEditGrinderStatic(db, fork, "Turin", "DF83V", "83mm DLC flat"), fork);
+
+            // Unused package edits in place (same id).
+            EquipmentPackage q2;
+            const qint64 Q = EquipmentStorage::createPackageWithGrinderStatic(db, q2, "Niche", "Zero", "63mm conical");
+            QCOMPARE(EquipmentStorage::supersedeOrEditGrinderStatic(db, Q, "Niche", "Zero", "swapped"), Q);
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, Q).burrs, QString("swapped"));
+
+            // ENRICHMENT (#1713): filling in a component that was EMPTY on a USED
+            // package is recording gear it always had, not a swap — edit in place,
+            // keep the id, keep the shots. A fork here retires the package the whole
+            // history hangs off and the grinder reads as brand new.
+            EquipmentPackage e;
+            const qint64 E = EquipmentStorage::createPackageWithGrinderStatic(db, e, "Eureka", "Mignon Single Dose", "");
+            const qint64 eShot = addShot(E);
+            QCOMPARE(EquipmentStorage::supersedeOrEditGrinderStatic(db, E, "Eureka", "Mignon Single Dose", "Lebrew Sweet"), E);
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, E).burrs, QString("Lebrew Sweet"));
+            QVERIFY(EquipmentStorage::loadPackageStatic(db, E).inInventory);   // not retired
+            QCOMPARE(shotEq(eShot), E);                                        // history still attached
+
+            // ...but CHANGING a component that had a value is a real swap and still
+            // forks, so the earlier shots keep the burrs they were actually pulled on.
+            const qint64 eFork = EquipmentStorage::supersedeOrEditGrinderStatic(db, E, "Eureka", "Mignon Single Dose", "Lebrew Sharp");
+            QVERIFY(eFork > 0 && eFork != E);
+            QCOMPARE(shotEq(eShot), E);
+
+            // Enrichment across the whole tuple: an empty basket + puck prep named
+            // for the first time on a used package stays in place too.
+            EquipmentPackage f;
+            const qint64 F = EquipmentStorage::createPackageWithGrinderStatic(db, f, "Niche", "Duo", "");
+            addShot(F);
+            QCOMPARE(EquipmentStorage::supersedeOrEditStatic(db, F, "Niche", "Duo", "83mm",
+                                                             "IMS", "Superfine 18g", QStringLiteral("wdt")), F);
+            QCOMPARE(EquipmentStorage::loadBasketItemStatic(db, F).model, QString("Superfine 18g"));
+            QCOMPARE(EquipmentStorage::loadPuckPrepItemStatic(db, F).model, QStringLiteral("wdt"));
+
+            // Adding a technique to an EXISTING puck prep is a change, not enrichment:
+            // the earlier shots really were pulled with the shorter routine.
+            const qint64 fFork = EquipmentStorage::supersedeOrEditStatic(db, F, "Niche", "Duo", "83mm",
+                                                                         "IMS", "Superfine 18g",
+                                                                         PuckPrep::recanonical(QStringLiteral("wdt,rdt")));
+            QVERIFY(fFork > 0 && fFork != F);
+
+            // A grinder-less (basket-only tea) package GAINING a grinder is a real
+            // identity change, not enrichment: its shots were pulled with nothing
+            // ground, and they must not start reporting a grinder.
+            EquipmentPackage tea;
+            const qint64 T = EquipmentStorage::createPackageWithGrinderStatic(
+                db, tea, "", "", "", "IMS", "Superfine 18g", QString());
+            const qint64 teaShot = addShot(T);
+            const qint64 teaFork = EquipmentStorage::supersedeOrEditStatic(
+                db, T, "Niche", "Zero", "", "IMS", "Superfine 18g", QString());
+            QVERIFY(teaFork > 0 && teaFork != T);
+            QCOMPARE(shotEq(teaShot), T);   // the tea shot keeps its grinder-less package
+
+            // Clearing a component is a change, not enrichment -> forks as well.
+            EquipmentPackage g;
+            const qint64 G = EquipmentStorage::createPackageWithGrinderStatic(db, g, "Mazzer", "Philos", "83mm");
+            addShot(G);
+            const qint64 gFork = EquipmentStorage::supersedeOrEditGrinderStatic(db, G, "Mazzer", "Philos", "");
+            QVERIFY(gFork > 0 && gFork != G);
+
+            // Merge: a USED package edited to the fork's identity merges into it.
+            EquipmentPackage s;
+            const qint64 S = EquipmentStorage::createPackageWithGrinderStatic(db, s, "Mazzer", "Major", "83mm");
+            addShot(S);
+            const qint64 merged = EquipmentStorage::supersedeOrEditGrinderStatic(db, S, "Turin", "DF83V", "83mm DLC flat");
+            QCOMPARE(merged, fork);  // repointed to the existing matching package
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, S).supersededBy, fork);
+
+            // A history load of the shot on P (or S) lands on the live fork;
+            // a removed or missing package resolves to nothing.
+            QCOMPARE(EquipmentStorage::currentPackageIdStatic(db, P), fork);
+            QCOMPARE(EquipmentStorage::currentPackageIdStatic(db, S), fork);
+            QCOMPARE(EquipmentStorage::currentPackageIdStatic(db, fork), fork);
+            QSqlQuery rm(db);
+            QVERIFY(rm.exec(QString("UPDATE equipment_packages SET in_inventory = 0 WHERE id = %1").arg(fork)));
+            QCOMPARE(EquipmentStorage::currentPackageIdStatic(db, P), qint64(0));
+            QCOMPARE(EquipmentStorage::currentPackageIdStatic(db, 999999), qint64(0));
+        });
+    }
+
+    // --- explicit two-id merge (the repair for a wrongly split grinder, #1713) ---
+    void mergePackagesById() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_merge_ids", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            auto addShot = [&](qint64 eq) {
+                QSqlQuery q(db); q.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+                q.addBindValue(eq); q.exec(); return q.lastInsertId().toLongLong();
+            };
+            auto shotEq = [&](qint64 id) {
+                QSqlQuery q(db); q.prepare("SELECT equipment_id FROM shots WHERE id=?");
+                q.addBindValue(id); q.exec(); q.next(); return q.value(0).toLongLong();
+            };
+            auto pkgExists = [&](qint64 id) {
+                QSqlQuery q(db); q.prepare("SELECT COUNT(*) FROM equipment_packages WHERE id=?");
+                q.addBindValue(id); q.exec(); q.next(); return q.value(0).toInt() > 0;
+            };
+
+            // The shape a pre-enrichment fork left behind: OLD holds the history and
+            // is retired, NEW is live and has the burrs. Undoing it means merging the
+            // live NEW into the retired OLD, so a retired target must be accepted.
+            EquipmentPackage o;
+            const qint64 old_ = EquipmentStorage::createPackageWithGrinderStatic(db, o, "Eureka", "Mignon Single Dose", "stock");
+            const qint64 oldShot = addShot(old_);
+            // A real burr CHANGE still forks (enrichment only covers empty -> value),
+            // which is how the two-package state under repair gets built here.
+            const qint64 fresh = EquipmentStorage::supersedeOrEditGrinderStatic(db, old_, "Eureka", "Mignon Single Dose", "Lebrew Sweet");
+            QVERIFY(fresh > 0 && fresh != old_);
+            const qint64 newShot = addShot(fresh);
+
+            const EquipmentMergeResult r = EquipmentStorage::mergePackagesStatic(db, fresh, old_);
+            QVERIFY2(r.ok, qPrintable(r.error));
+            QCOMPARE(r.shotsMoved, (qint64)1);
+            QCOMPARE(r.recipesMoved, (qint64)0);          // no recipes table in this fixture
+            QCOMPARE(shotEq(newShot), old_);              // history united on the survivor
+            QCOMPARE(shotEq(oldShot), old_);
+            QVERIFY(!pkgExists(fresh));                   // source gone, no dangling references
+            const EquipmentPackage survivor = EquipmentStorage::loadPackageStatic(db, old_);
+            QVERIFY(survivor.inInventory);                // revived: it holds the history now
+            QCOMPARE(survivor.supersededBy, (qint64)0);   // and no longer points at the deleted fork
+
+            // Refusals are clean no-ops with a machine-readable reason.
+            QCOMPARE(EquipmentStorage::mergePackagesStatic(db, old_, old_).error, QString("samePackage"));
+            QCOMPARE(EquipmentStorage::mergePackagesStatic(db, 99999, old_).error, QString("sourceNotFound"));
+            QCOMPARE(EquipmentStorage::mergePackagesStatic(db, old_, 99999).error, QString("targetNotFound"));
+            QVERIFY(pkgExists(old_));
+
+            // A third package superseded BY the source follows it to the target
+            // rather than being left pointing at a deleted row.
+            EquipmentPackage a;
+            const qint64 keep = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Mazzer", "Kold", "83mm");
+            addShot(keep);
+            const qint64 keepFork = EquipmentStorage::supersedeOrEditGrinderStatic(db, keep, "Mazzer", "Kold", "83mm titanium");
+            QVERIFY(keepFork > 0 && keepFork != keep);
+            QVERIFY(EquipmentStorage::mergePackagesStatic(db, keepFork, old_).ok);
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, keep).supersededBy, old_);
+        });
+    }
+
+    // Calibration anchors live on the package (add-grinder-ugs-calibration): a
+    // fork starts clean, a merge keeps the target's anchors and fills its empty
+    // sides from the source. (Delete-clears is migration 46's trigger, tested in
+    // tst_dialing_blocks, which runs the migrations.)
+    void calibrationAnchorsFollowThePackage() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_calib_anchors", [](QSqlDatabase& db) {
+            createMinimalShots(db);
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            auto addShot = [&](qint64 eq) {
+                QSqlQuery q(db); q.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+                q.addBindValue(eq); q.exec(); return q.lastInsertId().toLongLong();
+            };
+            EquipmentPackage p;
+            const qint64 P = EquipmentStorage::createPackageWithGrinderStatic(db, p, "Niche", "Zero", "63mm conical");
+            const qint64 s1 = addShot(P), s2 = addShot(P);
+            QVERIFY(EquipmentStorage::setCalibrationAnchorStatic(db, P, "fine", s1));
+            QVERIFY(EquipmentStorage::setCalibrationAnchorStatic(db, P, "coarse", s2));
+            QVERIFY(!EquipmentStorage::setCalibrationAnchorStatic(db, P, "medium", s2));
+
+            QVERIFY(EquipmentStorage::setCalibrationAnchorStatic(db, P, "fine", 0));
+            CalibrationAnchors a = EquipmentStorage::loadCalibrationAnchorsStatic(db, P);
+            QCOMPARE(a.fineShotId, qint64(0));
+            QCOMPARE(a.coarseShotId, s2);
+            Q_UNUSED(s1);
+
+            const qint64 fork = EquipmentStorage::supersedeOrEditGrinderStatic(db, P, "Niche", "Zero", "63mm SSP");
+            QVERIFY(fork > 0 && fork != P);
+            a = EquipmentStorage::loadCalibrationAnchorsStatic(db, fork);
+            QCOMPARE(a.fineShotId, qint64(0));
+            QCOMPARE(a.coarseShotId, qint64(0));
+            QCOMPARE(EquipmentStorage::loadCalibrationAnchorsStatic(db, P).coarseShotId, s2);
+
+            EquipmentPackage q;
+            const qint64 Q = EquipmentStorage::createPackageWithGrinderStatic(db, q, "Turin", "DF64", "64mm");
+            const qint64 s3 = addShot(Q);
+            QVERIFY(EquipmentStorage::setCalibrationAnchorStatic(db, Q, "fine", s3));
+            QVERIFY(EquipmentStorage::mergePackagesStatic(db, P, Q).ok);
+            a = EquipmentStorage::loadCalibrationAnchorsStatic(db, Q);
+            QCOMPARE(a.fineShotId, s3);    // the target's own
+            QCOMPARE(a.coarseShotId, s2);  // filled from the source
+        });
+    }
+
+    // --- merge sub-branches + name derivation ---
+    void mergeAndNameEdges() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_edges", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            auto addShot = [&](qint64 eq) {
+                QSqlQuery q(db); q.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+                q.addBindValue(eq); q.exec(); return q.lastInsertId().toLongLong();
+            };
+            auto pkgExists = [&](qint64 id) {
+                QSqlQuery q(db); q.prepare("SELECT COUNT(*) FROM equipment_packages WHERE id=?");
+                q.addBindValue(id); q.exec(); q.next(); return q.value(0).toInt() > 0;
+            };
+
+            EquipmentPackage t;
+            const qint64 target = EquipmentStorage::createPackageWithGrinderStatic(db, t, "Niche", "Zero", "63mm conical");
+
+            // Unused source merged into an existing target → source hard-deleted.
+            EquipmentPackage s;
+            const qint64 src = EquipmentStorage::createPackageWithGrinderStatic(db, s, "Mazzer", "Major", "83mm");
+            QCOMPARE(EquipmentStorage::supersedeOrEditGrinderStatic(db, src, "Niche", "Zero", "63mm conical"), target);
+            QVERIFY(!pkgExists(src));  // unused source physically removed, not just retired
+
+            // Editing a used package onto an ARCHIVED package's identity merges into
+            // it and restores it (add-grinder-ugs-calibration), rather than forking a
+            // duplicate of archived gear.
+            EquipmentPackage u;
+            const qint64 used = EquipmentStorage::createPackageWithGrinderStatic(db, u, "Turin", "DF83V", "83mm flat steel");
+            addShot(used);
+            { QSqlQuery q(db); q.prepare("UPDATE equipment_packages SET in_inventory=0 WHERE id=?");
+              q.addBindValue(target); q.exec(); }
+            QCOMPARE(EquipmentStorage::supersedeOrEditGrinderStatic(db, used, "Niche", "Zero", "63mm conical"), target);
+            QVERIFY(EquipmentStorage::loadPackageStatic(db, target).inInventory);
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, used).supersededBy, target);  // kept, retired into it
+
+            // Name derived from a partial identity (brand only).
+            EquipmentPackage p;
+            const qint64 pid = EquipmentStorage::createPackageWithGrinderStatic(db, p, "Turin", "", "");
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, pid).name, QString("Turin"));
+        });
+    }
+
+    // --- basket: optional second item + derive-at-read + setBasketItemStatic ---
+    void basketOptionalAndDerive() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_basket", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+
+            // Grinder-only package: no basket item.
+            EquipmentPackage p0;
+            const qint64 g0 = EquipmentStorage::createPackageWithGrinderStatic(db, p0, "Niche", "Zero", "63mm conical");
+            QVERIFY(g0 > 0);
+            QVERIFY(!EquipmentStorage::loadBasketItemStatic(db, g0).isValid());
+
+            // Regression: a grinder-only lookup (basket params default to a NULL
+            // QString) MUST find a no-basket package. Without the bind-side
+            // IFNULL(:bbrand,'') in findPackageByGrinderIdentityStatic the null
+            // binds as SQL NULL, '' = NULL is never true, and the package is missed
+            // — re-creating it as a duplicate. Pin the fix here (basketIdentityWidening
+            // can't: its packages all have baskets, so it returns 0 either way).
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Niche", "Zero", "63mm conical"), g0);
+
+            // setBasketItemStatic inserts when the package has no basket yet, and a
+            // clear on an already-basketless package is a success no-op (true), not
+            // a failure (the return-contract the edit-in-place rollback depends on).
+            QVERIFY(EquipmentStorage::setBasketItemStatic(db, g0, "", ""));  // no-op -> true
+            QVERIFY(EquipmentStorage::setBasketItemStatic(db, g0, "VST", "18g"));  // insert -> true
+            QCOMPARE(EquipmentStorage::loadBasketItemStatic(db, g0).model, QString("18g"));
+            QVERIFY(EquipmentStorage::setBasketItemStatic(db, g0, "", ""));  // clear existing -> true
+            QVERIFY(!EquipmentStorage::loadBasketItemStatic(db, g0).isValid());
+
+            // Package with a registry basket (created in one call).
+            EquipmentPackage p1;
+            const qint64 g1 = EquipmentStorage::createPackageWithGrinderStatic(
+                db, p1, "Turin", "DF83V", "83mm flat steel", "Decent", "18g Ridgeless");
+            QVERIFY(g1 > 0);
+            const EquipmentItem b = EquipmentStorage::loadBasketItemStatic(db, g1);
+            QVERIFY(b.isValid());
+            QCOMPARE(b.kind, QString("basket"));
+            QCOMPARE(b.brand, QString("Decent"));
+            QCOMPARE(b.model, QString("18g Ridgeless"));
+
+            // Derive-at-read: the view's variant map carries REGISTRY specs (the
+            // basket item itself stores none).
+            EquipmentPackageView v;
+            v.package = EquipmentStorage::loadPackageStatic(db, g1);
+            v.grinder = EquipmentStorage::loadGrinderItemStatic(db, g1);
+            v.basket = b;
+            const QVariantMap m = v.toVariantMap();
+            QCOMPARE(m.value("basketBrand").toString(), QString("Decent"));
+            QCOMPARE(m.value("basketWallProfile").toString(), QString("straight"));
+            QVERIFY(m.value("basketPrecision").toBool());
+            QVERIFY(m.value("basketDoseMaxG").toDouble() > 0);
+
+            // A custom (off-registry) basket resolves to identity only — no specs.
+            EquipmentPackage p2;
+            const qint64 g2 = EquipmentStorage::createPackageWithGrinderStatic(
+                db, p2, "Niche", "Zero", "63mm", "Acme", "Imaginary Basket");
+            EquipmentPackageView v2;
+            v2.package = EquipmentStorage::loadPackageStatic(db, g2);
+            v2.grinder = EquipmentStorage::loadGrinderItemStatic(db, g2);
+            v2.basket = EquipmentStorage::loadBasketItemStatic(db, g2);
+            const QVariantMap m2 = v2.toVariantMap();
+            QCOMPARE(m2.value("basketBrand").toString(), QString("Acme"));
+            QVERIFY(!m2.contains("basketWallProfile"));  // unknown specs omitted
+
+            // setBasketItemStatic: clear removes the item; set re-adds.
+            QVERIFY(EquipmentStorage::setBasketItemStatic(db, g1, "", ""));
+            QVERIFY(!EquipmentStorage::loadBasketItemStatic(db, g1).isValid());
+            QVERIFY(EquipmentStorage::setBasketItemStatic(db, g1, "VST", "18g"));
+            QCOMPARE(EquipmentStorage::loadBasketItemStatic(db, g1).model, QString("18g"));
+        });
+    }
+
+    // --- basket participates in package identity (dedup + copy-on-write) ---
+    void basketIdentityWidening() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_basket_id", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            auto addShot = [&](qint64 eq) {
+                QSqlQuery q(db); q.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+                q.addBindValue(eq); q.exec(); return q.lastInsertId().toLongLong();
+            };
+
+            // Same grinder, different basket → distinct packages.
+            EquipmentPackage a, bp;
+            const qint64 A = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Turin", "DF83V", "83mm", "VST", "18g");
+            const qint64 B = EquipmentStorage::createPackageWithGrinderStatic(db, bp, "Turin", "DF83V", "83mm", "Weber", "Unibasket 18g");
+            QVERIFY(A > 0 && B > 0 && A != B);
+
+            // Full-identity dedup: grinder AND basket must match.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Turin", "DF83V", "83mm", 0, "VST", "18g"), A);
+            // Same grinder, wrong basket → not A.
+            QVERIFY(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Turin", "DF83V", "83mm", 0, "VST", "20g") != A);
+            // "No basket" is a distinct identity: grinder-only query matches neither.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Turin", "DF83V", "83mm"), (qint64)0);
+
+            // Changing the basket on a USED package forks (copy-on-write).
+            addShot(A);
+            const qint64 fork = EquipmentStorage::supersedeOrEditStatic(db, A, "Turin", "DF83V", "83mm", "IMS", "Competition 18g", QString());
+            QVERIFY(fork > 0 && fork != A);
+            QCOMPARE(EquipmentStorage::loadBasketItemStatic(db, fork).brand, QString("IMS"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, A).supersededBy, fork);
+
+            // The grinder-only wrapper PRESERVES the basket.
+            EquipmentPackage cpk;
+            const qint64 C = EquipmentStorage::createPackageWithGrinderStatic(db, cpk, "Mazzer", "Major", "83mm", "VST", "20g");
+            const qint64 c2 = EquipmentStorage::supersedeOrEditGrinderStatic(db, C, "Mazzer", "Major V2", "83mm");
+            QCOMPARE(c2, C);  // unused → edit in place
+            QCOMPARE(EquipmentStorage::loadBasketItemStatic(db, C).model, QString("20g"));  // basket preserved
+        });
+    }
+
+    // --- puck prep: canonical helper, optional item, derive-at-read, set contract ---
+    void puckPrepOptionalAndDerive() {
+        // Canonical is order-independent + sorted (the identity key).
+        auto canon = [](bool wdt, bool shaker, bool puckScreen, bool paper, bool rdt) {
+            QVariantMap m;
+            m["wdt"] = wdt; m["shaker"] = shaker; m["puckScreen"] = puckScreen;
+            m["paperFilter"] = paper; m["rdt"] = rdt;
+            return PuckPrep::canonical(m);
+        };
+        QCOMPARE(canon(true, true, false, false, false), QString("shaker,wdt"));
+        QCOMPARE(canon(false, false, false, false, false), QString(""));
+        QCOMPARE(PuckPrep::distribution("shaker,wdt"), QString("thorough"));
+        QCOMPARE(PuckPrep::distribution("shaker"), QString("thorough"));     // shaker == WDT (equal weight)
+        QCOMPARE(PuckPrep::distribution("rdt"), QString("light"));           // anti-static only
+        QCOMPARE(PuckPrep::distribution("puckScreen"), QString("none"));     // no active distribution
+
+        // recanonical: idempotent, re-sorts an unsorted string, drops unknown tokens.
+        QCOMPARE(PuckPrep::recanonical("shaker,wdt"), QString("shaker,wdt"));
+        QCOMPARE(PuckPrep::recanonical("wdt,shaker"), QString("shaker,wdt"));   // re-sorted
+        QCOMPARE(PuckPrep::recanonical("wdt,bogus, shaker "), QString("shaker,wdt")); // unknown dropped
+        QCOMPARE(PuckPrep::recanonical(""), QString(""));
+
+        // canonicalMerged: partial overrides on a current string keep the untouched
+        // flags — the load-bearing data-preservation path for partial (MCP/dialog)
+        // edits. A regression here silently wipes a user's other flags.
+        auto over = [](const QString& key, bool v) { QVariantMap m; m["puckPrep_" + key] = v; return m; };
+        QCOMPARE(PuckPrep::canonicalMerged("shaker,wdt", over("paperFilter", true)),
+                 QString("paperFilter,shaker,wdt"));               // added, re-sorted, others kept
+        QCOMPARE(PuckPrep::canonicalMerged("shaker,wdt", over("wdt", false)),
+                 QString("shaker"));                               // one cleared, rest kept
+        QCOMPARE(PuckPrep::canonicalMerged("", over("wdt", true)), QString("wdt"));  // from empty
+        QCOMPARE(PuckPrep::canonicalMerged("rdt,wdt", QVariantMap()), QString("rdt,wdt")); // empty map = no change
+        // mapTouches gates the edit: a puckPrep_* key trips it; unrelated keys / {} don't.
+        QVERIFY(PuckPrep::mapTouches(over("wdt", true)));
+        QVERIFY(!PuckPrep::mapTouches(QVariantMap{{"basketBrand", "VST"}}));
+        QVERIFY(!PuckPrep::mapTouches(QVariantMap()));
+
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_puck", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+
+            // Create a package with puck prep in one call.
+            EquipmentPackage p1;
+            const qint64 g1 = EquipmentStorage::createPackageWithGrinderStatic(
+                db, p1, "Turin", "DF83V", "83mm", QString(), QString(), "shaker,wdt");
+            QVERIFY(g1 > 0);
+            const EquipmentItem pp = EquipmentStorage::loadPuckPrepItemStatic(db, g1);
+            QVERIFY(pp.isValid());
+            QCOMPARE(pp.kind, QString("puckprep"));
+            QCOMPARE(pp.model, QString("shaker,wdt"));  // canonical in `model`
+
+            // Derive-at-read: the view map carries the flags + canonical string
+            // (distribution is AI-only and excluded — asserted below).
+            EquipmentPackageView v;
+            v.package = EquipmentStorage::loadPackageStatic(db, g1);
+            v.grinder = EquipmentStorage::loadGrinderItemStatic(db, g1);
+            v.puckPrep = pp;
+            const QVariantMap m = v.toVariantMap();
+            QCOMPARE(m.value("puckPrep_wdt").toBool(), true);
+            QCOMPARE(m.value("puckPrep_shaker").toBool(), true);
+            QCOMPARE(m.value("puckPrep_puckScreen").toBool(), false);
+            QCOMPARE(m.value("puckPrepCanonical").toString(), QString("shaker,wdt"));
+            // distribution is AI-only — deliberately NOT in the QML-facing map.
+            QVERIFY(!m.contains("puckPrepDistribution"));
+
+            // Grinder-only package: no puckprep item; map omits the fields.
+            EquipmentPackage p0;
+            const qint64 g0 = EquipmentStorage::createPackageWithGrinderStatic(db, p0, "Niche", "Zero", "63mm");
+            QVERIFY(!EquipmentStorage::loadPuckPrepItemStatic(db, g0).isValid());
+
+            // setPuckPrepItemStatic: insert, no-op-clear (true), update, clear.
+            QVERIFY(EquipmentStorage::setPuckPrepItemStatic(db, g0, ""));        // no-op → true
+            QVERIFY(EquipmentStorage::setPuckPrepItemStatic(db, g0, "wdt"));     // insert → true
+            QCOMPARE(EquipmentStorage::loadPuckPrepItemStatic(db, g0).model, QString("wdt"));
+            QVERIFY(EquipmentStorage::setPuckPrepItemStatic(db, g0, "rdt,wdt")); // update → true
+            QCOMPARE(EquipmentStorage::loadPuckPrepItemStatic(db, g0).model, QString("rdt,wdt"));
+            QVERIFY(EquipmentStorage::setPuckPrepItemStatic(db, g0, ""));        // clear → true
+            QVERIFY(!EquipmentStorage::loadPuckPrepItemStatic(db, g0).isValid());
+        });
+    }
+
+    // --- puck prep participates in package identity (dedup + copy-on-write) ---
+    void puckPrepIdentityWidening() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_puck_id", [](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            QVERIFY(CoffeeBagStorage::ensureTableStatic(db));
+            createMinimalShots(db);
+            auto addShot = [&](qint64 eq) {
+                QSqlQuery q(db); q.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+                q.addBindValue(eq); q.exec(); return q.lastInsertId().toLongLong();
+            };
+
+            // Same grinder, different puck prep → distinct packages.
+            EquipmentPackage a, b;
+            const qint64 A = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Turin", "DF83V", "83mm", QString(), QString(), "wdt");
+            const qint64 B = EquipmentStorage::createPackageWithGrinderStatic(db, b, "Turin", "DF83V", "83mm", QString(), QString(), "shaker,wdt");
+            QVERIFY(A > 0 && B > 0 && A != B);
+
+            // Full-identity dedup keys on puck prep too.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Turin", "DF83V", "83mm", 0, QString(), QString(), "wdt"), A);
+            // An UNSORTED query arg still matches the canonical-stored value (the
+            // lookup re-canonicalizes its bind), so dedup can't be defeated by order.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Turin", "DF83V", "83mm", 0, QString(), QString(), "wdt,shaker"), B);
+            // "No puck prep" is a distinct value: a grinder+basket-only query matches neither.
+            QCOMPARE(EquipmentStorage::findPackageByGrinderIdentityStatic(db, "Turin", "DF83V", "83mm"), (qint64)0);
+
+            // Changing puck prep on a USED package forks.
+            addShot(A);
+            const qint64 fork = EquipmentStorage::supersedeOrEditStatic(db, A, "Turin", "DF83V", "83mm", QString(), QString(), "rdt,wdt");
+            QVERIFY(fork > 0 && fork != A);
+            QCOMPARE(EquipmentStorage::loadPuckPrepItemStatic(db, fork).model, QString("rdt,wdt"));
+            QCOMPARE(EquipmentStorage::loadPackageStatic(db, A).supersededBy, fork);
+
+            // The grinder-only wrapper PRESERVES puck prep.
+            EquipmentPackage cpk;
+            const qint64 C = EquipmentStorage::createPackageWithGrinderStatic(db, cpk, "Mazzer", "Major", "83mm", QString(), QString(), "wdt");
+            const qint64 c2 = EquipmentStorage::supersedeOrEditGrinderStatic(db, C, "Mazzer", "Major V2", "83mm");
+            QCOMPARE(c2, C);  // unused → edit in place
+            QCOMPARE(EquipmentStorage::loadPuckPrepItemStatic(db, C).model, QString("wdt"));  // preserved
+
+            // Partial edit through the same storage path requestUpdatePackage / the
+            // MCP equipment_update use (canonicalMerged): a single-flag override on an
+            // unused package preserves the rest.
+            EquipmentPackage dpk;
+            const qint64 D = EquipmentStorage::createPackageWithGrinderStatic(db, dpk, "Niche", "Zero", "63mm", QString(), QString(), "shaker,wdt");
+            const QString merged = PuckPrep::canonicalMerged(EquipmentStorage::loadPuckPrepItemStatic(db, D).model,
+                                                             QVariantMap{{"puckPrep_paperFilter", true}});
+            QCOMPARE(EquipmentStorage::supersedeOrEditStatic(db, D, "Niche", "Zero", "63mm", QString(), QString(), merged), D);
+            QCOMPARE(EquipmentStorage::loadPuckPrepItemStatic(db, D).model, QString("paperFilter,shaker,wdt"));
+        });
+    }
+
+    // --- puck prep in device-transfer dedup: same gear + same prep merges,
+    //     same gear + different prep stays distinct (no basket either side). ---
+    void puckPrepImportDedup() {
+        const QString srcPath = freshDbPath();
+        const QString dstPath = freshDbPath();
+
+        qint64 srcDiff = -1, srcSame = -1;
+        withRawDb(srcPath, "impp_src", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a, b;
+            srcDiff = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Niche", "Zero", "63mm", QString(), QString(), "wdt");
+            srcSame = EquipmentStorage::createPackageWithGrinderStatic(db, b, "Mazzer", "Major", "83mm", QString(), QString(), "shaker,wdt");
+        });
+        QVERIFY(srcDiff > 0 && srcSame > 0);
+
+        qint64 dstDiff = -1, dstSame = -1;
+        withRawDb(dstPath, "impp_dst", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a, b;
+            dstDiff = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Niche", "Zero", "63mm", QString(), QString(), "shaker"); // diff prep
+            dstSame = EquipmentStorage::createPackageWithGrinderStatic(db, b, "Mazzer", "Major", "83mm", QString(), QString(), "shaker,wdt"); // same
+        });
+        QVERIFY(dstDiff > 0 && dstSame > 0);
+
+        QHash<qint64, qint64> idMap;
+        {
+            QSqlDatabase src = QSqlDatabase::addDatabase("QSQLITE", "impp_s");
+            src.setDatabaseName(srcPath); QVERIFY(src.open());
+            QSqlDatabase dst = QSqlDatabase::addDatabase("QSQLITE", "impp_d");
+            dst.setDatabaseName(dstPath); QVERIFY(dst.open());
+            QVERIFY(EquipmentStorage::importEquipmentStatic(src, dst, /*merge*/ true, idMap));
+            src = QSqlDatabase(); dst = QSqlDatabase();
+        }
+        QSqlDatabase::removeDatabase("impp_s");
+        QSqlDatabase::removeDatabase("impp_d");
+
+        // Different prep -> imported as a NEW dest package, not merged onto dstDiff.
+        QVERIFY(idMap.value(srcDiff) > 0 && idMap.value(srcDiff) != dstDiff);
+        // Same grinder + same prep -> merged onto the existing dest package.
+        QCOMPARE(idMap.value(srcSame), dstSame);
+    }
+
+    // Device-transfer import (add-equipment-packages task 2.8):
+    // importEquipmentStatic copies packages + items with id-remap, MERGES an
+    // in-inventory source package onto an existing dest package of the same
+    // grinder identity (no duplicate), imports superseded (historical) packages
+    // as new rows, and remaps the superseded_by lineage pointer through the id
+    // map. Source ids must NOT survive verbatim into dest.
+    void importEquipmentRemap() {
+        const QString srcPath = freshDbPath();
+        const QString dstPath = freshDbPath();
+
+        // SOURCE: an in-inventory Niche (will merge into dest), plus a Turin
+        // lineage — an in-inventory "new" fork and a soft-deleted "old" package
+        // whose superseded_by points at the fork.
+        qint64 srcNiche = -1, srcTurinNew = -1, srcTurinOld = -1;
+        withRawDb(srcPath, "imp_src_build", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage n;
+            srcNiche = EquipmentStorage::createPackageWithGrinderStatic(db, n, "Niche", "Zero", "63mm conical");
+            EquipmentPackage t1;
+            srcTurinNew = EquipmentStorage::createPackageWithGrinderStatic(db, t1, "Turin", "DF83V", "83mm DLC flat");
+            EquipmentPackage t0;
+            srcTurinOld = EquipmentStorage::createPackageWithGrinderStatic(db, t0, "Turin", "DF83V", "83mm flat steel");
+            QSqlQuery q(db);
+            q.prepare("UPDATE equipment_packages SET in_inventory = 0, superseded_by = ? WHERE id = ?");
+            q.addBindValue(srcTurinNew); q.addBindValue(srcTurinOld);
+            QVERIFY(q.exec());
+        });
+        QVERIFY(srcNiche > 0 && srcTurinNew > 0 && srcTurinOld > 0);
+
+        // DEST: a pre-existing in-inventory Niche/Zero/63mm conical the source
+        // Niche must merge into.
+        qint64 dstNiche = -1;
+        withRawDb(dstPath, "imp_dst_build", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage n;
+            dstNiche = EquipmentStorage::createPackageWithGrinderStatic(db, n, "Niche", "Zero", "63mm conical");
+        });
+        QVERIFY(dstNiche > 0);
+
+        // Import (merge mode) with both connections open simultaneously.
+        QHash<qint64, qint64> idMap;
+        {
+            QSqlDatabase src = QSqlDatabase::addDatabase("QSQLITE", "imp_src");
+            src.setDatabaseName(srcPath);
+            QVERIFY(src.open());
+            QSqlDatabase dst = QSqlDatabase::addDatabase("QSQLITE", "imp_dst");
+            dst.setDatabaseName(dstPath);
+            QVERIFY(dst.open());
+            QVERIFY(EquipmentStorage::importEquipmentStatic(src, dst, /*merge*/ true, idMap));
+            src = QSqlDatabase();
+            dst = QSqlDatabase();
+        }
+        QSqlDatabase::removeDatabase("imp_src");
+        QSqlDatabase::removeDatabase("imp_dst");
+
+        withRawDb(dstPath, "imp_verify", [&](QSqlDatabase& db) {
+            // Merge: the source Niche mapped onto the existing dest Niche.
+            QCOMPARE(idMap.value(srcNiche), dstNiche);
+            QSqlQuery c(db);
+            QVERIFY(c.exec("SELECT COUNT(*) FROM equipment_items WHERE kind='grinder' AND brand='Niche'") && c.next());
+            QCOMPARE(c.value(0).toInt(), 1);  // no duplicate Niche package/item
+
+            // Both Turin packages imported as NEW rows (ids remapped, not verbatim).
+            const qint64 dTurinNew = idMap.value(srcTurinNew);
+            const qint64 dTurinOld = idMap.value(srcTurinOld);
+            QVERIFY(dTurinNew > 0 && dTurinOld > 0);
+
+            // The old Turin is soft-deleted with superseded_by remapped to the
+            // NEW dest id — lineage preserved across the transfer.
+            const EquipmentPackage oldP = EquipmentStorage::loadPackageStatic(db, dTurinOld);
+            QVERIFY(!oldP.inInventory);
+            QCOMPARE(oldP.supersededBy, dTurinNew);
+
+            // Items rode along with their grinder identity.
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, dTurinNew).burrs, QString("83mm DLC flat"));
+            QCOMPARE(EquipmentStorage::loadGrinderItemStatic(db, dTurinOld).burrs, QString("83mm flat steel"));
+        });
+    }
+
+    // Archive (removed, not forked) is reversible: listed, restorable, and
+    // recreating or editing to its gear brings the same row back.
+    void archiveRestoreAndRevive() {
+        const QString path = freshDbPath();
+        withRawDb(path, "eq_archive", [](QSqlDatabase& db) {
+            createMinimalShots(db);
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            auto addShot = [&](qint64 eq) {
+                QSqlQuery q(db); q.prepare("INSERT INTO shots (equipment_id) VALUES (?)");
+                q.addBindValue(eq); q.exec();
+            };
+            auto ids = [](const QVector<EquipmentPackageView>& views) {
+                QList<qint64> out;
+                for (const EquipmentPackageView& v : views) out << v.package.id;
+                return out;
+            };
+            auto create = [&](const char* burrs, const char* name, bool* reused = nullptr) {
+                QString fail;
+                return EquipmentStorage::createPackageStatic(db, QVariantMap{
+                    {"name", name}, {"grinderBrand", "Niche"}, {"grinderModel", "Zero"},
+                    {"grinderBurrs", burrs}}, nullptr, &fail, reused);
+            };
+            auto archive = [&](qint64 id) {
+                QVERIFY(EquipmentStorage::updatePackageFieldsStatic(db, id, {{"inInventory", false}}));
+            };
+
+            const qint64 A = create("63mm conical", "Home");
+            addShot(A);
+            archive(A);
+            QVERIFY(ids(EquipmentStorage::loadArchivedStatic(db)).contains(A));
+            QVERIFY(!ids(EquipmentStorage::loadInventoryStatic(db)).contains(A));
+
+            // Creating the same gear restores A instead of duplicating it.
+            bool reused = false;
+            QCOMPARE(create("63mm conical", "", &reused), A);
+            QVERIFY(reused);
+            QVERIFY(EquipmentStorage::loadPackageStatic(db, A).inInventory);
+
+            // An identity edit that lands on archived gear merges into it and restores it.
+            archive(A);
+            const qint64 B = create("SSP 63", "Spare");
+            QCOMPARE(EquipmentStorage::supersedeOrEditGrinderStatic(db, B, "Niche", "Zero", "63mm conical"), A);
+            QVERIFY(EquipmentStorage::loadPackageStatic(db, A).inInventory);
+
+            // A forked package is history, not archive: not listed, not revived, not restorable.
+            const qint64 F = create("Kony", "Old");
+            addShot(F);
+            const qint64 G = EquipmentStorage::supersedeOrEditGrinderStatic(db, F, "Niche", "Zero", "Kony v2");
+            QVERIFY(G > 0 && G != F);
+            QVERIFY(!ids(EquipmentStorage::loadArchivedStatic(db)).contains(F));
+            QVERIFY(create("Kony", "") != F);
+            QString why;
+            QVERIFY(!EquipmentStorage::restorePackageStatic(db, F, &why));
+            QCOMPARE(why, QStringLiteral("notArchived"));
+
+            // Restore is not a rename: a name another active package also holds
+            // (derived names repeat by design) does not block it.
+            archive(A);
+            QVERIFY(create("Mazzer Kony", "Home") > 0);
+            QVERIFY(EquipmentStorage::restorePackageStatic(db, A, &why));
+            QVERIFY(EquipmentStorage::loadPackageStatic(db, A).inInventory);
+        });
+    }
+
+    // Device transfer carries anchors through both id maps, and an existing
+    // destination package keeps the anchor it already has.
+    void importCarriesCalibrationAnchors() {
+        const QString srcPath = freshDbPath();
+        const QString dstPath = freshDbPath();
+        qint64 srcPkg = -1;
+        withRawDb(srcPath, "imp_calib_src", [&](QSqlDatabase& db) {
+            createMinimalShots(db);
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage n;
+            srcPkg = EquipmentStorage::createPackageWithGrinderStatic(db, n, "Niche", "Zero", "63mm conical");
+            QVERIFY(QSqlQuery(db).exec(QString("INSERT INTO shots (id, equipment_id) VALUES (5, %1), (6, %1)").arg(srcPkg)));
+            QVERIFY(EquipmentStorage::setCalibrationAnchorStatic(db, srcPkg, "fine", 5));
+            QVERIFY(EquipmentStorage::setCalibrationAnchorStatic(db, srcPkg, "coarse", 6));
+        });
+        qint64 dstPkg = -1;
+        withRawDb(dstPath, "imp_calib_dst", [&](QSqlDatabase& db) {
+            createMinimalShots(db);
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage n;
+            dstPkg = EquipmentStorage::createPackageWithGrinderStatic(db, n, "Niche", "Zero", "63mm conical");
+            QVERIFY(QSqlQuery(db).exec(QString("INSERT INTO shots (id, equipment_id) VALUES (40, %1), (50, %1), (60, %1)").arg(dstPkg)));
+            QVERIFY(EquipmentStorage::setCalibrationAnchorStatic(db, dstPkg, "fine", 40));
+        });
+
+        {
+            QSqlDatabase src = QSqlDatabase::addDatabase("QSQLITE", "imp_calib_s");
+            src.setDatabaseName(srcPath);
+            QVERIFY(src.open());
+            QSqlDatabase dst = QSqlDatabase::addDatabase("QSQLITE", "imp_calib_d");
+            dst.setDatabaseName(dstPath);
+            QVERIFY(dst.open());
+            QHash<qint64, qint64> pkgMap;
+            QVERIFY(EquipmentStorage::importEquipmentStatic(src, dst, /*merge*/ true, pkgMap));
+            QCOMPARE(pkgMap.value(srcPkg), dstPkg);
+            const QHash<qint64, qint64> shotMap{{5, 50}, {6, 60}};
+            QVERIFY(EquipmentStorage::importCalibrationAnchorsStatic(src, dst, pkgMap, shotMap));
+            const CalibrationAnchors a = EquipmentStorage::loadCalibrationAnchorsStatic(dst, dstPkg);
+            QCOMPARE(a.fineShotId, qint64(40));    // kept
+            QCOMPARE(a.coarseShotId, qint64(60));  // carried, remapped
+            src = QSqlDatabase();
+            dst = QSqlDatabase();
+        }
+        QSqlDatabase::removeDatabase("imp_calib_s");
+        QSqlDatabase::removeDatabase("imp_calib_d");
+    }
+
+    // Import dedup keys on the FULL identity (grinder + basket): a source package
+    // merges into a dest package only when BOTH match. Same grinder + DIFFERENT
+    // basket must NOT merge, or the basket identity is silently lost in transfer.
+    void importEquipmentBasketDedup() {
+        const QString srcPath = freshDbPath();
+        const QString dstPath = freshDbPath();
+
+        qint64 srcDiff = -1, srcSame = -1;
+        withRawDb(srcPath, "impb_src", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a, b;
+            srcDiff = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Niche", "Zero", "63mm", "VST", "18g");
+            srcSame = EquipmentStorage::createPackageWithGrinderStatic(db, b, "Mazzer", "Major", "83mm", "VST", "18g");
+        });
+        QVERIFY(srcDiff > 0 && srcSame > 0);
+
+        qint64 dstDiff = -1, dstSame = -1;
+        withRawDb(dstPath, "impb_dst", [&](QSqlDatabase& db) {
+            QVERIFY(EquipmentStorage::ensureTablesStatic(db));
+            EquipmentPackage a, b;
+            // Same grinder as srcDiff but a DIFFERENT basket -> must stay distinct.
+            dstDiff = EquipmentStorage::createPackageWithGrinderStatic(db, a, "Niche", "Zero", "63mm", "Weber", "20g Unibasket");
+            // Same grinder AND basket as srcSame -> must merge.
+            dstSame = EquipmentStorage::createPackageWithGrinderStatic(db, b, "Mazzer", "Major", "83mm", "VST", "18g");
+        });
+        QVERIFY(dstDiff > 0 && dstSame > 0);
+
+        QHash<qint64, qint64> idMap;
+        {
+            QSqlDatabase src = QSqlDatabase::addDatabase("QSQLITE", "impb_s");
+            src.setDatabaseName(srcPath); QVERIFY(src.open());
+            QSqlDatabase dst = QSqlDatabase::addDatabase("QSQLITE", "impb_d");
+            dst.setDatabaseName(dstPath); QVERIFY(dst.open());
+            QVERIFY(EquipmentStorage::importEquipmentStatic(src, dst, /*merge*/ true, idMap));
+            src = QSqlDatabase(); dst = QSqlDatabase();
+        }
+        QSqlDatabase::removeDatabase("impb_s");
+        QSqlDatabase::removeDatabase("impb_d");
+
+        // Different basket -> imported as a NEW dest package, NOT merged onto dstDiff.
+        QVERIFY(idMap.value(srcDiff) > 0 && idMap.value(srcDiff) != dstDiff);
+        // Same grinder + basket -> merged onto the existing dest package.
+        QCOMPARE(idMap.value(srcSame), dstSame);
+    }
+
+};
+
+QTEST_MAIN(tst_Equipment)
+#include "tst_equipment.moc"

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Decenza">
+  <meta name="color-scheme" content="light dark">
+  <title>Decenza</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/android-icon-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <style>
+    :root { font: 16px/1.45 system-ui, sans-serif; color: #202124; background: #f4f6f8; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; min-height: 100dvh; margin: 0; overflow: hidden; }
+    #status { position: fixed; z-index: 2; inset: 12px 12px auto; padding: 10px 12px; color: #202124; background: #f4f6f8; border-radius: 6px; overflow-wrap: anywhere; }
+    #status[data-state="error"] { color: #fff; background: #8b1e18; }
+    #retry { position: fixed; z-index: 3; inset: auto 12px 12px auto; padding: 10px 16px; }
+    #screen { position: fixed; inset: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="status" role="status" aria-live="polite">Starting Decenza…</div>
+  <button id="retry" type="button" hidden>Retry</button>
+  <div id="screen" aria-label="Decenza application" aria-busy="true"></div>
+  <script src="decenza-web.js"></script>
+  <script src="qtloader.js"></script>
+  <script src="qt-dialog-accessibility.js"></script>
+  <script>
+    const status = document.getElementById("status");
+    const retry = document.getElementById("retry");
+    const screen = document.getElementById("screen");
+    const iosVideo = /iPhone|iPad/.test(navigator.platform);
+    const videoStreamProperty = iosVideo
+      ? Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "srcObject") : null;
+    const emptyVideoStream = iosVideo ? new MediaStream() : null;
+    // Qt 6.12 creates hidden body-level videos without playsinline
+    // (qtmultimedia/src/plugins/multimedia/wasm/common/qwasmvideooutput.cpp:567-617).
+    // Keep iOS playback on the QML surface so taps reach its wake control.
+    new MutationObserver(records => {
+      for (const record of records)
+        for (const node of record.addedNodes)
+          if (node instanceof HTMLVideoElement && node.classList.contains("Video")) {
+            node.playsInline = true;
+            // QTBUG-151807: Qt 6.12 probes srcObject.getVideoTracks() on iOS, even
+            // for URL-backed videos whose native srcObject is null. Keep the
+            // decoder/source intact and supply an empty track list to that probe.
+            // This prevents the exception; continuous iOS rendering is still open.
+            if (videoStreamProperty) {
+              Object.defineProperty(node, "srcObject", {
+                configurable: true,
+                get() { return videoStreamProperty.get.call(this) || emptyVideoStream; },
+                set(value) { videoStreamProperty.set.call(this, value); }
+              });
+            }
+          }
+    }).observe(document.body, {childList: true});
+    const videoRecoveryKey = "decenza-released-video-handle-reloaded";
+    let videoRecoveryRequested = false;
+    function reportFailure(error) {
+      const message = error && error.message ? error.message : String(error);
+      status.dataset.state = "error";
+      status.textContent = `Decenza could not start: ${message}`;
+      status.hidden = false;
+      retry.hidden = false;
+      screen.setAttribute("aria-busy", "false");
+      // Qt's video frame callback holds a raw output pointer across animation
+      // frames (qwasmvideooutput.cpp:1264-1315). Reload once on this error;
+      // retain the ordinary error screen if storage is unavailable or it recurs
+      // before the user interacts, rather than entering a reload loop.
+      if (!message.includes("Cannot use deleted val. handle = 0") || videoRecoveryRequested)
+        return;
+      try {
+        if (sessionStorage.getItem(videoRecoveryKey)) return;
+        sessionStorage.setItem(videoRecoveryKey, "1");
+        videoRecoveryRequested = true;
+        location.reload();
+      } catch (_) {
+        // The Retry button remains available when session storage is blocked.
+      }
+    }
+    // Everyday iOS Safari re-downloads the ~30 MB runtime on every visit despite its
+    // immutable cache headers (measured 2026-10-26), so the page keeps it in Cache Storage.
+    // The <base> makes this the hash-versioned URL. Any storage failure falls through to a
+    // normal download; the hook is qtloader.js's `qt.module`.
+    async function runtimeModule() {
+      const url = new URL("decenza-web.wasm", document.baseURI).href;
+      let cache = null;
+      try {
+        cache = await caches.open("decenza-runtime");
+        const stored = await cache.match(url, {ignoreVary: true});
+        if (stored) {
+          try {
+            return await WebAssembly.compileStreaming(stored);
+          } catch (error) {
+            await cache.delete(url);
+          }
+        }
+      } catch (error) {
+        cache = null;
+      }
+      const response = await fetch(url, {credentials: "same-origin"});
+      if (!response.ok)
+        throw new Error(`Could not download the Decenza runtime (HTTP ${response.status})`);
+      // Store while compiling, so the two read the body together instead of buffering it.
+      // Older versions are never read again; drop them first so the new copy has room.
+      // A failed store only means the next visit downloads again.
+      if (cache) {
+        const copy = response.clone();
+        (async () => {
+          for (const request of await cache.keys())
+            if (request.url !== url) await cache.delete(request);
+          await cache.put(url, copy);
+        })().catch(() => {});
+      }
+      return WebAssembly.compileStreaming(response);
+    }
+    function allowVideoRecovery() {
+      try { sessionStorage.removeItem(videoRecoveryKey); } catch (_) {}
+    }
+    window.addEventListener("pointerdown", allowVideoRecovery);
+    window.addEventListener("keydown", allowVideoRecovery);
+    retry.addEventListener("click", () => { allowVideoRecovery(); location.reload(); });
+    window.addEventListener("error", event => reportFailure(event.message || "A required resource failed to load."));
+    window.addEventListener("unhandledrejection", event => reportFailure(event.reason));
+    qtLoad({
+      qt: {
+        module: runtimeModule(),
+        entryFunction: window.decenza_web_entry,
+        containerElements: [document.getElementById("screen")],
+        onLoaded: () => {
+          status.hidden = true;
+          retry.hidden = true;
+          screen.setAttribute("aria-busy", "false");
+        },
+        onExit: exitData => reportFailure(exitData.text || `exit code ${exitData.code}`)
+      }
+    }).then(instance => {
+      installQtDialogAccessibility(screen);
+      // Qt 6.12 disables touch gestures on its shadow-root divs
+      // (qtbase/src/plugins/platforms/wasm/qwasmcssstyle.cpp:30-32).
+      // Keep single-finger drags with Qt while allowing browser pinch zoom.
+      const qtShadow = screen.querySelector("#qt-shadow-container")?.shadowRoot;
+      if (qtShadow) {
+        const style = document.createElement("style");
+        // Qt's browser inputs are separate from the rendered QML controls. A
+        // small default font on those inputs makes iPhone Safari zoom on focus.
+        style.textContent = `@media (any-pointer: coarse) {
+          .qt-screen div { touch-action: pinch-zoom !important; }
+          .qt-screen input, .qt-screen textarea { font-size: 16px !important; }
+        }`;
+        qtShadow.appendChild(style);
+      }
+      // iOS can settle its container size after Qt's synchronous resize callback.
+      // Re-read it after layout through Qt's public API; no polling or Qt patches.
+      let resizeFrame = 0;
+      const resize = () => {
+        if (resizeFrame) return;
+        resizeFrame = requestAnimationFrame(() => {
+          resizeFrame = 0;
+          instance.qtResizeContainerElement(screen);
+        });
+      };
+      new ResizeObserver(resize).observe(screen);
+      window.visualViewport?.addEventListener("resize", resize);
+      window.addEventListener("orientationchange", resize);
+      window.addEventListener("pageshow", resize);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) resize();
+      });
+    }).catch(reportFailure);
+  </script>
+</body>
+</html>

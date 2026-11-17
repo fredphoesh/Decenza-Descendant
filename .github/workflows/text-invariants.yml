@@ -1,0 +1,243 @@
+name: Text invariants
+
+# Invariants of the QML and source corpus. Each one was violated in the tree at the time its
+# checker was written, none was caught by anything automatic, and none of them is expressible as
+# a unit test — they are properties of the whole corpus, not of any one function.
+#
+# They are checked here because guidance alone did not hold: an invariant that justifies a
+# load-bearing decision elsewhere in the code was otherwise enforced by whether someone remembered.
+#
+# What each one protects:
+#
+#   check_translation_key_conflicts.py — one English string per translation key, and no Tr whose
+#     key is switched by a condition. Either makes TranslationManager::noteSourceString see the
+#     key's English change on every render: a warning, a dirty registry, a recount and a 5 s
+#     batch write each time. The symptom is churn, not a failure, so nothing else would catch it.
+#
+#   check_translated_richtext.py — no translated string reaches a StyledText/RichText renderer
+#     unescaped. Community translations are fetched from the backend and uploading one is
+#     unauthenticated, so these strings are attacker-influenceable; StyledText renders <img>,
+#     which means an unescaped one fetches a remote URL for every user of that language.
+#
+#   check_font_family_literals.py — no QML names a font family as a string literal. A literal
+#     family is a bet that it exists on every platform; when it does not, Qt falls back to a
+#     host font and the same screen measures differently on two machines. Blocking, because
+#     unlike glyph coverage there is always a correct fix: omit the family and inherit the
+#     bundled application font, or name real families via Qt.font({families: [...]}). Four
+#     instances existed when this was written ("serif", "monospace", "Arial" x4, and a
+#     "Material Icons" reference to a font this project does not bundle), and all four were
+#     found by reading warnings out of a running app's log — a poor way to discover something
+#     a grep finds at commit time.
+#
+#   check_log_markers.py — every log line in a registered subsystem carries that subsystem's
+#     marker, applied by a helper rather than typed at the call site. The markers exist so ONE
+#     grep over a user-submitted log returns a whole subsystem's story, and that property is
+#     worth nothing unless it holds for every line: a site with its own hand-rolled prefix is
+#     invisible to the search AND the reader cannot tell it was missed, because the log looks
+#     complete. Blocking, because there is always a correct fix (call the helper) and because
+#     the failure is silent by construction. While the markers were being introduced, NINE
+#     hand-rolled prefix families were found in code already believed converted — including 40
+#     `DE1Simulator:` lines that left the connections page's DE1 view completely empty on a
+#     simulator session — and every one was found by a person reading a running app's log
+#     rather than by the tree. A grep finds them in milliseconds; guidance did not.
+#
+#   check_mcp_tool_budget.py — the MCP tool surface stays inside a declared budget: tool count,
+#     per-tool and per-property description length, no inline `data:` payloads, and an estimate
+#     of the whole tools/list response. Blocking, because the failure is invisible from inside
+#     the app: `tools/list` is sent in full on every connection and real clients TRUNCATE it
+#     silently. ChatGPT exposed 87 of 97 tools, so `get_flow_calibration` and
+#     `set_flow_calibration` simply did not exist for that user while `clear_flow_calibration`
+#     from the same trio did. The dominant cost was not the descriptions: per-tool base64 SVG
+#     icons were 216 KB of a ~248 KB payload — 87% — and 41 of 97 tools shipped the SAME 2292-byte
+#     fallback icon, all of it produced by one call to a helper and therefore invisible in review.
+#
+#   check_test_source_duplication.py — no production source is compiled into more than one test
+#     target. Each test is its own executable, so a .cpp in two source lists is compiled twice
+#     and nothing notices. Measured on a clean rebuild in July 2026: 17 sources, 46 redundant
+#     object files, 215 s of cpu, with two of the five slowest edges in the WHOLE build being
+#     the same profilemanager.cpp object built for different targets. Blocking, because the fix
+#     is mechanical (a narrow static library linked by exactly the targets that need it) and the
+#     violation is invisible in review — it is one line added to a source list. Guidance did not
+#     hold here either: the tree contained a case nobody had ever noticed, tst_visualizershotparse
+#     compiling shotanalysis.cpp that decenza_testlib already carried, which the check reports as
+#     its own violation class with its own fix ("delete the line").
+#
+#   check_profile_resources.py — no .qrc lists a bundled profile; the list is generated from
+#     resources/profiles/. Blocking: a hand-kept list is a second copy, and #1833 added Adaptive
+#     v3 to the tests' copy only, so nine profiles reached every test binary and no release.
+#
+#   check_qml_asi_hazards.py — no QML/JS statement opens with ( [ or ` after an unterminated
+#     line. JavaScript inserts no semicolon there, so the line silently continues the one above.
+#     Valid JavaScript, so the compiler and qmllint pass it: #1978 shipped one in 2.0.8 that left
+#     the post-shot AI Advice button dead. Blocking, because the fix is always mechanical (bind
+#     the value to a local first).
+#
+#   check_qml_banned_types.py — no QML instantiates a type Decenza wraps. A bare FileDialog or
+#     FolderDialog destroyed while open leaves Qt's Android helper registered for activity
+#     results, and the picker's result crashed the app (#2176). Blocking: the fix is mechanical
+#     (use the Decenza wrapper), and nothing else sees it before a user does.
+#
+#   check_qml_aot_declarations.py — no QML function with typed parameters lacks a return
+#     annotation, and no root object declares a signal above a property. Qt 6.12's compiler and
+#     run time disagree on both, and the run time then runs every calling unit interpreted,
+#     silently: 9 app units lost their AOT code at startup this way. Blocking, because the fix
+#     is mechanical (add `: void`; move the signal below the properties).
+#
+#   settings_search_index.py — every settings card is a SettingsCard and every adjustment on it
+#     has a search title, and the committed generated index matches the tabs. Blocking: a setting
+#     search cannot find fails silently, and the fix is always mechanical.
+#
+#   check_font_glyph_coverage.py — every non-emoji symbol in the QML has a glyph in a bundled
+#     font. A symbol that falls through to a host font is why the same screen used to measure
+#     differently on two machines. Advisory: it reports, and does not fail the job, because the
+#     honest answer for a genuinely uncovered glyph is sometimes "bundle another face", which is
+#     a decision rather than a fix. Note the script itself exits non-zero for anything uncovered
+#     outside AddLanguagePage (which it already exempts) — it is the `|| true` on the step that
+#     makes this advisory, not the script.
+#
+# Runs on PRs that touch the surfaces involved. ~16 s in CI (13-22 s observed), nearly
+# all of it actions/checkout plus setup-python; the checks themselves total ~2.5 s on an
+# M-series Mac (measured 2026-10-04), most of it check_log_markers.py. No build, no network. This is the one place that number lives — the docs say
+# "seconds" and point here, because three copies of it had already drifted to three
+# different values (~1 minute, 12 s, ~14 s).
+#
+# `src/**` is in the filter, so a pure C++ change IS gated here. That is easy to miss —
+# the job is named for text invariants and most of its checks are about QML — and
+# missing it is how a PR whose own run was red got merged and turned `main` red.
+#
+# The filter stays. Making it unconditional so the job could become a required status
+# check was tried in #1731 and reverted before merge (cited by PR, not by commit: the
+# squash leaves no hash to find). The real constraint is simple — a path-filtered check
+# CANNOT be a required one, because on a PR outside the paths it never reports at all
+# and the PR hangs pending forever. Requiring it therefore means running it on every
+# push, and that is the critical-path arrangement CI_CD.md argues against for BUILDS.
+# Note that argument does not transfer on its own: it is priced at ~3 minutes and zero
+# yield, while this job is ~16 s and caught #1729.
+
+on:
+  pull_request:
+    paths:
+      - 'qml/**'
+      - 'src/**'
+      - 'android/**'
+      - 'ios/**'
+      - 'scripts/check_*.py'
+      - 'scripts/settings_search_index.py'
+      - 'scripts/source_lexer.py'
+      - 'tests/CMakeLists.txt'
+      - 'tests/qml/**'
+      - 'tools/webclient/*.qml'
+      - 'resources/fonts/**'
+      - 'resources/profiles/**'
+      - 'resources/*.qrc'
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/qt-modules.txt'
+      - 'scripts/qt_modules.sh'
+  push:
+    branches: [main]
+    paths:
+      - 'qml/**'
+      - 'src/**'
+      - 'android/**'
+      - 'ios/**'
+      - 'scripts/check_*.py'
+      - 'scripts/settings_search_index.py'
+      - 'scripts/source_lexer.py'
+      - 'tests/CMakeLists.txt'
+      - 'tests/qml/**'
+      - 'tools/webclient/*.qml'
+      - 'resources/fonts/**'
+      - 'resources/profiles/**'
+      - 'resources/*.qrc'
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/qt-modules.txt'
+      - 'scripts/qt_modules.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  text-invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # Blocking: a conflict here silently degrades the running app.
+      - name: One English string per translation key
+        run: |
+          python3 scripts/check_translation_key_conflicts.py --self-test
+          python3 scripts/check_translation_key_conflicts.py
+
+      # Blocking: this one is a security property, not a style preference.
+      - name: No unescaped translated text in rich-text renderers
+        run: python3 scripts/check_translated_richtext.py
+
+      # Blocking: a literal family silently degrades to a host font, and there is always a
+      # correct fix.
+      - name: No hardcoded font.family literals in QML
+        run: python3 scripts/check_font_family_literals.py
+
+      # Blocking: an unmarked log line is invisible to the search the markers exist for, and
+      # nothing in a log reveals that a line is missing from it.
+      - name: Subsystem log lines carry a registered marker
+        run: |
+          python3 scripts/check_log_markers.py --self-test
+          python3 scripts/check_log_markers.py
+
+      # Blocking: a truncated tool list is invisible from inside the app, and the payload that
+      # causes it is invisible in review.
+      - name: MCP tool surface stays inside its budget
+        run: python3 scripts/check_mcp_tool_budget.py --verbose
+
+      # Blocking: a duplicate compile is invisible in review — one line added to a source list —
+      # and costs on every build forever. This reads tests/CMakeLists.txt as text, so it fits the
+      # build-free rule this job is built on.
+      - name: No production source compiled into two test targets
+        run: python3 scripts/check_test_source_duplication.py
+
+      # Blocking: a profile added to the tests' list and not the app's shipped in no
+      # release for two months (#1833's Adaptive v3, plus eight more). The list is
+      # now generated from the directory; this refuses a hand-written one coming back.
+      - name: No hand-written list of bundled profiles
+        run: python3 scripts/check_profile_resources.py
+
+      # Blocking: a hand-typed module list drifts silently, and a bad profile shows only when a
+      # tag build runs.
+      - name: CI Qt modules come from one list
+        run: python3 scripts/check_qt_module_lists.py
+
+      # Blocking: a missed semicolon compiles and lints clean.
+      - name: No QML statement glued onto the line above
+        run: |
+          python3 scripts/check_qml_asi_hazards.py --self-test
+          python3 scripts/check_qml_asi_hazards.py
+
+      # Blocking: both shapes compile, lint and pass tests that skip AOT validation.
+      - name: No QML declaration that silently disables AOT
+        run: |
+          python3 scripts/check_qml_aot_declarations.py --self-test
+          python3 scripts/check_qml_aot_declarations.py
+
+      # Blocking: a bare dialog compiles, lints and tests clean, and crashes only on Android.
+      - name: No QML type Decenza replaces with a wrapper
+        run: |
+          python3 scripts/check_qml_banned_types.py --self-test
+          python3 scripts/check_qml_banned_types.py
+
+      - name: Every settings card and adjustment is searchable
+        run: |
+          python3 scripts/settings_search_index.py --self-test
+          python3 scripts/settings_search_index.py --check
+
+      # Advisory by the `|| true`, not by the script: it exits non-zero for any uncovered glyph
+      # outside AddLanguagePage, which it already exempts. Non-blocking because bundling another
+      # OFL face is a judgement call rather than a mechanical fix.
+      - name: Symbol glyph coverage (advisory)
+        run: python3 scripts/check_font_glyph_coverage.py || true

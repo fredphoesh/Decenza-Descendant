@@ -1,0 +1,6 @@
+#define BuildNumber "@CURRENT_VERSION_CODE@"
+#define VersionNumber "@PROJECT_VERSION@"
+#define TargetName "Decenza"
+#define TargetArch "x64"
+#define TargetProduct "Decenza-Lab"
+#define TargetCompany "Decenza"

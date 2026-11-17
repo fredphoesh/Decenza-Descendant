@@ -1,0 +1,581 @@
+package io.github.kulitorum.decenza_de1;
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.Settings;
+import android.util.Log;
+
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+/**
+ * Helper for external storage permission.
+ * - Android 9-10: Requests WRITE_EXTERNAL_STORAGE at runtime
+ * - Android 11+: Opens settings for MANAGE_EXTERNAL_STORAGE
+ * This allows direct file access to Documents/Decenza for profile storage.
+ */
+public class StorageHelper {
+    private static final String TAG = "StorageHelper";
+    private static final int PERMISSION_REQUEST_CODE = 100;
+    private static Activity sActivity;
+
+    public static void init(Activity activity) {
+        sActivity = activity;
+    }
+
+    /**
+     * Check if we have external storage permission.
+     * On Android 9-10, checks WRITE_EXTERNAL_STORAGE runtime permission.
+     * On Android 11+, checks MANAGE_EXTERNAL_STORAGE.
+     */
+    public static boolean hasStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ (API 30+)
+            return Environment.isExternalStorageManager();
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // Android 6-10 (API 23-29) - check runtime permission
+            if (sActivity == null) return false;
+            return ContextCompat.checkSelfPermission(sActivity,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+        } else {
+            // Android 5 and below - permission granted at install
+            return true;
+        }
+    }
+
+    /**
+     * Request storage permission.
+     * On Android 9-10: Shows runtime permission dialog.
+     * On Android 11+: Opens system settings.
+     */
+    public static void requestStoragePermission() {
+        if (sActivity == null) {
+            DiagnosticLog.e("Storage", TAG, "Activity not initialized");
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ - open settings for MANAGE_EXTERNAL_STORAGE
+            try {
+                Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                Uri uri = Uri.fromParts("package", sActivity.getPackageName(), null);
+                intent.setData(uri);
+                sActivity.startActivity(intent);
+                DiagnosticLog.i("Storage", TAG, "Opened storage permission settings");
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Could not open app-specific settings, trying general: " + e.getMessage());
+                try {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                    sActivity.startActivity(intent);
+                } catch (Exception e2) {
+                    DiagnosticLog.e("Storage", TAG, "Could not open storage settings: " + e2.getMessage());
+                }
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // Android 6-10 - request runtime permission
+            ActivityCompat.requestPermissions(sActivity,
+                new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                PERMISSION_REQUEST_CODE);
+            DiagnosticLog.i("Storage", TAG, "Requested WRITE_EXTERNAL_STORAGE permission");
+        }
+    }
+
+    /**
+     * Get the path to the profiles directory (Documents/Decenza).
+     * Creates the directory if it doesn't exist.
+     */
+    public static String getProfilesPath() {
+        // Use public Documents directory
+        java.io.File documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+        java.io.File profilesDir = new java.io.File(documentsDir, "Decenza");
+
+        if (!profilesDir.exists()) {
+            if (profilesDir.mkdirs()) {
+                DiagnosticLog.i("Storage", TAG, "Created profiles directory: " + profilesDir.getAbsolutePath());
+            } else {
+                DiagnosticLog.e("Storage", TAG, "Failed to create profiles directory: " + profilesDir.getAbsolutePath());
+            }
+        }
+
+        return profilesDir.getAbsolutePath();
+    }
+
+    /**
+     * Get the path to the backups directory (Documents/Decenza Backups).
+     * Creates the directory if it doesn't exist.
+     */
+    public static String getBackupsPath() {
+        // Use public Documents directory
+        java.io.File documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+        java.io.File backupsDir = new java.io.File(documentsDir, "Decenza Backups");
+
+        if (!backupsDir.exists()) {
+            if (backupsDir.mkdirs()) {
+                DiagnosticLog.i("Storage", TAG, "Created backups directory: " + backupsDir.getAbsolutePath());
+            } else {
+                DiagnosticLog.e("Storage", TAG, "Failed to create backups directory: " + backupsDir.getAbsolutePath());
+            }
+        }
+
+        return backupsDir.getAbsolutePath();
+    }
+
+    /**
+     * Get the path to the logs directory (Documents/Decenza/logs).
+     * Creates the directory if it doesn't exist.
+     * Uses external storage so logs survive APK updates.
+     */
+    public static String getLogsPath() {
+        java.io.File documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+        java.io.File logsDir = new java.io.File(new java.io.File(documentsDir, "Decenza"), "logs");
+
+        if (!logsDir.exists()) {
+            if (logsDir.mkdirs()) {
+                DiagnosticLog.i("Storage", TAG, "Created logs directory: " + logsDir.getAbsolutePath());
+            } else {
+                DiagnosticLog.e("Storage", TAG, "Failed to create logs directory: " + logsDir.getAbsolutePath());
+            }
+        }
+
+        return logsDir.getAbsolutePath();
+    }
+
+    /**
+     * Check if we need to request storage permission.
+     * Returns true for Android 6+ where runtime permission is needed.
+     */
+    public static boolean needsStoragePermission() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.M;
+    }
+
+    /**
+     * Notify the media scanner about a new file so it appears in the Files app.
+     * Call this after creating a file in shared storage (Documents, Downloads, etc).
+     */
+    public static void scanFile(String filePath) {
+        if (sActivity == null) {
+            DiagnosticLog.w("Storage", TAG, "Activity not initialized, cannot scan file");
+            return;
+        }
+
+        try {
+            // Determine MIME type from file extension
+            final String mimeType;
+            if (filePath.endsWith(".zip")) {
+                mimeType = "application/zip";
+            } else if (filePath.endsWith(".db")) {
+                mimeType = "application/x-sqlite3";
+            } else if (filePath.endsWith(".txt")) {
+                mimeType = "text/plain";
+            } else {
+                mimeType = null;
+            }
+
+            android.media.MediaScannerConnection.scanFile(
+                sActivity,
+                new String[]{filePath},
+                new String[]{mimeType},  // Specify MIME type for proper recognition
+                new android.media.MediaScannerConnection.OnScanCompletedListener() {
+                    @Override
+                    public void onScanCompleted(String path, Uri uri) {
+                        DiagnosticLog.d("Storage", TAG, "Media scan completed for: " + path + " (type: " + mimeType + ")");
+                    }
+                }
+            );
+        } catch (Exception e) {
+            DiagnosticLog.e("Storage", TAG, "Failed to scan file: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Copy a file from source to destination using Java file I/O.
+     * This works with Android scoped storage where Qt's QFile::copy() might fail.
+     * Returns true on success, false on error.
+     */
+    public static boolean copyFile(String sourcePath, String destPath) {
+        java.io.FileInputStream fis = null;
+        java.io.FileOutputStream fos = null;
+
+        try {
+            java.io.File sourceFile = new java.io.File(sourcePath);
+            java.io.File destFile = new java.io.File(destPath);
+
+            if (!sourceFile.exists()) {
+                DiagnosticLog.e("Storage", TAG, "Source file does not exist: " + sourcePath);
+                return false;
+            }
+
+            // Delete destination if it exists
+            if (destFile.exists()) {
+                destFile.delete();
+            }
+
+            fis = new java.io.FileInputStream(sourceFile);
+            fos = new java.io.FileOutputStream(destFile);
+
+            byte[] buffer = new byte[4096];
+            int length;
+            while ((length = fis.read(buffer)) > 0) {
+                fos.write(buffer, 0, length);
+            }
+
+            fos.flush();
+
+            DiagnosticLog.i("Storage", TAG, "Copied file: " + sourcePath + " -> " + destPath);
+            return true;
+
+        } catch (Exception e) {
+            DiagnosticLog.e("Storage", TAG, "Failed to copy file: " + e.getMessage());
+            return false;
+        } finally {
+            // Ensure streams are always closed
+            try {
+                if (fos != null) fos.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close output stream: " + e.getMessage());
+            }
+            try {
+                if (fis != null) fis.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close input stream: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Extract a ZIP file to a destination path.
+     * Returns the path to the extracted file, or empty string on error.
+     */
+    public static String unzipFile(String zipFilePath, String destFilePath) {
+        java.io.FileInputStream fis = null;
+        java.util.zip.ZipInputStream zis = null;
+        java.io.FileOutputStream fos = null;
+
+        try {
+            java.io.File zipFile = new java.io.File(zipFilePath);
+            if (!zipFile.exists()) {
+                DiagnosticLog.e("Storage", TAG, "ZIP file does not exist: " + zipFilePath);
+                return "";
+            }
+
+            fis = new java.io.FileInputStream(zipFile);
+            zis = new java.util.zip.ZipInputStream(fis);
+
+            java.util.zip.ZipEntry entry = zis.getNextEntry();
+            if (entry == null) {
+                DiagnosticLog.e("Storage", TAG, "ZIP file is empty: " + zipFilePath);
+                return "";
+            }
+
+            // Extract first file in ZIP to destination
+            fos = new java.io.FileOutputStream(destFilePath);
+
+            byte[] buffer = new byte[4096];
+            int length;
+            while ((length = zis.read(buffer)) > 0) {
+                fos.write(buffer, 0, length);
+            }
+
+            DiagnosticLog.i("Storage", TAG, "Extracted ZIP file: " + zipFilePath + " -> " + destFilePath);
+            return destFilePath;
+
+        } catch (Exception e) {
+            DiagnosticLog.e("Storage", TAG, "Failed to extract ZIP file: " + e.getMessage());
+            return "";
+        } finally {
+            try {
+                if (fos != null) fos.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close output stream: " + e.getMessage());
+            }
+            try {
+                if (zis != null) {
+                    zis.closeEntry();
+                    zis.close();
+                }
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close zip stream: " + e.getMessage());
+            }
+            try {
+                if (fis != null) fis.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close input stream: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Create a ZIP file containing the source file.
+     * Returns the path to the created ZIP file, or empty string on error.
+     */
+    public static String zipFile(String sourceFilePath, String zipFilePath) {
+        java.io.FileInputStream fis = null;
+        java.io.FileOutputStream fos = null;
+        java.util.zip.ZipOutputStream zos = null;
+
+        try {
+            java.io.File sourceFile = new java.io.File(sourceFilePath);
+            if (!sourceFile.exists()) {
+                DiagnosticLog.e("Storage", TAG, "Source file does not exist: " + sourceFilePath);
+                return "";
+            }
+
+            fis = new java.io.FileInputStream(sourceFile);
+            fos = new java.io.FileOutputStream(zipFilePath);
+            zos = new java.util.zip.ZipOutputStream(fos);
+
+            // Set maximum compression level (9 = best compression, slower)
+            zos.setLevel(java.util.zip.Deflater.BEST_COMPRESSION);
+
+            // Add file to ZIP with just the filename (not full path)
+            java.util.zip.ZipEntry zipEntry = new java.util.zip.ZipEntry(sourceFile.getName());
+            zos.putNextEntry(zipEntry);
+
+            // Copy file content to ZIP
+            byte[] buffer = new byte[1024];
+            int length;
+            while ((length = fis.read(buffer)) > 0) {
+                zos.write(buffer, 0, length);
+            }
+
+            DiagnosticLog.i("Storage", TAG, "Created ZIP file: " + zipFilePath);
+            return zipFilePath;
+
+        } catch (Exception e) {
+            DiagnosticLog.e("Storage", TAG, "Failed to create ZIP file: " + e.getMessage());
+            return "";
+        } finally {
+            try {
+                if (zos != null) {
+                    zos.closeEntry();
+                    zos.close();
+                }
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close zip stream: " + e.getMessage());
+            }
+            try {
+                if (fos != null) fos.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close output stream: " + e.getMessage());
+            }
+            try {
+                if (fis != null) fis.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close input stream: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Recursively zip all files in a directory into a ZIP archive.
+     * Preserves subdirectory structure within the ZIP.
+     * Returns the zip path on success, or empty string on failure.
+     */
+    public static String zipDirectory(String dirPath, String zipPath) {
+        java.io.FileOutputStream fos = null;
+        java.util.zip.ZipOutputStream zos = null;
+
+        try {
+            java.io.File dir = new java.io.File(dirPath);
+            if (!dir.exists() || !dir.isDirectory()) {
+                DiagnosticLog.e("Storage", TAG, "Directory does not exist or is not a directory: " + dirPath);
+                return "";
+            }
+
+            fos = new java.io.FileOutputStream(zipPath);
+            zos = new java.util.zip.ZipOutputStream(fos);
+
+            // Set maximum compression level (9 = best compression, slower)
+            zos.setLevel(java.util.zip.Deflater.BEST_COMPRESSION);
+
+            addDirectoryToZip(zos, dir, "");
+
+            DiagnosticLog.i("Storage", TAG, "Created ZIP from directory: " + dirPath + " -> " + zipPath);
+            return zipPath;
+
+        } catch (Exception e) {
+            DiagnosticLog.e("Storage", TAG, "Failed to zip directory: " + e.getMessage());
+            return "";
+        } finally {
+            try {
+                if (zos != null) zos.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close zip stream: " + e.getMessage());
+            }
+            try {
+                if (fos != null) fos.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close output stream: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Recursively add files from a directory to a ZipOutputStream.
+     * @param zos the ZipOutputStream to write to
+     * @param dir the current directory being processed
+     * @param parentPath the relative path prefix for entries (empty for root)
+     */
+    private static void addDirectoryToZip(java.util.zip.ZipOutputStream zos,
+                                           java.io.File dir, String parentPath)
+            throws java.io.IOException {
+        java.io.File[] files = dir.listFiles();
+        if (files == null) {
+            return;
+        }
+
+        byte[] buffer = new byte[4096];
+
+        for (java.io.File file : files) {
+            String entryName = parentPath.isEmpty()
+                    ? file.getName()
+                    : parentPath + "/" + file.getName();
+
+            if (file.isDirectory()) {
+                addDirectoryToZip(zos, file, entryName);
+            } else {
+                java.io.FileInputStream fis = null;
+                try {
+                    java.util.zip.ZipEntry zipEntry = new java.util.zip.ZipEntry(entryName);
+                    zos.putNextEntry(zipEntry);
+
+                    fis = new java.io.FileInputStream(file);
+                    int length;
+                    while ((length = fis.read(buffer)) > 0) {
+                        zos.write(buffer, 0, length);
+                    }
+
+                    zos.closeEntry();
+                } finally {
+                    try {
+                        if (fis != null) fis.close();
+                    } catch (Exception e) {
+                        DiagnosticLog.w("Storage", TAG, "Failed to close input stream: " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract all files from a ZIP archive to a destination directory.
+     * Preserves subdirectory structure from the ZIP.
+     * Returns true on success, false on error.
+     */
+    public static boolean unzipToDirectory(String zipPath, String destDir) {
+        java.io.FileInputStream fis = null;
+        java.util.zip.ZipInputStream zis = null;
+
+        try {
+            java.io.File zipFile = new java.io.File(zipPath);
+            if (!zipFile.exists()) {
+                DiagnosticLog.e("Storage", TAG, "ZIP file does not exist: " + zipPath);
+                return false;
+            }
+
+            java.io.File destDirFile = new java.io.File(destDir);
+            if (!destDirFile.exists()) {
+                if (!destDirFile.mkdirs()) {
+                    DiagnosticLog.e("Storage", TAG, "Failed to create destination directory: " + destDir);
+                    return false;
+                }
+            }
+
+            fis = new java.io.FileInputStream(zipFile);
+            zis = new java.util.zip.ZipInputStream(fis);
+
+            java.util.zip.ZipEntry entry;
+            byte[] buffer = new byte[4096];
+
+            while ((entry = zis.getNextEntry()) != null) {
+                java.io.File outFile = new java.io.File(destDirFile, entry.getName());
+
+                // Guard against zip slip (path traversal) attacks
+                String canonicalDest = destDirFile.getCanonicalPath();
+                String canonicalOut = outFile.getCanonicalPath();
+                if (!canonicalOut.startsWith(canonicalDest + java.io.File.separator)
+                        && !canonicalOut.equals(canonicalDest)) {
+                    DiagnosticLog.e("Storage", TAG, "ZIP entry outside target directory: " + entry.getName());
+                    return false;
+                }
+
+                if (entry.isDirectory()) {
+                    if (!outFile.exists() && !outFile.mkdirs()) {
+                        DiagnosticLog.e("Storage", TAG, "Failed to create directory: " + outFile.getAbsolutePath());
+                        return false;
+                    }
+                } else {
+                    // Ensure parent directories exist
+                    java.io.File parent = outFile.getParentFile();
+                    if (parent != null && !parent.exists()) {
+                        if (!parent.mkdirs()) {
+                            DiagnosticLog.e("Storage", TAG, "Failed to create parent directory: " + parent.getAbsolutePath());
+                            return false;
+                        }
+                    }
+
+                    java.io.FileOutputStream fos = null;
+                    try {
+                        fos = new java.io.FileOutputStream(outFile);
+                        int length;
+                        while ((length = zis.read(buffer)) > 0) {
+                            fos.write(buffer, 0, length);
+                        }
+                    } finally {
+                        try {
+                            if (fos != null) fos.close();
+                        } catch (Exception e) {
+                            DiagnosticLog.w("Storage", TAG, "Failed to close output stream: " + e.getMessage());
+                        }
+                    }
+                }
+
+                zis.closeEntry();
+            }
+
+            DiagnosticLog.i("Storage", TAG, "Extracted ZIP to directory: " + zipPath + " -> " + destDir);
+            return true;
+
+        } catch (Exception e) {
+            DiagnosticLog.e("Storage", TAG, "Failed to extract ZIP to directory: " + e.getMessage());
+            return false;
+        } finally {
+            try {
+                if (zis != null) zis.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close zip stream: " + e.getMessage());
+            }
+            try {
+                if (fis != null) fis.close();
+            } catch (Exception e) {
+                DiagnosticLog.w("Storage", TAG, "Failed to close input stream: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Request the system to uninstall this app.
+     * Shows the native Android uninstall confirmation dialog.
+     */
+    public static void requestUninstall() {
+        if (sActivity == null) {
+            DiagnosticLog.e("Storage", TAG, "Activity not initialized, cannot request uninstall");
+            return;
+        }
+
+        try {
+            Intent intent = new Intent(Intent.ACTION_DELETE);
+            intent.setData(Uri.parse("package:" + sActivity.getPackageName()));
+            sActivity.startActivity(intent);
+            DiagnosticLog.i("Storage", TAG, "Launched uninstall dialog");
+        } catch (Exception e) {
+            DiagnosticLog.e("Storage", TAG, "Failed to launch uninstall dialog: " + e.getMessage());
+        }
+    }
+}

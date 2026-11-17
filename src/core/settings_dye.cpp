@@ -1,0 +1,1037 @@
+#include "core/diagnosticlogging.h"
+#include "settings_dye.h"
+#include "settings.h"
+#include "../history/bagid.h"
+#include "../history/coffeebagstorage.h"
+#include "../history/equipmentstorage.h"
+#include "grinderaliases.h"
+#include "yieldspec.h"
+#include "basketaliases.h"
+
+#include <QtMath>
+#include <QDebug>
+#include <QScopedValueRollback>
+
+SettingsDye::SettingsDye(QObject* parent)
+    : QObject(parent)
+{
+}
+
+void SettingsDye::setBagStorage(CoffeeBagStorage* storage)
+{
+    if (m_bagStorage == storage)
+        return;
+    m_bagStorage = storage;
+    if (!m_bagStorage)
+        return;
+
+    // Refresh the dye cache whenever the active bag row changes elsewhere
+    // (bag edit dialog, Next Portion, post-shot dose stamp). Our own
+    // write-throughs are skipped in bagUpdated; a reload of the same bag is a
+    // cache refresh, not a switch (m_appliedBagId).
+    connect(m_bagStorage, &CoffeeBagStorage::bagReady, this,
+            [this](qint64 bagId, const QVariantMap& bag) {
+                if (bagId == m_reviewProtectedBagId) return;
+                applyBagRow(bagId, bag);
+            });
+    connect(m_bagStorage, &CoffeeBagStorage::bagUpdateCommitted, this,
+            [this](qint64 bagId, const QVariantMap& bag) {
+                // This event precedes bagUpdateFinished and the scoped caller's
+                // completion, so a host write is visible in SettingsDye before
+                // another client can request a fresh form snapshot.
+                ++m_committedBagUpdateRows[bagId];
+                if (bagId == activeBagId() && m_pendingSelfWrites == 0) {
+                    if (bagId == m_reviewProtectedBagId) refreshReviewProtectedBag(bagId);
+                    else applyBagRow(bagId, bag);
+                }
+            });
+    connect(m_bagStorage, &CoffeeBagStorage::bagUpdateFinished, this,
+            [this](qint64 bagId, bool success) {
+                bool rowWasPublished = false;
+                auto published = m_committedBagUpdateRows.find(bagId);
+                if (published != m_committedBagUpdateRows.end()) {
+                    rowWasPublished = true;
+                    if (--published.value() <= 0)
+                        m_committedBagUpdateRows.erase(published);
+                }
+                // Only the active bag concerns the dye cache. Gating here keeps
+                // an update to a DIFFERENT bag (a shot-save dose/yield stamp on a
+                // non-active bag, a concurrent edit elsewhere) from spuriously
+                // consuming a pending-self-write token — write-throughs only ever
+                // target the active bag, so a non-active bagUpdated is never our echo.
+                if (bagId != activeBagId())
+                    return;
+                // Skip the refresh for our own write-throughs — the dye cache
+                // is already the source of those values; re-reading per
+                // keystroke would just churn. (requestUpdateBag always emits
+                // bagUpdated, success or fail, so the token is always consumed.)
+                if (m_pendingSelfWrites > 0) {
+                    m_pendingSelfWrites--;
+                    return;
+                }
+                if (success && !rowWasPublished)
+                    m_bagStorage->requestBag(bagId);
+            });
+    // An edit pulled from Visualizer is never one of our write-throughs, so it
+    // consumes no token.
+    connect(m_bagStorage, &CoffeeBagStorage::bagPulledFromVisualizer, this,
+            [this](qint64 bagId) {
+                if (bagId == activeBagId()) {
+                    if (bagId == m_reviewProtectedBagId) refreshReviewProtectedBag(bagId);
+                    else m_bagStorage->requestBag(bagId);
+                }
+            });
+
+    if (bagIdIsSet(activeBagId()))
+        m_bagStorage->requestBag(activeBagId());
+}
+
+QString SettingsDye::dyeEffectiveGrinder() const
+{
+    const QString model = dyeGrinderModel().trimmed();
+    if (!model.isEmpty())
+        return (dyeGrinderBrand().trimmed() + QLatin1Char(' ') + model).trimmed();
+    const QString name = m_dyeEquipmentName.trimmed();
+    if (!name.isEmpty())
+        return name;   // package named like a grinder (e.g. "eureka Mignon")
+    return QString();
+}
+
+void SettingsDye::applyBagRow(qint64 bagId, const QVariantMap& bag)
+{
+    if (bagId != activeBagId())
+        return;
+    if (bag.isEmpty()) {
+        // Active bag vanished (deleted row / failed migration map).
+        DIAG_WARN(APP, "SettingsDye") << "active bag" << bagId << "not found - clearing selection";
+        m_keepFieldsOnNextApply = false;
+        setActiveBagId(-1);
+        return;
+    }
+    if (m_keepFieldsOnNextApply) {
+        m_keepFieldsOnNextApply = false;
+        const QString frozen = bag.value("frozenDate").toString();
+        const QString defrost = bag.value("defrostDate").toString();
+        const QString storageHint = bag.value("storageHint").toString();
+        const QString opened = bag.value("openedDate").toString();
+        if (frozen != m_activeBagFrozenDate || defrost != m_activeBagDefrostDate
+            || storageHint != m_activeBagStorageHint || opened != m_activeBagOpenedDate) {
+            m_activeBagFrozenDate = frozen;
+            m_activeBagDefrostDate = defrost;
+            m_activeBagStorageHint = storageHint;
+            m_activeBagOpenedDate = opened;
+            emit activeBagChanged();
+        }
+        // The caller owns what applies to the session (recipe activation must
+        // not have the bag's spec re-armed over the recipe's); only caches follow.
+        refreshBagCaches(bag);
+        m_appliedBagId = activeBagId();
+        return;
+    }
+    applyActiveBag(bag);
+}
+
+void SettingsDye::setEquipmentStorage(EquipmentStorage* storage)
+{
+    if (m_equipmentStorage == storage)
+        return;
+    m_equipmentStorage = storage;
+    if (!m_equipmentStorage)
+        return;
+
+    // The active package is the source of truth for grinder identity; resolve it
+    // here and refresh the display cache whenever it arrives or changes.
+    connect(m_equipmentStorage, &EquipmentStorage::packageReady, this,
+            [this](qint64 packageId, const QVariantMap& pkg) {
+                if (packageId != activeEquipmentId())
+                    return;
+                applyEquipmentIdentity(pkg);  // empty pkg (not found) clears it
+            });
+    connect(m_equipmentStorage, &EquipmentStorage::packagesChanged, this,
+            [this]() {
+                // An edit to the active package (incl. a copy-on-write that left
+                // its identity in place) — re-resolve the current selection.
+                const qint64 id = activeEquipmentId();
+                if (id > 0)
+                    m_equipmentStorage->requestPackage(id);
+            });
+
+    if (activeEquipmentId() > 0)
+        m_equipmentStorage->requestPackage(activeEquipmentId());
+}
+
+// Refresh the grinder-identity display cache from a resolved package map (from
+// EquipmentStorage). Display-only: the setters update the cache + QSettings
+// mirror, never the bag.
+void SettingsDye::applyEquipmentIdentity(const QVariantMap& pkg)
+{
+    setDyeGrinderBrand(pkg.value("grinderBrand").toString());
+    setDyeGrinderModel(pkg.value("grinderModel").toString());
+    setDyeGrinderBurrs(pkg.value("grinderBurrs").toString());
+
+    // The package's display name (user-editable label; defaults to "{brand}
+    // {model}"). Surfaced so UI shows the package name, not the grinder identity.
+    QString name = pkg.value("name").toString().trimmed();
+    if (name.isEmpty())
+        name = (dyeGrinderBrand().trimmed() + QLatin1Char(' ') + dyeGrinderModel().trimmed()).trimmed();
+    if (m_dyeEquipmentName != name) {
+        m_dyeEquipmentName = name;
+        emit dyeEquipmentNameChanged();
+    }
+
+    // Basket identity + registry summary (resolved from the package; empty when
+    // the package has no basket or it's a custom off-registry basket).
+    const QString basketBrand = pkg.value("basketBrand").toString();
+    const QString basketModel = pkg.value("basketModel").toString();
+    const QString basketSummary = pkg.value("basketSummary").toString();
+    if (m_dyeBasketBrand != basketBrand || m_dyeBasketModel != basketModel
+        || m_dyeBasketSummary != basketSummary) {
+        m_dyeBasketBrand = basketBrand;
+        m_dyeBasketModel = basketModel;
+        m_dyeBasketSummary = basketSummary;
+        emit dyeBasketChanged();
+    }
+
+    const QString puckCanon = pkg.value("puckPrepCanonical").toString();
+    if (m_dyePuckPrepCanonical != puckCanon) {
+        m_dyePuckPrepCanonical = puckCanon;
+        emit dyePuckPrepChanged();
+    }
+}
+
+// DYE metadata
+
+QString SettingsDye::dyeBeanBrand() const {
+    return m_settings.value("dye/beanBrand", "").toString();
+}
+
+void SettingsDye::setDyeBeanBrand(const QString& value) {
+    if (dyeBeanBrand() != value) {
+        m_settings.setValue("dye/beanBrand", value);
+        writeThroughToBag("roasterName", value);
+        emit dyeBeanBrandChanged();
+    }
+}
+
+QString SettingsDye::dyeBeanType() const {
+    return m_settings.value("dye/beanType", "").toString();
+}
+
+void SettingsDye::setDyeBeanType(const QString& value) {
+    if (dyeBeanType() != value) {
+        m_settings.setValue("dye/beanType", value);
+        writeThroughToBag("coffeeName", value);
+        emit dyeBeanTypeChanged();
+    }
+}
+
+QString SettingsDye::dyeRoastDate() const {
+    return m_settings.value("dye/roastDate", "").toString();
+}
+
+void SettingsDye::setDyeRoastDate(const QString& value) {
+    if (dyeRoastDate() != value) {
+        m_settings.setValue("dye/roastDate", value);
+        writeThroughToBag("roastDate", value);
+        emit dyeRoastDateChanged();
+    }
+}
+
+QString SettingsDye::dyeRoastLevel() const {
+    return m_settings.value("dye/roastLevel", "").toString();
+}
+
+void SettingsDye::setDyeRoastLevel(const QString& value) {
+    if (dyeRoastLevel() != value) {
+        m_settings.setValue("dye/roastLevel", value);
+        writeThroughToBag("roastLevel", value);
+        emit dyeRoastLevelChanged();
+    }
+}
+
+void SettingsDye::ensureDyeCacheLoaded() const {
+    if (!m_dyeCacheInitialized) {
+        m_dyeGrinderBrandCache = m_settings.value("dye/grinderBrand", "").toString();
+        m_dyeGrinderModelCache = m_settings.value("dye/grinderModel", "").toString();
+        m_dyeGrinderBurrsCache = m_settings.value("dye/grinderBurrs", "").toString();
+        m_dyeGrinderSettingCache = m_settings.value("dye/grinderSetting", "").toString();
+        m_dyeGrinderRpmCache = m_settings.value("dye/grinderRpm", 0).toInt();
+        m_dyeBeanWeightCache = m_settings.value("dye/beanWeight", 18.0).toDouble();
+        m_dyeDrinkWeightCache = m_settings.value("dye/drinkWeight", 36.0).toDouble();
+        m_dyeCacheInitialized = true;
+    }
+}
+
+QString SettingsDye::dyeGrinderBrand() const {
+    ensureDyeCacheLoaded();
+    return m_dyeGrinderBrandCache;
+}
+
+// Grinder identity (brand/model/burrs) is RESOLVED from the active equipment
+// package (add-equipment-packages), not stored on the bag. These setters update
+// the display cache (+ a QSettings mirror for correct cold-start before the
+// package resolves) and emit — they do NOT write through to the bag. The cache
+// is refreshed from the package by applyEquipmentIdentity() whenever the active
+// package changes; callers wanting to *change* identity go through the equipment
+// package (switchToEquipment / equipment action=update), not these setters.
+void SettingsDye::setDyeGrinderBrand(const QString& value) {
+    if (dyeGrinderBrand() != value) {
+        m_dyeGrinderBrandCache = value;
+        m_settings.setValue("dye/grinderBrand", value);
+        emit dyeGrinderBrandChanged();
+    }
+}
+
+QString SettingsDye::dyeGrinderModel() const {
+    ensureDyeCacheLoaded();
+    return m_dyeGrinderModelCache;
+}
+
+void SettingsDye::setDyeGrinderModel(const QString& value) {
+    if (dyeGrinderModel() != value) {
+        m_dyeGrinderModelCache = value;
+        m_settings.setValue("dye/grinderModel", value);
+        emit dyeGrinderModelChanged();
+    }
+}
+
+QString SettingsDye::dyeGrinderBurrs() const {
+    ensureDyeCacheLoaded();
+    return m_dyeGrinderBurrsCache;
+}
+
+void SettingsDye::setDyeGrinderBurrs(const QString& value) {
+    if (dyeGrinderBurrs() != value) {
+        m_dyeGrinderBurrsCache = value;
+        m_settings.setValue("dye/grinderBurrs", value);
+        emit dyeGrinderBurrsChanged();
+    }
+}
+
+QString SettingsDye::dyeGrinderSetting() const {
+    ensureDyeCacheLoaded();
+    return m_dyeGrinderSettingCache;
+}
+
+void SettingsDye::setDyeGrinderSetting(const QString& value) {
+    if (dyeGrinderSetting() != value) {
+        m_dyeGrinderSettingCache = value;
+        m_settings.setValue("dye/grinderSetting", value);
+        // The active package remembers its last dial; recipes are stamped
+        // independently by MainController.
+        writeThroughToActivePackage("lastGrindSetting", value);
+        emit dyeGrinderSettingChanged();
+    }
+}
+
+int SettingsDye::dyeGrinderRpm() const {
+    ensureDyeCacheLoaded();
+    return m_dyeGrinderRpmCache;
+}
+
+void SettingsDye::setDyeGrinderRpm(int value) {
+    if (dyeGrinderRpm() != value) {
+        m_dyeGrinderRpmCache = value;
+        m_settings.setValue("dye/grinderRpm", value);
+        writeThroughToActivePackage("lastRpm", value > 0 ? QVariant(value) : QVariant());
+        emit dyeGrinderRpmChanged();
+    }
+}
+
+qint64 SettingsDye::activeEquipmentId() const {
+    return m_settings.value("dye/activeEquipmentId", -1).toLongLong();
+}
+
+void SettingsDye::setActiveEquipmentId(qint64 id) {
+    if (activeEquipmentId() == id)
+        return;
+    m_settings.setValue("dye/activeEquipmentId", id);
+    emit activeEquipmentIdChanged();
+    // Resolve the package to refresh the grinder-identity display cache.
+    if (id > 0 && m_equipmentStorage)
+        m_equipmentStorage->requestPackage(id);   // -> packageReady -> applyEquipmentIdentity
+    else if (id <= 0)
+        applyEquipmentIdentity({});               // no equipment -> clear identity
+}
+
+void SettingsDye::switchToEquipment(const QVariantMap& pkg) {
+    const qint64 id = pkg.value("id").toLongLong();
+    if (id <= 0)
+        return;
+    setActiveEquipmentId(id);
+    // Apply the package's grinder identity to the display cache. The setters
+    // cache in QSettings only (no bag write-through); identity is owned by the
+    // equipment package and re-resolved from it on activeEquipmentId changes.
+    setDyeGrinderBrand(pkg.value("grinderBrand").toString());
+    setDyeGrinderModel(pkg.value("grinderModel").toString());
+    setDyeGrinderBurrs(pkg.value("grinderBurrs").toString());
+    // Apply the package's last dial — grinder-scoped memory, never blank, editable.
+    setDyeGrinderSetting(pkg.value("lastGrindSetting").toString());
+    setDyeGrinderRpm(pkg.value("lastRpm").toInt());
+    // Refresh the basket display cache immediately (the async packageReady ->
+    // applyEquipmentIdentity will re-confirm it). The picker's pkg map carries the
+    // resolved basket identity + summary from EquipmentPackageView::toVariantMap.
+    const QString basketBrand = pkg.value("basketBrand").toString();
+    const QString basketModel = pkg.value("basketModel").toString();
+    const QString basketSummary = pkg.value("basketSummary").toString();
+    if (m_dyeBasketBrand != basketBrand || m_dyeBasketModel != basketModel
+        || m_dyeBasketSummary != basketSummary) {
+        m_dyeBasketBrand = basketBrand;
+        m_dyeBasketModel = basketModel;
+        m_dyeBasketSummary = basketSummary;
+        emit dyeBasketChanged();
+    }
+    const QString puckCanon = pkg.value("puckPrepCanonical").toString();
+    if (m_dyePuckPrepCanonical != puckCanon) {
+        m_dyePuckPrepCanonical = puckCanon;
+        emit dyePuckPrepChanged();
+    }
+    if (m_equipmentStorage)
+        m_equipmentStorage->requestTouchLastUsed(id);
+}
+
+bool SettingsDye::grinderRpmCapable(const QString& brand, const QString& model) const {
+    return EquipmentStorage::deriveRpmCapable(brand, model);
+}
+
+bool SettingsDye::grinderIsClickIndexed(const QString& brand, const QString& model) const {
+    const GrinderAliases::GrinderEntry* entry = GrinderAliases::findEntry(brand, model);
+    return entry && entry->notation == GrinderAliases::SettingNotation::Compound;
+}
+
+QStringList SettingsDye::suggestedBurrs(const QString& brand, const QString& model) const {
+    return GrinderAliases::suggestedBurrs(brand, model);
+}
+
+bool SettingsDye::isBurrSwappable(const QString& brand, const QString& model) const {
+    return GrinderAliases::isBurrSwappable(brand, model);
+}
+
+QStringList SettingsDye::knownGrinderBrands() const {
+    return GrinderAliases::allBrands();
+}
+
+QStringList SettingsDye::knownGrinderModels(const QString& brand) const {
+    return GrinderAliases::modelsForBrand(brand);
+}
+
+// The per-delta half of stepGrinderSetting, once the grinder and the current
+// value are already resolved. Extracted rather than duplicated because
+// stepGrinderSettingRange() below resolves both ONCE and then calls this 801
+// times; a second copy of these rules is exactly the drift CLAUDE.md forbids,
+// and the two callers must agree row-for-row or the wheel and the web
+// datalist disagree about the same dial.
+QString SettingsDye::stepFromParsed(const GrinderAliases::GrinderEntry& entry,
+                                    double linear, const QString& current,
+                                    double deltaUnits, int decimals) {
+    const double stepped = linear + deltaUnits;
+    // Below-zero candidates are skipped only on click-indexed (Compound)
+    // grinders, keyed on the grinder's registry notation — NOT the current
+    // value's written form — because a negative linear position is meaningless
+    // there however it is written ("2.5" on a Mignon still skips). A
+    // plain-numeric grinder can be a stepless collar whose zero is a user-set
+    // calibration reference (Niche Zero), where dialling finer than zero is a
+    // real operation, so negatives pass through.
+    if (stepped < 0.0 && entry.notation == GrinderAliases::SettingNotation::Compound)
+        return QString();  // below the click-indexed dial floor → skip this row
+
+    // Compound rotation ("a+b") renders in its own notation (rev/position
+    // carry-borrow). We gate on the CURRENT value actually being compound: a
+    // compound-notation grinder whose setting is recorded as a plain number
+    // (parseGrinderSetting accepts that — some Mignon users log "0.5") keeps the
+    // numeric form instead of being re-notated to "0+0.5".
+    if (entry.notation == GrinderAliases::SettingNotation::Compound
+        && current.contains(QLatin1Char('+')))
+        return GrinderAliases::formatGrinderSetting(entry, stepped);
+
+    // Plain-numeric: honor the caller's step precision (the grind widget passes
+    // the decimals of its history-derived step, up to 2), not
+    // formatGrinderSetting's fixed single decimal, then strip trailing zeros to
+    // match the display convention.
+    const int d = qBound(0, decimals, 3);
+    QString s = QString::number(stepped, 'f', d);
+    if (s.contains(QLatin1Char('.'))) {
+        while (s.endsWith(QLatin1Char('0'))) s.chop(1);
+        if (s.endsWith(QLatin1Char('.'))) s.chop(1);
+    }
+    return s;
+}
+
+QString SettingsDye::stepGrinderSetting(const QString& brand, const QString& model,
+                                        const QString& current, double deltaUnits,
+                                        int decimals) const {
+    // Registry-only: a custom grinder (no match) returns "" so the caller keeps
+    // its plain-numeric / letter / history fallback, exactly as before.
+    const GrinderAliases::GrinderEntry* entry = GrinderAliases::findEntry(brand, model);
+    if (!entry)
+        return QString();
+    const auto linear = GrinderAliases::parseGrinderSetting(*entry, current);
+    if (!linear)
+        return QString();  // unparseable (e.g. pure letters) → caller's fallback
+    return stepFromParsed(*entry, *linear, current, deltaUnits, decimals);
+}
+
+// One call for a whole wheel, instead of one per row.
+//
+// GrindRowSource.grindRowsFor() builds 801 candidates (grindWindowSteps: 400)
+// and every one crossed into C++ to re-resolve the same grinder and re-parse the
+// same current value. The QML profiler measured that loop at 186 ms over 8020
+// calls across ten opens — 63% of the picker's whole open — and a memo on the
+// registry lookup did not touch it, because the cost is the 801 crossings and
+// their argument marshalling, not the work behind them. Measured again after
+// memoizing the decimal count inside the loop: no change. The only thing that
+// helps is not making the calls.
+//
+// Returns exactly what stepGrinderSetting would return for each n in
+// [fromN, toN], INCLUDING the empty strings — the caller distinguishes "the
+// catalog declined this row" from "the catalog produced a value" and falls back
+// per row, so collapsing the empties here would silently drop its JS branches.
+QStringList SettingsDye::stepGrinderSettingRange(const QString& brand, const QString& model,
+                                                 const QString& current, double stepUnits,
+                                                 int fromN, int toN, int decimals) const {
+    QStringList out;
+    if (toN < fromN)
+        return out;
+    out.reserve(toN - fromN + 1);
+
+    const GrinderAliases::GrinderEntry* entry = GrinderAliases::findEntry(brand, model);
+    const std::optional<double> linear =
+        entry ? GrinderAliases::parseGrinderSetting(*entry, current) : std::optional<double>{};
+    // A custom grinder or an unparseable value declines every row, exactly as
+    // stepGrinderSetting does one at a time. Fill rather than return short: the
+    // caller indexes by n and a shorter list would silently shift the window.
+    if (!entry || !linear) {
+        for (int n = fromN; n <= toN; ++n)
+            out.append(QString());
+        return out;
+    }
+
+    for (int n = fromN; n <= toN; ++n)
+        out.append(stepFromParsed(*entry, *linear, current, n * stepUnits, decimals));
+    return out;
+}
+
+QStringList SettingsDye::knownBasketBrands() const {
+    return BasketAliases::allBrands();
+}
+
+QStringList SettingsDye::knownBasketModels(const QString& brand) const {
+    return BasketAliases::modelsForBrand(brand);
+}
+
+QString SettingsDye::basketModelSummary(const QString& brand, const QString& model) const {
+    if (const BasketAliases::BasketEntry* e = BasketAliases::findEntry(brand, model))
+        return BasketAliases::summary(*e);
+    return QString();
+}
+
+double SettingsDye::dyeBeanWeight() const {
+    ensureDyeCacheLoaded();
+    return m_dyeBeanWeightCache;
+}
+
+void SettingsDye::setDyeBeanWeight(double value) {
+    if (!qFuzzyCompare(1.0 + dyeBeanWeight(), 1.0 + value)) {
+        m_dyeBeanWeightCache = value;
+        m_settings.setValue("dye/beanWeight", value);
+        writeThroughToBag("doseWeightG", value);
+        // The write-through makes this the bag's dose, so the ladder's cache
+        // has to follow it (dose-source-precedence). Without this a bag that
+        // started with no dose would keep reading as an empty rung after the
+        // user dialed one, and a later profile load would overwrite it.
+        //
+        // The condition MIRRORS writeThroughToBag's, m_bagStorage included: the
+        // cache may only claim the bag owns a dose that was actually persisted
+        // to its row. Skipped while applying a bag — there the cache is set
+        // from the row itself.
+        if (!m_applyingBag && m_bagStorage && bagIdIsSet(activeBagId())) {
+            m_activeBagDoseG = value > 0 ? value : 0;
+            m_activeBagDoseResolved = true;
+        }
+        emit dyeBeanWeightChanged();
+    }
+}
+
+double SettingsDye::dyeDrinkWeight() const {
+    ensureDyeCacheLoaded();
+    return m_dyeDrinkWeightCache;
+}
+
+void SettingsDye::setDyeDrinkWeight(double value) {
+    if (!qFuzzyCompare(1.0 + dyeDrinkWeight(), 1.0 + value)) {
+        m_dyeDrinkWeightCache = value;
+        m_settings.setValue("dye/drinkWeight", value);
+        // dyeDrinkWeight is the recorded drink weight (DYE metadata), not the
+        // bag's yield spec — the session anchor lives in Settings.brew and
+        // reaches the bag only via persistYieldSpecToBag(). No write-through.
+        emit dyeDrinkWeightChanged();
+    }
+}
+
+double SettingsDye::dyeDrinkTds() const {
+    return m_dyeDrinkTds;
+}
+
+void SettingsDye::setDyeDrinkTds(double value) {
+    if (!qFuzzyCompare(1.0 + m_dyeDrinkTds, 1.0 + value)) {
+        m_dyeDrinkTds = value;
+        emit dyeDrinkTdsChanged();
+    }
+}
+
+double SettingsDye::dyeDrinkEy() const {
+    return m_dyeDrinkEy;
+}
+
+void SettingsDye::setDyeDrinkEy(double value) {
+    if (!qFuzzyCompare(1.0 + m_dyeDrinkEy, 1.0 + value)) {
+        m_dyeDrinkEy = value;
+        emit dyeDrinkEyChanged();
+    }
+}
+
+QString SettingsDye::dyeShotNotes() const {
+    // Try new key first, fall back to old key for backward compatibility
+    QString notes = m_settings.value("dye/shotNotes", "").toString();
+    if (notes.isEmpty()) {
+        notes = m_settings.value("dye/espressoNotes", "").toString();
+    }
+    return notes;
+}
+
+void SettingsDye::setDyeShotNotes(const QString& value) {
+    if (dyeShotNotes() != value) {
+        m_settings.setValue("dye/shotNotes", value);
+        // When the user clears notes, also remove the legacy key — otherwise
+        // the getter's fallback would resurrect old notes from `dye/espressoNotes`.
+        // For non-empty writes the new key shadows the old one in the getter, so
+        // the legacy key is harmless dead data until the user clears notes.
+        if (value.isEmpty()) {
+            m_settings.remove("dye/espressoNotes");
+        }
+        emit dyeShotNotesChanged();
+    }
+}
+
+QString SettingsDye::dyeBarista() const {
+    return m_settings.value("dye/barista", "").toString();
+}
+
+void SettingsDye::setDyeBarista(const QString& value) {
+    if (dyeBarista() != value) {
+        m_settings.setValue("dye/barista", value);
+        emit dyeBaristaChanged();
+    }
+}
+
+QString SettingsDye::dyeShotDateTime() const {
+    return m_settings.value("dye/shotDateTime", "").toString();
+}
+
+void SettingsDye::setDyeShotDateTime(const QString& value) {
+    if (dyeShotDateTime() != value) {
+        m_settings.setValue("dye/shotDateTime", value);
+        emit dyeShotDateTimeChanged();
+    }
+}
+
+// Bean Base link state
+
+QString SettingsDye::dyeBeanBaseId() const {
+    return m_settings.value("dye/beanBaseId", "").toString();
+}
+
+void SettingsDye::setDyeBeanBaseId(const QString& value) {
+    if (dyeBeanBaseId() != value) {
+        m_settings.setValue("dye/beanBaseId", value);
+        writeThroughToBag("beanBaseId", value);
+        emit dyeBeanBaseIdChanged();
+    }
+}
+
+QString SettingsDye::dyeBeanBaseData() const {
+    return m_settings.value("dye/beanBaseData", "").toString();
+}
+
+void SettingsDye::setDyeBeanBaseData(const QString& value) {
+    if (dyeBeanBaseData() != value) {
+        m_settings.setValue("dye/beanBaseData", value);
+        writeThroughToBag("beanBaseData", value);
+        emit dyeBeanBaseDataChanged();
+    }
+}
+
+void SettingsDye::clearBeanBaseLink() {
+    setDyeBeanBaseId(QString());
+    setDyeBeanBaseData(QString());
+}
+
+// Active bag
+
+int SettingsDye::activeRecipeId() const {
+    return m_settings.value("dye/activeRecipeId", -1).toInt();
+}
+
+void SettingsDye::setActiveRecipeId(int recipeId) {
+    if (activeRecipeId() == recipeId)
+        return;
+    m_settings.setValue("dye/activeRecipeId", recipeId);
+    // A different recipe is a different rung: drop the previous one's dose, and
+    // mark the rung unresolved until whoever read the row calls
+    // setActiveRecipe(). Deactivation (id <= 0) resolves immediately — "no
+    // recipe" needs no row to confirm it.
+    m_activeRecipeDoseG = 0;
+    m_activeRecipeDoseResolved = recipeId <= 0;
+    emit activeRecipeIdChanged();
+}
+
+void SettingsDye::setActiveRecipe(int recipeId, double doseG) {
+    // Id first — setActiveRecipeId clears the dose on any change, so setting it
+    // afterwards is what keeps the pair consistent in both orders of arrival.
+    setActiveRecipeId(recipeId);
+    if (recipeId <= 0)
+        return;
+    m_activeRecipeDoseG = doseG > 0 ? doseG : 0;
+    m_activeRecipeDoseResolved = true;
+}
+
+bool SettingsDye::doseLadderResolved() const {
+    // Only a rung that is actually SET needs its row: an unset id supplies
+    // nothing, so there is nothing to wait for.
+    if (bagIdIsSet(activeBagId()) && !m_activeBagDoseResolved)
+        return false;
+    if (activeRecipeId() > 0 && !m_activeRecipeDoseResolved)
+        return false;
+    return true;
+}
+
+SettingsDye::DoseOwner SettingsDye::doseOwner() const {
+    // recipe → bag → profile. A source holding no dose is SKIPPED, not read as
+    // zero: a grind-only recipe or a never-dialed bag must not strand the dose
+    // on a rung that has nothing to supply.
+    //
+    // Callers that WRITE off this answer must also check doseLadderResolved() —
+    // an unresolved rung reads as empty here, which is indistinguishable from a
+    // source that genuinely designs no dose.
+    if (activeRecipeId() > 0 && m_activeRecipeDoseG > 0)
+        return DoseOwner::Recipe;
+    if (bagIdIsSet(activeBagId()) && m_activeBagDoseG > 0)
+        return DoseOwner::Bag;
+    return DoseOwner::Profile;
+}
+
+// Auto-load recipe (recipe-auto-load). Mutual exclusion with
+// SettingsApp::autoLoadProfileFilename is wired in Settings, not here.
+
+int SettingsDye::autoLoadRecipeId() const {
+    return m_settings.value("dye/autoLoadRecipeId", -1).toInt();
+}
+
+void SettingsDye::setAutoLoadRecipeId(int recipeId) {
+    if (autoLoadRecipeId() == recipeId)
+        return;
+    m_settings.setValue("dye/autoLoadRecipeId", recipeId);
+    emit autoLoadRecipeIdChanged();
+}
+
+int SettingsDye::activeBagId() const {
+    return m_settings.value("dye/activeBagId", -1).toInt();
+}
+
+void SettingsDye::setActiveBagId(int bagId) {
+    if (activeBagId() == bagId)
+        return;
+    m_reviewProtectedBagId = -1;
+    m_reviewProtectedBag.clear();
+    m_settings.setValue("dye/activeBagId", bagId);
+    emit activeBagIdChanged();
+
+    if (!bagIdIsSet(bagId)) {
+        // No bag selected: bean identity goes silent. Grinder/dose globals
+        // stay — the physical grinder didn't change.
+        m_applyingBag = true;
+        setDyeBeanBrand(QString());
+        setDyeBeanType(QString());
+        setDyeRoastDate(QString());
+        setDyeRoastLevel(QString());
+        setDyeBeanBaseId(QString());
+        setDyeBeanBaseData(QString());
+        m_applyingBag = false;
+        m_activeBagFrozenDate.clear();
+        m_activeBagDefrostDate.clear();
+        m_activeBagStorageHint.clear();
+        m_activeBagOpenedDate.clear();
+        m_activeBagYieldValue = 0;      // no bag → no yield spec
+        m_activeBagYieldMode = QStringLiteral("none");
+        m_activeBagDoseG = 0;           // no bag → no rung, and nothing to wait for
+        m_activeBagDoseResolved = true;
+        m_appliedBagId = -1;
+        emit activeBagYieldSpecChanged();
+        emit activeBagChanged();
+        return;
+    }
+
+    // A different bag is a different rung: drop the previous one's dose and
+    // hold the ladder unanswerable until this bag's row lands
+    // (dose-source-precedence). Without this, the window between selecting a
+    // bag and its bagReady reads as "the bag designs no dose" — and a profile
+    // load in that window writes its own dose straight through onto the new
+    // bag's stored doseWeightG.
+    m_activeBagDoseG = 0;
+    m_activeBagDoseResolved = false;
+    // A switch was requested: the next row to land applies as one, even if it
+    // is the previously applied bag's (A -> B -> A before B's row arrives) or
+    // a keep-fields read is still in flight.
+    m_appliedBagId = -1;
+    m_keepFieldsOnNextApply = false;
+
+    if (m_bagStorage) {
+        m_bagStorage->requestBag(bagId);     // applies via bagReady
+        m_bagStorage->requestTouchLastUsed(bagId);
+    }
+}
+
+void SettingsDye::setActiveBagKeepFields(int bagId)
+{
+    if (activeBagId() == bagId)
+        return;
+    m_reviewProtectedBagId = -1;
+    m_reviewProtectedBag.clear();
+    if (!bagIdIsSet(bagId)) {
+        // Caller is about to set its own field values — just drop the bag
+        // link without the identity-clearing that setActiveBagId(-1) does.
+        m_settings.setValue("dye/activeBagId", -1);
+        m_activeBagFrozenDate.clear();
+        m_activeBagDefrostDate.clear();
+        m_activeBagStorageHint.clear();
+        m_activeBagOpenedDate.clear();
+        m_activeBagYieldValue = 0;      // no bag → no yield spec
+        m_activeBagYieldMode = QStringLiteral("none");
+        m_activeBagDoseG = 0;           // no bag → no rung, and nothing to wait for
+        m_activeBagDoseResolved = true;
+        m_appliedBagId = -1;
+        emit activeBagYieldSpecChanged();
+        emit activeBagIdChanged();
+        emit activeBagChanged();
+        return;
+    }
+    m_settings.setValue("dye/activeBagId", bagId);
+    emit activeBagIdChanged();
+    m_activeBagDoseG = 0;               // see setActiveBagId: unresolved until the row lands
+    m_activeBagDoseResolved = false;
+    m_appliedBagId = -1;
+
+    if (m_bagStorage) {
+        m_keepFieldsOnNextApply = true;
+        m_bagStorage->requestBag(bagId);     // lifecycle-only via bagReady
+        m_bagStorage->requestTouchLastUsed(bagId);
+    }
+}
+
+void SettingsDye::refreshReviewProtectedBag(qint64 bagId)
+{
+    if (!m_bagStorage || bagId != m_reviewProtectedBagId) return;
+    m_bagStorage->requestBagWithCompletion(bagId, this,
+        [this](qint64 id, bool success, const QVariantMap& bag, const QString&) {
+            if (success && !bag.isEmpty() && id == m_reviewProtectedBagId && id == activeBagId())
+                applyReviewProtectedBagUpdate(id, bag);
+        });
+}
+
+void SettingsDye::applyReviewProtectedBagUpdate(qint64 bagId, const QVariantMap& bag)
+{
+    if (bagId != m_reviewProtectedBagId || bagId != activeBagId()) return;
+    const QVariantMap previous = m_reviewProtectedBag;
+    m_reviewProtectedBag = bag;
+    const auto changed = [&previous, &bag](const char* key) {
+        return previous.value(QLatin1String(key)) != bag.value(QLatin1String(key));
+    };
+    const QScopedValueRollback<bool> suppressWrites(m_applyingBag, true);
+    if (changed("roasterName")) setDyeBeanBrand(bag.value(QStringLiteral("roasterName")).toString());
+    if (changed("coffeeName")) setDyeBeanType(bag.value(QStringLiteral("coffeeName")).toString());
+    if (changed("roastDate")) setDyeRoastDate(bag.value(QStringLiteral("roastDate")).toString());
+    if (changed("roastLevel")) setDyeRoastLevel(bag.value(QStringLiteral("roastLevel")).toString());
+    if (changed("beanBaseId")) setDyeBeanBaseId(bag.value(QStringLiteral("beanBaseId")).toString());
+    if (changed("beanBaseData")) setDyeBeanBaseData(bag.value(QStringLiteral("beanBaseData")).toString());
+    refreshBagCaches(bag);
+    if (changed("doseWeightG") && m_activeBagDoseG > 0 && doseOwner() != DoseOwner::Recipe)
+        setDyeBeanWeight(m_activeBagDoseG);
+    m_activeBagFrozenDate = bag.value(QStringLiteral("frozenDate")).toString();
+    m_activeBagDefrostDate = bag.value(QStringLiteral("defrostDate")).toString();
+    m_activeBagStorageHint = bag.value(QStringLiteral("storageHint")).toString();
+    m_activeBagOpenedDate = bag.value(QStringLiteral("openedDate")).toString();
+    emit activeBagChanged();
+}
+
+bool SettingsDye::applyShotReviewPatch(const QVariantMap& patch, const QVariantMap& committedBag)
+{
+    if (patch.size() == 1 && patch.contains(QStringLiteral("barista"))) {
+        setDyeBarista(patch.value(QStringLiteral("barista")).toString());
+        return true;
+    }
+    const int bagId = patch.contains(QStringLiteral("bagId"))
+        ? patch.value(QStringLiteral("bagId")).toInt() : activeBagId();
+    if (bagId > 0 && committedBag.value(QStringLiteral("id")).toInt() != bagId)
+        return false;
+    const QScopedValueRollback<bool> suppressWrites(m_applyingBag, true);
+    const bool bagChanged = activeBagId() != (bagId > 0 ? bagId : -1);
+    if (bagChanged) m_settings.setValue("dye/activeBagId", bagId > 0 ? bagId : -1);
+    m_reviewProtectedBagId = bagId > 0 ? bagId : -1;
+    m_reviewProtectedBag = bagId > 0 ? committedBag : QVariantMap();
+    m_keepFieldsOnNextApply = false;
+    m_appliedBagId = bagId > 0 ? bagId : -1;
+    if (bagId > 0) {
+        m_activeBagFrozenDate = committedBag.value(QStringLiteral("frozenDate")).toString();
+        m_activeBagDefrostDate = committedBag.value(QStringLiteral("defrostDate")).toString();
+        m_activeBagStorageHint = committedBag.value(QStringLiteral("storageHint")).toString();
+        m_activeBagOpenedDate = committedBag.value(QStringLiteral("openedDate")).toString();
+        refreshBagCaches(committedBag);
+    } else {
+        m_activeBagFrozenDate.clear(); m_activeBagDefrostDate.clear();
+        m_activeBagStorageHint.clear(); m_activeBagOpenedDate.clear();
+        m_activeBagYieldValue = 0; m_activeBagYieldMode = QStringLiteral("none");
+        m_activeBagDoseG = 0; m_activeBagDoseResolved = true;
+        emit activeBagYieldSpecChanged();
+    }
+    if (patch.contains(QStringLiteral("beanBrand"))) setDyeBeanBrand(patch.value(QStringLiteral("beanBrand")).toString());
+    if (patch.contains(QStringLiteral("beanType"))) setDyeBeanType(patch.value(QStringLiteral("beanType")).toString());
+    if (patch.contains(QStringLiteral("roastDate"))) setDyeRoastDate(patch.value(QStringLiteral("roastDate")).toString());
+    if (patch.contains(QStringLiteral("roastLevel"))) setDyeRoastLevel(patch.value(QStringLiteral("roastLevel")).toString());
+    if (patch.contains(QStringLiteral("beanBaseId"))) setDyeBeanBaseId(patch.value(QStringLiteral("beanBaseId")).toString());
+    if (patch.contains(QStringLiteral("beanBaseJson"))) setDyeBeanBaseData(patch.value(QStringLiteral("beanBaseJson")).toString());
+    if (patch.contains(QStringLiteral("doseWeight"))) setDyeBeanWeight(patch.value(QStringLiteral("doseWeight")).toDouble());
+    if (patch.contains(QStringLiteral("grinderSetting"))) setDyeGrinderSetting(patch.value(QStringLiteral("grinderSetting")).toString());
+    if (patch.contains(QStringLiteral("rpm"))) setDyeGrinderRpm(patch.value(QStringLiteral("rpm")).toInt());
+    if (patch.contains(QStringLiteral("equipmentId"))) setActiveEquipmentId(patch.value(QStringLiteral("equipmentId")).toLongLong());
+    if (patch.contains(QStringLiteral("barista"))) setDyeBarista(patch.value(QStringLiteral("barista")).toString());
+    if (bagChanged) emit activeBagIdChanged();
+    emit activeBagChanged();
+    return true;
+}
+
+void SettingsDye::applyActiveBag(const QVariantMap& bag)
+{
+    // Same-bag reload = cache refresh, not a switch (m_appliedBagId).
+    const bool bagChanged = m_appliedBagId != activeBagId();
+    m_appliedBagId = activeBagId();
+
+    // Guard suppresses the setters' write-through — these values just came
+    // FROM the bag.
+    m_applyingBag = true;
+
+    // Bean identity always follows the bag, including empties — an absent
+    // roast date displays as silence, not as the previous bean's date.
+    setDyeBeanBrand(bag.value("roasterName").toString());
+    setDyeBeanType(bag.value("coffeeName").toString());
+    setDyeRoastDate(bag.value("roastDate").toString());
+    setDyeRoastLevel(bag.value("roastLevel").toString());
+    setDyeBeanBaseId(bag.value("beanBaseId").toString());
+    setDyeBeanBaseData(bag.value("beanBaseData").toString());
+
+    // Caches first: doseOwner() below reads the dose rung.
+    refreshBagCaches(bag);
+    // Applying the bag's dose is gated on no recipe supplying one — the
+    // dose-source-precedence ladder, the same gate coffee-bag-model already
+    // put on the bag's yield spec. Without it, an external edit to the active
+    // bag (the bag dialog, Next Portion, a post-shot stamp) re-enters here via
+    // bagReady and writes the bag's dose over the active recipe's — and since
+    // dyeBeanWeightChanged stamps the recipe, that overwrites the recipe's
+    // stored doseG too. m_applyingBag suppresses the write-through to the bag,
+    // not the stamp.
+    if (m_activeBagDoseG > 0 && doseOwner() != DoseOwner::Recipe)
+        setDyeBeanWeight(m_activeBagDoseG);
+
+    m_applyingBag = false;
+
+    const QString frozen = bag.value("frozenDate").toString();
+    const QString defrost = bag.value("defrostDate").toString();
+    const QString storageHint = bag.value("storageHint").toString();
+    const QString opened = bag.value("openedDate").toString();
+    if (frozen != m_activeBagFrozenDate || defrost != m_activeBagDefrostDate
+        || storageHint != m_activeBagStorageHint || opened != m_activeBagOpenedDate) {
+        m_activeBagFrozenDate = frozen;
+        m_activeBagDefrostDate = defrost;
+        m_activeBagStorageHint = storageHint;
+        m_activeBagOpenedDate = opened;
+        emit activeBagChanged();
+    }
+
+    // The bag's yield spec drives the session anchor (Settings.brew), not the
+    // DYE drink weight — only on a switch, and after the switch's
+    // clear-to-profile reset. MainController gates it on no recipe being
+    // active (recipe outranks bag). mode "none" → the profile default stands.
+    if (bagChanged)
+        emit activeBagYieldSpecApplied(m_activeBagYieldValue, m_activeBagYieldMode);
+}
+
+// The bag's yield spec and dose rung, cached whether or not the row is
+// APPLIED: the baseline ladders, Update Bag's enable-gate and doseOwner() read
+// them, so a keep-fields load or a same-bag reload that declines to write must
+// still not leave them describing the previous row.
+void SettingsDye::refreshBagCaches(const QVariantMap& bag)
+{
+    m_activeBagYieldValue = bag.value("yieldValue", 0.0).toDouble();
+    m_activeBagYieldMode = YieldSpec::normalizedMode(bag.value("yieldMode").toString());
+    if (m_activeBagYieldValue <= 0)
+        m_activeBagYieldMode = YieldSpec::modeNone();
+    emit activeBagYieldSpecChanged();
+    const double dose = bag.value("doseWeightG", 0.0).toDouble();
+    m_activeBagDoseG = dose > 0 ? dose : 0;
+    m_activeBagDoseResolved = true;
+}
+
+void SettingsDye::persistYieldSpecToBag(double value, const QString& mode)
+{
+    // The "Update Bag" write — SettingsDye's only path from yield to bag. Goes
+    // through writeThroughToBag per field (skips when no bag/storage is
+    // attached, and dodges the bagUpdated echo via m_pendingSelfWrites).
+    // Writing a spec whose mode is "none" clears the bag's anchor.
+    m_activeBagYieldMode = YieldSpec::normalizedMode(mode);
+    // Normalize to the range the session resolves within (YieldSpec::clampValue
+    // — 0.5–100 for a ratio, 1–500 g for an absolute). This holds the invariant
+    // at the point of STORAGE: a bag must never hold a value the session cannot
+    // resolve to, or its stored design and the brewed shot disagree permanently
+    // and silently — the bag reads 900 g everywhere while the shot pulls 500.
+    // Clamp ONLY a value that is actually set: 0 is the "no anchor" sentinel,
+    // and clamping it would bound it UP to the 1 g floor and defeat the
+    // mode-collapse below.
+    const bool haveValue = YieldSpec::isSet(m_activeBagYieldMode) && value > 0;
+    m_activeBagYieldValue = haveValue ? YieldSpec::clampValue(m_activeBagYieldMode, value) : 0.0;
+    if (m_activeBagYieldValue <= 0)
+        m_activeBagYieldMode = YieldSpec::modeNone();
+    // Notify unconditionally: the cache above has already changed, so the
+    // Q_PROPERTY bindings that read it (the Update Bag button's enabled
+    // state, the brew baseline) are stale from here on whether or not a bag
+    // is attached to persist to.
+    emit activeBagYieldSpecChanged();
+    if (!m_applyingBag && m_bagStorage && bagIdIsSet(activeBagId())) {
+        m_pendingSelfWrites++;
+        m_bagStorage->requestUpdateBag(activeBagId(),
+                                       {{QStringLiteral("yieldValue"), m_activeBagYieldValue},
+                                        {QStringLiteral("yieldMode"), m_activeBagYieldMode}});
+        // The bag's spec is a baseline rung — let listeners (the brew
+        // baseline, idle widgets) re-evaluate against the new stored value.
+        emit activeBagYieldSpecApplied(m_activeBagYieldValue, m_activeBagYieldMode);
+    }
+}
+
+void SettingsDye::writeThroughToBag(const QString& field, const QVariant& value)
+{
+    if (m_applyingBag || !m_bagStorage)
+        return;
+    const int bagId = activeBagId();
+    if (!bagIdIsSet(bagId))
+        return;
+    m_pendingSelfWrites++;
+    m_bagStorage->requestUpdateBag(bagId, {{field, value}});
+}
+
+void SettingsDye::writeThroughToActivePackage(const QString& field, const QVariant& value)
+{
+    if (m_applyingBag || !m_equipmentStorage)
+        return;
+    const qint64 eqId = activeEquipmentId();
+    if (eqId <= 0)
+        return;
+    m_equipmentStorage->requestUpdatePackage(eqId, {{field, value}});
+}

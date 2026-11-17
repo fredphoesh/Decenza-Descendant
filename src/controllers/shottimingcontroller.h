@@ -1,0 +1,249 @@
+#pragma once
+
+#include <QObject>
+#include <QPointer>
+#include <QTimer>
+#include <QDateTime>
+#include <QSet>
+#include <optional>
+
+#include "settlingconstants.h"
+#include "../profile/profile.h"
+
+class DE1Device;
+class ScaleDevice;
+class Settings;
+class MachineState;
+struct ShotSample;
+
+/**
+ * ShotTimingController centralizes all shot timing, tare management, and weight processing.
+ *
+ * This eliminates the previous architecture where timing was spread across:
+ * - MachineState (wall-clock timer, tare flags)
+ * - MainController (DE1 BLE timer sync)
+ * - ShotDataModel (raw time tracking)
+ *
+ * Single source of truth: DE1's BLE timer (sample.timer)
+ *
+ * Responsibilities:
+ * 1. Shot timing using DE1's BLE timer
+ * 2. Tare state machine (Idle -> Pending -> Complete)
+ * 3. Weight-to-timestamp synchronization
+ * 4. Stop-at-weight detection
+ * 5. Per-frame weight exit detection
+ */
+class ShotTimingController : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(double shotTime READ shotTime NOTIFY shotTimeChanged)
+    Q_PROPERTY(bool tareComplete READ isTareComplete NOTIFY tareCompleteChanged)
+    Q_PROPERTY(double currentWeight READ currentWeight NOTIFY weightChanged)
+    Q_PROPERTY(bool sawSettling READ isSawSettling NOTIFY sawSettlingChanged)
+
+public:
+    enum class TareState { Idle, Pending, Complete };
+    Q_ENUM(TareState)
+
+    explicit ShotTimingController(DE1Device* device, QObject* parent = nullptr);
+
+    // Properties
+    double shotTime() const;
+    // Receive-time mapping shared by asynchronous sensors, including SAW settling.
+    std::optional<double> sensorTime(qint64 receivedAtMs) const;
+    double extractionDuration() const { return m_extractionEndTime; }
+    bool isTareComplete() const { return m_tareState == TareState::Complete; }
+    double currentWeight() const { return m_weight; }
+    TareState tareState() const { return m_tareState; }
+    bool isSawSettling() const { return m_sawSettling; }
+
+    // Configuration
+    void setScale(ScaleDevice* scale);
+    void setSettings(Settings* settings);
+    void setMachineState(MachineState* machineState);
+    void setTargetWeight(double weight);
+    void setCurrentProfile(const Profile* profile);
+
+    // Shot lifecycle
+    void startShot();   // Called when espresso cycle starts
+    void endShot();     // Called when shot ends
+
+    // Transition reason tracking
+    bool wasWeightExit(int frameNumber) const { return m_weightExitFrames.contains(frameNumber); }
+
+    // #1161: true iff stop-at-weight (SAW) ended this shot. Backed by
+    // m_stopAtWeightTriggered (set in onSawTriggered, reset ONLY in
+    // startShot) — NOT m_sawTriggeredThisShot, which onSettlingComplete /
+    // the cup-removal path / the settling-cancel branch all clear *before*
+    // emitting shotProcessingReady, so it is already false by the time the
+    // synchronous onShotEnded save reads it. m_stopAtWeightTriggered is
+    // reset at startShot() line ~97, which runs AFTER the settling-cancel
+    // emit (line ~83) that saves the prior shot, so it remains valid for
+    // every onShotEnded save path (normal settle, back-to-back, cup
+    // removal).
+    bool wasSawTriggered() const { return m_stopAtWeightTriggered; }
+
+    // Data ingestion
+    void onShotSample(const ShotSample& sample, double pressureGoal, double flowGoal,
+                      double tempGoal, int frameNumber, bool isFlowMode);
+    // Called by WeightProcessor (via QueuedConnection from worker thread)
+    void onWeightSample(double weight, double flowRate, double flowRateShort = 0);
+
+    // The pre-shot zero offset WeightProcessor is currently subtracting from the weights it
+    // emits (WeightProcessor::preShotZeroOffsetChanged). Cleared after each shot is saved.
+    void setAppliedZeroOffset(double offsetG) { m_appliedZeroOffsetG = offsetG; }
+
+    // Called by WeightProcessor when SAW triggers (captures state for learning)
+    void onSawTriggered(double weightAtStop, double flowRateAtStop, double targetWeight);
+
+    // Called by WeightProcessor when per-frame weight exit fires (for transition tracking)
+    void recordWeightExit(int frameNumber);
+
+    // Tare control
+    void tare();
+
+    // Hot water started while the last espresso is still settling. Ends settling
+    // before the hot water's tare can reach the reading; see SAW_LEARNING.md.
+    void endSettlingForHotWater();
+
+signals:
+    void extractionClockStarted();
+    void shotTimeChanged();
+    void tareCompleteChanged();
+    void weightChanged();
+    void sawSettlingChanged();
+
+    // Unified sample output (all data with consistent timestamp)
+    void sampleReady(double time, double pressure, double flow, double temp,
+                     double pressureGoal, double flowGoal, double tempGoal,
+                     int frameNumber, bool isFlowMode);
+    void weightSampleReady(double time, double weight, double flowRate);
+    void weightBaselineReady(double time, double weight);
+    void weightSourceUsed(const QString& source);
+
+    // Stop conditions
+    void stopAtWeightReached();
+    void perFrameWeightReached(int frameNumber);
+
+    // SAW learning - emits drip (grams after stop) and flow rate for learning
+    void sawLearningComplete(double drip, double flowAtStop, double overshoot);
+
+    // Emitted when shot is ready to be saved/processed
+    // (immediately if no SAW, or after settling if SAW triggered)
+    void shotProcessingReady();
+
+private slots:
+    void onTareTimeout();
+    void onDisplayTimerTick();
+    void onSettlingComplete();
+
+private:
+    QString servingWeightSource() const;
+    void startSettlingTimer();
+    // Ends settling, unless a disturbed reading is still waiting for the sample that
+    // would confirm it -- then the scale went quiet mid-disturbance.
+    void completeSettling();
+    // `disturbance` is None for a cup lift.
+    void abandonSettling(double reading, double flowShort, Settling::SettleDisturbance disturbance);
+    // The tail every abandon shares: save `savedG`, leave settling, release the shot.
+    void finishAbandonedSettle(double savedG);
+    void tracePostSettle(double weight);
+    void flushPostSettleTrace(const QString& reason = QString());
+    QString postSettleEndReason() const;
+
+    DE1Device* m_device = nullptr;
+    QPointer<ScaleDevice> m_scale;
+    Settings* m_settings = nullptr;
+    MachineState* m_machineState = nullptr;
+    const Profile* m_currentProfile = nullptr;
+
+    // Timing state (wall clock based - simple and reliable)
+    double m_currentTime = 0;      // Current shot time in seconds (advances during settling for graph)
+    double m_extractionEndTime = 0; // Frozen at extraction end (for timer display and saved duration)
+    bool m_shotActive = false;
+
+    // Weight state
+    double m_weight = 0;
+    double m_flowRate = 0;
+    double m_smoothedFlowRate = 0.0;  // EMA-smoothed flow rate for display/recording
+    bool m_flowRateInitialized = false; // First sample bootstraps EMA
+    double m_flowRateShort = 0;  // 500ms LSLR for SOW decisions (less stale than 1s)
+    double m_targetWeight = 0;
+    bool m_stopAtWeightTriggered = false;
+    int m_frameWeightSkipSent = -1;  // Frame for which we've sent weight-based skip
+    QSet<int> m_weightExitFrames;    // Frames that exited due to weight (for transition reason tracking)
+    int m_currentFrameNumber = -1;   // Current frame number from shot samples
+    bool m_extractionStarted = false; // True after frame 0 seen (preheating complete)
+
+    // SAW learning state
+    bool m_sawTriggeredThisShot = false;
+    double m_flowRateAtStop = 0.0;
+    double m_weightAtStop = 0.0;      // Weight when SAW triggered
+    double m_targetWeightAtStop = 0.0;
+    QTimer m_settlingTimer;
+    bool m_sawSettling = false;  // Event-based flag (not timer-backed) for settling state
+    double m_lastStableWeight = 0.0;  // For detecting weight stabilization
+    qint64 m_lastWeightChangeTime = 0; // Timestamp of last significant weight change (ms)
+    double m_settlingPeakWeight = 0.0; // Peak weight seen during settling (for cup removal detection)
+    double m_settleStartWeight = 0.0;  // m_weight when settling began; see Settling::settleBaseG()
+    double m_settleFlowRefGps = -1.0;  // Settling::settleFlowRefGps(), set on the first sample
+    bool m_settleAmountCheck = true;   // the profile's drip is bounded (espresso group)
+    int m_disturbedRun = 0;            // consecutive disturbed settling samples
+    Settling::RateRiseRecovery m_settleRateRecovery;
+    // The first of them, held until the next sample decides whether it was a glitch.
+    double m_pendingReadingG = 0.0;
+    double m_pendingFlowGps = 0.0;
+    Settling::SettleDisturbance m_pendingDisturbance = Settling::SettleDisturbance::None;
+
+    // Rolling average for settling stability detection
+    // Tolerates oscillations by checking if the average weight has stopped drifting.
+    // Scale cadences vary 4–10 Hz across supported hardware (Decent v1 ~4 Hz, most
+    // WiFi/v2 scales ~10 Hz); window size is chosen to absorb at least one full
+    // BLE drop-out without losing the trend.
+    // Both "drip still ongoing" log sites throttle on this one interval. Without
+    // it onDisplayTimerTick's fires every 50 ms tick and onWeightSample's fires on
+    // every sample (4-10 Hz depending on scale) — 100+ lines a shot either way.
+    static constexpr int DRIP_ONGOING_LOG_THROTTLE_MS = 1000;
+    double m_settlingWindow[Settling::SETTLING_WINDOW_SIZE] = {};
+    int m_settlingWindowCount = 0;
+    int m_settlingWindowIndex = 0;
+    double m_lastSettlingAvg = 0.0;
+    // Most recent rolling-window avg observed while the stability gate held
+    // (drift < SETTLING_AVG_THRESHOLD, weight ≤ avg + SETTLING_ABOVE_AVG_MARGIN,
+    // avg ≥ m_weightAtStop − 0.5) AND the gate had been holding for at least
+    // SETTLING_CLEAN_CAPTURE_MS — see that constant for the rationale behind
+    // the time gate. Used as the cup-removal fallback for m_weight when the
+    // user lifts the cup before SETTLING_STABLE_MS elapses.
+    // 0 ⇒ no clean avg has been observed yet this settling cycle.
+    double m_lastCleanSettlingAvg = 0.0;
+    qint64 m_settlingAvgStableSince = 0; // When the rolling avg stopped drifting
+    qint64 m_lastDripOngoingLogMs = 0;   // Throttle "drip still ongoing" log to 1/sec
+
+    // After-settle trace: one DEBUG line per shot with the reading for 5 s after the
+    // saved weight was taken, to see whether it kept moving. Sample-driven, no timer.
+    static constexpr int POST_SETTLE_TRACE_S = 5;
+    struct PostSettleTrace {
+        double savedG;
+        double zeroOffsetG;  // the offset the saved value was corrected by
+        qint64 startMs;
+        int nextSecond = 1;
+        QString text;
+        double lastG = 0;
+        double maxRiseG = 0;
+        double largestStepG = 0;
+        double elapsedSec = 0;
+    };
+    std::optional<PostSettleTrace> m_postSettle;
+    double m_appliedZeroOffsetG = 0.0;
+
+    // Tare state machine
+    TareState m_tareState = TareState::Idle;
+    QTimer m_tareTimeout;
+
+    // Display timer (for smooth UI updates between BLE samples)
+    QTimer m_displayTimer;
+    qint64 m_displayTimeBase = 0;  // Wall clock when shot started
+
+#ifdef DECENZA_TESTING
+    friend class tst_Settling;
+#endif
+};

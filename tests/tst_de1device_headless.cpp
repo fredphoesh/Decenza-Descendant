@@ -1,0 +1,648 @@
+#include <QtTest>
+
+#include "ble/de1device.h"
+#include "ble/protocol/de1characteristics.h"
+#include "mocks/MockTransport.h"
+
+// Guards the GHC "headless" gate default (PR Kulitorum/Decenza#1470). m_isHeadless means "the
+// app may start operations on-screen". It must default TRUE (matching de1app,
+// whose ghc_is_installed defaults to 0 → ghc_required()==0 → app can start): a
+// false default bricks every start button on the common no-GHC machine until
+// (or unless) the GHC MMR read returns. Only a positive GHC read flips it
+// false, and a disconnect must restore the permissive default so a GHC
+// machine's false cannot bleed into the next connection.
+//
+// Also guards DE1::SubState reset on disconnect (de1app commit 04d3b02e): a
+// substate is never reset by de1app's own disconnect handler, so a stale
+// Error_NoAC can pin the front-standby-switch warning up forever, even after
+// the switch is flipped back and the app reconnects. Same shape as the
+// headless reset above, different field.
+//
+// And the water-level filter, which is here rather than in a file of its own because a new test
+// TU costs ~1.4 s of every clean build forever while a slot in an existing one costs milliseconds
+// (see TESTING.md). It shares this file's fixture: a DE1Device on a MockTransport, driven by
+// feeding characteristic payloads.
+
+class tst_DE1DeviceHeadless : public QObject {
+    Q_OBJECT
+
+private:
+    struct TestFixture {
+        MockTransport transport;
+        DE1Device device;
+        TestFixture() { device.setTransport(&transport); }
+    };
+
+    // Build a WaterLevels payload reading `mm` at the sensor, i.e. before the +5 mm mount offset
+    // the parser adds. U16P8 big-endian.
+    static QByteArray waterPayload(double sensorMm) {
+        const uint16_t raw = static_cast<uint16_t>(sensorMm * 256.0 + 0.5);
+        QByteArray d;
+        d.append(static_cast<char>((raw >> 8) & 0xFF));
+        d.append(static_cast<char>(raw & 0xFF));
+        return d;
+    }
+
+    static QByteArray statePayload(DE1::State state, DE1::SubState subState) {
+        QByteArray d;
+        d.append(static_cast<char>(state));
+        d.append(static_cast<char>(subState));
+        return d;
+    }
+
+    static QList<QByteArray> requestedStates(const MockTransport& t) {
+        return t.writesFor(DE1::Characteristic::REQUESTED_STATE);
+    }
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    void defaultsToHeadless() {
+        // A freshly constructed device (no GHC read yet) must allow app starts.
+        DE1Device device;
+        QCOMPARE(device.isHeadless(), true);
+    }
+
+    void gcAbortStateRequiresFreshStateInfoAfterDisconnect() {
+        TestFixture f;
+        QSignalSpy received(&f.device, &DE1Device::stateInfoReceived);
+        QVERIFY(!f.device.hasCurrentStateInfo());
+        f.device.parseStateInfo(QByteArray(1, '\0'));
+        QVERIFY(!f.device.hasCurrentStateInfo());
+        QCOMPARE(received.count(), 0);
+        // The first reading may equal the default Sleep state; it must still
+        // notify the deferred abort coordinator that the state is now known.
+        f.device.parseStateInfo(statePayload(DE1::State::Sleep, DE1::SubState::Ready));
+        QVERIFY(f.device.hasCurrentStateInfo());
+        QCOMPARE(received.count(), 1);
+        f.device.onTransportDisconnected();
+        QVERIFY(!f.device.hasCurrentStateInfo());
+        f.device.parseStateInfo(statePayload(DE1::State::Espresso, DE1::SubState::Pouring));
+        QVERIFY(f.device.hasCurrentStateInfo());
+        QCOMPARE(received.count(), 2);
+    }
+
+    // A purge from a non-idle state goes through Idle first, as de1app's
+    // start_steam_rinse does; from Idle it is the one request.
+    void steamPurgeRequestsSteamRinse() {
+        TestFixture f;
+        f.device.parseStateInfo(statePayload(DE1::State::Idle, DE1::SubState::Ready));
+        f.transport.clearWrites();
+        f.device.startSteamPurge();
+        QCOMPARE(requestedStates(f.transport),
+                 QList<QByteArray>{QByteArray(1, char(DE1::State::SteamRinse))});
+
+        f.transport.clearWrites();
+        f.device.parseStateInfo(statePayload(DE1::State::Steam, DE1::SubState::Ready));
+        f.device.startSteamPurge();
+        QCOMPARE(requestedStates(f.transport),
+                 (QList<QByteArray>{QByteArray(1, char(DE1::State::Idle)),
+                                    QByteArray(1, char(DE1::State::SteamRinse))}));
+        f.device.parseStateInfo(statePayload(DE1::State::Idle, DE1::SubState::Ready));
+        f.device.parseStateInfo(statePayload(DE1::State::Steam, DE1::SubState::Ready));
+        QVERIFY(f.device.isSteamPurgeActive());
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression(
+            QStringLiteral(".*DE1 DISCONNECTED while Steam.*unrequested drop.*")));
+        f.device.onTransportDisconnected();
+        f.device.parseStateInfo(statePayload(DE1::State::Steam, DE1::SubState::Steaming));
+        QVERIFY(!f.device.isSteamPurgeActive());
+    }
+
+    void discardedPurgeDoesNotCaptureLaterSteam_data() {
+        QTest::addColumn<QString>("event");
+        QTest::addColumn<bool>("acknowledged");
+        QTest::addColumn<bool>("running");
+        QTest::addColumn<bool>("expectedPurge");
+        QTest::newRow("abandoned-purge") << "abandoned" << false << false << false;
+        QTest::newRow("cleared-queue") << "clear" << false << false << false;
+        QTest::newRow("empty-queue") << "empty" << false << false << true;
+        QTest::newRow("different-state-abandoned") << "other-state" << false << false << true;
+        QTest::newRow("different-characteristic-abandoned") << "other-characteristic" << false << false << true;
+        QTest::newRow("acknowledged-before-queue-clear") << "clear" << true << false << true;
+        QTest::newRow("running-before-queue-clear") << "clear" << false << true << true;
+        QTest::newRow("running-before-abandonment") << "abandoned" << false << true << true;
+        QTest::newRow("cancel-pending") << "cancel" << false << false << false;
+        QTest::newRow("cancel-acknowledged") << "cancel" << true << false << false;
+        QTest::newRow("cancel-running") << "cancel" << false << true << false;
+        QTest::newRow("urgent-cancel-pending") << "urgent" << false << false << false;
+        QTest::newRow("urgent-cancel-acknowledged") << "urgent" << true << false << false;
+        QTest::newRow("urgent-cancel-running") << "urgent" << false << true << false;
+        QTest::newRow("cancel-with-late-steam") << "cancel-transient" << false << false << false;
+        QTest::newRow("acknowledged-cancel-with-late-steam") << "cancel-transient" << true << false << false;
+    }
+
+    void discardedPurgeDoesNotCaptureLaterSteam() {
+        QFETCH(QString, event);
+        QFETCH(bool, acknowledged);
+        QFETCH(bool, running);
+        QFETCH(bool, expectedPurge);
+        TestFixture f;
+        const QByteArray purge(1, char(DE1::State::SteamRinse));
+        f.device.parseStateInfo(statePayload(DE1::State::Idle, DE1::SubState::Ready));
+        f.device.startSteamPurge();
+        if (acknowledged)
+            emit f.transport.writeComplete(DE1::Characteristic::REQUESTED_STATE, purge);
+        if (running)
+            f.device.parseStateInfo(statePayload(DE1::State::Steam, DE1::SubState::Ready));
+
+        if (event == "abandoned")
+            emit f.transport.writeAbandoned(DE1::Characteristic::REQUESTED_STATE, purge);
+        else if (event == "other-state")
+            emit f.transport.writeAbandoned(DE1::Characteristic::REQUESTED_STATE,
+                                           QByteArray(1, char(DE1::State::Idle)));
+        else if (event == "other-characteristic")
+            emit f.transport.writeAbandoned(DE1::Characteristic::HEADER_WRITE, purge);
+        else if (event == "cancel" || event == "cancel-transient")
+            f.device.requestIdle();
+        else if (event == "urgent")
+            f.device.stopOperationUrgent();
+        else {
+            f.transport.pendingQueueSize = event == "clear" ? 1 : 0;
+            f.device.clearCommandQueue();
+        }
+
+        QVERIFY(f.device.isConnected());
+        const bool cancelled = event == "cancel" || event == "cancel-transient" || event == "urgent";
+        if (event == "cancel-transient") {
+            f.device.parseStateInfo(statePayload(DE1::State::Steam, DE1::SubState::Ending));
+            QVERIFY(f.device.isSteamPurgeActive());
+        }
+        if (!running || cancelled)
+            f.device.parseStateInfo(statePayload(DE1::State::Idle, DE1::SubState::Ready));
+        f.device.parseStateInfo(statePayload(DE1::State::Steam, DE1::SubState::Steaming));
+        QCOMPARE(f.device.isSteamPurgeActive(), expectedPurge);
+    }
+
+    void gcAbortPendingBlocksNewOperationsButAllowsStop() {
+        TestFixture f;
+        f.device.setGcAbortPending(true);
+        for (const auto state : {DE1::State::Espresso, DE1::State::Steam, DE1::State::HotWater,
+                                 DE1::State::HotWaterRinse, DE1::State::SteamRinse,
+                                 DE1::State::Descale, DE1::State::Clean, DE1::State::AirPurge}) {
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(
+                QStringLiteral(".*Operation start blocked while a QML GC crash report is pending.*")));
+            f.device.requestState(state);
+        }
+        QVERIFY(requestedStates(f.transport).isEmpty());
+        f.device.requestState(DE1::State::Idle);
+        f.device.requestState(DE1::State::SkipToNext);
+        f.device.stopOperationUrgent();
+        QCOMPARE(requestedStates(f.transport),
+                 (QList<QByteArray>{QByteArray(1, char(DE1::State::Idle)),
+                                    QByteArray(1, char(DE1::State::SkipToNext)),
+                                    QByteArray(1, char(DE1::State::Idle))}));
+    }
+
+    void gcAbortStateIsInvalidatedOnTransportReplacement() {
+        TestFixture f;
+        MockTransport replacement;
+        f.device.parseStateInfo(statePayload(DE1::State::Idle, DE1::SubState::Ready));
+        QVERIFY(f.device.hasCurrentStateInfo());
+        f.device.setTransport(&replacement);
+        QVERIFY(!f.device.hasCurrentStateInfo());
+        f.device.parseStateInfo(statePayload(DE1::State::Steam, DE1::SubState::Steaming));
+        QVERIFY(f.device.hasCurrentStateInfo());
+        f.device.setTransport(&f.transport);
+        QVERIFY(!f.device.hasCurrentStateInfo());
+    }
+
+    void gcAbortRequestsStateAndInvalidatesItOnExplicitDisconnect() {
+        TestFixture f;
+        f.device.parseStateInfo(statePayload(DE1::State::Idle, DE1::SubState::Ready));
+        QVERIFY(f.device.hasCurrentStateInfo());
+        f.transport.reads.clear();
+        f.device.requestCurrentStateInfo();
+        QCOMPARE(f.transport.reads, (QList<QBluetoothUuid>{DE1::Characteristic::STATE_INFO}));
+        f.device.disconnect();
+        QVERIFY(!f.device.hasCurrentStateInfo());
+        f.device.requestCurrentStateInfo();
+        QCOMPARE(f.transport.reads.size(), 1);
+    }
+
+    void firmwareDescaleProgressKeepsMeasuredSchedule() {
+        TestFixture f;
+        emit f.transport.dataReceived(DE1::Characteristic::STATE_INFO,
+                                      statePayload(DE1::State::Descale, DE1::SubState::DescaleInit));
+        QTRY_VERIFY_WITH_TIMEOUT(f.device.descaleProgress() > 0.0, 2000);
+        QCOMPARE(f.device.descaleStepIndex(), 1);
+        QVERIFY(f.device.descaleProgress() < 1.0);
+        QVERIFY(f.device.descaleSecondsRemaining() >= 718);
+        QVERIFY(f.device.descaleSecondsRemaining() <= 720);
+
+        emit f.transport.dataReceived(DE1::Characteristic::STATE_INFO,
+                                      statePayload(DE1::State::Descale, DE1::SubState::DescaleFillGroup));
+        QCOMPARE(f.device.descaleStepIndex(), 2);
+        QVERIFY(f.device.descaleProgress() >= 30.0 / 720.0);
+        QVERIFY(f.device.descaleProgress() <= 31.0 / 720.0);
+        QVERIFY(f.device.descaleProgress() < 1.0);
+        QVERIFY(f.device.descaleSecondsRemaining() >= 689);
+        QVERIFY(f.device.descaleSecondsRemaining() <= 690);
+
+        emit f.transport.dataReceived(DE1::Characteristic::STATE_INFO,
+                                      statePayload(DE1::State::Idle, DE1::SubState::Ready));
+        QCOMPARE(f.device.descaleProgress(), 0.0);
+        QCOMPARE(f.device.descaleStepIndex(), 0);
+        QCOMPARE(f.device.descaleSecondsRemaining(), 0);
+    }
+
+    void coldTransportUsesTheMaintenanceHandler_data() {
+        QTest::addColumn<int>("firmwareBuild");
+        QTest::addColumn<bool>("headless");
+        QTest::addColumn<bool>("deferred");
+        QTest::addColumn<bool>("ghcConfirmed");
+        QTest::newRow("unknown-ghc") << 0 << false << true << true;
+        QTest::newRow("pre-native-ghc") << 1352 << false << true << true;
+        QTest::newRow("native-boundary-ghc") << 1356 << false << false << true;
+        QTest::newRow("post-native-ghc") << 1358 << false << false << true;
+        QTest::newRow("pre-native-no-ghc") << 1352 << true << false << true;
+        QTest::newRow("unknown-firmware-ghc-unread") << 0 << true << true << false;
+        QTest::newRow("old-firmware-ghc-unread") << 1352 << true << true << false;
+        QTest::newRow("native-firmware-ghc-unread") << 1356 << true << false << false;
+    }
+
+    void coldTransportUsesTheMaintenanceHandler() {
+        QFETCH(int, firmwareBuild);
+        QFETCH(bool, headless);
+        QFETCH(bool, deferred);
+        QFETCH(bool, ghcConfirmed);
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = firmwareBuild;
+        if (ghcConfirmed)
+            f.device.parseMMRResponse(DE1Device::buildMMRPayload(DE1::MMR::GHC_INFO, headless ? 0 : 7));
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+
+        f.device.startAirPurge();
+        const QByteArray airPurge(1, static_cast<char>(DE1::State::AirPurge));
+        if (deferred) {
+            QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::AirPurge);
+            QVERIFY(requestedStates(f.transport).isEmpty());
+            QVERIFY(!f.transport.writesFor(DE1::Characteristic::HEADER_WRITE).isEmpty());
+            QSignalSpy uploaded(&f.device, &DE1Device::profileUploaded);
+            f.transport.ackAllWritesInOrder();
+            QCOMPARE(uploaded.count(), 1);
+            QVERIFY(uploaded.first().at(0).toBool());
+            // Still heating: no drain request may overtake preparation.
+            f.device.flushPendingMaintenanceState();
+            QVERIFY(requestedStates(f.transport).isEmpty());
+            // Drive the real state-notification path that releases preparation.
+            const QByteArray ready = QByteArray::fromHex("0200"); // Idle / Ready
+            f.device.parseStateInfo(ready);
+            QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::NoRequest);
+        } else {
+            QVERIFY(f.transport.writesFor(DE1::Characteristic::HEADER_WRITE).isEmpty());
+        }
+        QCOMPARE(requestedStates(f.transport), QList<QByteArray>{airPurge});
+    }
+
+    void cancelledColdTransportDoesNotStartOnTheNextReadyNotification() {
+        TestFixture f;
+        f.device.setIsHeadless(false);
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.startAirPurge();
+        f.transport.ackAllWritesInOrder();
+        QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::AirPurge);
+
+        QVERIFY(f.device.cancelPendingAirPurge());
+        QVERIFY(!f.device.cancelPendingAirPurge()); // repeated exit is a no-op
+        f.device.parseStateInfo(QByteArray::fromHex("0200")); // Idle / Ready
+        QVERIFY(requestedStates(f.transport).isEmpty());
+        QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::NoRequest);
+
+        // Cancellation does not poison a later explicit Start.
+        f.device.startAirPurge();
+        QCOMPARE(requestedStates(f.transport),
+                 QList<QByteArray>{QByteArray(1, static_cast<char>(DE1::State::AirPurge))});
+    }
+
+    void cancelledColdDescaleDoesNotStartOnTheNextReadyNotification() {
+        TestFixture f;
+        f.device.setIsHeadless(false);
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.startDescale();
+        f.transport.ackAllWritesInOrder();
+        QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::Descale);
+
+        QVERIFY(f.device.cancelPendingDescale());
+        QVERIFY(!f.device.cancelPendingDescale());
+        f.device.parseStateInfo(QByteArray::fromHex("0200")); // Idle / Ready
+        QVERIFY(requestedStates(f.transport).isEmpty());
+        QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::NoRequest);
+
+        // A later deliberate start still follows the existing cold-prep path.
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.startDescale();
+        QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::Descale);
+        f.transport.ackAllWritesInOrder();
+    }
+
+    void replacementStateCancelsColdTransportBeforeObservers_data() {
+        QTest::addColumn<QByteArray>("replacement");
+        QTest::newRow("operation-heating") << QByteArray::fromHex("0401");
+        QTest::newRow("operation-flowing") << QByteArray::fromHex("0507");
+        QTest::newRow("sleep") << QByteArray::fromHex("0000");
+    }
+
+    void replacementStateCancelsColdTransportBeforeObservers() {
+        QFETCH(QByteArray, replacement);
+        TestFixture f;
+        f.device.setIsHeadless(false);
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.startAirPurge();
+        f.transport.ackAllWritesInOrder();
+        bool observerCalled = false;
+        connect(&f.device, &DE1Device::stateChanged, this, [&]() {
+            observerCalled = true;
+            QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::NoRequest);
+            QVERIFY(requestedStates(f.transport).isEmpty());
+        });
+        f.device.parseStateInfo(replacement);
+        QVERIFY(observerCalled);
+        f.device.parseStateInfo(QByteArray::fromHex("0200"));
+        QVERIFY(requestedStates(f.transport).isEmpty());
+    }
+
+    void ghcConfirmationDoesNotCarryAcrossConnections() {
+        TestFixture f;
+        f.device.parseMMRResponse(DE1Device::buildMMRPayload(DE1::MMR::GHC_INFO, 0));
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.startAirPurge();
+        QVERIFY(!requestedStates(f.transport).isEmpty());
+        f.transport.setConnectedSim(false);
+        f.transport.clearWrites();
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.startAirPurge();
+        QVERIFY(requestedStates(f.transport).isEmpty());
+        QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::AirPurge);
+        f.transport.ackAllWritesInOrder();
+    }
+
+    void transportExitDoesNotCancelAnotherMaintenanceRequest() {
+        TestFixture f;
+        f.device.setIsHeadless(false);
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.startDescale();
+        f.transport.ackAllWritesInOrder();
+        QVERIFY(!f.device.cancelPendingAirPurge());
+        f.device.parseStateInfo(QByteArray::fromHex("0200"));
+        QCOMPARE(requestedStates(f.transport),
+                 QList<QByteArray>{QByteArray(1, static_cast<char>(DE1::State::Descale))});
+    }
+
+    void disconnectCancelsDeferredMaintenance_data() {
+        QTest::addColumn<int>("maintenanceState");
+        QTest::newRow("air-purge") << static_cast<int>(DE1::State::AirPurge);
+        QTest::newRow("descale") << static_cast<int>(DE1::State::Descale);
+        QTest::newRow("clean") << static_cast<int>(DE1::State::Clean);
+    }
+
+    void disconnectCancelsDeferredMaintenance() {
+        QFETCH(int, maintenanceState);
+        TestFixture f;
+        f.device.setIsHeadless(false);
+        f.device.m_state = DE1::State::Idle;
+        f.device.m_subState = DE1::SubState::Heating;
+        f.device.requestMaintenanceState(static_cast<DE1::State>(maintenanceState));
+        f.transport.ackAllWritesInOrder();
+        QVERIFY(f.device.m_pendingMaintenanceState != DE1::State::NoRequest);
+        f.transport.setConnectedSim(false);
+        QCOMPARE(f.device.m_pendingMaintenanceState, DE1::State::NoRequest);
+        f.device.parseStateInfo(QByteArray::fromHex("0200"));
+        QVERIFY(requestedStates(f.transport).isEmpty());
+    }
+
+    // ---- Water level filtering (see DE1Device::parseWaterLevel) ----
+
+    // The first sample IS the level. Without the seed the EMA ramps from zero and every connect
+    // shows the tank filling over the filter's settling time — visible on screen, not just in
+    // the log, because the property is driven from the same value.
+    void waterLevelSeedsFromFirstSample() {
+        TestFixture f;
+        f.device.parseWaterLevel(waterPayload(30.0));
+        QCOMPARE(f.device.waterLevelMm(), 35.0);  // 30 at the sensor + 5 mm offset
+    }
+
+    // The defect this whole change exists for: under the pump the tank sloshes, a field log showed
+    // 5.5 mm to 33.5 mm inside four seconds, and a 2 mm hysteresis on the INSTANTANEOUS reading
+    // passed on essentially every sample. Feed that waveform and nothing may reach the log.
+    //
+    // Deliberately asserted on m_lastLoggedWaterLevelMm rather than on captured output: it is the
+    // gate's own state, so the test fails if the gate is removed, widened past the slosh, or fed
+    // the raw sample again — and does not care how the line is worded.
+    void sloshDoesNotReachTheLog() {
+        TestFixture f;
+        f.device.parseWaterLevel(waterPayload(20.0));
+        const double afterFirst = f.device.m_lastLoggedWaterLevelMm;
+
+        // +/-10 mm about a level that is not actually changing, 60 samples (~15 s at 4 Hz).
+        for (int i = 0; i < 60; ++i)
+            f.device.parseWaterLevel(waterPayload(i % 2 == 0 ? 30.0 : 10.0));
+
+        QCOMPARE(f.device.m_lastLoggedWaterLevelMm, afterFirst);
+        // ...and the filtered level stayed at the true mean rather than chasing either extreme.
+        QVERIFY(qAbs(f.device.waterLevelMm() - 25.0) < 2.0);
+    }
+
+    // The other half, and the reason a bigger threshold was not the fix: a REAL move still has to
+    // arrive. A refill is a sustained step, so the filter must follow it and the gate must fire.
+    void aSustainedRefillStillLogs() {
+        TestFixture f;
+        f.device.parseWaterLevel(waterPayload(10.0));
+        const double afterFirst = f.device.m_lastLoggedWaterLevelMm;
+
+        for (int i = 0; i < 60; ++i)
+            f.device.parseWaterLevel(waterPayload(40.0));
+
+        QVERIFY(f.device.m_lastLoggedWaterLevelMm > afterFirst + 20.0);
+    }
+
+    // A reconnect must not measure its first delta against the previous session, nor ramp from the
+    // old average. Both endpoints are cleared with the seed.
+    void disconnectResetsTheWaterFilter() {
+        TestFixture f;
+        f.device.parseWaterLevel(waterPayload(40.0));
+        QVERIFY(f.device.m_waterLevelSeeded);
+
+        f.device.onTransportDisconnected();
+        QVERIFY(!f.device.m_waterLevelSeeded);
+        QCOMPARE(f.device.m_lastLoggedWaterLevelMl, -1);
+
+        // Re-seeds at the new level rather than easing across from 45 mm.
+        f.device.parseWaterLevel(waterPayload(10.0));
+        QCOMPARE(f.device.waterLevelMm(), 15.0);
+    }
+
+    void disconnectRestoresHeadless() {
+        TestFixture f;
+        // Simulate a positive GHC read having marked the machine GHC-controlled.
+        f.device.setIsHeadless(false);
+        QCOMPARE(f.device.isHeadless(), false);
+
+        QSignalSpy spy(&f.device, &DE1Device::isHeadlessChanged);
+
+        // A connect/disconnect cycle must restore the permissive default so the
+        // next connection isn't left blocking start until its own GHC read.
+        f.transport.setConnectedSim(true);
+        f.transport.setConnectedSim(false);
+
+        QCOMPARE(f.device.isHeadless(), true);
+        QCOMPARE(spy.count(), 1);  // flipped once (setIsHeadless dedups), not a no-op
+    }
+
+    void disconnectResetsSubState() {
+        TestFixture f;
+        f.transport.setConnectedSim(true);
+        f.device.m_subState = DE1::SubState::Error_NoAC;
+
+        QSignalSpy spy(&f.device, &DE1Device::subStateChanged);
+        f.transport.setConnectedSim(false);
+
+        QCOMPARE(f.device.subState(), DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 1);
+    }
+
+    // The last sleep or wake requested while connecting is what the connect
+    // sends. Before the link can carry it, nothing is written: a doomed write
+    // is reported as a link fault. SM-X210, 2026-09-19: a wake during the
+    // connect was lost and the machine stayed asleep behind an awake app.
+    void connectSendsTheLastSleepOrWakeRequestedWhileConnecting() {
+        const QByteArray sleep(1, static_cast<char>(DE1::State::Sleep));
+        const QByteArray idle(1, static_cast<char>(DE1::State::Idle));
+
+        // Link not ready: sleep is held, then sent in place of the wake.
+        TestFixture f;
+        f.transport.m_connected = false;
+        f.device.m_connecting = true;
+        f.device.goToSleep();
+        QVERIFY(requestedStates(f.transport).isEmpty());
+        f.transport.setConnectedSim(true);
+        QCOMPARE(requestedStates(f.transport), QList<QByteArray>{sleep});
+
+        // Link not ready: a later wake cancels the held sleep.
+        TestFixture g;
+        g.transport.m_connected = false;
+        g.device.m_connecting = true;
+        g.device.goToSleep();
+        QTest::ignoreMessage(QtInfoMsg,
+                             QRegularExpression(QStringLiteral("the sleep requested earlier will not be sent")));
+        g.device.wakeUp();
+        QVERIFY(requestedStates(g.transport).isEmpty());
+        g.transport.setConnectedSim(true);
+        QCOMPARE(requestedStates(g.transport), QList<QByteArray>{idle});
+
+        // Link already carrying writes but still connecting (a required
+        // stream failed, or USB replaced it): sent at once, not held for a
+        // connect that may never complete. The connect that follows must then
+        // neither wake the machine nor repeat the sleep — SM-X210, 2026-09-19,
+        // where the characteristics went ready 0.75 s before the connect did.
+        TestFixture h;
+        h.device.m_connecting = true;
+        h.device.goToSleep();
+        QCOMPARE(requestedStates(h.transport), QList<QByteArray>{sleep});
+        h.transport.emitConnectedSim();
+        QCOMPARE(requestedStates(h.transport), QList<QByteArray>{sleep});
+    }
+
+    // A sleep held for a connect that then FAILS must not reach the next connect.
+    // BleTransport retries on the same object (bletransport.cpp:113-137), so a
+    // failed attempt reaches onTransportDisconnected() and never disconnect() —
+    // the only teardown that used to clear the flags. Left set, the next connect
+    // suppressed its own wake for a sleep belonging to a dead attempt, and the
+    // machine stayed asleep behind an app that showed it connected.
+    void aFailedConnectDoesNotCarryItsSleepIntoTheNext() {
+        const QByteArray idle(1, static_cast<char>(DE1::State::Idle));
+
+        TestFixture f;
+        f.transport.m_connected = false;
+        f.device.m_connecting = true;
+        f.device.goToSleep();
+        QVERIFY(requestedStates(f.transport).isEmpty());
+
+        f.device.onTransportDisconnected();  // the attempt failed
+        f.device.m_connecting = true;        // the transport retries by itself
+        f.transport.setConnectedSim(true);
+
+        // A connect carrying no sleep of its own wakes the machine.
+        QCOMPARE(requestedStates(f.transport), QList<QByteArray>{idle});
+    }
+
+    // #1976: a reconnect woke a machine that had been asleep for hours. A connect
+    // wakes it only while the app is awake, or for a wake asked for while the
+    // link was down (auto-wake, MQTT, a screensaver tap) — which must outlive the
+    // failed attempts before the one that connects, and which a later sleep
+    // cancels.
+    void aConnectWakesTheMachineOnlyWhileTheAppIsAwake() {
+        const QByteArray idle(1, static_cast<char>(DE1::State::Idle));
+        const auto drop = [](TestFixture& t) {
+            t.transport.setConnectedSim(false);
+            t.transport.clearWrites();
+        };
+
+        TestFixture f;
+        f.transport.m_connected = false;
+        f.device.setAppAsleep(true);
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("app is asleep; leaving the machine asleep")));
+        f.transport.setConnectedSim(true);
+        QVERIFY(requestedStates(f.transport).isEmpty());
+
+        drop(f);
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("disconnected; it will be sent once connected")));
+        f.device.wakeUp();
+        QVERIFY(requestedStates(f.transport).isEmpty());  // nothing written to a dead link
+        f.device.m_connecting = true;
+        // A failed attempt, which must not read as a drop of the last session's link.
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("Connect attempt failed before the DE1 was ready")));
+        f.device.onTransportDisconnected();
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("sending the wake requested while disconnected")));
+        f.transport.setConnectedSim(true);
+        QCOMPARE(requestedStates(f.transport), QList<QByteArray>{idle});
+
+        drop(f);
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("disconnected; it will be sent once connected")));
+        f.device.wakeUp();
+        f.device.goToSleep();
+        f.transport.clearWrites();
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("app is asleep; leaving the machine asleep")));
+        f.transport.setConnectedSim(true);
+        QVERIFY(requestedStates(f.transport).isEmpty());
+
+        // The app falling asleep again while still disconnected cancels the owed
+        // wake: the tap that asked for it is hours old by the time the DE1 returns.
+        drop(f);
+        f.device.setAppAsleep(false);
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("disconnected; it will be sent once connected")));
+        f.device.wakeUp();
+        f.device.setAppAsleep(true);
+        QTest::ignoreMessage(QtInfoMsg, QRegularExpression(QStringLiteral("app is asleep; leaving the machine asleep")));
+        f.transport.setConnectedSim(true);
+        QVERIFY(requestedStates(f.transport).isEmpty());
+
+        TestFixture awake;
+        awake.transport.m_connected = false;
+        awake.transport.setConnectedSim(true);
+        QCOMPARE(requestedStates(awake.transport), QList<QByteArray>{idle});
+    }
+
+    void disconnectIsANoOpWhenSubStateAlreadyReady() {
+        // onTransportDisconnected() guards the reset on a value check, so an
+        // already-quiet disconnect (the overwhelmingly common case) does not spam
+        // subStateChanged.
+        TestFixture f;
+        f.transport.setConnectedSim(true);
+
+        QSignalSpy spy(&f.device, &DE1Device::subStateChanged);
+        f.transport.setConnectedSim(false);
+
+        QCOMPARE(f.device.subState(), DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 0);
+    }
+};
+
+QTEST_MAIN(tst_DE1DeviceHeadless)
+#include "tst_de1device_headless.moc"

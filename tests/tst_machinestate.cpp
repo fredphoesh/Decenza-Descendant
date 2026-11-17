@@ -1,0 +1,1977 @@
+#include <QScopeGuard>
+#include <QtTest>
+#include <QSignalSpy>
+#include <QRegularExpression>
+#include <QStringList>
+#include <QUuid>
+
+#include "machine/machinestate.h"
+#include "ble/de1device.h"
+#include "controllers/drinksequencecontroller.h"
+#include "controllers/recipewatercontroller.h"
+#include "history/shotwaterjoin.h"
+#include "controllers/shottimingcontroller.h"
+#include "core/settings.h"
+#include "mocks/MockScaleDevice.h"
+#include "mocks/MockTransport.h"
+
+// Test MachineState phase transitions, volume reset, tare lifecycle, and signals.
+// Uses DECENZA_TESTING friend access to manipulate private state directly.
+// Reuses TestFixture pattern from tst_sav.
+
+class tst_MachineState : public QObject {
+    Q_OBJECT
+
+private:
+    struct TestFixture {
+        DE1Device device;
+        Settings settings;
+        MockScaleDevice scale;
+        MachineState state{&device};
+
+        TestFixture() {
+            state.setSettings(&settings);
+            state.setScale(&scale);
+            // Use simulation mode so isConnected() returns true without a BLE transport
+            device.m_simulationMode = true;
+        }
+
+        void setDE1State(DE1::State s, DE1::SubState ss) {
+            device.m_state = s;
+            device.m_subState = ss;
+            state.onDE1StateChanged();
+        }
+    };
+
+    // Elapses the settle wait by shortening the REAL timer and letting it fire, so the
+    // production connect() in the constructor is what sets m_noAcSettled. Setting that
+    // flag by hand instead would leave the wiring — the whole mechanism — uncovered:
+    // deleting the connect() would then fail no test at all.
+    // (QTimer::timeout takes a QPrivateSignal, so it cannot be emitted from here.)
+    static void elapseNoAcWait(TestFixture& f) {
+        QVERIFY(f.state.m_noAcSettleTimer->isActive());
+        f.state.m_noAcSettleTimer->stop();
+        f.state.m_noAcSettleTimer->setInterval(1);
+        f.state.m_noAcSettleTimer->start();
+        QTRY_VERIFY(f.state.m_noAcSettled);
+    }
+
+    // Puts the fixture in the pre-flow window with a completed tare, which is the
+    // only state in which either gate is live.
+    void armPreheat(TestFixture& f) {
+        f.scale.mockSetConnected(true);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Heating);
+        f.state.m_tareCompleted = true;
+        f.state.m_waitingForTare = false;
+        f.scale.resetTareCount();
+    }
+
+    // The real BLE path end to end: state notifications in through the transport,
+    // requested states out through it. Simulation mode would swallow the requests.
+    struct SequenceFixture {
+        MockTransport transport;
+        DE1Device device;
+        Settings settings;
+        MockScaleDevice scale;
+        MachineState state{&device};
+        QVariantMap recipe;
+        std::unique_ptr<RecipeWaterController> water;
+        DrinkSequenceController sequence{&device, &state, [this] { return recipe; }};
+
+        explicit SequenceFixture(const QString& order) {
+            device.setTransport(&transport);
+            sequence.setIdleDelayForTesting(20);
+            sequence.setStartTimeoutForTesting(200);
+            state.setSettings(&settings);
+            state.setScale(&scale);
+            recipe = {{"name", "Drink"}, {"profileTitle", "Profile"},
+                      {"hotWaterJson", QStringLiteral("{\"hasWater\":true,\"vesselName\":\"Mug\","
+                                                      "\"order\":\"%1\"}").arg(order)}};
+            notify(DE1::State::Idle, DE1::SubState::Ready);
+            transport.clearWrites();
+            water = std::make_unique<RecipeWaterController>(&settings, &device, &state, &sequence, [] {}, &state);
+            device.setHotWaterStartGuard([this] { return water->startError(false); });
+        }
+        void setupWater(double target, double ratio = 2.5, bool editedTarget = false) {
+            const QJsonObject spec{{"hasWater", true}, {"vesselName", "Runtime cup"}, {"amountMode", "ratio"},
+                {"waterToEspressoRatio", ratio}, {"mode", "weight"}, {"temperatureC", 90}, {"flowRate", 40},
+                {"order", recipe.value("hotWaterJson").toString().contains("before") ? "before" : "after"}};
+            recipe.insert("hotWaterJson", QString::fromUtf8(QJsonDocument(spec).toJson(QJsonDocument::Compact)));
+            water->recipeSetup(1, spec, target, editedTarget);
+        }
+        void notify(DE1::State s, DE1::SubState ss) {
+            QByteArray d;
+            d.append(static_cast<char>(s));
+            d.append(static_cast<char>(ss));
+            emit transport.dataReceived(DE1::Characteristic::STATE_INFO, d);
+        }
+        QList<QByteArray> requested() const {
+            return transport.writesFor(DE1::Characteristic::REQUESTED_STATE);
+        }
+        static QByteArray one(DE1::State s) { return QByteArray(1, static_cast<char>(s)); }
+    };
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+
+    void standaloneSettingsOverridesSurviveWaterCompletion() {
+        SequenceFixture f("after");
+        auto* brew = f.settings.brew();
+        brew->addWaterVesselPreset("Standalone override cup", 200, "weight", 40, 85);
+        const int index = static_cast<int>(brew->waterVesselPresets().size()) - 1;
+        QVERIFY(f.water->selectVessel(index));
+        brew->setWaterVolume(150);
+        brew->setWaterTemperature(91);
+        f.settings.hardware()->setHotWaterFlowRate(55);
+        f.notify(DE1::State::HotWater, DE1::SubState::Pouring);
+        QCOMPARE(f.water->state().effectivePlan().result.amount, 150);
+        QCOMPARE(f.water->state().effectivePlan().temperatureC, 91.0);
+        QCOMPARE(f.water->state().effectivePlan().flowRate, 55);
+        brew->setWaterVolume(160); // Another explicit edit belongs to the next setup.
+        QCOMPARE(f.water->state().effectivePlan().result.amount, 150);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(brew->waterVolume(), 160);
+        QCOMPARE(brew->waterTemperature(), 91.0);
+        QCOMPARE(f.settings.hardware()->hotWaterFlowRate(), 55);
+        QCOMPARE(brew->getWaterVesselPreset(index).value("volume").toInt(), 200);
+    }
+
+    void selectedPresetEditsApplyWithAnEspressoOnlyRecipe() {
+        SequenceFixture f("after");
+        auto* brew = f.settings.brew();
+        brew->addWaterVesselPreset("Espresso only water", 100, "weight", 40, 85);
+        const int index = static_cast<int>(brew->waterVesselPresets().size()) - 1;
+        QVERIFY(f.water->selectVessel(index));
+        for (const auto& disabled : {QJsonObject{}, QJsonObject{{"hasWater", false}}}) {
+            f.water->recipeSetup(7, disabled, 40, false);
+            brew->updateWaterVesselPreset(index, "Espresso only water", 180, "volume", 35, 90);
+            f.water->presetEdited();
+            QCOMPARE(brew->waterVolume(), 180);
+            QCOMPARE(brew->waterVolumeMode(), QStringLiteral("volume"));
+            QCOMPARE(brew->waterTemperature(), 90.0);
+            QCOMPARE(f.settings.hardware()->hotWaterFlowRate(), 35);
+            brew->setWaterVolume(100);
+        }
+    }
+
+    void waterApplicationFailureBlocksStartsAndRecovers() {
+        SequenceFixture f("after");
+        const auto originalRows = f.settings.value("water/vesselPresets");
+        const int originalIndex = f.settings.brew()->selectedWaterVessel();
+        const auto restore = qScopeGuard([&] {
+            f.settings.setValue("water/vesselPresets", originalRows);
+            f.settings.brew()->setSelectedWaterCup(originalIndex);
+        });
+        f.settings.brew()->setWaterVolume(200);
+        f.settings.setValue("water/vesselPresets", QByteArray("{}"));
+        for (int i = 0; i < 4; ++i)
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(".*water/vesselPresets.*not an array.*"));
+        const QJsonObject spec{{"hasWater", true}, {"vesselName", "Application recovery cup"},
+            {"amountMode", "ratio"}, {"waterToEspressoRatio", 2.5}};
+        f.water->recipeSetup(1, spec, 40, false);
+        QCOMPARE(f.settings.brew()->waterVolume(), 200);
+        QVERIFY(!f.water->startError(false).isEmpty());
+        QVERIFY(!f.device.startHotWater());
+        QVERIFY(f.requested().isEmpty());
+        f.settings.setValue("water/vesselPresets", originalRows);
+        f.water->apply();
+        QVERIFY(f.water->startError(false).isEmpty());
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+    }
+
+    void recipeVesselNamesUseCanonicalWhitespace() {
+        SequenceFixture f("after");
+        f.setupWater(40);
+        const auto count = f.settings.brew()->waterVesselPresets().size();
+        auto spec = QJsonDocument::fromJson(f.recipe.value("hotWaterJson").toString().toUtf8()).object();
+        spec.insert("vesselName", " Runtime cup ");
+        f.water->recipeSetup(1, spec, 40, false);
+        QVERIFY(f.water->startError(false).isEmpty());
+        QCOMPARE(f.settings.brew()->waterVesselPresets().size(), count);
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        QCOMPARE(f.water->historySnapshot().value("vesselName").toString(), QStringLiteral("Runtime cup"));
+    }
+
+    void waterRuntimeRequiresAnExplicitVessel() {
+        SequenceFixture f("after");
+        const auto original = f.settings.brew()->selectedWaterVessel();
+        for (const auto& spec : {
+                QJsonObject{{"hasWater", true}, {"order", "after"}},
+                QJsonObject{{"hasWater", true}, {"volume", 100}, {"amountMode", "fixed"}},
+                QJsonObject{{"hasWater", true}, {"amountMode", "ratio"}, {"waterToEspressoRatio", 2.5}}}) {
+            f.water->recipeSetup(1, spec, 40, false);
+            QVERIFY(!f.water->startError(false).isEmpty());
+            QCOMPARE(f.settings.brew()->selectedWaterVessel(), original);
+            QVERIFY(!f.device.startHotWater());
+        }
+        f.setupWater(40);
+        QVERIFY(f.water->startError(false).isEmpty());
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+    }
+
+    void waterRuntimeRestoresAndEditsFixedSnapshots() {
+        SequenceFixture f("after");
+        f.settings.brew()->setWaterVolume(200);
+        QJsonObject fixed{{"hasWater", true}, {"vesselName", "Runtime fixed cup"}, {"volume", 100},
+            {"mode", "weight"}, {"flowRate", 31}, {"temperatureC", 85}};
+        f.water->recipeSetup(1, fixed, 40, false);
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        fixed.insert("volume", 150);
+        fixed.insert("mode", "volume");
+        fixed.insert("flowRate", 51);
+        fixed.insert("temperatureC", 92);
+        f.water->recipeSetup(1, fixed, 40, false);
+        QCOMPARE(f.settings.brew()->waterVolume(), 150);
+        QCOMPARE(f.settings.brew()->waterVolumeMode(), QStringLiteral("volume"));
+        QCOMPARE(f.settings.hardware()->hotWaterFlowRate(), 51);
+        QCOMPARE(f.settings.brew()->waterTemperature(), 92.0);
+        f.setupWater(40);
+        const int index = f.settings.brew()->selectedWaterVessel();
+        f.settings.brew()->updateWaterVesselPreset(index, "Renamed shared cup", 200, "volume", 30, 85);
+        f.water->presetEdited();
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        QCOMPARE(f.water->state().setupRecipeId(), 1);
+    }
+
+    void waterRuntimeKeepsFrozenSpecAndActualTarget() {
+        SequenceFixture f("after");
+        f.setupWater(40);
+        f.sequence.setEspressoOperationProvider([] { return 42; });
+        QSignalSpy results(&f.sequence, &DrinkSequenceController::waterResultReady);
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.water->bindEspresso(42);
+        const auto originalSpec = QString::fromUtf8(QJsonDocument(f.water->historySnapshot()).toJson(QJsonDocument::Compact));
+        f.setupWater(40, 3);
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        f.water->espressoTargetEdited(42, 45);
+        QCOMPARE(f.settings.brew()->waterVolume(), 113);
+        f.water->espressoTargetEdited(42, 40);
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        f.sequence.onShotSettled();
+        QTRY_VERIFY(f.requested().contains(SequenceFixture::one(DE1::State::HotWater)));
+        f.setupWater(42, 3, true);
+        QCOMPARE(f.settings.brew()->waterVolume(), 105);
+        f.notify(DE1::State::HotWater, DE1::SubState::Pouring);
+        QVERIFY(f.water->state().waterCaptured());
+        f.setupWater(44, 3, true);
+        QCOMPARE(f.settings.brew()->waterVolume(), 105);
+        QCOMPARE(f.water->historySnapshot().value("waterToEspressoRatio").toDouble(), 2.5);
+        f.state.m_waterSettle.setInterval(1);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(f.settings.brew()->waterVolume(), 132);
+        QTRY_COMPARE(results.count(), 1);
+        const auto result = ShotWaterResult::fromMap(results.first().at(1).toMap());
+        QCOMPARE(result.targetWeightG.value_or(0), 105.0);
+        const auto savedSpec = QJsonDocument::fromJson(result.specWithCapturedTarget(originalSpec).toUtf8()).object();
+        QCOMPARE(savedSpec.value("resolvedTargetG").toDouble(), 105.0);
+        QCOMPARE(savedSpec.value("waterToEspressoRatio").toDouble(), 2.5);
+    }
+
+    void longBlackReplacementDefersSettingsUntilDrinkEnds() {
+        SequenceFixture f("before");
+        f.setupWater(40);
+        f.sequence.setEspressoOperationProvider([] { return 42; });
+        f.sequence.expectRecipeWater();
+        f.notify(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.settings.brew()->addWaterVesselPreset("Next standalone cup", 180, "weight", 35, 85);
+        const int next = static_cast<int>(f.settings.brew()->waterVesselPresets().size()) - 1;
+        QVERIFY(f.water->selectVessel(next));
+        f.water->recipeSetup(0, {}, 0, false);
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        QCOMPARE(f.water->historySnapshot().value("resolvedTargetG").toInt(), 100);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_VERIFY(f.requested().contains(SequenceFixture::one(DE1::State::Espresso)));
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.water->bindEspresso(42);
+        QCOMPARE(f.settings.brew()->waterVolume(), 100);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(f.settings.brew()->waterVolume(), 180);
+        QVERIFY(!f.water->state().drinking());
+    }
+
+    void skippedWaterRetainsLatestPlannedTarget() {
+        SequenceFixture f("after");
+        f.setupWater(40);
+        f.sequence.setEspressoOperationProvider([] { return 42; });
+        QVariantMap result;
+        QObject::connect(&f.sequence, &DrinkSequenceController::waterResultReady, &f.state,
+            [&](qint64 operation, const QVariantMap& raw) { result = f.water->waterResult(operation, raw); });
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.water->bindEspresso(42);
+        const auto original = QString::fromUtf8(QJsonDocument(f.water->historySnapshot()).toJson(QJsonDocument::Compact));
+        f.water->espressoTargetEdited(42, 45);
+        f.sequence.skip();
+        QCOMPARE(result.value("status").toString(), QStringLiteral("notDispensed"));
+        QCOMPARE(result.value("targetWeightG").toInt(), 113);
+        QVERIFY(!result.contains("weightG"));
+        const auto saved = QJsonDocument::fromJson(ShotWaterResult::fromMap(result).specWithCapturedTarget(original).toUtf8()).object();
+        QCOMPARE(saved.value("resolvedTargetG").toInt(), 113);
+    }
+
+    void waterRuntimeRejectsInvalidAndRecoversWithoutPendingHold() {
+        SequenceFixture f("after");
+        f.setupWater(300);
+        QSignalSpy errors(&f.device, &DE1Device::errorOccurred);
+        QVERIFY(!f.device.startHotWater());
+        QCOMPARE(errors.count(), 1);
+        QVERIFY(f.requested().isEmpty());
+        f.setupWater(40);
+        QVERIFY(f.device.startHotWater());
+        QVERIFY(!f.water->state().waterCaptured());
+        f.setupWater(42, 2.5, true);
+        QCOMPARE(f.settings.brew()->waterVolume(), 105);
+        f.notify(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.setupWater(44, 2.5, true);
+        QCOMPARE(f.settings.brew()->waterVolume(), 105);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(f.settings.brew()->waterVolume(), 110);
+    }
+
+    void invalidRecipeWaterBlocksManualAndSequencedStarts() {
+        SequenceFixture f("after");
+        f.sequence.setEspressoOperationProvider([] { return 42; });
+        QSignalSpy results(&f.sequence, &DrinkSequenceController::waterResultReady);
+        f.device.setHotWaterStartGuard([] { return QStringLiteral("Water target is invalid"); });
+        QCOMPARE(f.device.hotWaterStartError(), QStringLiteral("Water target is invalid"));
+        QSignalSpy errors(&f.device, &DE1Device::errorOccurred);
+        f.device.startHotWater();
+        QCOMPARE(errors.count(), 1);
+        QVERIFY(f.requested().isEmpty());
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        f.sequence.onShotSettled();
+        QTRY_COMPARE(errors.count(), 2);
+        QVERIFY(f.requested().isEmpty());
+        QVERIFY(!f.sequence.isActive());
+        QCOMPARE(results.count(), 1);
+        QCOMPARE(results.first().at(1).toMap().value("status").toString(), QStringLiteral("notDispensed"));
+        f.device.setHotWaterStartGuard({});
+        QVERIFY(f.device.hotWaterStartError().isEmpty());
+        f.device.startHotWater();
+        QTRY_VERIFY(f.requested().contains(SequenceFixture::one(DE1::State::HotWater)));
+    }
+
+    void waterResultRetainsTargetSeparateFromMeasurement() {
+        TestFixture f;
+        f.settings.brew()->setWaterVolumeMode("weight");
+        f.settings.brew()->setWaterVolume(105);
+        f.scale.mockSetConnected(true);
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.scale.mockSetWeight(107);
+        f.state.m_waterSettle.setInterval(1);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(result.count(), 1);
+        const auto water = ShotWaterResult::fromMap(result.first().at(1).toMap());
+        QCOMPARE(water.targetWeightG.value_or(0), 105.0);
+        QCOMPARE(water.weightG.value_or(0), 107.0);
+        QCOMPARE(ShotWaterResult::fromJson(water.toJson()).targetWeightG.value_or(0), 105.0);
+    }
+
+    void waterCaptureMeasuresNetFinalDropsAndIgnoresCupLift() {
+        TestFixture f;
+        f.settings.brew()->setWaterVolumeMode("volume");
+        f.settings.brew()->setWaterTemperature(85);
+        f.scale.mockSetConnected(true);
+        f.scale.mockSetWeight(200);
+        f.state.m_preShotZeroOffset = 7;
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.tareScale();
+        f.scale.mockSetWeight(210);
+        f.scale.mockSetWeight(0); // late tare, after 10 g was already added
+        f.scale.mockSetWeight(90);
+        f.state.m_hotWaterFrozenWeight = 98;
+        f.state.m_waterSettle.setInterval(1);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.scale.mockSetWeight(93.2);
+        f.scale.mockSetWeight(-200); // cup removed during completion
+        QTRY_COMPARE(result.count(), 1);
+        const auto r = result.first().at(1).toMap();
+        QCOMPARE(r.value("weightG").toDouble(), 103.2);
+        QCOMPARE(r.value("temperatureC").toDouble(), 85.0);
+        QCOMPARE(r.value("amountSource").toString(), QString("scale"));
+        QCOMPARE(r.value("status").toString(), QString("dispensed"));
+        QCOMPARE(f.state.scaleWeight(), 98.0); // completion display survives capture finalization
+        f.state.tareScale();
+        f.scale.mockSetWeight(0);
+        QCOMPARE(f.state.scaleWeight(), 98.0);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        QCOMPARE(f.state.scaleWeight(), 0.0); // a new operation releases the freeze
+    }
+
+    void waterCaptureUsesFlowWhenScaleIsVirtual_data() {
+        QTest::addColumn<bool>("virtualScale");
+        QTest::newRow("no-scale") << false;
+        QTest::newRow("virtual-scale") << true;
+    }
+    void waterCaptureUsesFlowWhenScaleIsVirtual() {
+        QFETCH(bool, virtualScale);
+        TestFixture f;
+        f.scale.setIsFlowScale(virtualScale);
+        f.scale.mockSetConnected(virtualScale);
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.onFlowSample(10, 1);
+        f.state.m_waterSettle.setInterval(1);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(result.count(), 1);
+        const auto r = result.first().at(1).toMap();
+        QCOMPARE(r.value("volumeMl").toDouble(), 10.0);
+        QCOMPARE(r.value("amountSource").toString(), QString("flowEstimate"));
+        QVERIFY(!r.contains("weightG"));
+    }
+
+    void waterResultFinalizesBeforeAnotherOperationTares() {
+        TestFixture f;
+        f.scale.mockSetConnected(true);
+        f.settings.brew()->setWaterVolumeMode("volume");
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.scale.mockSetWeight(70);
+        const auto token = f.state.hotWaterCycleId();
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Heating);
+        QCOMPARE(result.count(), 1);
+        QCOMPARE(result.first().at(0).toULongLong(), token);
+        QCOMPARE(result.first().at(1).toMap().value("weightG").toDouble(), 70.0);
+        f.scale.mockSetWeight(0);
+        QVERIFY(!f.state.m_waterSettle.isActive());
+    }
+
+    void waterSettlingStillLearnsSawOvershoot() {
+        TestFixture f;
+        f.scale.mockSetConnected(true);
+        f.settings.brew()->setWaterVolumeMode("weight");
+        f.settings.brew()->setWaterVolume(100);
+        f.settings.brew()->setHotWaterSawOffset(2);
+        f.settings.brew()->setHotWaterSawSampleCount(0);
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.tareScale();
+        f.scale.mockSetWeight(0);
+        f.scale.mockSetWeight(98);
+        QVERIFY(f.state.m_stopAtWeightTriggered);
+        f.state.m_waterSettle.setInterval(1);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.scale.mockSetWeight(101);
+        QTRY_COMPARE(result.count(), 1);
+        QCOMPARE(f.settings.brew()->hotWaterSawSampleCount(), 1);
+        QCOMPARE(f.settings.brew()->hotWaterSawOffset(), 2.5);
+        QCOMPARE(result.first().at(1).toMap().value("weightG").toDouble(), 101.0);
+    }
+
+    void waterCaptureInvalidScaleFallsBackAndDisconnectIsPartial() {
+        TestFixture f;
+        f.scale.mockSetConnected(true);
+        f.settings.brew()->setWaterVolumeMode("volume");
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.onFlowSample(10, 1);
+        f.scale.mockSetWeight(std::numeric_limits<double>::quiet_NaN());
+        f.state.m_waterSettle.setInterval(1);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(result.count(), 1);
+        QCOMPARE(result.first().at(1).toMap().value("amountSource").toString(), QString("flowEstimate"));
+        f.scale.mockSetWeight(200);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.scale.mockSetWeight(250);
+        f.device.m_simulationMode = false;
+        f.state.updatePhase();
+        QCOMPARE(result.count(), 2);
+        QCOMPARE(result.last().at(1).toMap().value("status").toString(), QString("interrupted"));
+        QCOMPARE(result.last().at(1).toMap().value("weightG").toDouble(), 50.0);
+    }
+
+    void waterDisconnectAfterFlowStoppedIsComplete() {
+        TestFixture f;
+        f.scale.mockSetConnected(true);
+        f.settings.brew()->setWaterVolumeMode("volume");
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.scale.mockSetWeight(50);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QVERIFY(f.state.m_waterSettle.isActive());
+        f.device.m_simulationMode = false;
+        f.state.updatePhase();
+        QCOMPARE(result.count(), 1);
+        QCOMPARE(result.first().at(1).toMap().value("status").toString(), QString("dispensed"));
+        QCOMPARE(result.first().at(1).toMap().value("weightG").toDouble(), 50.0);
+    }
+
+    void waterLateTareFromAnAlreadyZeroedCup_data() {
+        QTest::addColumn<double>("beforeTare");
+        QTest::newRow("large-reset") << 10.0;
+        QTest::newRow("small-reset") << 1.5;
+        QTest::newRow("sub-gram-reset") << 0.5;
+    }
+    void waterLateTareFromAnAlreadyZeroedCup() {
+        QFETCH(double, beforeTare);
+        TestFixture f;
+        f.scale.mockSetConnected(true);
+        f.settings.brew()->setWaterVolumeMode("volume");
+        QSignalSpy result(&f.state, &MachineState::hotWaterResultReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.tareScale();
+        f.scale.mockSetWeight(0); // an ordinary zero sample before the command takes effect
+        f.scale.mockSetWeight(beforeTare);
+        f.scale.mockSetWeight(0); // actual delayed tare
+        f.scale.mockSetWeight(100 - beforeTare);
+        f.state.m_waterSettle.setInterval(1);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(result.count(), 1);
+        QCOMPARE(result.first().at(1).toMap().value("amountSource").toString(), QString("scale"));
+        QCOMPARE(result.first().at(1).toMap().value("weightG").toDouble(), 100.0);
+    }
+
+    void waterJoinKeepsBothCompletionOrders() {
+        const QVariantMap water{{"status", "dispensed"}, {"amountSource", "scale"}, {"weightG", 103.2}};
+        ShotWaterJoin join;
+        join.expect(10);
+        join.expect(11);
+        QVERIFY(!join.saved(10, 100, "older"));
+        QVERIFY(!join.result(11, water));
+        const auto older = join.result(10, water);
+        QVERIFY(older);
+        QCOMPARE(older->shotId, qint64(100));
+        QCOMPARE(older->uuid, QString("older"));
+        const auto newer = join.saved(11, 101, "newer");
+        QVERIFY(newer);
+        QCOMPARE(newer->shotId, qint64(101));
+        QVERIFY(!join.result(10, water));
+        join.expect(12);
+        join.discard(12);
+        QVERIFY(!join.result(12, water));
+        QVERIFY(!join.saved(12, 102, "discarded"));
+    }
+
+    void sequenceSkippedOrRefusedWaterIsNotDispensed_data() {
+        QTest::addColumn<bool>("refused");
+        QTest::newRow("skipped") << false;
+        QTest::newRow("refused") << true;
+    }
+    void sequenceSkippedOrRefusedWaterIsNotDispensed() {
+        QFETCH(bool, refused);
+        SequenceFixture f("after");
+        f.sequence.setEspressoOperationProvider([] { return 42; });
+        QSignalSpy result(&f.sequence, &DrinkSequenceController::waterResultReady);
+        if (refused) QTest::ignoreMessage(QtWarningMsg, QRegularExpression(".*did not start within.*"));
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        if (refused) {
+            f.notify(DE1::State::Idle, DE1::SubState::Ready);
+            f.sequence.onShotSettled();
+            QTRY_COMPARE(result.count(), 1);
+        } else {
+            f.sequence.skip();
+            QCOMPARE(result.count(), 1);
+        }
+        QCOMPARE(result.first().at(0).toLongLong(), qint64(42));
+        QCOMPARE(result.first().at(1).toMap().value("status").toString(), QString("notDispensed"));
+        QVERIFY(!result.first().at(1).toMap().contains("weightG"));
+    }
+
+    void sequencePublishesWaterForItsEspresso_data() {
+        QTest::addColumn<QString>("order");
+        QTest::addColumn<bool>("manual");
+        QTest::newRow("americano") << QString("after") << false;
+        QTest::newRow("long-black") << QString("before") << false;
+        QTest::newRow("americano-manual") << QString("after") << true;
+        QTest::newRow("long-black-manual") << QString("before") << true;
+    }
+    void sequencePublishesWaterForItsEspresso() {
+        QFETCH(QString, order);
+        QFETCH(bool, manual);
+        SequenceFixture f(order);
+        if (manual) f.sequence.setIdleDelayForTesting(1000);
+        f.sequence.setEspressoOperationProvider([] { return 42; });
+        f.settings.brew()->setWaterVolumeMode("volume");
+        f.scale.mockSetConnected(true);
+        QSignalSpy result(&f.sequence, &DrinkSequenceController::waterResultReady);
+        QSignalSpy association(&f.sequence, &DrinkSequenceController::waterEspressoAssociated);
+        const bool before = order == "before";
+        if (before) f.sequence.expectRecipeWater();
+        f.notify(before ? DE1::State::HotWater : DE1::State::Espresso, DE1::SubState::Pouring);
+        if (before) f.scale.mockSetWeight(100);
+        f.state.m_waterSettle.setInterval(1);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        // MainController also processes the water-only completion (operation 0)
+        // before the long black's espresso has started or received an identity.
+        if (before) f.sequence.discardWaterForOperation(0);
+        if (!before) f.sequence.onShotSettled();
+        if (!manual) QTRY_VERIFY(!f.requested().isEmpty());
+        f.recipe.clear(); // completion must not re-read current recipe selection
+        // Espresso may enter preheating before its flow-start association arrives.
+        if (manual && before) f.notify(DE1::State::Espresso, DE1::SubState::Heating);
+        f.notify(before ? DE1::State::Espresso : DE1::State::HotWater, DE1::SubState::Pouring);
+        QCOMPARE(f.sequence.pendingStep(), DrinkSequenceController::Step::None);
+        if (manual) QVERIFY(f.requested().isEmpty());
+        if (!before) f.scale.mockSetWeight(100);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(result.count(), 1);
+        QCOMPARE(association.count(), 1);
+        QCOMPARE(result.first().at(0).toLongLong(), qint64(42));
+        QCOMPARE(result.first().at(1).toMap().value("weightG").toDouble(), 100.0);
+        QCOMPARE(result.first().at(1).toMap().value("status").toString(), QString("dispensed"));
+        if (manual) QVERIFY(f.requested().isEmpty());
+    }
+
+    void drinkSequenceRequestsTheSecondStepOnceAtIdle_data() {
+        QTest::addColumn<QString>("order");
+        QTest::addColumn<int>("firstState");
+        QTest::addColumn<int>("firstSubState");
+        QTest::addColumn<int>("secondState");
+        QTest::newRow("americano") << "after" << int(DE1::State::Espresso)
+                                   << int(DE1::SubState::Pouring) << int(DE1::State::HotWater);
+        QTest::newRow("long-black") << "before" << int(DE1::State::HotWater)
+                                    << int(DE1::SubState::Pouring) << int(DE1::State::Espresso);
+    }
+
+    void drinkSequenceRequestsTheSecondStepOnceAtIdle() {
+        QFETCH(QString, order);
+        QFETCH(int, firstState);
+        QFETCH(int, firstSubState);
+        QFETCH(int, secondState);
+        SequenceFixture f(order);
+        const bool americano = order == "after";
+        if (!americano)
+            f.sequence.expectRecipeWater();
+
+        f.notify(DE1::State(firstState), DE1::SubState(firstSubState));
+        QVERIFY(f.sequence.pendingStep() != DrinkSequenceController::Step::None);
+        QVERIFY(f.requested().isEmpty());
+
+        // A long black has no shot to settle: it must fire without one.
+        if (americano)
+            f.sequence.onShotSettled();
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QVERIFY(f.requested().isEmpty());  // the Idle delay has not run yet
+        QTRY_COMPARE(f.requested(), QList<QByteArray>{f.one(DE1::State(secondState))});
+        QCOMPARE(f.sequence.pendingStep(), DrinkSequenceController::Step::None);
+
+        // The drink stays one operation on screen until its second step ends, and
+        // that step arms nothing further.
+        QVERIFY(f.sequence.isActive());
+        f.notify(DE1::State(secondState), DE1::SubState::Pouring);
+        QTest::qWait(250);  // past the start timeout: a started step is not a refusal
+        QVERIFY(f.sequence.isActive());
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QVERIFY(!f.sequence.isActive());
+        QTest::qWait(60);
+        QCOMPARE(f.requested().size(), 1);
+    }
+
+    // A state the DE1 only passes through on the way to the requested step is not
+    // a refusal; only another operation or sleep is.
+    void drinkSequenceWaitsThroughATransientState() {
+        SequenceFixture f("after");
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.sequence.onShotSettled();
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(f.requested(), QList<QByteArray>{f.one(DE1::State::HotWater)});
+        f.notify(DE1::State::Busy, DE1::SubState::Ready);
+        QVERIFY(f.sequence.isActive());
+        f.notify(DE1::State::HotWater, DE1::SubState::Pouring);
+        QTest::qWait(250);  // past the start timeout
+        QVERIFY(f.sequence.isActive());
+        f.notify(DE1::State::Steam, DE1::SubState::Heating);
+        QVERIFY(!f.sequence.isActive());
+    }
+
+    // The DE1 says nothing when it refuses: a step that never starts ends the
+    // drink after the start timeout, so the first step's page does not hang.
+    void drinkSequenceEndsWhenTheSecondStepNeverStarts() {
+        SequenceFixture f("after");
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.sequence.onShotSettled();
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(f.requested(), QList<QByteArray>{f.one(DE1::State::HotWater)});
+        QVERIFY(f.sequence.isActive());
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("did not start within .* likely refused"));
+        QTRY_VERIFY(!f.sequence.isActive());
+    }
+
+    // The later of the two: an americano's water waits for the shot's settle even
+    // when the Idle delay has already run, and a long black has no shot to wait for.
+    void drinkSequenceWaitsForTheShotToSettle() {
+        SequenceFixture f("after");
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTest::qWait(60);
+        QVERIFY(f.requested().isEmpty());
+
+        f.sequence.onShotSettled();
+        QCOMPARE(f.requested(), QList<QByteArray>{f.one(DE1::State::HotWater)});
+    }
+
+    // With a long black selected, hot water the recipe did not start (tea) is
+    // not the drink's first step and must not pull a shot.
+    void longBlackArmsOnlyOnItsRecipeWater() {
+        SequenceFixture f("before");
+        f.notify(DE1::State::HotWater, DE1::SubState::Pouring);
+        QCOMPARE(f.sequence.pendingStep(), DrinkSequenceController::Step::None);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTest::qWait(60);
+        QVERIFY(f.requested().isEmpty());
+    }
+
+    // Skip after the first step has ended: there is no flow left to re-arm, so
+    // the latch must not outlive this drink and swallow the next one.
+    void skipWhileWaitingLeavesTheNextDrinkSequenced() {
+        SequenceFixture f("after");
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        f.sequence.skip();
+        QCOMPARE(f.sequence.pendingStep(), DrinkSequenceController::Step::None);
+
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        QCOMPARE(f.sequence.pendingStep(), DrinkSequenceController::Step::HotWater);
+    }
+
+    void drinkSequenceEndsOnDisconnect_data() {
+        QTest::addColumn<bool>("started");
+        QTest::newRow("requested") << false;
+        QTest::newRow("started") << true;
+    }
+
+    // Once the second step is requested or running, only a state change or a
+    // disconnect can end the drink; a stuck one would hold its page forever.
+    void drinkSequenceEndsOnDisconnect() {
+        QFETCH(bool, started);
+        SequenceFixture f("after");
+        f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.sequence.onShotSettled();
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTRY_COMPARE(f.requested(), QList<QByteArray>{f.one(DE1::State::HotWater)});
+        if (started)
+            f.notify(DE1::State::HotWater, DE1::SubState::Pouring);
+        QVERIFY(f.sequence.isActive());
+
+        // The transport only warns about a drop in the middle of an operation.
+        if (started)
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression("unrequested drop"));
+        f.transport.setConnectedSim(false);
+        QVERIFY(!f.sequence.isActive());
+    }
+
+    // Hot water started after the shot ended but while it still settles: the
+    // flow-start edge must end the settle before the water's tare zeroes it.
+    void hotWaterDuringSettlingEndsIt() {
+        TestFixture f;
+        ShotTimingController tc(&f.device);
+        tc.setScale(&f.scale);
+        tc.setMachineState(&f.state);
+        f.state.setTimingController(&tc);
+
+        tc.startShot();
+        tc.onSawTriggered(34.8, 1.5, 36.0);
+        tc.onWeightSample(34.8, 1.5);
+        tc.endShot();
+        QVERIFY(tc.isSawSettling());
+
+        QSignalSpy ready(&tc, &ShotTimingController::shotProcessingReady);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+
+        QVERIFY(!tc.isSawSettling());
+        QCOMPARE(ready.count(), 1);
+        f.state.setTimingController(nullptr);
+    }
+
+    // The order the simulator produced on 2026-10-30: the espresso's queued end
+    // reached the timing controller after the americano's hot water had started,
+    // so settling began during the pour and the water's tare read as a cup lift.
+    void hotWaterBeforeTheQueuedShotEndSkipsSettling() {
+        TestFixture f;
+        ShotTimingController tc(&f.device);
+        tc.setScale(&f.scale);
+        tc.setMachineState(&f.state);
+        f.state.setTimingController(&tc);
+
+        tc.startShot();
+        tc.onSawTriggered(34.8, 1.5, 36.0);
+        tc.onWeightSample(34.8, 1.5);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+
+        QSignalSpy ready(&tc, &ShotTimingController::shotProcessingReady);
+        QSignalSpy learning(&tc, &ShotTimingController::sawLearningComplete);
+        tc.endShot();
+
+        QVERIFY(!tc.isSawSettling());
+        QCOMPARE(ready.count(), 1);
+        QCOMPARE(tc.currentWeight(), 34.8);
+        QCOMPARE(learning.count(), 0);
+        f.state.setTimingController(nullptr);
+    }
+
+    void drinkSequenceNotRequested_data() {
+        QTest::addColumn<QString>("how");
+        QTest::newRow("never-poured") << "never-poured";
+        QTest::newRow("went-to-sleep") << "sleep";
+        QTest::newRow("skipped") << "skip";
+        QTest::newRow("disconnected") << "disconnect";
+    }
+
+    void drinkSequenceNotRequested() {
+        QFETCH(QString, how);
+        SequenceFixture f("after");
+
+        if (how == "never-poured") {
+            f.notify(DE1::State::Espresso, DE1::SubState::Heating);
+        } else {
+            f.notify(DE1::State::Espresso, DE1::SubState::Pouring);
+            QCOMPARE(f.sequence.pendingStep(), DrinkSequenceController::Step::HotWater);
+            if (how == "sleep")
+                f.notify(DE1::State::Sleep, DE1::SubState::Ready);
+            else if (how == "skip")
+                f.sequence.skip();
+            else {
+                QTest::ignoreMessage(QtWarningMsg, QRegularExpression("unrequested drop"));
+                f.transport.setConnectedSim(false);
+            }
+        }
+        QCOMPARE(f.sequence.pendingStep(), DrinkSequenceController::Step::None);
+
+        f.sequence.onShotSettled();
+        f.notify(DE1::State::Idle, DE1::SubState::Ready);
+        QTest::qWait(60);
+        QVERIFY(!f.requested().contains(f.one(DE1::State::HotWater)));
+    }
+
+    // ==========================================
+    // Phase Mapping (de1app update_de1_state)
+    // ==========================================
+
+    void phaseMapping_data() {
+        QTest::addColumn<int>("de1State");
+        QTest::addColumn<int>("de1SubState");
+        QTest::addColumn<int>("expectedPhase");
+
+        // Sleep
+        QTest::newRow("Sleep")
+            << int(DE1::State::Sleep) << int(DE1::SubState::Ready)
+            << int(MachineState::Phase::Sleep);
+        QTest::newRow("GoingToSleep")
+            << int(DE1::State::GoingToSleep) << int(DE1::SubState::Ready)
+            << int(MachineState::Phase::Sleep);
+
+        // Idle with substates
+        QTest::newRow("Idle/Ready")
+            << int(DE1::State::Idle) << int(DE1::SubState::Ready)
+            << int(MachineState::Phase::Ready);
+        QTest::newRow("Idle/Heating")
+            << int(DE1::State::Idle) << int(DE1::SubState::Heating)
+            << int(MachineState::Phase::Heating);
+        QTest::newRow("Idle/Stabilising")
+            << int(DE1::State::Idle) << int(DE1::SubState::Stabilising)
+            << int(MachineState::Phase::Ready);
+
+        // Espresso substates
+        QTest::newRow("Espresso/Heating")
+            << int(DE1::State::Espresso) << int(DE1::SubState::Heating)
+            << int(MachineState::Phase::EspressoPreheating);
+        QTest::newRow("Espresso/Preinfusion")
+            << int(DE1::State::Espresso) << int(DE1::SubState::Preinfusion)
+            << int(MachineState::Phase::Preinfusion);
+        QTest::newRow("Espresso/Pouring")
+            << int(DE1::State::Espresso) << int(DE1::SubState::Pouring)
+            << int(MachineState::Phase::Pouring);
+        QTest::newRow("Espresso/Ending")
+            << int(DE1::State::Espresso) << int(DE1::SubState::Ending)
+            << int(MachineState::Phase::Ending);
+
+        // Other states
+        QTest::newRow("HotWater")
+            << int(DE1::State::HotWater) << int(DE1::SubState::Pouring)
+            << int(MachineState::Phase::HotWater);
+        QTest::newRow("HotWaterRinse/Flush")
+            << int(DE1::State::HotWaterRinse) << int(DE1::SubState::Pouring)
+            << int(MachineState::Phase::Flushing);
+        QTest::newRow("Steam/Steaming")
+            << int(DE1::State::Steam) << int(DE1::SubState::Steaming)
+            << int(MachineState::Phase::Steaming);
+        QTest::newRow("Descale")
+            << int(DE1::State::Descale) << int(DE1::SubState::Pouring)
+            << int(MachineState::Phase::Descaling);
+        QTest::newRow("Clean")
+            << int(DE1::State::Clean) << int(DE1::SubState::Pouring)
+            << int(MachineState::Phase::Cleaning);
+        QTest::newRow("Refill")
+            << int(DE1::State::Refill) << int(DE1::SubState::Ready)
+            << int(MachineState::Phase::Refill);
+        QTest::newRow("AirPurge")
+            << int(DE1::State::AirPurge) << int(DE1::SubState::Ready)
+            << int(MachineState::Phase::Transport);
+        QTest::newRow("SteamRinse")
+            << int(DE1::State::SteamRinse) << int(DE1::SubState::Ready)
+            << int(MachineState::Phase::SteamPurge);
+    }
+
+    void phaseMapping() {
+        QFETCH(int, de1State);
+        QFETCH(int, de1SubState);
+        QFETCH(int, expectedPhase);
+
+        TestFixture f;
+        f.setDE1State(static_cast<DE1::State>(de1State),
+                      static_cast<DE1::SubState>(de1SubState));
+        QCOMPARE(int(f.state.phase()), expectedPhase);
+    }
+
+    // A purge blocks other starts but is not a flow (no shot or scale timer).
+    void steamPurgeIsAnOperationButNotAFlow() {
+        TestFixture f;
+        f.setDE1State(DE1::State::SteamRinse, DE1::SubState::Ready);
+        QVERIFY(!f.state.isReady());
+        QVERIFY(!f.state.isFlowing());
+    }
+
+    void requestedSteamPurgeRecognizesFirmwareReplies_data() {
+        QTest::addColumn<int>("reportedState");
+        QTest::newRow("firmware-1359") << int(DE1::State::Steam);
+        QTest::newRow("steam-rinse") << int(DE1::State::SteamRinse);
+    }
+
+    void requestedSteamPurgeRecognizesFirmwareReplies() {
+        QFETCH(int, reportedState);
+        SequenceFixture f(QStringLiteral("after"));
+        QTRY_COMPARE(f.state.m_lastEmittedPhase, MachineState::Phase::Ready);
+        QSignalSpy stopped(&f.state, &MachineState::steamFlowStopped);
+        QSignalSpy phases(&f.state, &MachineState::phaseChanged);
+
+        // Include a preliminary Idle response and a second purge, matching
+        // the reported idle-pill -> completion-window workflow.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            f.device.startSteamPurge();
+            f.notify(DE1::State::Idle, DE1::SubState::Ready);
+            for (const auto subState : {DE1::SubState::Ready, DE1::SubState::Steaming,
+                                        DE1::SubState::Puffing, DE1::SubState::Ending}) {
+                f.notify(DE1::State(reportedState), subState);
+                QVERIFY(f.device.isSteamPurgeActive());
+                QCOMPARE(f.state.phase(), MachineState::Phase::SteamPurge);
+                QVERIFY(f.state.isOperating());
+                QVERIFY(!f.state.isReady());
+                QVERIFY(!f.state.isFlowing());
+            }
+            QTRY_COMPARE(phases.count(), attempt * 2 + 1);
+            f.notify(DE1::State::Idle, DE1::SubState::Ready);
+            QVERIFY(!f.device.isSteamPurgeActive());
+            QCOMPARE(f.state.phase(), MachineState::Phase::Ready);
+            QTRY_COMPARE(phases.count(), attempt * 2 + 2);
+        }
+        QCOMPARE(phases.count(), 4);
+        QCOMPARE(stopped.count(), 0);
+
+        f.notify(DE1::State::Steam, DE1::SubState::Steaming);
+        QVERIFY(!f.device.isSteamPurgeActive());
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+        QVERIFY(f.state.isFlowing());
+    }
+
+    // ==========================================
+    // isFlowing property
+    // ==========================================
+
+    void isFlowing_data() {
+        QTest::addColumn<int>("de1State");
+        QTest::addColumn<int>("de1SubState");
+        QTest::addColumn<bool>("expectedFlowing");
+
+        QTest::newRow("Preinfusion=true")
+            << int(DE1::State::Espresso) << int(DE1::SubState::Preinfusion) << true;
+        QTest::newRow("Pouring=true")
+            << int(DE1::State::Espresso) << int(DE1::SubState::Pouring) << true;
+        QTest::newRow("HotWater=true")
+            << int(DE1::State::HotWater) << int(DE1::SubState::Pouring) << true;
+        QTest::newRow("Steaming=true")
+            << int(DE1::State::Steam) << int(DE1::SubState::Steaming) << true;
+        QTest::newRow("Flushing=true")
+            << int(DE1::State::HotWaterRinse) << int(DE1::SubState::Pouring) << true;
+        QTest::newRow("Idle=false")
+            << int(DE1::State::Idle) << int(DE1::SubState::Ready) << false;
+        QTest::newRow("Sleep=false")
+            << int(DE1::State::Sleep) << int(DE1::SubState::Ready) << false;
+        QTest::newRow("EspressoPreheating=false")
+            << int(DE1::State::Espresso) << int(DE1::SubState::Heating) << false;
+    }
+
+    void isFlowing() {
+        QFETCH(int, de1State);
+        QFETCH(int, de1SubState);
+        QFETCH(bool, expectedFlowing);
+
+        TestFixture f;
+        f.setDE1State(static_cast<DE1::State>(de1State),
+                      static_cast<DE1::SubState>(de1SubState));
+        QCOMPARE(f.state.isFlowing(), expectedFlowing);
+    }
+
+    // ==========================================
+    // Volume reset between extractions (bug PR Kulitorum/Decenza#505)
+    // ==========================================
+
+    void volumeResetOnNewExtraction() {
+        // Bug PR Kulitorum/Decenza#505: stale volume counters from first shot caused instant stop on second shot
+        TestFixture f;
+
+        // First extraction: accumulate volume
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.state.m_pourVolume = 50.0;
+        f.state.m_preinfusionVolume = 10.0;
+        f.state.m_cumulativeVolume = 60.0;
+
+        // Return to idle
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+
+        // Second extraction: volumes must be 0
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Preinfusion);
+        QCOMPARE(f.state.m_pourVolume, 0.0);
+        QCOMPARE(f.state.m_preinfusionVolume, 0.0);
+        QCOMPARE(f.state.m_cumulativeVolume, 0.0);
+    }
+
+    void volumeResetOnHotWater() {
+        // Hot water also resets volumes
+        TestFixture f;
+
+        // First: hot water with volume
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.m_pourVolume = 200.0;
+
+        // Return to idle
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+
+        // Second hot water: should be reset
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        QCOMPARE(f.state.m_pourVolume, 0.0);
+    }
+
+    // ==========================================
+    // Hot water tare
+    // ==========================================
+
+    // The tare is scheduled a moment after flow starts, to keep it off the timer
+    // commands' heels. Weight samples arrive in between carrying the PREVIOUS pour's
+    // zero (a field log read -138.40 g, 56 ms before its own tare fired). Skipping them
+    // is right; reporting "Tare not completed" is not — that names a tare that failed,
+    // and this one had not been sent yet. init() calls QTest::failOnWarning(), so the
+    // silence is asserted.
+    void hotWaterTareInFlightIsNotReportedAsAFailedTare() {
+        TestFixture f;
+
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        QVERIFY(f.state.m_hotWaterTarePending);   // scheduled, not yet sent
+        QVERIFY(!f.state.m_tareCompleted);
+        f.state.checkStopAtWeightHotWater(-138.4);
+    }
+
+    // ...and the warning is still there for a tare that really did not complete: the
+    // gate is the pendency, not the phase.
+    void hotWaterTareNeverCompletedStillWarns() {
+        TestFixture f;
+
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.m_hotWaterTarePending = false;    // the scheduled tare has run
+        QVERIFY(!f.state.m_tareCompleted);
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("Tare not completed"));
+        f.state.checkStopAtWeightHotWater(-138.4);
+    }
+
+    // The -/+ on the Hot Water page moves only this pour's stop weight: the stop check
+    // honours it, the saved volume is untouched, and the next pour starts from the
+    // saved volume again.
+    void hotWaterTargetAdjustLastsOnePour() {
+        TestFixture f;
+        f.settings.brew()->setWaterVolume(70);
+        f.settings.brew()->setWaterVolumeMode(QStringLiteral("weight"));
+        f.settings.brew()->setHotWaterSawOffset(2.0);
+        f.scale.mockSetConnected(true);
+
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.m_tareCompleted = true;
+        QSignalSpy targetChanged(&f.state, &MachineState::hotWaterTargetWeightChanged);
+        QVERIFY(f.state.adjustHotWaterTarget(10.0));
+        QCOMPARE(targetChanged.count(), 1);
+        QCOMPARE(f.state.hotWaterTargetWeight(), 80.0);
+        QCOMPARE(f.settings.brew()->waterVolume(), 70);
+
+        // Past the saved target's threshold but short of the adjusted one, then at it.
+        f.state.checkStopAtWeightHotWater(75.0);
+        QVERIFY(!f.state.m_stopAtWeightTriggered);
+        f.state.checkStopAtWeightHotWater(78.0);
+        QVERIFY(f.state.m_stopAtWeightTriggered);
+        QVERIFY(!f.state.adjustHotWaterTarget(10.0));  // the stop is already on its way
+
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        QCOMPARE(f.state.hotWaterTargetWeight(), 70.0);
+
+        // A vessel picked mid-pour replaces the target the adjustment was relative to.
+        QVERIFY(f.state.adjustHotWaterTarget(-10.0));
+        f.settings.brew()->setWaterVolume(300);
+        QCOMPARE(f.state.hotWaterTargetWeight(), 300.0);
+
+        // Never against the press: a saved volume outside the editor's range stays put.
+        f.settings.brew()->setWaterVolume(600);
+        QVERIFY(f.state.adjustHotWaterTarget(10.0));
+        QCOMPARE(f.state.hotWaterTargetWeight(), 600.0);
+        f.settings.brew()->setWaterVolume(20);
+        QVERIFY(f.state.adjustHotWaterTarget(-10.0));
+        QVERIFY(f.state.adjustHotWaterTarget(-10.0));  // at the floor: accepted, no change
+        QCOMPARE(f.state.hotWaterTargetWeight(), MachineState::MinHotWaterTargetG);
+
+        // Refused when there is no real scale to stop on, or in volume mode.
+        f.scale.setIsFlowScale(true);
+        QVERIFY(!f.state.adjustHotWaterTarget(10.0));
+        f.scale.setIsFlowScale(false);
+        f.settings.brew()->setWaterVolumeMode(QStringLiteral("volume"));
+        QVERIFY(!f.state.adjustHotWaterTarget(10.0));
+        f.settings.brew()->setWaterVolumeMode(QStringLiteral("weight"));
+    }
+
+    // ==========================================
+    // Stop flags reset
+    // ==========================================
+
+    void stopFlagsResetOnNewExtraction() {
+        TestFixture f;
+
+        // First extraction triggers all stops
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Pouring);
+        f.state.m_stopAtWeightTriggered = true;
+        f.state.m_stopAtVolumeTriggered = true;
+        f.state.m_stopAtTimeTriggered = true;
+
+        // Return to idle
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+
+        // New extraction: all flags cleared
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Preinfusion);
+        QVERIFY(!f.state.m_stopAtWeightTriggered);
+        QVERIFY(!f.state.m_stopAtVolumeTriggered);
+        QVERIFY(!f.state.m_stopAtTimeTriggered);
+    }
+
+    // ==========================================
+    // Hot water weight (bugs PR Kulitorum/Decenza#530, PR Kulitorum/Decenza#509)
+    // ==========================================
+
+    void hotWaterFrozenWeightClearedOnNewFlow() {
+        // Bug PR Kulitorum/Decenza#530: hot water frozen weight persists into espresso display
+        TestFixture f;
+
+        // Hot water SAW freezes display
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.m_hotWaterFrozenWeight = 75.0;
+
+        // Return to idle
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+
+        // Start espresso: frozen weight must be cleared
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Preinfusion);
+        QCOMPARE(f.state.m_hotWaterFrozenWeight, -1.0);  // -1 means "not frozen"
+    }
+
+    void hotWaterBaselineResetOnNewFlow() {
+        // Hot water tare baseline must not leak into espresso
+        TestFixture f;
+
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.state.m_hotWaterTareBaseline = 150.0;
+
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Preinfusion);
+        QCOMPARE(f.state.m_hotWaterTareBaseline, 0.0);
+    }
+
+    // ==========================================
+    // Signal verification
+    // ==========================================
+
+    void phaseChangedSignalEmitted() {
+        TestFixture f;
+        QSignalSpy spy(&f.state, &MachineState::phaseChanged);
+
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCoreApplication::processEvents();  // Signals use QueuedConnection
+        QVERIFY(spy.count() >= 1);
+
+        // Two changes before the queued emissions run: both read the live phase, so
+        // without the guard every handler saw Sleep twice.
+        spy.clear();
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Heating);
+        f.setDE1State(DE1::State::Sleep, DE1::SubState::Ready);
+        QCoreApplication::processEvents();
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Sleep);
+    }
+
+    void controlContextChangesOnRawOperationAndConnectionBoundaries()
+    {
+        TestFixture f;
+        const auto isCanonicalUuid = [](const QString& value) {
+            const QUuid uuid(value);
+            return !uuid.isNull()
+                && uuid.toString(QUuid::WithoutBraces) == value;
+        };
+        QVERIFY(isCanonicalUuid(f.state.controlContextId()));
+
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        const QString readyContext = f.state.controlContextId();
+        QVERIFY(isCanonicalUuid(readyContext));
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(f.state.controlContextId(), readyContext);
+
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Steaming);
+        const QString firstSteamContext = f.state.controlContextId();
+        QVERIFY(isCanonicalUuid(firstSteamContext));
+        QVERIFY(firstSteamContext != readyContext);
+
+        // A substate boundary rotates synchronously even when the derived phase
+        // remains Steaming and phaseChanged has not yet been delivered.
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Pouring);
+        const QString purgeContext = f.state.controlContextId();
+        QVERIFY(isCanonicalUuid(purgeContext));
+        QVERIFY(purgeContext != firstSteamContext);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        const QString idleContext = f.state.controlContextId();
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Steaming);
+        QVERIFY(f.state.controlContextId() != idleContext);
+        QVERIFY(f.state.controlContextId() != firstSteamContext);
+
+        const QString connectedContext = f.state.controlContextId();
+        f.device.m_simulationMode = false;
+        f.state.onDE1StateChanged();
+        const QString disconnectedContext = f.state.controlContextId();
+        QVERIFY(disconnectedContext != connectedContext);
+        f.device.m_simulationMode = true;
+        f.state.onDE1StateChanged();
+        QVERIFY(f.state.controlContextId() != disconnectedContext);
+    }
+
+    void espressoCycleStartedSignal() {
+        // espressoCycleStarted should emit when entering espresso from non-espresso
+        TestFixture f;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCoreApplication::processEvents();
+
+        QSignalSpy spy(&f.state, &MachineState::espressoCycleStarted);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Heating);
+        QCoreApplication::processEvents();
+        QCOMPARE(spy.count(), 1);
+    }
+
+    void directFlowStartCapturesAfterNewEspressoCycleIdEdge() {
+        TestFixture f;
+        QStringList synchronousOrder;
+        connect(&f.state, &MachineState::espressoCycleStarted, &f.state,
+                [&] { synchronousOrder.append(QStringLiteral("cycle")); });
+        connect(&f.state, &MachineState::shotFlowStarted, &f.state,
+                [&](int) { synchronousOrder.append(QStringLiteral("flow")); });
+
+        // A DE1 can enter flowing espresso without an observed preheat state.
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Pouring);
+        QCOMPARE(synchronousOrder,
+                 QStringList({QStringLiteral("cycle"), QStringLiteral("flow")}));
+    }
+
+    void espressoCycleStartedNotOnSubstateChange() {
+        // Should NOT re-emit when transitioning within espresso (e.g., preheating → preinfusion)
+        TestFixture f;
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Heating);
+        QCoreApplication::processEvents();
+
+        QSignalSpy spy(&f.state, &MachineState::espressoCycleStarted);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Preinfusion);
+        QCoreApplication::processEvents();
+        QCOMPARE(spy.count(), 0);  // Already in espresso cycle
+    }
+
+    void shotEndedSignalOnExitToIdle() {
+        // shotEnded emits when leaving an active espresso phase to non-espresso
+        TestFixture f;
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Pouring);
+        QCoreApplication::processEvents();
+
+        QSignalSpy flowEndSpy(&f.state, &MachineState::shotFlowEnded);
+        QSignalSpy spy(&f.state, &MachineState::shotEnded);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        // The token-capture edge is synchronous; the presentation/completion
+        // signal remains deferred for the existing event-loop contract.
+        QCOMPARE(flowEndSpy.count(), 1);
+        QCOMPARE(flowEndSpy.takeFirst().at(0).toBool(), true);
+        QCOMPARE(spy.count(), 0);
+        QCoreApplication::processEvents();
+        QCOMPARE(spy.count(), 1);
+    }
+
+    void shotFlowEndIsCapturedBeforeQueuedShotEndedAndNextCycle() {
+        TestFixture f;
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Pouring);
+        QCoreApplication::processEvents();
+
+        QSignalSpy flowEndSpy(&f.state, &MachineState::shotFlowEnded);
+        QSignalSpy shotEndedSpy(&f.state, &MachineState::shotEnded);
+        QSignalSpy cycleEndedSpy(&f.state, &MachineState::espressoCycleEnded);
+
+        // The physical flow stops as the machine enters Ending. Before the
+        // posted shotEnded event runs, drive the later exit and next cycle.
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Ending);
+        QCOMPARE(flowEndSpy.count(), 1);
+        QCOMPARE(flowEndSpy.takeFirst().at(0).toBool(), true);
+        QCOMPARE(shotEndedSpy.count(), 0);
+
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(cycleEndedSpy.count(), 1);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Heating);
+        QCoreApplication::processEvents();
+
+        // The queued end notification belongs to the flow-stop transition,
+        // even though MachineState now reflects the next cycle.
+        QCOMPARE(shotEndedSpy.count(), 1);
+    }
+
+    void mixedFlowPrecursorsStayPairedWithDeferredSignals() {
+        TestFixture f;
+        QSignalSpy startContextSpy(&f.state, &MachineState::shotFlowStarted);
+        QSignalSpy endContextSpy(&f.state, &MachineState::shotFlowEnded);
+        QSignalSpy startedSpy(&f.state, &MachineState::shotStarted);
+        QSignalSpy endedSpy(&f.state, &MachineState::shotEnded);
+
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Steaming);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Preinfusion);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+
+        QCOMPARE(startContextSpy.count(), 2);
+        QCOMPARE(startContextSpy.at(0).at(0).toInt(), int(MachineState::Phase::Steaming));
+        QCOMPARE(startContextSpy.at(1).at(0).toInt(), int(MachineState::Phase::Preinfusion));
+        QCOMPARE(endContextSpy.count(), 2);
+        QCOMPARE(endContextSpy.at(0).at(0).toBool(), false);
+        QCOMPARE(endContextSpy.at(1).at(0).toBool(), true);
+        QCOMPARE(startedSpy.count(), 0);
+        QCOMPARE(endedSpy.count(), 0);
+
+        QCoreApplication::processEvents();
+        QCOMPARE(startedSpy.count(), 2);
+        QCOMPARE(endedSpy.count(), 2);
+    }
+
+    // ==========================================
+    // Tare lifecycle
+    // ==========================================
+
+    void tareResetOnNewExtraction() {
+        TestFixture f;
+
+        // Simulate completed tare from previous extraction
+        f.state.m_tareCompleted = true;
+        f.state.m_waitingForTare = false;
+
+        // Return to idle then start new extraction
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Preinfusion);
+
+        // New extraction should have tare cleared
+        QVERIFY(!f.state.m_tareCompleted);
+        QVERIFY(!f.state.m_waitingForTare);
+    }
+
+    // ==========================================
+    // Disconnected state
+    // ==========================================
+
+    void disconnectedWhenDeviceNotConnected() {
+        TestFixture f;
+        f.device.m_simulationMode = false;  // No transport + no sim = disconnected
+        f.state.onDE1StateChanged();
+        QCOMPARE(f.state.phase(), MachineState::Phase::Disconnected);
+    }
+
+    void disconnectedOverridesAnyDE1State() {
+        TestFixture f;
+        // Set to espresso first
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Pouring);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Pouring);
+
+        // Disconnect
+        f.device.m_simulationMode = false;
+        f.state.onDE1StateChanged();
+        QCOMPARE(f.state.phase(), MachineState::Phase::Disconnected);
+    }
+
+    void midFlowDisconnectStopsBothTimersOnce_data() {
+        QTest::addColumn<int>("de1State");
+        QTest::addColumn<int>("de1SubState");
+        // Espresso and steam start both timers down different branches of
+        // updatePhase(), and the stop is deliberately not gated on the espresso
+        // predicate. Without the steam row, moving the stop under the
+        // wasInEspresso gate seven lines below leaves the suite green.
+        QTest::newRow("espresso") << int(DE1::State::Espresso) << int(DE1::SubState::Pouring);
+        QTest::newRow("steam") << int(DE1::State::Steam) << int(DE1::SubState::Steaming);
+    }
+
+    // A drop mid-flow has to stop both clocks, and stop them once: updatePhase()
+    // runs again on every DE1 signal while the link is down, so a stop that is
+    // not latched by the phase would put repeated BLE writes on a scale that is
+    // already stopped.
+    void midFlowDisconnectStopsBothTimersOnce() {
+        QFETCH(int, de1State);
+        QFETCH(int, de1SubState);
+
+        TestFixture f;
+        f.scale.mockSetConnected(true);
+        f.setDE1State(static_cast<DE1::State>(de1State),
+                      static_cast<DE1::SubState>(de1SubState));
+        QVERIFY(f.state.m_shotTimer->isActive());
+        QCOMPARE(f.scale.stopTimerCount(), 0);
+
+        f.device.m_simulationMode = false;
+        f.state.onDE1StateChanged();
+
+        QCOMPARE(f.state.phase(), MachineState::Phase::Disconnected);
+        QVERIFY(!f.state.m_shotTimer->isActive());
+        QCOMPARE(f.scale.stopTimerCount(), 1);
+
+        f.state.onDE1StateChanged();
+        f.state.onDE1StateChanged();
+        QCOMPARE(f.scale.stopTimerCount(), 1);
+    }
+
+    // The gate that keeps the stop off a scale nobody was timing with. A drop
+    // from Idle has no clock to stop, and the scale's own button is the other
+    // way its timer starts.
+    void disconnectFromIdleSendsNoScaleStop() {
+        TestFixture f;
+        f.scale.mockSetConnected(true);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QVERIFY(!f.state.m_shotTimer->isActive());
+
+        f.device.m_simulationMode = false;
+        f.state.onDE1StateChanged();
+
+        QCOMPARE(f.state.phase(), MachineState::Phase::Disconnected);
+        QCOMPARE(f.scale.stopTimerCount(), 0);
+    }
+
+    // ==========================================
+    // Standby switch (Error_NoAC) — de1app commit 04d3b02e
+    // ==========================================
+
+    void standbySwitchOpenOnSupportedFirmware() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1337;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        elapseNoAcWait(f);
+        QVERIFY(f.state.standbySwitchOpen());
+    }
+
+    void standbySwitchStaysClosedOnOldFirmware_data() {
+        QTest::addColumn<int>("firmwareBuildNumber");
+        QTest::newRow("unknown (0)") << 0;
+        QTest::newRow("just below the gate") << 1336;
+        QTest::newRow("well below the gate") << 1200;
+    }
+
+    void standbySwitchStaysClosedOnOldFirmware() {
+        QFETCH(int, firmwareBuildNumber);
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = firmwareBuildNumber;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        // Elapse the wait, or this passes because of the wait rather than the firmware
+        // gate — and deleting the gate would not fail it.
+        elapseNoAcWait(f);
+        QVERIFY(!f.state.standbySwitchOpen());
+    }
+
+    void standbySwitchClearsOnDisconnect() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1337;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        elapseNoAcWait(f);
+        QVERIFY(f.state.standbySwitchOpen());
+
+        f.device.m_simulationMode = false;  // No transport + no sim = disconnected
+        f.state.onDE1StateChanged();
+        QVERIFY(!f.state.standbySwitchOpen());
+    }
+
+    // A snapshot cannot tell an open switch from the machine's own brief report —
+    // both read "Idle, Error_NoAC" — so the warning waits the condition out. Field
+    // reports on v1363 (inside the range the 1337 gate trusts) show the blip on every
+    // tap-to-wake, clearing untouched after ~3 s.
+    void standbySwitchWaitsBeforeWarning() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1363;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        QVERIFY(!f.state.standbySwitchOpen());
+
+        elapseNoAcWait(f);
+        QVERIFY(f.state.standbySwitchOpen());
+    }
+
+    // The interval is a deliberate figure, and the spec names it. Pinned so a change to
+    // it is a decision rather than a typo.
+    void standbySwitchWaitIsSixSeconds() {
+        TestFixture f;
+        QCOMPARE(f.state.m_noAcSettleTimer->interval(), 6000);
+        QVERIFY(f.state.m_noAcSettleTimer->isSingleShot());
+    }
+
+    // The log lines are the deliverable: the interval is an estimate, and only a field
+    // log can correct it. Asserted on content, not merely that something was emitted,
+    // because a line missing its duration is the failure that matters.
+    void standbySwitchLogsTheEpisodeDurationWhenItSelfClears() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1363;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        QTest::ignoreMessage(QtDebugMsg,  // cleared inside the wait: no warning was shown
+            QRegularExpression("\\[DE1\\]\\[StandbySwitch\\].*reported no AC for "
+                               "\\d+ ms then cleared it.*Heating"));
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Heating);
+    }
+
+    void standbySwitchLogsWhenTheWarningIsShown() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1363;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        QTest::ignoreMessage(QtInfoMsg,
+            QRegularExpression("\\[DE1\\]\\[StandbySwitch\\] warning shown.*"
+                               "\\d+ ms.*firmware build 1363"));
+        elapseNoAcWait(f);
+        QVERIFY(f.state.standbySwitchOpen());
+    }
+
+    // Guards against a future history-based shortcut, not against current behaviour:
+    // there is no branch on the preceding substate, so all four rows take one path
+    // today. They are here because the design that keyed on the arriving substate
+    // shipped once and missed the tap-to-wake entry point (Ready) entirely.
+    void standbySwitchWaitsWhateverItArrivedFrom_data() {
+        QTest::addColumn<int>("fromSubState");
+        QTest::newRow("Ready (tap-to-wake)") << int(DE1::SubState::Ready);
+        QTest::newRow("Heating") << int(DE1::SubState::Heating);
+        QTest::newRow("FinalHeating") << int(DE1::SubState::FinalHeating);
+        QTest::newRow("Stabilising") << int(DE1::SubState::Stabilising);
+    }
+
+    void standbySwitchWaitsWhateverItArrivedFrom() {
+        QFETCH(int, fromSubState);
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1363;
+        f.setDE1State(DE1::State::Idle, static_cast<DE1::SubState>(fromSubState));
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        QVERIFY(!f.state.standbySwitchOpen());
+    }
+
+    // The reported defect: the substate clears on its own before the wait elapses.
+    void standbySwitchNeverWarnsForAnEpisodeThatClearsItself() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1363;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Heating);
+
+        QVERIFY(!f.state.m_noAcSettleTimer->isActive());
+        QVERIFY(!f.state.standbySwitchOpen());
+    }
+
+    // The wait must not restart on every re-evaluation, or an episode that outlives it
+    // would never reach the user. updatePhase() re-runs on connectedChanged and
+    // firmwareVersionChanged with the substate unchanged.
+    void standbySwitchWaitIsNotRestartedByAReEvaluation() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1363;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        QTimer* timer = f.state.m_noAcSettleTimer;
+        QVERIFY(timer->isActive());
+
+        // Watch the episode clock, not the timer: isActive() stays true whether or not
+        // start() was called again, and remainingTime() is too coarse at 6 s to resolve a
+        // short wait. m_noAcEpisode is a QElapsedTimer restarted in the same branch, so a
+        // restart shows up as its elapsed time going backwards. Both weaker checks were
+        // tried here and neither could fail for the regression this test names.
+        QTest::qWait(20);
+        const qint64 beforeReEvaluation = f.state.m_noAcEpisode.elapsed();
+        QVERIFY(beforeReEvaluation > 0);
+
+        emit f.device.firmwareVersionChanged();
+        QVERIFY(f.state.m_noAcEpisode.elapsed() >= beforeReEvaluation);
+        QVERIFY(timer->isActive());
+    }
+
+    // A disconnect ends the episode: the wait must not carry over and fire against a
+    // machine we are no longer talking to.
+    void standbySwitchWaitIsAbandonedOnDisconnect() {
+        TestFixture f;
+        f.device.m_firmwareBuildNumber = 1363;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        QVERIFY(f.state.m_noAcSettleTimer->isActive());
+
+        f.device.m_simulationMode = false;  // No transport + no sim = disconnected
+        f.state.onDE1StateChanged();
+        QVERIFY(!f.state.m_noAcSettleTimer->isActive());
+        QVERIFY(!f.state.standbySwitchOpen());
+    }
+
+    void standbySwitchRecheckedWhenFirmwareArrivesLate() {
+        // The substate STATE_INFO read is queued before sendInitialSettings()'s MMR
+        // read populates firmwareBuildNumber(), so a machine already sitting in
+        // Error_NoAC when the app connects evaluates the gate against firmware 0
+        // (unknown) first. Without a recheck when the firmware number lands,
+        // Error_NoAC's latching nature means nothing would ever re-evaluate it for
+        // the rest of the session.
+        TestFixture f;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Error_NoAC);
+        elapseNoAcWait(f);
+        QVERIFY(!f.state.standbySwitchOpen());  // firmware still unknown
+
+        f.device.m_firmwareBuildNumber = 1400;
+        emit f.device.firmwareVersionChanged();
+        QVERIFY(f.state.standbySwitchOpen());
+    }
+
+    // ==========================================
+    // Steam phase with substates
+    // ==========================================
+
+    void steamHeatingPhase() {
+        // Steam heating shows as Heating, not Steaming
+        TestFixture f;
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Heating);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Heating);
+    }
+
+    void steamPuffingPhase() {
+        // Puffing substate stays in Steaming (not Ending)
+        TestFixture f;
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Puffing);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+    }
+
+    void steamEndingPhase() {
+        // Ending substate stays in Steaming
+        TestFixture f;
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Ending);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+    }
+
+    // ==========================================
+    // steamFlowStopped emission (LiveSteamCoach contract)
+    // ==========================================
+
+    // Auto-stop cycle: flow ends via the substate change (phase stays Steaming)
+    // and the machine later returns to Idle. Exactly ONE emission — at the
+    // actual end of flow. The later phase-exit transition also runs the
+    // flow-stopped branch (wasFlowing derives from oldPhase alone) but the
+    // consumed m_steamFlowStopPending flag keeps it silent.
+    void steamFlowStopped_autoStopThenIdle() {
+        TestFixture f;
+        QSignalSpy spy(&f.state, &MachineState::steamFlowStopped);
+
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Steaming);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+        QCOMPARE(spy.count(), 0);
+
+        // Firmware auto-stop: substate leaves Steaming, phase stays Steaming.
+        // The shot timer is still active from flow start, so the substate-change
+        // block stops it and emits.
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Puffing);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+        QCOMPARE(spy.count(), 1);
+
+        // Machine returns to idle: no duplicate — the pending flag was consumed.
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 1);
+    }
+
+    // Manual stop straight out of flowing steam (e.g. GHC stop -> Idle): the
+    // phase-change path is the only emitter, exactly once.
+    void steamFlowStopped_manualStopToIdle() {
+        TestFixture f;
+        QSignalSpy spy(&f.state, &MachineState::steamFlowStopped);
+
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Steaming);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 1);
+    }
+
+    // Other flow types ending must not emit — the signal is steam-only
+    // (pins the oldPhase == Steaming guard).
+    void steamFlowStopped_notForOtherFlows() {
+        TestFixture f;
+        QSignalSpy spy(&f.state, &MachineState::steamFlowStopped);
+
+        f.setDE1State(DE1::State::HotWater, DE1::SubState::Pouring);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 0);
+    }
+
+    // A steam whose flow was never observed (entered mid-sequence at Puffing —
+    // both flowing-substate notifications dropped) must stay silent: the
+    // pending flag never armed, so the phase exit is not a flow-stop event.
+    // Guards LiveSteamCoach against a ghost "Steam done" computed off a stale
+    // shot clock.
+    void steamFlowStopped_notWhenFlowNeverSeen() {
+        TestFixture f;
+        QSignalSpy spy(&f.state, &MachineState::steamFlowStopped);
+
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Puffing);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 0);
+    }
+
+    // "Flow observed" is the isFlowing() whitelist, which includes Pouring:
+    // a steam whose FIRST observed substate is Pouring (only the initial
+    // Steaming notification missed) still arms and still gets its stop event.
+    // Pins the arming condition's real boundary — only Puffing/Ending-first
+    // entries stay silent (test above).
+    void steamFlowStopped_armsWhenFirstSeenAtPouring() {
+        TestFixture f;
+        QSignalSpy spy(&f.state, &MachineState::steamFlowStopped);
+
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Pouring);
+        QCOMPARE(f.state.phase(), MachineState::Phase::Steaming);
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Puffing);
+        QCOMPARE(spy.count(), 1);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 1);
+    }
+
+    // A BLE disconnect mid-steam must disarm WITHOUT emitting (a dropped
+    // connection is not a completion), and the stale arm must not leak across
+    // the disconnect into a later never-flowed steam's phase exit.
+    void steamFlowStopped_disconnectDisarmsWithoutEmitting() {
+        TestFixture f;
+        QSignalSpy spy(&f.state, &MachineState::steamFlowStopped);
+
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Steaming);  // arms
+        // BLE drops mid-steam: updatePhase's disconnect early-return runs.
+        f.device.m_simulationMode = false;  // isConnected() -> false
+        f.state.onDE1StateChanged();
+        QCOMPARE(f.state.phase(), MachineState::Phase::Disconnected);
+        QCOMPARE(spy.count(), 0);  // disconnect is not a flow-stop event
+
+        // Reconnect idle, then a steam observed only mid-sequence (never
+        // flowing): the stale arm from before the disconnect must not
+        // ghost-emit on its phase exit.
+        f.device.m_simulationMode = true;
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        f.setDE1State(DE1::State::Steam, DE1::SubState::Puffing);
+        f.setDE1State(DE1::State::Idle, DE1::SubState::Ready);
+        QCOMPARE(spy.count(), 0);
+    }
+
+    // ==========================================
+    // activeScaleType / activeScaleName
+    //
+    // The authority for "which scale is serving", used to key SAW learning, the
+    // Calibration tab's model display, and the reset_saw_learning_for_profile MCP
+    // default. Its failure mode is a corrupted persisted learning pool that no
+    // screen reveals, so it is asserted here rather than trusted to on-device use:
+    // the WiFi→BLE fallback that triggers it is rare and its symptom is a slightly
+    // wrong SAW stop weeks later.
+    // ==========================================
+
+    void activeScaleTypePrefersConnectedScaleOverSavedPrimary() {
+        // The bug this exists to fix: WiFi primary preserved on purpose by the
+        // WiFi→BLE fallback, BLE actually delivering every weight sample. Four
+        // consecutive shots on-device logged scale="decent-wifi" while served by BLE.
+        TestFixture f;
+        f.settings.setScaleType("decent-wifi");
+        f.settings.setScaleName("Half Decent Scale (WiFi)");
+        f.scale.setType("decent");
+        f.scale.mockSetConnected(true);
+
+        QCOMPARE(f.state.activeScaleType(), QStringLiteral("decent"));
+        // Canonical name of the scale actually serving — NOT the stale saved label,
+        // which would name one scale beside another's learned model.
+        QCOMPARE(f.state.activeScaleName(), QStringLiteral("Decent Scale"));
+    }
+
+    void activeScaleNameKeepsUserLabelWhenServingScaleIsThePrimary() {
+        TestFixture f;
+        f.settings.setScaleType("decent");
+        f.settings.setScaleName("Kitchen scale");  // user's own label
+        f.scale.setType("decent");
+        f.scale.mockSetConnected(true);
+
+        QCOMPARE(f.state.activeScaleType(), QStringLiteral("decent"));
+        QCOMPARE(f.state.activeScaleName(), QStringLiteral("Kitchen scale"));
+    }
+
+    void activeScaleTypeFallsBackForNonCanonicalScale() {
+        // FlowScale reports "flow" and is permanently isConnected(). Keying on it
+        // would open a "flow" pool and make SettingsCalibration::sensorLag() warn
+        // about an unknown type on every espresso cycle — which, under
+        // QTest::failOnWarning(), would surface as failures elsewhere in the suite.
+        TestFixture f;
+        f.settings.setScaleType("decent");
+        f.scale.setType("flow");
+        f.scale.mockSetConnected(true);
+        QCOMPARE(f.state.activeScaleType(), QStringLiteral("decent"));
+
+        // Base ScaleDevice::type() returns "" — an empty key would write learning
+        // entries into a pool nothing ever reads.
+        f.scale.setType(QString());
+        QCOMPARE(f.state.activeScaleType(), QStringLiteral("decent"));
+    }
+
+    void activeScaleTypeFallsBackWhenNotConnectedOrAbsent() {
+        TestFixture f;
+        f.settings.setScaleType("decent-wifi");
+        f.scale.setType("decent");
+
+        f.scale.mockSetConnected(false);
+        QCOMPARE(f.state.activeScaleType(), QStringLiteral("decent-wifi"));
+
+        f.state.setScale(nullptr);
+        QCOMPARE(f.state.activeScaleType(), QStringLiteral("decent-wifi"));
+    }
+
+    void activeScaleTypeNotifiesOnEverySourceThatCanChangeIt() {
+        // Each of these is a one-line wiring that, if dropped, leaves the Calibration
+        // tab bound to a stale value while its reset button — an imperative read, not
+        // a binding — clears a different pool. Silent, and exactly the read/write
+        // divergence activeScaleType exists to prevent.
+        TestFixture f;
+        f.settings.setScaleType("decent-wifi");
+        QSignalSpy spy(&f.state, &MachineState::activeScaleTypeChanged);
+
+        f.scale.setType("decent");
+        f.scale.mockSetConnected(true);           // ScaleDevice::connectedChanged
+        QVERIFY2(spy.count() >= 1, "connect/disconnect must notify");
+
+        spy.clear();
+        MockScaleDevice other;
+        other.setType("bookoo");
+        f.state.setScale(&other);                  // setScale()
+        QVERIFY2(spy.count() >= 1, "swapping the serving scale must notify");
+
+        spy.clear();
+        f.state.setScale(nullptr);                 // now on the saved-primary fallback
+        spy.clear();
+        f.settings.setScaleType("acaia");          // Settings::scaleTypeChanged
+        QVERIFY2(spy.count() >= 1,
+                 "changing the saved primary must notify while on the fallback path");
+        QCOMPARE(f.state.activeScaleType(), QStringLiteral("acaia"));
+
+        spy.clear();
+        f.settings.setScaleName("Renamed");        // Settings::scaleNameChanged
+        QVERIFY2(spy.count() >= 1, "renaming the saved scale must notify activeScaleName");
+    }
+
+    // ==========================================
+    // Auto-tare settle gate
+    // ==========================================
+    //
+    // Field case: the 2026-08-20 9:37 AM shot tared while the cell was still moving.
+    // The scale acknowledged 0.00 g and then read -20.6 g at rest, so every weight
+    // that shot was 20.6 g low and stop-at-weight fired 23 g late, while the log said
+    // `tare= true` throughout. Nothing downstream could tell.
+
+    void autoTareWaitsForTheCellToStopRinging() {
+        TestFixture f;
+        armPreheat(f);
+
+        // The ring from the field log: alternating sign, tens of grams apart. The
+        // pre-fix code tared on the first sample over the threshold.
+        for (double w : {8.3, -6.8, 9.1, -4.2, 7.7})
+            f.scale.mockSetWeight(w);
+        QCOMPARE(f.scale.tareCount(), 0);
+
+        // Cup now sitting still: the window fills and the tare goes out.
+        for (double w : {302.0, 302.3, 302.1, 302.2, 302.15})
+            f.scale.mockSetWeight(w);
+        QCOMPARE(f.scale.tareCount(), 1);
+    }
+
+    void aSlowRampIsNotMistakenForStillness_data() {
+        QTest::addColumn<double>("gramsPerSample");
+        QTest::addColumn<int>("expectedTares");
+        // A window of N samples spans (N-1) steps, so at N=4 and a 1.0 g band any
+        // ramp above 1.0/3 = 0.333 g/sample is rejected. 0.47 is the field rate --
+        // the case a per-sample band AND a 3-sample window both let through, which
+        // is why this row exists at exactly that number.
+        QTest::newRow("field rate 0.47") << 0.47 << 0;
+        QTest::newRow("faster 1.0") << 1.0 << 0;
+        // Below the bound the ramp is genuinely indistinguishable from a still
+        // reading at this window size, and it tares. Asserted rather than left
+        // unstated so the limit is on the record instead of being rediscovered.
+        QTest::newRow("under the bound 0.2") << 0.2 << 1;
+    }
+
+    void aSlowRampIsNotMistakenForStillness() {
+        QFETCH(double, gramsPerSample);
+        QFETCH(int, expectedTares);
+        TestFixture f;
+        armPreheat(f);
+
+        double w = 300.0;
+        for (int i = 0; i < 10; ++i) { f.scale.mockSetWeight(w); w += gramsPerSample; }
+        QCOMPARE(f.scale.tareCount(), expectedTares);
+    }
+
+    void aStillCupIsTaredEvenWhenTheReadingNeverChanges() {
+        TestFixture f;
+        armPreheat(f);
+
+        // ScaleDevice::setWeight dedupes weightChanged on value, so an identical
+        // repeated reading emits nothing on that signal. The window would never fill
+        // and a perfectly still cup would never be tared at all. This is why the
+        // auto-tare is wired to weightSampleReceived instead.
+        for (int i = 0; i < 6; ++i)
+            f.scale.mockSetWeight(250.0);
+        QCOMPARE(f.scale.tareCount(), 1);
+    }
+
+    void autoTareIgnoresSamplesOutsideThePreFlowWindow() {
+        TestFixture f;
+        armPreheat(f);
+        f.setDE1State(DE1::State::Espresso, DE1::SubState::Pouring);
+
+        // Deliberately STILL samples, well above AUTO_TARE_THRESHOLD -- a cup mid-pour
+        // reads exactly like this. The settle gate is satisfied here, so it is not what
+        // rules the tare out; only the pre-flow window check is. An earlier version of
+        // this test stepped 5 g at a time, which the settle band rejected on its own --
+        // so it passed with the window check deleted and asserted nothing.
+        for (int i = 0; i < 6; ++i)
+            f.scale.mockSetWeight(25.0 + i * 0.1);
+        QCOMPARE(f.scale.tareCount(), 0);
+    }
+
+    // The floor a live stop-at-weight target may not cross. Both minus buttons in
+    // EspressoPage and MainController::bumpTargetWeight()'s clamp read this one
+    // predicate, so pinning it here is what stops the three of them drifting apart
+    // -- they had already: the buttons wrote `targetWeight > 1` by hand while the
+    // clamp was an unconditional std::max, which RAISED a sub-floor target on a
+    // decrease. bumpTargetWeight() itself stays uncovered: no test constructs a
+    // MainController and there is no harness for one (see tst_autoflowcal.cpp:382).
+    void aDecreaseMayNotDisarmStopAtWeight_data() {
+        QTest::addColumn<double>("target");
+        QTest::addColumn<bool>("expected");
+        QTest::newRow("disabled")   << 0.0  << false;  // zero already means "no SAW"
+        QTest::newRow("sub-floor")  << 0.5  << false;
+        QTest::newRow("at floor")   << 1.0  << false;
+        QTest::newRow("just above") << 1.1  << true;
+        QTest::newRow("typical")    << 36.0 << true;
+    }
+
+    void aDecreaseMayNotDisarmStopAtWeight() {
+        QFETCH(double, target);
+        QFETCH(bool, expected);
+        TestFixture f;
+        f.state.setTargetWeight(target);
+        QCOMPARE(f.state.canDecreaseTargetWeight(), expected);
+    }
+
+    void theStopAtWeightFloorIsOneGram() {
+        QCOMPARE(MachineState::MinLiveTargetWeightG, 1.0);
+    }
+
+};
+
+QTEST_GUILESS_MAIN(tst_MachineState)
+#include "tst_machinestate.moc"

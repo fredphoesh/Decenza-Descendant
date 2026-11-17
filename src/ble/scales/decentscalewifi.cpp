@@ -1,0 +1,1364 @@
+#include "decentscalewifi.h"
+#include "scalelogging.h"
+#include "../protocol/decentscaleprotocol.h"
+
+#include <QWebSocket>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTimer>
+#include <QUrl>
+#include <QAbstractSocket>
+#include <QHostAddress>
+#include <QHostInfo>
+#include <QThread>
+#include <QPointer>
+#include <algorithm>
+#include <utility>
+
+#include "../../network/mdnsresolver.h"
+// For kHdsResolveTimeoutMs — the A-record deadline is a property of the HDS
+// responder, shared with the discovery path, so both read it from one place.
+#include "../../network/wifiscalediscovery.h"
+#include "../../network/wifiscaleresult.h"  // wifiScaleDisplayName
+
+#define WIFI_LOG(msg)  SCALE_LOG("DecentScaleWifi", msg)
+#define WIFI_INFO(msg) SCALE_INFO("DecentScaleWifi", msg)
+#define WIFI_WARN(msg) SCALE_WARN("DecentScaleWifi", msg)
+
+DecentScaleWifi::DecentScaleWifi(QObject* parent)
+    : ScaleDevice(parent)
+    , m_socket(nullptr)
+    , m_recognitionTimer(new QTimer(this))
+    , m_keepAwakeTimer(new QTimer(this))
+    , m_checkInTimeout(new QTimer(this))
+{
+    m_recognitionTimer->setSingleShot(true);
+    connect(m_recognitionTimer, &QTimer::timeout,
+            this, &DecentScaleWifi::onRecognitionTimeout);
+    connect(m_keepAwakeTimer, &QTimer::timeout,
+            this, &DecentScaleWifi::checkInToStayAwake);
+    m_checkInTimeout->setSingleShot(true);
+    connect(m_checkInTimeout, &QTimer::timeout, this, [this]() {
+        finishCheckIn(false, QStringLiteral("no frame within %1 ms").arg(kRecognitionTimeoutMs));
+    });
+
+    // Initial socket — recreateSocket() will swap it on every connect attempt.
+    // Called here rather than deferring to the first attemptTarget() because
+    // several code paths assume m_socket is non-null without a guard
+    // (e.g. onRecognitionTimeout calls m_socket->abort() directly). The
+    // destructor's own check IS null-safe, so this isn't about destructor
+    // safety — it's about the invariant "m_socket is always live" that the
+    // signal handlers rely on.
+    recreateSocket();
+}
+
+DecentScaleWifi::~DecentScaleWifi() {
+    endSleepKeepAwake();  // a scale swap mid-sleep still logs the check-in summary
+    if (!m_socket || m_socket->state() == QAbstractSocket::UnconnectedState)
+        return;
+    if (m_socket->state() == QAbstractSocket::ConnectedState) {
+        m_socket->close();
+        return;
+    }
+    // Mid-connect: same hazard as disconnectFromScale(), with no replacement
+    // socket needed.
+    m_socket->disconnect(this);
+    m_socket->abort();
+}
+
+void DecentScaleWifi::connectToDevice(const QBluetoothDeviceInfo& device) {
+    // device is unused on the WiFi path (no BLE info exists). We rely on
+    // connectToHost being called instead; if connectToDevice is the only
+    // entry point taken, fall back to the default hostname.
+    Q_UNUSED(device);
+    connectToHost(m_hostname.isEmpty() ? QStringLiteral("hds.local") : m_hostname);
+}
+
+void DecentScaleWifi::setEndpoint(quint16 port, const QString& path) {
+    if (port != 0)
+        m_wsPort = port;
+    if (!path.isEmpty())
+        m_wsPath = path.startsWith(QLatin1Char('/')) ? path : QLatin1Char('/') + path;
+}
+
+QString DecentScaleWifi::name() const {
+    // m_hostname is empty until connectToHost() runs; the shared formatter
+    // returns the generic label in that case, which is what the old stored
+    // m_name always was.
+    return WifiScaleResultUtil::wifiScaleDisplayName(m_hostname);
+}
+
+void DecentScaleWifi::connectToHost(const QString& hostname, const QString& preferredIp) {
+    endSleepKeepAwake();
+    m_hostname = hostname;
+    m_userInitiatedShutdown = false;
+    m_triedHostnameFallback = false;
+    m_pendingHostnameFallback = false;
+    m_socketErrorThisConnect = false;
+    m_wsHandshakeDone = false;
+    m_lastSocketErrorString.clear();
+    // Reset the app-initiated-power-off latch — if a prior cycle armed it via
+    // sleep() but the firmware echo never arrived (e.g. socket dropped first),
+    // the next connection's first real power_off frame (low battery, button)
+    // must surface, not be silently suppressed.
+    m_powerOffInitiatedByApp = false;
+    // New connection cycle — invalidate any in-flight resolve from a prior call.
+    ++m_resolveGeneration;
+
+    // A caller with a just-completed mDNS resolution (a scan selection / the
+    // "Add WiFi Scale" dialog's "Use" button) passes it as preferredIp. Dial it
+    // first — it's the freshest ground truth for where the scale is right now,
+    // so it supersedes both the persisted cache and a fresh re-resolve. It is
+    // NOT persisted here: only a verified connect (onRecognizedAsHds) writes the
+    // cache, so a stale preferredIp can never clobber a good cached value (the
+    // reason the earlier pre-seed was removed). If it fails the recognition
+    // window, onRecognitionTimeout falls back to attemptHostname to re-resolve.
+    //
+    // preferredIp OUTRANKS m_retryShouldReresolve. It is checked first because
+    // it is strictly fresher than anything a re-resolve could produce: the
+    // caller resolved it *after* the attempt that set the flag, and it reflects
+    // a deliberate user action (a scan selection, or the dialog's "Use"
+    // button). Discarding it in favour of re-resolving would throw away the
+    // user's explicit choice — and if resolution then fails, attemptHostname
+    // dials nothing at all, so the tap would produce no network activity
+    // whatsoever. Consume the flag here: dialling a freshly-resolved address
+    // satisfies the same obligation a re-resolve would have.
+    if (!preferredIp.isEmpty() && preferredIp != hostname) {
+        m_retryShouldReresolve = false;
+        m_targetSource = QStringLiteral("caller-supplied");
+        WIFI_LOG(QString("Trying freshly-resolved IP %1 for %2").arg(preferredIp, hostname));
+        attemptTarget(preferredIp, /*isHostname=*/false);
+        return;
+    }
+
+    // The previous attempt ended because nothing answered. Re-dialling a
+    // remembered address would just repeat it, so resolve the name first —
+    // that picks up an address that moved AND puts an mDNS exchange on the wire.
+    //
+    // NOT consumed here. The flag means "we have not reached the scale since a
+    // transient failure", and only onRecognizedAsHds — proof we are talking to
+    // a real scale — clears it. Clearing it on entry instead made the driver
+    // oscillate: re-resolve, fail, fall back to the cache next cycle, fail,
+    // re-arm, forever, with half the attempts knowingly dialling an address the
+    // previous cycle had just proven unreachable. attemptHostname falls back to
+    // the cached IP when resolution fails, so leaving the flag set still dials
+    // something on every cycle.
+    if (m_retryShouldReresolve) {
+        // DEBUG, not INFO — DEMOTED, and that is the fix rather than a cost of it.
+        //
+        // This line used to read "Previous attempt found X unreachable —
+        // re-resolving before retry" at INFO, and it was the whole defect: it
+        // announces an INTENT, and attemptHostname() may then resolve OR fail and
+        // dial the remembered address instead. The fallback logged at DEBUG, so an
+        // INFO read of a real session showed this line followed by eight minutes
+        // of failures against one unchanging address — reading as a freshly
+        // resolved address that was merely unreachable, when the truth was a
+        // stale cache and a scale that had moved.
+        //
+        // The honest fix is NOT a second INFO line announcing the fallback; that
+        // costs a line per cycle forever to correct a line that should not have
+        // been at INFO. It is to stop narrating the intent and let the ONE line
+        // that reports the outcome carry the address and where it came from —
+        // see m_targetSource and the WebSocket error line. Net INFO+ lines per
+        // failing cycle: unchanged. Net information: strictly more.
+        WIFI_LOG(QString("Retry: %1 was unreachable last attempt, resolving it again")
+                 .arg(hostname));
+        attemptHostname();
+        return;
+    }
+
+    // Try the cached IP first if we have one. The recognition-timer guard
+    // catches the case where DHCP has reassigned the IP and we're connecting
+    // to the wrong device.
+    const QString cachedIp = m_ipResolver ? m_ipResolver(hostname) : QString();
+    if (!cachedIp.isEmpty() && cachedIp != hostname) {
+        m_targetSource = QStringLiteral("remembered from a previous connect");
+        WIFI_LOG(QString("Trying cached IP %1 for %2").arg(cachedIp, hostname));
+        attemptTarget(cachedIp, /*isHostname=*/false);
+    } else {
+        attemptHostname();
+    }
+}
+
+bool DecentScaleWifi::dialCachedIpAfterResolveFailure() {
+    // Resolution failed. Before giving the cycle up entirely, fall back to the
+    // cached IP if we hold one: a remembered address that might be stale beats
+    // opening no socket at all, and it is the reason the cache exists — mDNS is
+    // exactly what goes deaf under BLE-coexistence load.
+    //
+    // Without this the re-resolve flag (which stays set until a recognized
+    // connect) would make every subsequent cycle re-resolve, fail, and dial
+    // nothing, so a deaf-mDNS device would never attempt a connection again.
+    const QString cachedIp = m_ipResolver ? m_ipResolver(m_hostname) : QString();
+    if (cachedIp.isEmpty() || cachedIp == m_hostname)
+        return false;
+    // Stays at DEBUG. The fact a reader needs — that this address is remembered
+    // rather than freshly resolved — rides on the failure line via m_targetSource
+    // instead of costing an INFO line of its own on every cycle.
+    m_targetSource = QStringLiteral("remembered; mDNS found no responder this attempt");
+    WIFI_LOG(QString("Resolution failed — falling back to cached IP %1 for %2")
+             .arg(cachedIp, m_hostname));
+    attemptTarget(cachedIp, /*isHostname=*/false);
+    return true;
+}
+
+void DecentScaleWifi::attemptTarget(const QString& target, bool isHostname) {
+    m_currentTarget = target;
+    m_currentTargetIsHostname = isHostname;
+    // Dialing the name itself resolves through the OS, so no caller set a source.
+    // Stamp it here rather than leaving the previous attempt's source attached to
+    // this one — a stale source on a failure line is worse than none, because it
+    // reads as fact.
+    if (isHostname)
+        m_targetSource = QStringLiteral("hostname dialed directly, resolved by the OS");
+    m_recognized = false;
+    m_socketErrorThisConnect = false;
+    m_wsHandshakeDone = false;
+    m_lastSocketErrorString.clear();
+    if (isHostname) m_triedHostnameFallback = true;
+
+    // Fresh QWebSocket per attempt — see recreateSocket()'s docstring for
+    // the staleness bug this works around. Cheap (microseconds) and
+    // architecturally correct.
+    recreateSocket();
+
+    // Endpoint from the scale's own DNS-SD advertisement when we have it,
+    // falling back to the firmware's current :80/snapshot otherwise. The port
+    // is omitted from the URL when it's the HTTP default, so logs and the
+    // existing 403-diagnosis paths keep reading the way they always have.
+    const QString hostPort = m_wsPort == 80 ? target
+                                            : QStringLiteral("%1:%2").arg(target).arg(m_wsPort);
+    const QUrl url(QStringLiteral("ws://%1%2").arg(hostPort, m_wsPath));
+    WIFI_LOG(QString("Connecting to %1 (%2)").arg(
+        url.toString(), isHostname ? QStringLiteral("hostname") : QStringLiteral("cached IP")));
+    // ORDER MATTERS: arm the recognition window BEFORE open(), never after.
+    // open() can fail synchronously — an address the OS rejects at the routing
+    // layer (EHOSTUNREACH, the exact case of a scale that has dropped off the
+    // network) emits errorOccurred from inside this call, not from a later
+    // event-loop turn. With start() after open(), onError's stop() runs against
+    // a timer that has not been started yet, this line then starts it anyway,
+    // and onRecognitionTimeout fires 5 s later on an attempt that was already
+    // resolved — evicting a cached IP that the error handler had deliberately
+    // decided to keep. Arming first makes the stop land.
+    m_recognitionTimer->start(kRecognitionTimeoutMs);
+    m_socket->open(url);
+}
+
+void DecentScaleWifi::recreateSocket() {
+    // Stop the recognition timer first: if the old socket was mid-attempt,
+    // the timer's onRecognitionTimeout slot would otherwise fire against
+    // the new socket (the slot calls m_socket->abort() which would kill the
+    // fresh attempt).
+    m_recognitionTimer->stop();
+
+    if (m_socket) {
+        // Detach the old socket's signals from this object. These connections
+        // are Qt::AutoConnection → DirectConnection (same thread), so they
+        // fire synchronously, not through the signal queue. The risk we're
+        // guarding against: the underlying QSocketNotifier / QAbstractSocket
+        // may already have a state-change event posted to the event loop
+        // from before we call abort() below. When that event runs, the
+        // dying socket re-emits disconnected/errorOccurred, and without
+        // this disconnect those would invoke onDisconnected/onError against
+        // `this` — which by then references the NEW m_socket, and the stale
+        // event would corrupt the new attempt's state machine.
+        m_socket->disconnect(this);
+        // Hard close (abort) before scheduling deletion — close() is graceful
+        // and would queue a close frame that might race the delete. abort()
+        // tears the TCP down immediately. deleteLater defers destruction past
+        // the current event loop tick, which is safe even while signals from
+        // the old socket are unwinding.
+        if (m_socket->state() != QAbstractSocket::UnconnectedState) {
+            m_socket->abort();
+        }
+        m_socket->deleteLater();
+    }
+
+    m_socket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
+
+    connect(m_socket, &QWebSocket::connected,
+            this, &DecentScaleWifi::onConnected);
+    connect(m_socket, &QWebSocket::disconnected,
+            this, &DecentScaleWifi::onDisconnected);
+    connect(m_socket, &QWebSocket::textMessageReceived,
+            this, &DecentScaleWifi::onTextMessageReceived);
+    connect(m_socket, QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::errorOccurred),
+            this, &DecentScaleWifi::onError);
+}
+
+void DecentScaleWifi::attemptHostname() {
+    // NOTE: m_triedHostnameFallback is deliberately NOT set here. It marks "the
+    // hostname fallback has been spent", and merely entering this function does
+    // not spend it — resolution can fail, in which case nothing was tried.
+    //
+    // It is set at each point a dial actually begins: at the two resolved-IP
+    // dials below, and by attemptTarget itself for the non-".local" direct dial
+    // (which passes isHostname=true).
+    //
+    // Setting it on entry, as this used to, made the resolve-failure fallback
+    // dial in dialCachedIpAfterResolveFailure() exempt from BOTH eviction gates
+    // — onError's cachedIpAttempt and onRecognitionTimeout's fallback branch
+    // each require !m_triedHostnameFallback. A cached IP that DHCP had handed to
+    // a live host (a printer answering 403) would then be re-dialled on every
+    // cycle and never evicted, for as long as resolution kept failing.
+
+#ifdef Q_OS_ANDROID
+    // Qt's resolver (getaddrinfo) doesn't speak mDNS on Android, so opening
+    // ws://<name>.local fails with HostNotFoundError. Resolve the ".local"
+    // name to an IP via a direct mDNS A-query — the same MdnsResolver path
+    // MqttClient uses — on a worker thread (resolveHostname blocks), then dial
+    // the IP. The generation guard drops a stale result if a newer connect or
+    // disconnect superseded this attempt while the worker was in flight.
+    if (m_hostname.endsWith(QStringLiteral(".local"), Qt::CaseInsensitive)) {
+        const QString host = m_hostname;
+        const int generation = ++m_resolveGeneration;
+        WIFI_LOG(QString("Resolving %1 via mDNS (Android)...").arg(host));
+        QPointer<DecentScaleWifi> guard(this);
+        QThread* thread = QThread::create([this, guard, host, generation]() {
+            // kHdsResolveTimeoutMs, matching the discovery path rather than
+            // taking MdnsResolver's 2000 ms default.
+            //
+            // DO NOT read this as the fix for reconnect. It was introduced as
+            // one (PR Kulitorum/Decenza#1737, on the theory that the 2 s default was too short for a
+            // responder that answers in 2-4 s) and the next Android session
+            // FALSIFIED it: the misses continued, now ending at ~5002 ms having
+            // received ZERO records, against a scale that had served a WebSocket
+            // on its IP 16 s earlier. So the deadline was not the problem.
+            //
+            // It is TEMPTING to conclude the responder never answers a bare
+            // A-query. It does: a later run on the same tablet and scale
+            // resolved this host here in 357 ms, one query, one record.
+            //
+            // What separates the two is whether this device had sent the scale
+            // IP traffic. Resolution is PER PEER: measured 2026-08-06 with two
+            // controls, a failed TCP connect to one scale moved that scale from
+            // 0/6 to 4/6 while a second scale stayed at 0/6, and a connect to
+            // the gateway moved neither. So the miss and the 357 ms hit are the
+            // same responder in two states, not an unreliable path.
+            //
+            // docs/WIFI_SCALE_MDNS.md carries the measurements, the mechanism
+            // (inferred, not captured: the scale must ARP for us before it can
+            // unicast a reply to a legacy query), and the two accounts refuted
+            // along the way. Do not restate any of it here — an earlier version
+            // of this comment asserted one of the refuted ones as settled.
+            //
+            // The constant stays because agreeing with the discovery path is
+            // right on its own terms, and because a 5 s budget costs nothing on
+            // a path that already failed. The actual recovery is
+            // BLEManager::startReconnectBrowseIfNeeded(), which browses when a
+            // direct attempt has failed.
+            //
+            // WHY THIS CALL SITE BOUNDS THE CONSTANT:
+            //
+            // The worst single connect cycle is resolve fails (5 s) →
+            // dialCachedIpAfterResolveFailure → cached-IP recognition timeout
+            // (5 s) → re-resolve (5 s) → recognition (5 s) = 20 s, which is
+            // EXACTLY BLEManager::m_scaleConnectionTimer's interval
+            // (blemanager.cpp, setInterval(20000)). Not "well inside" it —
+            // equal to it. Before this timeout was made explicit the same chain
+            // was 2+5+2+5 = 14 s and had 6 s of slack; there is now none.
+            //
+            // The tie is currently safe: onScaleConnectionTimeout takes the
+            // WiFi→BLE fallback, and the driver's own give-up branch only
+            // aborts, because recognitionFailed is wired solely for manual
+            // "Add WiFi Scale" entries. Either order ends the attempt.
+            //
+            // So: kHdsResolveTimeoutMs CANNOT BE RAISED AGAIN without first
+            // shortening this chain or lengthening that timer. Re-derive the
+            // sum before touching either number — do not trust this comment if
+            // you have changed a step, re-count the steps.
+            //
+            // Blocks a detached QThread::create worker (NOT a QThreadPool task,
+            // so ~QCoreApplication does not wait on it) for up to the timeout.
+            // No cancel token is passed, matching MqttClient's equivalent
+            // resolve; the QPointer guard and generation check below discard a
+            // stale result, but the thread itself still runs to completion.
+            //
+            // That prediction was tested and came back. The one observed
+            // success had resolved in 362 ms — inside even the OLD 2 s window —
+            // while a DNS-SD browse ran concurrently, which is why the browse,
+            // not the deadline, turned out to be the operative difference.
+            // Expect this resolve to keep failing on such a scale; recovery is
+            // the reconnect browse, and this call is the leg that runs first
+            // and cheaply covers responders that DO answer an A-query.
+            const QString ip = MdnsResolver::resolveHostname(
+                host, WifiScaleDiscovery::kHdsResolveTimeoutMs);
+            // Back on the object's thread. `guard` gates liveness — the object
+            // may have been destroyed during the blocking resolve. The `!guard`
+            // check runs first (short-circuit), so member access via `this`
+            // (incl. the WIFI_LOG macro's `emit logMessage`) only happens once
+            // the object is confirmed alive.
+            QMetaObject::invokeMethod(guard.data(), [this, guard, ip, host, generation]() {
+                if (!guard || generation != m_resolveGeneration) return;
+                if (!ip.isEmpty()) {
+                    m_targetSource = QStringLiteral("freshly resolved via mDNS");
+                    WIFI_LOG(QString("Resolved %1 to %2 via mDNS").arg(host, ip));
+                    // Persist the peer IP so the next connect skips resolution.
+                    // A stale answer self-heals: the cached-IP attempt fails the
+                    // recognition window and falls back here to re-resolve.
+                    if (m_ipCacheUpdate) m_ipCacheUpdate(host, ip);
+                    // The hostname fallback is spent HERE, not on entry to
+                    // attemptHostname — a resolve that failed spent nothing.
+                    m_triedHostnameFallback = true;
+                    attemptTarget(ip, /*isHostname=*/false);
+                } else {
+                    // The mDNS A-query found no responder. On Android the OS
+                    // resolver can't resolve ".local" either, so we don't dial
+                    // ws://<host> (it would fail later with a misleading generic
+                    // HostNotFound). This is a TRANSIENT connect failure — e.g. a
+                    // power-cycled scale still booting/rejoining WiFi — so log it
+                    // but do NOT pop a modal. The connect isn't abandoned —
+                    // BLEManager's connection timer (onScaleConnectionTimeout) is
+                    // the backstop: it retries, recovers a still-booting scale, and
+                    // for a genuinely-gone scale emits the FlowScale-fallback notice
+                    // that informs the user. (See PR Kulitorum/Decenza#1253.)
+                    if (dialCachedIpAfterResolveFailure()) return;
+                    WIFI_WARN(QString("mDNS resolution failed for %1 — no responder and no "
+                                      "cached IP; not dialing (transient; auto-reconnect will retry)").arg(host));
+                    m_userInitiatedShutdown = true;  // mark expected; reconnect owned by main.cpp
+                }
+            }, Qt::QueuedConnection);
+        });
+        connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+        thread->start();
+        return;
+    }
+#endif
+
+    // Non-Android ".local" name: resolve explicitly via QHostInfo::lookupHost
+    // — the same call WifiScaleDiscovery already uses successfully for the
+    // discovery-time mDNS lookup (see wifiscalediscovery.cpp) — then dial the
+    // resolved IP directly, mirroring the Android branch above. Letting
+    // QWebSocket::open() resolve the hostname implicitly instead (the prior
+    // behavior here) was observed in production to stall ~5s and then fail
+    // with a network error, even on a machine where an explicit
+    // QHostInfo::lookupHost() for the exact same name resolves in well under
+    // a second — so route through the known-working call instead of trusting
+    // QAbstractSocket's internal resolution path.
+    if (m_hostname.endsWith(QStringLiteral(".local"), Qt::CaseInsensitive)) {
+        const QString host = m_hostname;
+        const int generation = ++m_resolveGeneration;
+        QHostInfo::lookupHost(host, this, [this, host, generation](const QHostInfo& info) {
+            // `this` is the lookup's context object, so Qt already drops this
+            // callback if `this` was destroyed; the generation check further
+            // drops a stale result superseded by a newer connect/disconnect
+            // while this lookup was in flight.
+            if (generation != m_resolveGeneration) return;
+            if (info.error() != QHostInfo::NoError || info.addresses().isEmpty()) {
+                // Transient — e.g. a power-cycled scale still booting/rejoining
+                // WiFi. Same handling as the Android mDNS-miss branch above: log,
+                // don't dial, don't pop a modal. BLEManager's connection timer
+                // (onScaleConnectionTimeout) is the backstop.
+                if (dialCachedIpAfterResolveFailure()) return;
+                const QString failure = QString("QHostInfo resolution failed for %1: %2 — no cached IP; "
+                                                "not dialing (transient; auto-reconnect will retry)")
+                    .arg(host, info.errorString());
+                if (m_repeatFailureSink)
+                    m_repeatFailureSink(failure, /*warn=*/true);
+                else
+                    WIFI_WARN(failure);
+                m_userInitiatedShutdown = true;  // mark expected; reconnect owned by main.cpp
+                return;
+            }
+            const QString ip = info.addresses().first().toString();
+            m_targetSource = QStringLiteral("freshly resolved via QHostInfo");
+            WIFI_LOG(QString("Resolved %1 to %2 via QHostInfo").arg(host, ip));
+            // Persist the peer IP so the next connect skips resolution. A stale
+            // answer self-heals: the cached-IP attempt fails the recognition
+            // window and falls back here to re-resolve.
+            if (m_ipCacheUpdate) m_ipCacheUpdate(host, ip);
+            // The hostname fallback is spent HERE, not on entry to
+            // attemptHostname — a resolve that failed spent nothing.
+            m_triedHostnameFallback = true;
+            attemptTarget(ip, /*isHostname=*/false);
+        });
+        return;
+    }
+
+    // A non-".local" name: nothing mDNS-specific to resolve — let Qt dial it
+    // directly.
+    attemptTarget(m_hostname, /*isHostname=*/true);
+}
+
+void DecentScaleWifi::disconnectFromScale() {
+    // User-initiated close. Mark so onDisconnected logs it as expected.
+    // (Reconnect is owned by main.cpp's scaleReconnectTimer — this flag
+    // does not gate reconnect anymore; it just controls the log line.)
+    m_userInitiatedShutdown = true;
+    // Invalidate any in-flight mDNS resolve or queued fallback, and any
+    // recognition deadline, so none can reopen the socket after this close.
+    ++m_resolveGeneration;
+    m_recognitionTimer->stop();
+    m_pendingHostnameFallback = false;
+    endSleepKeepAwake();
+    if (m_socket && m_socket->state() == QAbstractSocket::ConnectedState) {
+        // A peer reset while our close completes reaches onError, which would
+        // evict a cached IP and dial the hostname. It says nothing about the address.
+        disconnect(m_socket, QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::errorOccurred),
+                   this, nullptr);
+        m_socket->close();  // onDisconnected reports the drop
+        return;
+    }
+    if (m_socket && m_socket->state() != QAbstractSocket::UnconnectedState) {
+        // Still connecting. close() would flush a close frame onto the unconnected
+        // socket (Qt warns "QNativeSocketEngine::write() was not called in
+        // ConnectedState"), and the error that follows reaches onError as "a peer
+        // answered", which evicted the cached IP and dialed the hostname for a
+        // connection we were abandoning. recreateSocket() detaches and aborts it.
+        recreateSocket();
+    }
+    // Neither path reaches onDisconnected, and a hostname fallback in flight
+    // still reads as connected (it skips setConnected(false)): report the drop.
+    if (isConnected()) {
+        markExpectedDisconnect();
+        setConnected(false);
+    }
+}
+
+void DecentScaleWifi::beginSleepKeepAwake(bool checkInNow) {
+    if (m_lastRecognizedUrl.isEmpty()) {
+        // INFO, not WARN: reached nightly when the scale was simply off all session.
+        WIFI_INFO(QString("%1 has not answered this session — no keep-awake check-ins while the "
+                          "DE1 sleeps, so it powers itself off after 15 min unless it is on USB power")
+                      .arg(m_hostname));
+        return;
+    }
+    m_checkInsReached = 0;
+    m_checkInsFailed = 0;
+    m_lastCheckInFailed = false;
+    m_keepAwakeTimer->start(kKeepAwakeIntervalMs);
+    WIFI_INFO(QString("Checking in with %1 every %2 min while the DE1 sleeps, so the scale's "
+                      "15-min auto-off does not fire")
+                  .arg(m_lastRecognizedUrl.host())
+                  .arg(kKeepAwakeIntervalMs / 60000));
+    if (checkInNow)
+        checkInToStayAwake();
+}
+
+void DecentScaleWifi::endSleepKeepAwake() {
+    if (!m_keepAwakeTimer->isActive())
+        return;
+    m_keepAwakeTimer->stop();
+    dropCheckInSocket();
+    WIFI_INFO(QString("Stopped keep-awake check-ins: %1 reached the scale, %2 failed")
+                  .arg(m_checkInsReached)
+                  .arg(m_checkInsFailed));
+}
+
+void DecentScaleWifi::checkInToStayAwake() {
+    // A previous check-in still in flight is bounded by m_checkInTimeout.
+    if (m_checkInSocket)
+        return;
+    m_checkInSocket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
+    QWebSocket* socket = m_checkInSocket;
+    connect(socket, &QWebSocket::textMessageReceived, this, [this]() {
+        finishCheckIn(true, QString());
+    });
+    connect(socket, QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::errorOccurred),
+            this, [this, socket]() { finishCheckIn(false, socket->errorString()); });
+    // Armed before open(): open() can fail synchronously (see attemptTarget).
+    m_checkInTimeout->start(kRecognitionTimeoutMs);
+    socket->open(m_lastRecognizedUrl);
+}
+
+void DecentScaleWifi::finishCheckIn(bool reached, const QString& failure) {
+    if (!m_checkInSocket)
+        return;
+    dropCheckInSocket(/*graceful=*/reached);
+    if (reached) {
+        ++m_checkInsReached;
+        if (m_lastCheckInFailed)
+            WIFI_INFO(QString("Keep-awake check-in reached %1 again").arg(m_lastRecognizedUrl.host()));
+    } else {
+        ++m_checkInsFailed;
+        // First failure of a run only; the end-of-sleep line carries the count.
+        if (!m_lastCheckInFailed)
+            WIFI_WARN(QString("Keep-awake check-in to %1 failed: %2 — the scale may have powered off")
+                          .arg(m_lastRecognizedUrl.host(), failure));
+    }
+    // A run's first failure retries soon: the next interval would land past the
+    // scale's 15-min auto-off. A second failure means it is off; back to the interval.
+    if (m_keepAwakeTimer->isActive())
+        m_keepAwakeTimer->start(!reached && !m_lastCheckInFailed ? kCheckInRetryMs
+                                                                 : kKeepAwakeIntervalMs);
+    m_lastCheckInFailed = !reached;
+}
+
+void DecentScaleWifi::dropCheckInSocket(bool graceful) {
+    m_checkInTimeout->stop();
+    if (!m_checkInSocket)
+        return;
+    QWebSocket* socket = std::exchange(m_checkInSocket, nullptr);
+    // Detach first so a queued signal from the dying socket cannot re-enter.
+    socket->disconnect(this);
+    if (graceful && socket->state() == QAbstractSocket::ConnectedState) {
+        // close() flushes the close frame behind any pending data and waits
+        // at most 3 s for the peer's reply (qtwebsockets
+        // src/websockets/qwebsocket_p.cpp, doClose), so this delete is bounded.
+        connect(socket, &QWebSocket::disconnected, socket, &QObject::deleteLater);
+        socket->close();
+        return;
+    }
+    if (socket->state() != QAbstractSocket::UnconnectedState)
+        socket->abort();
+    socket->deleteLater();
+}
+
+void DecentScaleWifi::onConnected() {
+    const QString peerIp   = m_socket ? m_socket->peerAddress().toString() : QString();
+    const quint16 peerPort = m_socket ? m_socket->peerPort() : 0;
+    const QString localIp  = m_socket ? m_socket->localAddress().toString() : QString();
+    const quint16 localPort = m_socket ? m_socket->localPort() : 0;
+    // Log the local source address, not just the port: on a multi-homed host
+    // (e.g. wired + WiFi on the same subnet) it names the egress interface the
+    // OS bound this connection to, which is the datum needed to diagnose a
+    // connect that leaves via the wrong / a down interface.
+    m_wsHandshakeDone = true;
+    WIFI_INFO(QString("WebSocket connected — peer=%1:%2 local=%3:%4")
+             .arg(peerIp).arg(peerPort).arg(localIp).arg(localPort));
+    setConnected(true);
+
+    // Bump to the highest cadence the firmware supports, opt in to events,
+    // and seed an initial status frame so battery/firmware_version populate
+    // immediately. Periodic battery/charging refreshes are driven by
+    // sendKeepAlive() below — the WS firmware does not push status
+    // unsolicited, so we must request it ourselves (matches the BT driver's
+    // ~4-minute battery poll; see decentscale.cpp kBatteryPollHeartbeatTicks).
+    send(QStringLiteral("rate 10k"));
+    send(QStringLiteral("events on"));
+    send(QStringLiteral("status"));
+    m_ticksSinceBatteryPoll = 0;
+    // Restore the LCD on every (re)connect. Idempotent on a fresh-connect
+    // scale (LCD defaults on); required on a reconnect after the DE1-sleep
+    // keepScaleOn=true+WiFi path, where disableLcd() was sent before the WS
+    // was gracefully closed. Not a full wake(): soft_sleep off isn't needed
+    // here because sleep() (which would have soft-slept) wasn't called on
+    // that path — only the LCD was disabled. Skipped while displayHeldOff().
+    if (!displayHeldOff())
+        send(QStringLiteral("display on"));
+}
+
+void DecentScaleWifi::onDisconnected() {
+    if (m_recognitionTimer) m_recognitionTimer->stop();
+    m_ticksSinceBatteryPoll = 0;
+
+    // Classify the disconnect for triage. A genuine transport error means the
+    // link dropped under us, so it must read "(unexpected)" regardless of any
+    // shutdown flag; power-off and deliberate closes read "(expected)". Do NOT
+    // use closeCode() as the abnormality signal: Qt sets closeCode()/
+    // closeReason() only when a real close frame is received, and the reused
+    // socket keeps a stale value across reconnects, so on an abnormal drop
+    // closeCode() is stale/default (1000), never 1006.
+    //
+    // The handshake check comes first because a FAILED CONNECT arrives here too
+    // (QWebSocket synthesizes a `disconnected` for one — see m_wsHandshakeDone's
+    // declaration for both Qt sources), and none of the branches below describe
+    // one. `disconnected` is delivered before `errorOccurred`, so
+    // m_socketErrorThisConnect is still false and the classifier used to fall
+    // through to the peer-close branch and print the stale closeCode — reporting
+    // an unreachable
+    // host as "disconnected (unexpected) — peer close (code 1000)", i.e. a clean
+    // goodbye from a peer that never answered. Observed live on every WiFi
+    // attempt to an unreachable scale. This is DEBUG, not INFO: the attempt
+    // itself was already announced, and the WARN that follows one line later
+    // carries the actual reason, so an INFO here only contradicts it.
+    // Whether THIS close was deliberate. Recorded as a local and handed to the
+    // base class only immediately before setConnected(false), never here.
+    //
+    // Setting the base-class flag at classification time leaked it: the
+    // hostname-fallback branch below returns WITHOUT calling setConnected(false)
+    // (the intermediate disconnect is deliberately not propagated), and the flag
+    // is only consumed by that call. onRecognitionTimeout() sets both
+    // m_userInitiatedShutdown and m_pendingHostnameFallback, so a cached IP that
+    // completes a WebSocket handshake but is not an HDS took exactly that path —
+    // and left the flag set indefinitely, so the NEXT genuine drop (cable pulled,
+    // scale batteries dead) would have logged INFO "(expected)" instead of WARN.
+    // A log-honesty fix that hides real faults is worse than the thing it fixed.
+    bool expectedClose = false;
+
+    QString disconnectLog;
+    if (!m_wsHandshakeDone) {
+        WIFI_LOG(QStringLiteral("Connect attempt ended without a WebSocket handshake"));
+        // Fall through to the normal post-disconnect bookkeeping below — the
+        // fallback and reconnect paths must still run for a failed connect.
+    } else if (!m_lastPowerEventReason.isEmpty()) {
+        expectedClose = true;
+        disconnectLog = QStringLiteral("WebSocket disconnected (expected) — scale power-off: ")
+                        + m_lastPowerEventReason;
+    } else if (m_socketErrorThisConnect) {
+        disconnectLog = QStringLiteral("WebSocket disconnected (unexpected) — transport error: ")
+                        + m_lastSocketErrorString;
+    } else if (m_userInitiatedShutdown) {
+        expectedClose = true;
+        disconnectLog = QStringLiteral("WebSocket disconnected (expected)");
+    } else {
+        const int closeCode = m_socket ? static_cast<int>(m_socket->closeCode()) : -1;
+        const QString closeReason = m_socket ? m_socket->closeReason() : QString();
+        disconnectLog = QString("WebSocket disconnected (unexpected) — peer close (code %1").arg(closeCode);
+        if (!closeReason.isEmpty())
+            disconnectLog += QString(", reason=\"%1\"").arg(closeReason);
+        disconnectLog += QStringLiteral(")");
+    }
+    // Empty only on the failed-connect branch, which logged its own line above.
+    if (!disconnectLog.isEmpty())
+        WIFI_INFO(disconnectLog);
+
+    // Pending hostname fallback (cached IP didn't validate): the recognition
+    // timer marked this disconnect as the one we were waiting for. Run the
+    // fallback inline now that the socket has fully closed — event-driven,
+    // no zero-delay timer needed.
+    if (m_pendingHostnameFallback) {
+        m_pendingHostnameFallback = false;
+        m_userInitiatedShutdown = false;
+        // Don't propagate the brief intermediate disconnect to consumers —
+        // the connection cycle is still in progress. setConnected(false) is
+        // skipped here; it will fire only if the hostname attempt also fails.
+        // Re-resolve via attemptHostname() (mDNS on Android) rather than dialing
+        // the bare ".local" name, which Qt can't resolve there. This also picks
+        // up a new IP if DHCP moved the scale since the cached entry.
+        attemptHostname();
+        return;
+    }
+
+    if (expectedClose)
+        markExpectedDisconnect();
+    setConnected(false);
+
+    // Clear per-connect state so the next connect re-captures it fresh.
+    if (!m_firmwareVersion.isEmpty()) {
+        m_firmwareVersion.clear();
+        emit firmwareVersionChanged();
+    }
+    m_loggedProtoVersion = -1;
+    m_loggedFrameShapes.clear();
+    m_awaitingFirmwareUpdateAck = false;
+    m_lastPowerEventReason.clear();
+    m_lastPowerEventCode = -1;
+    m_userInitiatedShutdown = false;
+
+    // Reconnect is owned by main.cpp's scaleReconnectTimer (it already runs
+    // an exponential-backoff loop against settings.scaleAddress() and will
+    // re-fire BLEManager::tryDirectConnectToScale, which routes back through
+    // this driver). Keeping a second reconnect path inside the driver would
+    // race with that timer and require a debounce-style delay — neither is
+    // appropriate per the project's "no timer-as-guard" rule.
+}
+
+void DecentScaleWifi::onTextMessageReceived(const QString& message) {
+    const QByteArray bytes = message.toUtf8();
+    QJsonParseError err{};
+    const QJsonDocument doc = QJsonDocument::fromJson(bytes, &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+        // Silently drop malformed frames at debug level only. WIFI_LOG, not a
+        // bare qDebug with its own prefix — that spelling was a fifth prefix
+        // family ("[DecentScaleWifi]") that no [Scale] or [BLE …] grep found.
+        WIFI_LOG(QStringLiteral("dropping malformed frame: %1").arg(err.errorString()));
+        return;
+    }
+    const QJsonObject obj = doc.object();
+
+    // Frame routing (per the openscale WS README): a frame with NO "type" is a
+    // weight snapshot; every typed frame (status/button/power/rate/error)
+    // carries "type". A status frame ALSO carries a "grams" field, so snapshots
+    // must be discriminated by the ABSENCE of "type" — keying on the presence
+    // of "grams" (as we used to) swallowed every status frame as a snapshot,
+    // which is why firmware_version, battery, and charging were never seen over
+    // WiFi.
+    const QString type = obj.value(QStringLiteral("type")).toString();
+    if (type.isEmpty()) {
+        handleSnapshotFrame(obj);
+        return;
+    }
+
+    // Consumed by the very next TYPED frame — see m_awaitingFirmwareUpdateAck's
+    // doc comment for why "the next frame" is safe here even though snapshot
+    // streaming would make it unsafe elsewhere: untyped weight snapshots
+    // already returned above, before reaching this point, so they can never
+    // steal it. Every frame type below IS a direct, synchronous reply to
+    // whatever command Decenza most recently sent.
+    const bool awaitingFirmwareUpdateAck = m_awaitingFirmwareUpdateAck;
+    m_awaitingFirmwareUpdateAck = false;
+
+    // Diagnostic: log one sample of each distinct typed frame per connect, so
+    // the firmware's actual WS surface is visible (frame types and, for status,
+    // its fields incl. firmware_version).
+    if (!m_loggedFrameShapes.contains(type)) {
+        m_loggedFrameShapes.insert(type);
+        WIFI_LOG(QString("First '%1' frame this connect: %2")
+                 .arg(type, QString::fromUtf8(bytes.left(200))));
+    }
+
+    if (type == QStringLiteral("status")) {
+        handleStatusFrame(obj);
+    } else if (type == QStringLiteral("button")) {
+        handleButtonFrame(obj);
+    } else if (type == QStringLiteral("power")) {
+        handlePowerFrame(obj);
+    } else if (type == QStringLiteral("rate")) {
+        handleRateFrame(obj);
+    }
+    // An "error" frame is the only machine-readable refusal this app ever sees:
+    // everything the scale checks after accepting an update (catalog eligibility,
+    // signature, rollback) happens once it has already closed its WebSocket
+    // clients, and reaches its own display alone.
+    //
+    // Warn unconditionally rather than leaning on the frame-shape sampler above,
+    // which logs one frame per TYPE per connect — any earlier error frame
+    // (invalid_action, unknown_command, frame_too_large are all "error") would
+    // otherwise consume the slot and leave a refused firmware update recorded
+    // nowhere at all.
+    else if (type == QStringLiteral("error")) {
+        const QString errorCode = obj.value(QStringLiteral("code")).toString();
+        const QString errorMessage = obj.value(QStringLiteral("message")).toString();
+        WIFI_WARN(QString("Scale reported error '%1': %2").arg(errorCode, errorMessage));
+        if (awaitingFirmwareUpdateAck) {
+            emit firmwareUpdateRejected(errorMessage.isEmpty() ? errorCode : errorMessage);
+        }
+    }
+    // Any other unknown type is captured by the diagnostic log above; no
+    // further action.
+}
+
+void DecentScaleWifi::handleSnapshotFrame(const QJsonObject& obj) {
+    const QJsonValue grams = obj.value(QStringLiteral("grams"));
+    if (!grams.isDouble()) return;
+    onRecognizedAsHds();
+    setWeight(grams.toDouble());
+}
+
+void DecentScaleWifi::handleStatusFrame(const QJsonObject& obj) {
+    onRecognizedAsHds();
+
+    // Battery + charging — independent fields per protocol.
+    const QJsonValue batt = obj.value(QStringLiteral("battery_percent"));
+    if (batt.isDouble()) {
+        const int pct = std::clamp(batt.toInt(), 0, 100);
+        setBatteryLevel(pct);
+    }
+    const QJsonValue charging = obj.value(QStringLiteral("charging"));
+    if (charging.isBool()) {
+        setCharging(charging.toBool());
+    }
+
+    // Firmware version — log once per connect, warn-log on mid-connect change.
+    const QJsonValue fwv = obj.value(QStringLiteral("firmware_version"));
+    if (fwv.isString()) {
+        const QString reported = fwv.toString();
+        // The SAME normaliser the discovery list uses — the scale publishes this
+        // string on its mDNS TXT `fw` key and its status frame alike, so a second
+        // copy here would let one view show "3.1.13-dev" and the other "3.1.13".
+        // Any prerelease suffix stays: HdsFirmwareCatalog::parseVersion ignores
+        // it when comparing, exactly as the firmware's own comparator does.
+        const QString version = WifiScaleResultUtil::normalizeFirmwareVersion(reported);
+        if (!version.isEmpty() && m_firmwareVersion != version) {
+            if (m_firmwareVersion.isEmpty()) {
+                WIFI_LOG(QString("Firmware version: %1 (reported '%2')").arg(version, reported));
+            } else {
+                WIFI_WARN(QString("Firmware version changed mid-connect: %1 -> %2")
+                          .arg(m_firmwareVersion, version));
+            }
+            m_firmwareVersion = version;
+            // Drives supportsFirmwareUpdate too, and the update controller
+            // re-evaluates availability on it. Without this the Update action
+            // could never appear for a WiFi scale.
+            emit firmwareVersionChanged();
+        }
+    }
+
+    // Protocol version — log once per connect (reset on disconnect, like
+    // m_firmwareVersion) for diagnostics only.
+    const QJsonValue pv = obj.value(QStringLiteral("protocol_version"));
+    if (pv.isDouble()) {
+        const int v = pv.toInt();
+        if (v != m_loggedProtoVersion) {
+            m_loggedProtoVersion = v;
+            WIFI_LOG(QString("Protocol version: %1").arg(v));
+        }
+    }
+}
+
+void DecentScaleWifi::handleButtonFrame(const QJsonObject& obj) {
+    const int buttonNumber = obj.value(QStringLiteral("button_number")).toInt(0);
+    const int pressCode    = obj.value(QStringLiteral("press_code")).toInt(0);
+    if (buttonNumber == 0 || pressCode == 0) return;
+    emit buttonPressed(encodeButton(buttonNumber, pressCode));
+}
+
+void DecentScaleWifi::handlePowerFrame(const QJsonObject& obj) {
+    const QString event   = obj.value(QStringLiteral("event")).toString();
+    const QString reason  = obj.value(QStringLiteral("reason")).toString();
+    const int reasonCode  = obj.value(QStringLiteral("reason_code")).toInt(-1);
+    if (event != QStringLiteral("power_off")) return;
+
+    // Reject malformed power_off frames that omit BOTH the reason string and
+    // the numeric reason code — without either, we have no diagnostic detail
+    // to log, and marking the disconnect as "expected" would hide a
+    // potentially-real failure. Let the following unexpected disconnect log
+    // surface so it's diagnosable.
+    if (reason.isEmpty() && reasonCode == -1) {
+        WIFI_WARN("Malformed power_off frame (no reason or reason_code) — "
+                  "treating as unexpected disconnect");
+        return;
+    }
+
+    m_lastPowerEventReason = reason;
+    m_lastPowerEventCode = reasonCode;
+    // Mark the imminent disconnect as expected so onDisconnected logs it
+    // accordingly instead of as an unexpected drop. Reconnect itself is
+    // owned by main.cpp's scaleReconnectTimer.
+    m_userInitiatedShutdown = true;
+    const QString reasonText = reason.isEmpty()
+        ? QString("code %1").arg(reasonCode)
+        : reason;
+
+    // Consume-and-clear the app-initiated flag so the next firmware-initiated
+    // power_off still logs with full detail. We don't surface a dialog either
+    // way — the existing "Scale Disconnected" notice (only after reconnect
+    // gives up) is the user-facing signal.
+    if (m_powerOffInitiatedByApp) {
+        m_powerOffInitiatedByApp = false;
+        WIFI_INFO(QString("Scale shut down: %1 (code %2) — app-initiated")
+                 .arg(reasonText).arg(reasonCode));
+        return;
+    }
+
+    WIFI_WARN(QString("Scale shut down: %1 (code %2)").arg(reasonText).arg(reasonCode));
+}
+
+void DecentScaleWifi::handleRateFrame(const QJsonObject& obj) {
+    const int hz = obj.value(QStringLiteral("hz")).toInt(0);
+    const int intervalMs = obj.value(QStringLiteral("interval_ms")).toInt(0);
+    WIFI_LOG(QString("Rate acknowledged: %1 Hz (interval %2 ms)").arg(hz).arg(intervalMs));
+}
+
+void DecentScaleWifi::onRecognizedAsHds() {
+    if (m_recognized) return;
+    m_recognized = true;
+    m_recognitionTimer->stop();
+    // We're talking to a real scale again, so any pending "re-resolve on the
+    // next attempt" obligation from an earlier unreachable window is
+    // discharged. Cleared here rather than in onConnected because a bare WS
+    // upgrade doesn't prove we reached the scale — only a recognized HDS frame
+    // does, and that is the same bar the rest of this driver uses.
+    m_retryShouldReresolve = false;
+
+    if (m_socket) {
+        m_lastRecognizedUrl = m_socket->requestUrl();
+        m_lastRecognizedUrl.setHost(m_socket->peerAddress().toString());
+    }
+
+    // Cache the peer IP after a hostname connect succeeds, so the next
+    // connect can skip the OS resolver entirely. A cached-IP hit or a
+    // freshly-resolved preferredIp doesn't re-cache here (the resolve path
+    // already persists the IP it dials via m_ipCacheUpdate, and a preferredIp
+    // connect self-populates the cache on the first reconnect's re-resolve),
+    // so a cached-IP hit stays a pure direct connect with no cache write.
+    if (m_currentTargetIsHostname && m_ipCacheUpdate) {
+        const QString peerIp = m_socket ? m_socket->peerAddress().toString() : QString();
+        if (!peerIp.isEmpty() && peerIp != m_hostname) {
+            WIFI_LOG(QString("Caching peer IP %1 for %2").arg(peerIp, m_hostname));
+            m_ipCacheUpdate(m_hostname, peerIp);
+        }
+    }
+
+    emit recognizedAsHds();
+}
+
+void DecentScaleWifi::onRecognitionTimeout() {
+    // WARN only when a peer answered and was not an HDS. Silence is DEBUG: the
+    // fallback below follows, and the attempt's own outcome is the line to read.
+    const QString noFrame = QString("No recognizable HDS frame within %1 ms from %2")
+                                .arg(kRecognitionTimeoutMs).arg(m_currentTarget);
+    if (m_wsHandshakeDone)
+        WIFI_WARN(noFrame);
+    else
+        WIFI_LOG(noFrame + QStringLiteral(" (nothing answered)"));
+
+    // Cached-IP attempt failed validation → fall back to the hostname. (If we
+    // were already on the hostname, we've exhausted options.)
+    //
+    // Whether to EVICT the cached IP turns on whether anything answered. The
+    // recognition timeout fires for two states that need opposite responses:
+    //
+    //  - A peer answered and is not an HDS — DHCP handed the address to a
+    //    router/printer, or it was typed wrong. The WebSocket handshake completed
+    //    (or onError classified a peer-answered failure), and the IP is genuinely
+    //    wrong. Evict it, or every future connect dials a dead address.
+    //  - NOTHING answered. No handshake, no error from a listening peer. That is
+    //    not evidence about the address at all — it is what a scale that is
+    //    rebooting, asleep, or momentarily unreachable looks like.
+    //
+    // Evicting on silence turns a transient miss into a long outage, and mDNS
+    // silence is common: on an ordinary LAN a single query goes unanswered 25-60%
+    // of the time, for every host on the segment, not just the scale. See
+    // docs/WIFI_SCALE_MDNS.md for the measurements.
+    //
+    // Keep the address. The reason is narrow and survives whatever the responder
+    // turns out to be doing: silence says nothing about whether the address is
+    // right. Do not re-derive a mechanism here — three have been asserted at this
+    // call site and all three were refuted; the doc records them so a fourth does
+    // not get written from memory.
+    //
+    // m_wsHandshakeDone is exactly this distinction, already tracked: cleared at
+    // the top of every attempt, set in onConnected(). A completed handshake means
+    // something at that address spoke HTTP/WebSocket to us and then failed to be
+    // an HDS; no handshake means nothing was there to judge.
+    const bool peerAnswered = m_wsHandshakeDone;
+    if (!m_currentTargetIsHostname && !m_triedHostnameFallback) {
+        if (peerAnswered) {
+            WIFI_LOG(QString("Cached IP %1 answered but did not validate as HDS — evicting cache "
+                             "and falling back to hostname %2")
+                     .arg(m_currentTarget, m_hostname));
+            if (m_ipCacheUpdate) m_ipCacheUpdate(m_hostname, QString());
+        } else {
+            WIFI_LOG(QString("Cached IP %1 did not answer — keeping it and falling back to "
+                             "hostname %2")
+                     .arg(m_currentTarget, m_hostname));
+        }
+        // Hand the fallback off to onDisconnected via an event-driven flag:
+        // when the socket-close completes, onDisconnected sees the flag and
+        // runs attemptTarget(hostname) inline. No timer-as-guard.
+        m_pendingHostnameFallback = true;
+        m_userInitiatedShutdown = true;
+        // abort() (hard close), not close() (graceful), to avoid Qt warning
+        // "QNativeSocketEngine::write() was not called in ConnectedState" —
+        // the recognition window expired without the WS upgrade completing,
+        // so any in-flight handshake writes Qt has queued internally would
+        // try to flush against a half-open socket on the graceful path.
+        m_socket->abort();
+        return;
+    }
+
+    // Hostname attempt also failed recognition — give up THIS attempt. Transient
+    // connect failure: log it but don't pop a modal. BLEManager's connection timer
+    // (onScaleConnectionTimeout) is the backstop for the saved-scale reconnect
+    // case — it retries, and a genuinely-gone scale is surfaced by the
+    // FlowScale-fallback notice. PR Kulitorum/Decenza#1253
+    //
+    // For the MANUAL "Add WiFi Scale" path, the outer connection timer has
+    // already been stopped (onScaleConnectedChanged stops it when setConnected(true)
+    // fires from WS-connect, which happens before recognition), so its
+    // manualWifiValidationFailed emission won't fire. Emit recognitionFailed so
+    // main.cpp's deferred-persistence handler can route the failure to the
+    // user-visible dialog. The signal is only meaningful in the give-up branch
+    // — the cached-IP fallback branch above starts a new attempt, so recognition
+    // could still succeed there. (#1281)
+    WIFI_WARN(QStringLiteral("WiFi scale did not respond as HDS — giving up this attempt"));
+    // ORDER MATTERS: write internal state and abort the socket BEFORE emitting
+    // recognitionFailed. The signal's only slot (in main.cpp's deferred-
+    // persistence wiring) emits disconnectScaleRequested synchronously, whose
+    // handler calls physicalScale.reset() — destroying THIS object while we're
+    // still on the call stack of onRecognitionTimeout. Any access to `this`
+    // (m_userInitiatedShutdown, m_socket) after the emit would be a use-after-
+    // free. By writing before the emit, we ensure those mutations complete
+    // while `this` is still alive; the implicit function return after the
+    // emit doesn't touch `this`, so it's safe to be destroyed during the emit.
+    m_userInitiatedShutdown = true;  // mark expected; reconnect owned by main.cpp
+    m_socket->abort();  // Same rationale as the fallback path above.
+    emit recognitionFailed();  // MUST be last — slot may destroy `this`.
+}
+
+int DecentScaleWifi::encodeButton(int buttonNumber, int pressCode) {
+    return kWifiButtonFlag | ((buttonNumber & 0xF) << 8) | (pressCode & 0xFF);
+}
+
+bool DecentScaleWifi::isTransientTransportError(QAbstractSocket::SocketError err) {
+    // Mapping verified against Qt 6.11.1 (qtbase/src/network/socket/
+    // qnativesocketengine_unix.cpp, nativeConnect's errno switch). Re-check on a
+    // Qt upgrade — this classification is only as good as that switch, and the
+    // enum names do NOT tell you which errno values land where.
+    switch (err) {
+    // The only class that matters in practice. nativeConnect maps BOTH
+    // EHOSTUNREACH and ENETUNREACH here, and also ETIMEDOUT (a connect that
+    // never got a reply) — so "nothing answered" arrives as NetworkError in all
+    // three shapes, including the sub-millisecond failure of a connect() that
+    // never bound a local port because the OS had a cached negative route.
+    //
+    // What matters here is only that nothing answered, so nothing was learned
+    // about whether the address is still the scale's. This comment used to name
+    // a cause (an ESP32 in WiFi power-save missing an ARP request); that account
+    // is refuted — see docs/WIFI_SCALE_MDNS.md — and the handling never depended
+    // on it.
+    //
+    // NOTE: EHOSTDOWN is NOT in that switch — it falls through to
+    // UnknownSocketError and is therefore treated as non-transient here. That
+    // is a Qt gap, not a decision of ours; if a platform starts producing it
+    // for a sleeping scale, this is the line to revisit.
+    case QAbstractSocket::NetworkError:
+    // Not produced by nativeConnect (ETIMEDOUT becomes NetworkError above), but
+    // reachable from the waitFor* paths. Same reasoning, kept for completeness.
+    case QAbstractSocket::SocketTimeoutError:
+        return true;
+    default:
+        // Everything else stays on the evict-and-fall-back path.
+        //
+        // HostNotFoundError is deliberately NOT transient, despite "the name
+        // didn't resolve" sounding like nothing answered. It can only reach
+        // onError from a bare-hostname dial — ".local" names are resolved
+        // out-of-band in attemptHostname and never handed to QWebSocket as a
+        // name — and a hostname attempt has m_currentTargetIsHostname set, so
+        // it was already excluded from the cached-IP eviction branch. Marking
+        // it transient therefore protects no cache decision; its only effect
+        // would be to suppress the give-up path that raises the manual
+        // "Add WiFi Scale" failure dialog, leaving a user who typed a bad
+        // hostname with no feedback at all.
+        //
+        // ConnectionRefusedError USUALLY means a host is up and refused the
+        // port — the DHCP-reassignment evidence this branch acts on. It is not
+        // airtight: a firewall REJECT produces it with no host at the address,
+        // Qt also maps EINVAL onto it, and a rebooting ESP32 refuses briefly
+        // before its WebSocket server binds. Eviction self-heals via the
+        // hostname fallback, so a false positive costs one extra resolve —
+        // cheap enough to prefer over the alternative, which is never
+        // correcting a genuinely reassigned address.
+        return false;
+    }
+}
+
+bool DecentScaleWifi::send(const QString& text) {
+    if (!m_socket || m_socket->state() != QAbstractSocket::ConnectedState) {
+        // Qt's sendTextMessage silently returns 0 bytes when the socket isn't
+        // ConnectedState (ClosingState, UnconnectedState, mid-handshake), with
+        // no errorOccurred signal — so without this check, commands queued
+        // during teardown would vanish without trace. Most observed at app
+        // exit when the DE1-sleep handler already initiated a graceful close.
+        WIFI_WARN(QStringLiteral("send() dropped — socket not connected: %1")
+                  .arg(text.left(80)));
+        return false;
+    }
+    m_socket->sendTextMessage(text);
+    return true;
+}
+
+void DecentScaleWifi::tare()       { send(QStringLiteral("tare")); }
+void DecentScaleWifi::startTimer() { send(QStringLiteral("timer start")); }
+void DecentScaleWifi::stopTimer()  { send(QStringLiteral("timer stop")); }
+void DecentScaleWifi::resetTimer() { send(QStringLiteral("timer reset")); }
+void DecentScaleWifi::disableLcd() { send(QStringLiteral("display off")); }
+
+void DecentScaleWifi::startFirmwareUpdate(const QString& targetVersion) {
+    if (!supportsFirmwareUpdate()) {
+        WIFI_WARN(DecentScaleProtocol::firmwareUpdateUnknownVersionMessage());
+        return;
+    }
+    // Required for the same reason as the byte transports, and true of the text
+    // command too: a bare "wifi_update" starts the scale's own picker
+    // (openscale include/websocket.h, an empty action yields no target).
+    //
+    // Canonical form rather than the caller's string: the scale's target parser
+    // requires three numeric components and nothing after them.
+    const auto components = HdsFirmwareCatalog::parseVersion(targetVersion);
+    if (!components) {
+        WIFI_WARN(DecentScaleProtocol::firmwareUpdateBadTargetMessage(targetVersion));
+        return;
+    }
+    WIFI_INFO(DecentScaleProtocol::firmwareUpdateStartingMessage(targetVersion));
+    if (send(QStringLiteral("wifi_update %1").arg(HdsFirmwareCatalog::canonicalVersion(*components)))) {
+        m_awaitingFirmwareUpdateAck = true;
+    } else {
+        // send() already WARN-logged the drop; without this, the controller
+        // would still flip to "update requested" (it has no other way to know
+        // the write never left this process) — the exact false-success shape
+        // firmwareUpdateRejected exists to prevent.
+        emit firmwareUpdateRejected(QStringLiteral("not connected — nothing was sent"));
+    }
+}
+
+void DecentScaleWifi::wake() {
+    // Order: restore sensors/loop first, then OLED.
+    send(QStringLiteral("soft_sleep off"));
+    send(QStringLiteral("display on"));
+}
+
+void DecentScaleWifi::sleep() {
+    // Firmware-level power off — the WS analog of BT's `0A 02 00`. The scale
+    // must be physically woken via its button afterward; this matches the BT
+    // transport's behavior exactly. `soft_sleep on` is the lighter reversible
+    // state and is wrong here: leaving the ESP32 radio active while the DE1
+    // sleeps drains a battery-only HDS.
+    //
+    // Mark the imminent power_off echo as app-initiated so handlePowerFrame
+    // logs at LOG level (we already know about it) rather than WARN. Set
+    // BEFORE the send to keep the assignment+send pair locally correct —
+    // any future caller or mock that delivers the echo synchronously inside
+    // send() still sees the flag set.
+    m_powerOffInitiatedByApp = true;
+    const bool sent = send(QStringLiteral("{\"command\":\"power\",\"action\":\"off\"}"));
+    if (!sent) {
+        // Caller (app-exit waitLoop, DE1-sleep handler) hangs forever waiting
+        // for sleepCompleted, so emit unconditionally — but warn so the
+        // dropped power-off command isn't masked by a misleading
+        // "drained successfully" log downstream. Common at app exit after a
+        // DE1-sleep keepScaleOn=true+WiFi close (socket already in ClosingState).
+        //
+        // Clear the latch locally: no echo will arrive (we didn't send the
+        // command), so if a firmware-initiated power_off (low battery, button)
+        // happens before the next connectToHost() cycle resets it, it must
+        // surface, not be silently suppressed. The connectToHost() reset is
+        // still the backstop for the case where send() succeeded but the
+        // socket dropped before the echo arrived.
+        m_powerOffInitiatedByApp = false;
+        WIFI_WARN("sleep(): power-off command not delivered (socket not connected)");
+    }
+    // BT waits for `characteristicWritten` as a "command left the radio" ack.
+    // The WS analog is send() returning success above. Emit immediately to
+    // match BT's intent.
+    emit sleepCompleted();
+}
+
+void DecentScaleWifi::setLed(int r, int g, int b) {
+    const int rc = std::clamp(r, 0, 255);
+    const int gc = std::clamp(g, 0, 255);
+    const int bc = std::clamp(b, 0, 255);
+    send(QStringLiteral("led %1 %2 %3").arg(rc).arg(gc).arg(bc));
+}
+
+void DecentScaleWifi::sendKeepAlive() {
+    // Liveness itself is covered by TCP keepalive; this hook exists so the
+    // base-class keep-alive timer (30 s) can drive a periodic `status` request,
+    // since the WS firmware no longer auto-pushes status frames. Send `status`
+    // on every kBatteryPollKeepAliveTicks tick (~4 min) — matches the BT
+    // driver's effective battery-poll cadence (see decentscale.cpp's
+    // kBatteryPollHeartbeatTicks). The base-class timer is started in
+    // setConnected(true) and stopped in setConnected(false), so no extra
+    // lifecycle wiring is needed here.
+    if (++m_ticksSinceBatteryPoll >= kBatteryPollKeepAliveTicks) {
+        m_ticksSinceBatteryPoll = 0;
+        send(QStringLiteral("status"));
+    }
+}
+
+void DecentScaleWifi::onError() {
+    const QAbstractSocket::SocketError err = m_socket
+        ? m_socket->error() : QAbstractSocket::UnknownSocketError;
+    const QString errStr = m_socket ? m_socket->errorString() : QStringLiteral("<no socket>");
+    // Include the local source address the OS bound (may be set even on a
+    // failed connect) alongside the target: on a multi-homed host a "Host
+    // unreachable" that egressed the wrong / a down interface shows up here as
+    // a local address on an interface that can't reach the target.
+    const QString localIp = m_socket ? m_socket->localAddress().toString() : QString();
+    // target= carries WHERE THE ADDRESS CAME FROM, not just what it was. The two
+    // failures look identical on the wire and mean opposite things: a freshly
+    // resolved address that is unreachable says the scale is off or off-network;
+    // a remembered one says the scale probably moved and mDNS is not answering.
+    // Without the source, a reader watching the same IP fail for eight minutes
+    // has no way to tell which — and the line that knew sat at DEBUG.
+    const QString errorLine =
+        QString("WebSocket error: %1 (code %2) — target=%3 (%4) local=%5")
+            .arg(errStr).arg(static_cast<int>(err))
+            .arg(m_currentTarget,
+                 m_targetSource.isEmpty() ? QStringLiteral("source unrecorded") : m_targetSource,
+                 localIp.isEmpty() ? QStringLiteral("<unbound>") : localIp);
+    // Through the shared budget: this is THE line a dead reconnect ladder repeats
+    // forever, once per retry cycle. The first few say what is wrong; the rest say
+    // only "still wrong", which the ladder's own lines already establish.
+    if (m_repeatFailureSink)
+        m_repeatFailureSink(errorLine, /*warn=*/true);
+    else
+        WIFI_WARN(errorLine);
+
+    // 503 detection — firmware refuses additional clients past its cap. Treat
+    // as an expected refusal so it isn't recorded as a transport error, but
+    // don't surface a modal: HDS firmware now allows multiple concurrent
+    // clients, so a 503 in practice means the cap is briefly saturated and the
+    // standard "Scale Disconnected" / FlowScale fallback notice is sufficient.
+    if (errStr.contains(QStringLiteral("503"))) {
+        m_userInitiatedShutdown = true;
+        return;
+    }
+
+    // Record a GENUINE transport error — one that dropped the link under us — so
+    // onDisconnected can flag an abnormal drop (closeCode() can't; see note there).
+    // Skip it when we already initiated a close: a deliberate abort()/close() can
+    // also surface here, and that is not an external transport failure. Reset per
+    // connect cycle/attempt (connectToHost/attemptTarget).
+    if (!m_userInitiatedShutdown) {
+        m_socketErrorThisConnect = true;
+        m_lastSocketErrorString = errStr;
+    }
+
+    // A failure where NOTHING answered says nothing about whether this address
+    // still belongs to the scale, so it must not be treated as cache-invalidating
+    // evidence. Retain the cached IP, leave the hostname fallback unconsumed,
+    // and end the attempt — main.cpp's scaleReconnectTimer owns the retry, as
+    // the reconnect-ownership requirement already specifies for mid-stream drops.
+    //
+    // This branch is the fix for a scale that dropped off the network for a few
+    // seconds. Previously ANY error evicted the cache and immediately re-dialed
+    // the hostname; because the re-dial happened ~45 ms later it landed inside
+    // the very same unreachability window, failed identically, consumed the
+    // fallback, and the driver gave up — leaving a healthy scale disconnected
+    // until the user manually rescanned. An instant retry cannot outlast a
+    // condition measured in seconds; only the backoff loop can.
+    //
+    // m_retryShouldReresolve makes the NEXT attempt resolve the hostname rather
+    // than re-dial the remembered address (see the header for why).
+    if (isTransientTransportError(err)) {
+        WIFI_LOG(QString("Transient transport error on %1 (%2) — cached IP retained, "
+                         "retry deferred to the app-level reconnect loop")
+                 .arg(m_currentTarget, errStr));
+        m_retryShouldReresolve = true;
+        m_recognitionTimer->stop();
+        // Deliberately NOT setting m_userInitiatedShutdown: this is a genuine
+        // transport failure and onDisconnected must still log it as an abnormal
+        // drop. m_socketErrorThisConnect was set above for exactly that.
+        return;
+    }
+
+    // Cached-IP attempt where a peer DID answer but isn't an HDS (handshake
+    // refused like 403, a RST from a host that has nothing on port 80, a
+    // protocol error): this IP isn't a working HDS endpoint. Evict the cached
+    // IP so we don't dial it again on the next connect cycle (or on the next
+    // proactive switch-back probe), and fall through to a fresh hostname/mDNS
+    // lookup.
+    //
+    // Why this catches more than socket-layer errors: a poisoned cached IP
+    // (manually-typed wrong address, DHCP-reassigned to a router/printer/NAS)
+    // commonly produces handshake-layer errors — e.g. the home router answers
+    // ws://192.168.1.1/snapshot with HTTP 403, which surfaces here as
+    // WebSocketProtocolError / UnknownSocketError. Without this, the cached-IP
+    // attempt would dead-end: onDisconnected stops the recognition timer, so
+    // the only other path that would have triggered hostname fallback
+    // (onRecognitionTimeout) never fires.
+    //
+    // 503 is the one peer-answered error we DO NOT route here: it's the
+    // openscale "client cap saturated" refusal — the scale is real and the
+    // cache is good; the link is briefly busy. That case is handled by the 503
+    // early-return at the top of this function (the first thing onError checks),
+    // which still short-circuits ahead of both this branch and the transient
+    // classification above.
+    // A drop after recognition (a reset, a dead battery) proves nothing against
+    // an address the scale has already answered on.
+    const bool cachedIpAttempt = !m_currentTargetIsHostname
+                              && !m_triedHostnameFallback
+                              && !m_pendingHostnameFallback
+                              && !m_recognized;
+    if (cachedIpAttempt) {
+        WIFI_LOG(QString("Cached IP %1 answered but is not an HDS (%2) — evicting cache "
+                         "and falling back to hostname %3")
+                 .arg(m_currentTarget, errStr, m_hostname));
+        if (m_ipCacheUpdate) m_ipCacheUpdate(m_hostname, QString());
+        m_userInitiatedShutdown = true;
+        m_recognitionTimer->stop();
+
+        if (m_socket && m_socket->state() != QAbstractSocket::UnconnectedState) {
+            // Socket is mid-teardown. Use the existing flag mechanism that
+            // onRecognitionTimeout uses: abort to force a clean disconnect,
+            // and onDisconnected sees m_pendingHostnameFallback and runs
+            // attemptHostname() inline once the close completes.
+            m_pendingHostnameFallback = true;
+            m_socket->abort();
+        } else {
+            // Socket has already disconnected (onDisconnected raced ahead of
+            // this onError and went through its normal path without the
+            // pending flag set). Dial the hostname fallback ourselves, queued
+            // to the event loop so signal handlers remain re-entrant-safe.
+            QMetaObject::invokeMethod(this,
+                [this, generation = m_resolveGeneration]() {
+                    if (generation == m_resolveGeneration)  // not superseded by a connect or disconnect
+                        attemptHostname();
+                },
+                Qt::QueuedConnection);
+        }
+    }
+}

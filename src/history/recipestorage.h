@@ -1,0 +1,624 @@
+#pragma once
+
+#include <QObject>
+#include <QHash>
+#include <QString>
+#include <QVariantList>
+#include <QVariantMap>
+#include <QVector>
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <optional>
+
+#include <QtQmlIntegration/qqmlintegration.h>
+#include "core/recipeeditfields.h"
+class QSqlDatabase;
+class SerialDbWorker;
+
+// A recipe: a named whole-drink specification (openspec change add-recipes).
+// A profile tells the machine how to push water; a recipe holds the drink —
+// profile, bean link, equipment, dose/yield/temp, its own grind, and steam.
+// Recipes follow the optionality ladder: only name + profile are required;
+// bean and equipment links are optional and a recipe works with whatever
+// rungs exist.
+//
+// Grind: always the recipe's own (fix-recipe-grind-integrity — the old
+// "empty grindPinned = inherit from the bag" mode is retired; migration 30
+// backfilled inherit-mode rows from their bag). grindPinned is this recipe's
+// own opaque grind text, rpmPinned rides with it. A bag does not supply the
+// recipe's grind. Grind-less drink types (tea) store none.
+//
+// Steam: steamJson holds the drink's steam block, serialized as
+// {hasMilk, milkWeightG, pitcherName, durationSec, flow, temperatureC, pitcherWeightG, secondsPerGram}. The
+// pitcher is snapshotted BY VALUE (name + duration/flow/temperature) — never a
+// preset-list reference — per the Bean Base snapshot-not-reference rule.
+//
+// Hot water: hotWaterJson holds the drink's added-hot-water block (for an
+// Americano), serialized as {hasWater, vesselName, volume, mode, flowRate,
+// temperatureC, order}. order is "after" (americano, default) or "before"
+// (long black). Hot water is opt-in — hasWater toggles it on and the user
+// selects a water vessel; the vessel's own values ride the recipe. Like
+// the steam pitcher the vessel is snapshotted BY VALUE (never a preset-list
+// reference); activation re-selects it by name and recreates it from the
+// snapshot if the preset was deleted. A recipe-only amountMode="ratio" stores
+// waterToEspressoRatio in place of volume; shared presets remain fixed.
+// Returned by the recipes-using-a-profile count when the count could not be
+// taken at all. Distinct from 0 on purpose — see countRecipesUsingProfile.
+inline constexpr int kRecipeCountUnknown = -1;
+
+struct Recipe {
+    qint64 id = 0;
+
+    QString name;          // required
+    QString profileTitle;  // resolved by title at activation; may be empty ONLY
+                           // for a hot-water-only recipe (hasWater in the block)
+    QString profileJson;   // fallback when the titled profile is not installed
+
+    // Drink type (add-recipe-wizard-tea): user intent recorded by the wizard —
+    // "espresso" | "filter" | "americano" | "long_black" | "latte" |
+    // "latte_hotwater" | "tea" | "tea_hotwater". Presentation only: activation
+    // and machine behavior read the blocks, never this. Empty (legacy rows) =
+    // derive via deriveDrinkType.
+    QString drinkType;
+
+    // Bag link (recipes-bag-links-ui-polish): the SPECIFIC bag this recipe
+    // is made with; 0 = no bag (bean-less recipes per the optionality
+    // ladder). Activation applies this bag directly — no MRU resolution.
+    // The bean identity fields below are the display fallback and the
+    // matching key for the automatic relink lifecycle (roll-on-finish,
+    // wake-on-restock), never an activation-time resolver input.
+    qint64 bagId = 0;
+
+    // Bean identity: canonical Bean Base id when available, else
+    // roaster+coffee identity. Kept in sync with the linked bag; empty = no
+    // bean linked.
+    QString beanBaseId;
+    QString roasterName;
+    QString coffeeName;
+
+    qint64 equipmentId = 0;   // FK -> equipment_packages.id; 0 = none
+
+    double doseG = 0;         // 0 = unset
+    // Yield as a spec, not a number (add-yield-ratio-anchor): yieldValue +
+    // yieldMode ("none" | "absolute" | "ratio", see src/core/yieldspec.h).
+    // mode "none" = the recipe designs no yield and the ladder falls through
+    // to the bag, then the profile. A ratio's gram target is derived at use
+    // time (value x dose), mirroring how tempOffsetC below stores a relative
+    // quantity resolved at use time. Replaces the legacy absolute yield_g,
+    // which migration 34 converts and leaves dead in place.
+    double yieldValue = 0;    // 0 = unset (grams when absolute, multiplier when ratio)
+    QString yieldMode = QStringLiteral("none");
+    // Temperature as a SIGNED DELTA against the profile's espresso_temperature
+    // (recipe-relative-temp-offset); 0 = brew at the profile's own temperature.
+    // The effective brew temperature is always computed profileTemp + offset at
+    // use time, so editing the profile's temperature moves the recipe with it
+    // and can never manufacture a phantom offset. Replaces the legacy absolute
+    // temp_override_c, which migration 31 converts and leaves dead in place.
+    double tempOffsetC = 0;
+
+    QString grindPinned;      // the recipe's own grind (empty = none recorded)
+    qint64 rpmPinned = 0;     // rides with grindPinned; only applied alongside a non-empty grind (0 = unset)
+    QString steamJson;        // steam block, empty = none saved
+    QString hotWaterJson;     // hot-water block (opt-in water-vessel snapshot), empty = none
+
+    bool archived = false;
+
+    // Provenance (0 = none): the golden shot this recipe was promoted from,
+    // or the recipe it was cloned from. Clones do NOT copy the source's
+    // shot link — a clone hasn't earned a golden shot yet.
+    qint64 createdFromShotId = 0;
+    qint64 clonedFromRecipeId = 0;
+
+    qint64 lastUsedEpoch = 0; // bumped on activation and shot save (MRU)
+    // Stamped by the created_at SQL DEFAULT at insert. Never written through the
+    // generated kCols INSERT/UPDATE path (COL_EPOCH_RO); the import path
+    // re-stamps it directly to preserve source dates (see importRecipesStatic).
+    // Surfaced so the recipes page can sort by date added.
+    qint64 createdEpoch = 0;
+
+    bool isValid() const { return id > 0; }
+    QVariantMap toVariantMap() const;
+    // Raw fields that can be edited through an optimistic recipe update. Every
+    // field is present with its native QVariant type and default value.
+    QVariantMap editableSnapshot() const;
+    static QVariantMap editableSnapshot(const QVariantMap& raw);
+    static Recipe fromVariantMap(const QVariantMap& map);
+
+    // True when the hot-water block JSON is present with hasWater set — the
+    // condition under which a recipe may be profile-less. Shared by the save
+    // validation on every surface (wizard, MCP, web).
+    static bool hotWaterActive(const QString& hotWaterJson);
+
+    // The drink-type vocabulary. MCP schema enums are advisory (the registry
+    // doesn't enforce them) and the web API accepts free text, so write
+    // surfaces MUST gate on this — a stored "Tea" looks valid everywhere but
+    // misses every exact-match consumer (wizard template lookup, equipment
+    // default query, and the stored-tea protection in the update
+    // re-derivation, which would then lose the profile-derived category on a
+    // block edit).
+    static bool isKnownDrinkType(const QString& drinkType) {
+        static const QStringList kDrinkTypes = {
+            QStringLiteral("espresso"), QStringLiteral("filter"),
+            QStringLiteral("americano"), QStringLiteral("long_black"),
+            QStringLiteral("latte"), QStringLiteral("latte_hotwater"),
+            QStringLiteral("tea"), QStringLiteral("tea_hotwater")};
+        return kDrinkTypes.contains(drinkType);
+    }
+
+    // The one save-validation rule every surface enforces: a name, and a
+    // profile unless the recipe is hot-water-only. QML reaches it through
+    // RecipeStorage::isSaveValid.
+    static bool saveValidationPasses(const QString& name, const QString& profileTitle,
+                                     const QString& hotWaterJson) {
+        return RecipeEditFields::saveValidationPasses(name, profileTitle, hotWaterJson);
+    }
+
+    // True when the recipe names a profile, and so owns which profile is
+    // loaded. A profile-less recipe (tea, hot water) owns no profile choice —
+    // exactly as a bean-less recipe owns no bag choice and an equipment-less
+    // recipe owns no equipment choice — and must never be deactivated by a
+    // profile change, nor be marked as missing a profile it never had.
+    //
+    // The empty test is trimmed, matching saveValidationPasses above and the
+    // profile-less branches in MainController; the watcher this replaced had no
+    // empty test at all, which is why a tea recipe was dropped by every profile
+    // change.
+    static bool ownsProfileChoice(const QString& profileTitle) {
+        return !profileTitle.trimmed().isEmpty();
+    }
+
+    // True when the recipe names this particular profile. Both this and
+    // profileDiverged below gate on ownership first, so a profile-less recipe
+    // answers false to BOTH — it neither names a profile nor can diverge from
+    // one. Writing the deleted-profile check as !profileDiverged() instead
+    // would have deactivated every tea recipe on any profile deletion.
+    //
+    // EXACT: case-sensitive and NOT trimmed, because ProfileManager::
+    // findProfileByTitle compares `info.title == title` raw, and that compare is
+    // what decides whether the profile actually resolves. Anything looser here
+    // reports a recipe as matching a profile that will not load.
+    //
+    // This used to trim both sides, defended by "a whitespace-only difference
+    // cannot arise from a successful activation". True and beside the point: a
+    // title never has to activate to be STORED. profile_title is not normalized
+    // on write, so an MCP or web author can persist "D-Flow / Q " verbatim, and
+    // the trimmed compare then reported that recipe as fine everywhere while
+    // activation failed — the same "looks fine, does not run" failure this
+    // change exists to remove, reintroduced through whitespace instead of
+    // deletion.
+    //
+    // Deliberately NOT fixed by teaching findProfileByTitle to trim: that would
+    // change resolution for every caller (shot loading, auto-load, the MCP and
+    // web surfaces), which is a far larger blast radius than this change earns.
+    // A whitespace-differing title now reads as missing, which is the honest
+    // answer — it genuinely cannot resolve.
+    static bool namesProfile(const QString& recipeProfileTitle,
+                             const QString& profileTitle) {
+        return ownsProfileChoice(recipeProfileTitle)
+            && recipeProfileTitle == profileTitle;
+    }
+
+    // True when the recipe's profile is no longer the loaded one, and the
+    // recipe must therefore be deactivated. The single definition of that
+    // question: MainController asks it on a profile change and when a restored
+    // or refreshed recipe row arrives. Hand-written comparisons at each site
+    // were free to drift, and the drift was invisible until a shot was stamped
+    // with a recipe whose profile it had not run.
+    static bool profileDiverged(const QString& recipeProfileTitle,
+                                const QString& loadedProfileTitle) {
+        return ownsProfileChoice(recipeProfileTitle)
+            && !namesProfile(recipeProfileTitle, loadedProfileTitle);
+    }
+
+    // --- Ingredient ownership for the steam pitcher and the water vessel.
+    //
+    // Same shape as ownsProfileChoice/profileDiverged above: ownership gates
+    // divergence, so a recipe that names neither is never deactivated by a
+    // change to one. Statics over the block JSON, so they are asserted
+    // directly rather than through a MainController, which needs five live
+    // collaborators to stand up.
+
+    // True when the steam block names a pitcher — including the "Heater off"
+    // marker, which IS a choice (a drink saved with the boiler deliberately
+    // cold) and not the absence of one. The marker carries no name, which is
+    // why it needs its own test.
+    static bool ownsSteamPitcherChoice(const QString& steamJson);
+
+    // True when the live pitcher is not the one the recipe names, and the
+    // recipe must therefore be deactivated. `liveIsHeaterOff` is the caller's
+    // SettingsBrew::isHeaterOffPitcher verdict on the live selection — the
+    // marker has no name to compare. Name matching is case-insensitive, the
+    // same test activation resolves the block by.
+    static bool steamPitcherDiverged(const QString& steamJson,
+                                     const QString& livePitcherName,
+                                     bool liveIsHeaterOff);
+
+    // True when the hot-water block is active AND names a vessel. hasWater with
+    // no vessel is an incomplete block (toggled on, never picked), which owns
+    // no choice — the same gate applyActivatedRecipe uses before applying it.
+    static bool ownsWaterVesselChoice(const QString& hotWaterJson);
+
+    // True when the live water vessel is not the one the recipe names. Gated
+    // on ownsWaterVesselChoice, so a dormant or vessel-less block never
+    // diverges.
+    static bool waterVesselDiverged(const QString& hotWaterJson,
+                                    const QString& liveVesselName);
+
+    // Derive the drink type from the blocks + the profile's beverage_type
+    // (caller resolves it; pass empty when the profile is unknown). Used for
+    // legacy rows without a stored drinkType and for promote-from-shot.
+    // Precedence: profile-less + hot water → tea_hotwater; tea_portafilter →
+    // tea; milk AND hot water → latte_hotwater (a latte with an added water
+    // pour); milk alone → latte; hot water alone by order →
+    // americano/long_black; filter/pourover → filter; else espresso.
+    static QString deriveDrinkType(const Recipe& recipe, const QString& profileBeverageType);
+};
+
+// An inventory row: a recipe plus its shot count. Mirrors InventoryBag — the
+// count is a per-query aggregate (subquery on shots.recipe_id) computed only
+// by the inventory listing, and drives the delete-vs-archive action
+// (0 shots = mistaken creation, trashable; >0 = history, archive only).
+struct InventoryRecipe {
+    Recipe recipe;
+    qint64 shotCount = 0;
+    // Stale = the recipe has a bean and its linked bag is not in inventory
+    // (finished, deleted, or never resolved by the migration). A display
+    // state computed by the inventory query — never stored, never a gate:
+    // stale recipes list, activate, and pull shots normally.
+    bool stale = false;
+};
+
+// SQLite-backed recipe storage in the shot history database (recipes table,
+// created by ShotHistoryStorage::createTables()). All public request* methods are
+// async: DB work runs on a serialized background worker and results are
+// delivered back via signals, following the CoffeeBagStorage pattern. The
+// *Static helpers are synchronous, take a caller-provided connection, and are
+// shared with the migration and unit tests.
+class RecipeStorage : public QObject {
+    Q_OBJECT
+
+    // Compile-time QML registration, so qmllint, qmlcachegen and the language server can
+    // follow MainController's property through to this class. A runtime qmlRegister* call is
+    // invisible to all three. Full rationale in src/controllers/maincontroller.h.
+    QML_ELEMENT
+    QML_UNCREATABLE("RecipeStorage is created in C++ and reached via MainController")
+
+public:
+    using RecipeUpdateCompletion =
+        std::function<void(qint64 recipeId, bool success, const QString& failureReason,
+                           const QString& currentName)>;
+    using InventoryCompletion =
+        std::function<void(bool success, const QVariantList& recipes, const QString& failureReason)>;
+    using RecipeReadCompletion =
+        std::function<void(qint64 recipeId, bool success, const QVariantMap& recipe,
+                           const QString& failureReason)>;
+    using RecipeCreateCompletion =
+        std::function<void(qint64 recipeId, bool success, const QVariantMap& recipe,
+                           const QString& failureReason)>;
+    using RecipeDeleteCompletion =
+        std::function<void(qint64 recipeId, bool success, const QString& failureReason)>;
+    using LastEquipmentForDrinkTypeCompletion =
+        std::function<void(const QString& drinkType, qint64 equipmentId, bool success,
+                           const QString& failureReason)>;
+    using ProfileReferenceCountCompletion =
+        std::function<void(bool success, int count, const QString& failureReason)>;
+
+    explicit RecipeStorage(QObject* parent = nullptr);
+    ~RecipeStorage();
+
+    // dbPath must be the shot history database (table lives there).
+    void initialize(const QString& dbPath);
+    QString databasePath() const { return m_dbPath; }
+    void setProfileBrewSnapshotProvider(std::function<QHash<QString, WaterAmount::ProfileDefaults>()> provider) {
+        m_profileBrewSnapshot = std::move(provider);
+    }
+
+    // Async queries — results via signals (QVariantList of toVariantMap()).
+    // QML-visible view of Recipe::saveValidationPasses (the wizard's Save gate).
+    Q_INVOKABLE bool isSaveValid(const QString& name, const QString& profileTitle,
+                                 const QString& hotWaterJson) const {
+        return Recipe::saveValidationPasses(name, profileTitle, hotWaterJson);
+    }
+
+    // How many non-archived recipes name this profile, for the warning shown
+    // before deleting it. SYNCHRONOUS on purpose: a discrete user action (the
+    // delete confirmation is about to open), running once per delete — not a
+    // binding, not a delegate, not a repeating path.
+    //
+    // Measured with the sqlite3 CLI on a copy of the development database,
+    // 7 runs each, so these are query cost and EXCLUDE the withTempDb open:
+    //   16 recipes (the real table):  median 0.74 ms, worst 1.09 ms
+    //   1024 recipes (synthetic 64x): median 1.07 ms, worst 5.20 ms
+    // The worst case is a cold-cache outlier; the median barely moves across a
+    // 64x row count because the scan is over short text columns with no blobs
+    // dragged along. Well inside a discrete action's budget, and this never
+    // runs while the machine is busy.
+    //
+    // Returns kRecipeCountUnknown (-1) when the count could NOT be taken —
+    // never 0. The delete dialog hides its warning at 0, so collapsing a failed
+    // check into "no recipes use this" would show the user an all-clear that
+    // was never established, which is the failure class this change exists to
+    // remove. The caller must render "could not check" distinctly, and must
+    // still allow the delete: not blocking on a failed count and pretending it
+    // succeeded are different things.
+    //
+    // Matches the title EXACTLY, case-sensitively, because that is what
+    // ProfileManager::findProfileByTitle does when deciding whether a recipe's
+    // profile actually resolves. The LOWER() comparison elsewhere in this file
+    // (the import-dedup and sibling-relink queries) answers a different
+    // question — is this the SAME recipe identity — and borrowing it here would
+    // count recipes that will still activate fine, or miss ones that will not.
+    Q_INVOKABLE int countRecipesUsingProfile(const QString& profileTitle) const;
+    // Same canonical query on the serialized recipe DB worker. Used by the
+    // shared native/remote profile picker so the confirmation never opens a
+    // second SQLite connection on its UI thread.
+    void requestCountRecipesUsingProfileWithCompletion(
+        const QString& profileTitle, QObject* context,
+        ProfileReferenceCountCompletion completion);
+
+    Q_INVOKABLE void requestInventory();                   // archived = false, MRU order
+    Q_INVOKABLE void requestArchived();                    // archived = true, MRU order
+    void requestInventoryWithCompletion(QObject* context, InventoryCompletion completion,
+                                         bool archived = false);
+
+    // The wizard's per-drink-type equipment default: the package on the most
+    // recently used unarchived recipe of this drink type (0 = none; caller
+    // falls back to the active package). Emits lastEquipmentForDrinkTypeReady.
+    Q_INVOKABLE void requestLastEquipmentForDrinkType(const QString& drinkType);
+    void requestLastEquipmentForDrinkTypeWithCompletion(
+        const QString& drinkType, QObject* context,
+        LastEquipmentForDrinkTypeCompletion completion);
+    static qint64 lastEquipmentForDrinkTypeStatic(QSqlDatabase& db, const QString& drinkType,
+                                                   bool* querySucceeded = nullptr);
+    Q_INVOKABLE void requestRecipe(qint64 recipeId);       // recipeReady() or recipeCheckFailed()
+    void requestRecipeWithCompletion(qint64 recipeId, QObject* context,
+                                     RecipeReadCompletion completion);
+    // Activation bundle: the recipe row, its LINKED bag id, and that bag's
+    // full map, loaded in ONE background pass so activation applies a
+    // consistent snapshot. The linked bag is applied whether or not it is
+    // still in inventory (a stale recipe activates fully with the finished
+    // bag's data). bagId is -1 (and bag empty) when the recipe has no bag
+    // link or the linked bag row was deleted.
+    Q_INVOKABLE void requestRecipeForActivation(qint64 recipeId);  // recipeActivationReady()
+
+    // Relink lifecycle (recipe-bag-lifecycle): silent, event-driven, no
+    // options. Both emit recipesRelinked when at least one recipe moved.
+    // Roll-on-finish: relink the finished bag's recipes to the newest open
+    // bag of the same bean identity (dup-guard: skip when the target bag
+    // already has a recipe with the same profile title + drink type).
+    Q_INVOKABLE void requestRelinkForFinishedBag(qint64 finishedBagId);
+    // Wake-on-restock: relink stale recipes matching the new bag's bean
+    // identity onto it, MRU-first, same dup-guard.
+    Q_INVOKABLE void requestRelinkForRestockedBag(qint64 newBagId);
+    // Manual re-point (stale card / wizard bag row): link `recipeId` to
+    // `bagId`, adopting the bag's bean identity fields. The recipe's grind is
+    // untouched. Emits recipeUpdated + recipesChanged like any update.
+    Q_INVOKABLE void requestRelinkRecipeToBag(qint64 recipeId, qint64 bagId);
+
+    // Async writes — all emit recipesChanged() on success.
+    Q_INVOKABLE void requestCreateRecipe(const QVariantMap& recipe);        // recipeCreated()
+    void requestCreateRecipeWithCompletion(const QVariantMap& recipe, QObject* context,
+                                           RecipeCreateCompletion completion);
+    Q_INVOKABLE void requestUpdateRecipe(qint64 recipeId, const QVariantMap& fields); // recipeUpdated()
+    // Request-scoped completion for correlated callers. The optional raw-name
+    // guard and complete RecipeEditFields snapshot are checked inside the same
+    // write transaction as the update. Suppresses recipeUpdated/recipeUpdateFailed
+    // broadcasts; a successful update still emits recipeChanged/recipesChanged.
+    // Existing QML callers continue using requestUpdateRecipe() and its signals.
+    void requestUpdateRecipeWithCompletion(qint64 recipeId, const QVariantMap& fields,
+                                           QObject* context,
+                                           RecipeUpdateCompletion completion,
+                                           std::optional<QString> expectedName = std::nullopt,
+                                           std::optional<QVariantMap> expectedEditable = std::nullopt);
+    // Clone: copies every field except id, provenance (clonedFromRecipeId =
+    // source id, createdFromShotId cleared) and lastUsed; the copy is named
+    // by the caller. Emits recipeCreated() with the new row. requestToken
+    // (optional) is echoed in the emitted map — see recipeCreated.
+    Q_INVOKABLE void requestCloneRecipe(qint64 sourceId, const QString& newName,
+                                        const QString& requestToken = QString());
+    void requestCloneRecipeWithCompletion(qint64 sourceId, const QString& newName,
+                                          const QString& requestToken, QObject* context,
+                                          RecipeCreateCompletion completion);
+    Q_INVOKABLE void requestArchiveRecipe(qint64 recipeId);                 // recipeUpdated()
+    Q_INVOKABLE void requestUnarchiveRecipe(qint64 recipeId);               // recipeUpdated()
+    Q_INVOKABLE void requestTouchLastUsed(qint64 recipeId);                 // bump MRU (no signal)
+    // Deletes only when no shot references the recipe (shots.recipe_id count
+    // = 0); emits recipeDeleted(recipeId, success) — false when shots exist.
+    Q_INVOKABLE void requestDeleteRecipe(qint64 recipeId);
+    void requestDeleteRecipeWithCompletion(qint64 recipeId, QObject* context,
+                                           RecipeDeleteCompletion completion);
+
+    // --- Synchronous static helpers (caller provides the connection) ---
+
+    // Create the recipes table if missing. Used by the createTables() baseline and tests.
+    static bool ensureTableStatic(QSqlDatabase& db);
+
+    // Stores recipe.equipmentId as its live package (see liveEquipmentId in
+    // the .cpp); updateRecipeFieldsStatic does the same for an equipmentId key.
+    static qint64 insertRecipeStatic(QSqlDatabase& db, const Recipe& recipe, WaterAmount::ValidationContext profileContext = {}, QString* waterError = nullptr);
+    static Recipe loadRecipeStatic(QSqlDatabase& db, qint64 recipeId,
+                                   bool* querySucceeded = nullptr);
+    // True when a recipeReady()-shaped map represents a row that no longer
+    // qualifies as an auto-load/activation target: not found (empty map) or
+    // archived. Pure and side-effect-free — used by MainController's
+    // recipe-auto-load stale-check and unit-testable directly, without
+    // constructing a MainController (which needs its full subsystem
+    // closure — BLE, MQTT, ShotServer, etc. — that recipe logic alone does
+    // not).
+    static bool isRecipeStale(const QVariantMap& recipe);
+    static QVector<InventoryRecipe> loadInventoryStatic(QSqlDatabase& db, bool archived = false,
+                                                        bool* querySucceeded = nullptr);
+    // The id of a NON-ARCHIVED recipe whose name matches `name` (trimmed,
+    // case-insensitive), excluding `excludeId`, or 0. Backs the active-name
+    // uniqueness guard (block-duplicate-active-names). A blank name never matches.
+    static qint64 findRecipeByNameStatic(QSqlDatabase& db, const QString& name, qint64 excludeId = 0);
+
+    // How many non-archived recipes name this profile. Drives the warning shown
+    // before deleting a profile; see countRecipesUsingProfile below for why the
+    // comparison is exact.
+    static int countRecipesUsingProfileStatic(QSqlDatabase& db, const QString& profileTitle);
+    // Update only the columns named in `fields` (camelCase Recipe keys).
+    static bool updateRecipeFieldsStatic(QSqlDatabase& db, qint64 recipeId, const QVariantMap& fields,
+                                        WaterAmount::ValidationContext profileContext = {}, QString* waterError = nullptr);
+
+    // Resolve the recipe's bean identity to the current open bag: beanbase_id
+    // match first, else case-insensitive roaster+coffee identity; in-inventory
+    // bags only, most recently used first. Returns -1 when the recipe has no
+    // bean identity or no open bag of that bean exists. NOT an activation
+    // input anymore (activation uses the hard bag link) — this survives as
+    // the relink matching helper.
+    static qint64 resolveOpenBagStatic(QSqlDatabase& db, const Recipe& recipe);
+
+    // Migration 31 data pass (recipe-relative-temp-offset): convert the legacy
+    // absolute temp_override_c into the relative temp_offset_c. Touches ONLY
+    // rows whose temp_offset_c is NULL (the unconverted marker migration 31's
+    // ADD COLUMN leaves behind, and the marker unconverted-source imports
+    // set), so it is idempotent and safe to run every launch until no NULLs
+    // remain. offset = legacy absolute − the profile's espresso_temperature,
+    // resolved from profileTempsByTitle (the caller's snapshot of the profile
+    // catalog) with the recipe's embedded profile_json as fallback;
+    // unresolvable → 0 (a delta against an unknown baseline is meaningless;
+    // logged), |offset| < 0.05 → 0. Returns false when the pass could not run
+    // to completion; outConvertedCount (optional) reports how many rows were
+    // converted before any failure.
+    static bool convertLegacyTempOffsetsStatic(QSqlDatabase& db,
+                                               const QHash<QString, double>& profileTempsByTitle,
+                                               int* outConvertedCount = nullptr);
+
+    // Async wrapper for the conversion pass. Called by MainController at
+    // startup (before the active-recipe restore read is queued) and again
+    // after a device transfer / backup import lands unconverted rows. Emits
+    // recipesChanged() when at least one row was converted — including a
+    // partial pass that then failed; the remaining rows keep their NULL
+    // marker and retry next launch.
+    void requestLegacyTempOffsetConversion(const QHash<QString, double>& profileTempsByTitle);
+
+    // Roll-on-finish (synchronous core): relink the finished bag's
+    // non-archived recipes to the newest open bag of the same bean identity,
+    // skipping dup-guard collisions. Returns the moved recipe ids (empty when
+    // no successor bag exists or everything collided); *outTargetBagId names
+    // the successor when one was found.
+    static QVector<qint64> relinkForFinishedBagStatic(QSqlDatabase& db, qint64 finishedBagId,
+                                                      qint64* outTargetBagId = nullptr);
+
+    // Wake-on-restock (synchronous core): relink stale non-archived recipes
+    // matching the new bag's bean identity onto it, most recently used
+    // first, same dup-guard (so twin recipes wake one at a time). Returns
+    // the moved recipe ids.
+    static QVector<qint64> relinkForRestockedBagStatic(QSqlDatabase& db, qint64 newBagId);
+
+    // Copy recipes rows from srcDb into destDb (device transfer / backup
+    // restore), mirroring CoffeeBagStorage::importBagsStatic. Row ids change on
+    // insert — outIdMap records old->new so the caller can remap shots.recipe_id.
+    // Merge mode maps a source recipe matching an existing dest recipe
+    // (case-insensitive name + profile_title + bean identity) to the existing
+    // row instead of inserting a duplicate; replace mode clears dest recipes
+    // first. Runs inside the caller's destDb
+    // transaction. packageIdMap remaps each source recipe's equipment_id to the
+    // imported package's new dest id (EquipmentStorage::importEquipmentStatic
+    // runs first); a source equipment_id absent from the map becomes NULL.
+    // bagIdMap likewise remaps the source recipe's bag_id to the imported
+    // bag's new dest id (CoffeeBagStorage::importBagsStatic runs first); a
+    // source bag_id absent from the map becomes NULL → the stale display
+    // state, exactly like a finished-and-gone bag. The bean identity fields
+    // carry verbatim (they are the relink matching key). archived state is
+    // preserved so shot provenance never dangles.
+    static bool importRecipesStatic(QSqlDatabase& srcDb, QSqlDatabase& destDb, bool merge,
+                                    QHash<qint64, qint64>& outIdMap,
+                                    const QHash<qint64, qint64>& packageIdMap,
+                                    const QHash<qint64, qint64>& bagIdMap);
+
+    // True when no background CRUD work is queued, running, or waiting to
+    // deliver its result — see ShotHistoryStorage::isDbWorkIdle() for the full
+    // rationale (same shape, same worker type). This was the one storage of the
+    // four carrying a SerialDbWorker without the accessor, which is why a
+    // shutdown drain could not cover it.
+    bool isDbWorkIdle() const;
+
+signals:
+    void inventoryReady(const QVariantList& recipes);
+    void archivedReady(const QVariantList& recipes);
+    void lastEquipmentForDrinkTypeReady(const QString& drinkType, qint64 equipmentId);
+    void recipeReady(qint64 recipeId, const QVariantMap& recipe); // map empty if not found
+    // Terminal failure signal for requestRecipe(), emitted instead of
+    // recipeReady when the DB connection itself failed to open (or the
+    // storage isn't initialized yet) — as opposed to a genuine open-but-
+    // not-found, which recipeReady's empty-map contract already covers.
+    // Only requestRecipe() emits this; the other read-only refreshes
+    // (inventory/archived) still silently skip on open failure since a
+    // background list refresh can safely retry next cycle, but a caller
+    // waiting on one specific id (recipe-auto-load) needs a terminal signal
+    // either way so it doesn't hang forever on a pending flag.
+    void recipeCheckFailed(qint64 recipeId);
+    // recipe empty when the id was not found (activation must fail cleanly).
+    void recipeActivationReady(qint64 recipeId, const QVariantMap& recipe,
+                               qint64 linkedBagId, const QVariantMap& linkedBag);
+    // recipeId -1 on failure. recipeCreated is a BROADCAST — creates arrive
+    // from four surfaces concurrently, so one-shot listeners MUST correlate:
+    // pass a unique "requestToken" in the create map (or clone arg) and
+    // filter on recipe["requestToken"]; the token is echoed on failure too
+    // (transient — never stored on the row).
+    void recipeCreated(qint64 recipeId, const QVariantMap& recipe);
+    void recipeUpdated(qint64 recipeId, bool success);
+    // Successful request-scoped HTTP updates also notify native state consumers
+    // without reusing recipeUpdated as a cross-request completion broadcast.
+    void recipeChanged(qint64 recipeId);
+    // Successful request-scoped updates also carry the committed row so native
+    // caches can reconcile before the request completion is delivered.
+    void recipeChangedWithSnapshot(qint64 recipeId, const QVariantMap& recipe);
+    // Actionable failure before recipeUpdated(id, false): a cause code or
+    // WaterAmount::validationFailure containing the validation message.
+    void recipeUpdateFailed(qint64 recipeId, const QString& reason);
+    void recipeDeleted(qint64 recipeId, bool success);
+    // Domain event emitted after every committed deletion, including requests
+    // completed through request-scoped callbacks that suppress recipeDeleted.
+    void recipeRemoved(qint64 recipeId);
+    // An automatic relink moved `movedRecipeIds` onto bag `targetBagId`
+    // (roll-on-finish or wake-on-restock). Drives the courtesy toast —
+    // count + target bag name — and lets MainController refresh the active
+    // recipe cache when it was among the moved. Only emitted when at least
+    // one recipe actually moved.
+    void recipesRelinked(const QVariantList& movedRecipeIds, qint64 targetBagId,
+                         const QString& targetBagName);
+    // A roll-on-finish ran: emitted whenever its database work ran, after the
+    // recipes moved, with the successor bag (-1 when none) — so the active bag
+    // can follow in the same step.
+    void finishedBagRolled(qint64 finishedBagId, qint64 successorBagId,
+                           const QVariantList& movedRecipeIds);
+    // Coarse "something changed" signal so views can re-request the inventory.
+    void recipesChanged();
+
+private:
+    std::function<QHash<QString, WaterAmount::ProfileDefaults>()> m_profileBrewSnapshot;
+    void requestUpdateRecipeImpl(qint64 recipeId, const QVariantMap& fields,
+                                 QObject* completionContext,
+                                 RecipeUpdateCompletion completion,
+                                 std::optional<QString> expectedName,
+                                 std::optional<QVariantMap> expectedEditable,
+                                 bool emitLegacyCompletionSignals);
+    void requestInventoryImpl(bool archived, QObject* completionContext,
+                              InventoryCompletion completion, bool emitLegacyCompletionSignals);
+    void requestRecipeImpl(qint64 recipeId, QObject* completionContext,
+                           RecipeReadCompletion completion, bool emitLegacyCompletionSignals);
+    void requestCreateRecipeImpl(const QVariantMap& recipe, QObject* completionContext,
+                                 RecipeCreateCompletion completion, bool emitLegacyCompletionSignals);
+    void requestCloneRecipeImpl(qint64 sourceId, const QString& newName,
+                                const QString& requestToken, QObject* completionContext,
+                                RecipeCreateCompletion completion, bool emitLegacyCompletionSignals);
+    void requestDeleteRecipeImpl(qint64 recipeId, QObject* completionContext,
+                                 RecipeDeleteCompletion completion, bool emitLegacyCompletionSignals);
+
+    // Run `work(db)` on a background thread, then `done(dbOpened)` on the main
+    // thread. Read callers must skip their "Ready" emission when dbOpened is
+    // false (open failure → empty result that must not be read as not-found).
+    void runAsync(const QString& connPrefix,
+                  std::function<void(QSqlDatabase&)> work,
+                  std::function<void(bool dbOpened)> done);
+
+    static Recipe recipeFromQueryRow(const class QSqlQuery& query);
+
+    QString m_dbPath;
+    std::shared_ptr<std::atomic<bool>> m_destroyed = std::make_shared<std::atomic<bool>>(false);
+    std::unique_ptr<SerialDbWorker> m_dbWorker;
+};

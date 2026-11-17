@@ -1,0 +1,152 @@
+import QtQuick
+import QtQuick.Layouts
+import Decenza
+
+LayoutWidgetItem {
+    id: root
+
+    // Per-instance display mode (composable-status-bar): "text" (default) or
+    // "icon" (a temperature icon ahead of the value). Read from stored props.
+    readonly property string displayMode: (modelData && modelData.displayMode) ? modelData.displayMode : "text"
+
+    // Per-instance color override; "default"/unset keeps the temperature color.
+    readonly property string colorChoice: (modelData && modelData.color) ? modelData.color : "default"
+    readonly property color readoutColor: WidgetColor.resolve(colorChoice, Theme.temperatureColor)
+
+    readonly property double effectiveTargetTemp: Settings.brew.hasTemperatureOverride
+        ? Settings.brew.temperatureOverride
+        : ProfileManager.profileTargetTemperature
+    // A real override is a deviation from the ACTIVE baseline — the active
+    // recipe's own temperature when one is active, else the profile's — so a
+    // recipe's designed temperature is not flagged here (recipe-baseline-not-
+    // override, #1485). Shared with Brew Settings, the Shot Plan and CustomItem.
+    readonly property bool isRealOverride: MainController.temperatureIsRealOverride
+
+    implicitWidth: isCompact ? compactContent.implicitWidth : fullContent.implicitWidth
+    implicitHeight: isCompact ? compactContent.implicitHeight : fullContent.implicitHeight
+
+    Accessible.role: Accessible.StaticText
+    Accessible.name: {
+        var text = "Group temperature: " + Theme.cToDisplay(DE1Device.temperature).toFixed(1) + " degrees, target: " + Theme.cToDisplay(root.effectiveTargetTemp).toFixed(0) + " degrees"
+        if (root.isRealOverride) text += " (override active)"
+        return text
+    }
+    Accessible.focusable: true
+
+    // --- COMPACT MODE (bar rendering) ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: compactRow.implicitWidth
+        implicitHeight: compactRow.implicitHeight
+
+        Row {
+            id: compactRow
+            anchors.centerIn: parent
+            spacing: Theme.scaled(6)
+
+            ThemedIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.displayMode === "icon"
+                source: "qrc:/icons/temperature.svg"
+                iconSize: Theme.scaled(20)
+                color: root.readoutColor
+            }
+
+            Text {
+                id: compactTemp
+                anchors.verticalCenter: parent.verticalCenter
+                text: Theme.formatTemperature(DE1Device.temperature, 1)
+                color: root.readoutColor
+                font: Theme.bodyFont
+                Accessible.ignored: true
+            }
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            anchors.margins: -Theme.spacingSmall
+            onClicked: {
+                HomePresetActions.tareScale()
+                if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+                    let announcement = "Group temperature: " + Theme.cToDisplay(DE1Device.temperature).toFixed(1) + " degrees, target: " + Theme.cToDisplay(root.effectiveTargetTemp).toFixed(0) + " degrees"
+                    if (root.isRealOverride) announcement += " (override active)"
+                    AccessibilityManager.announceLabel(announcement)
+                }
+            }
+        }
+    }
+
+    // --- FULL MODE (center rendering) ---
+    Item {
+        id: fullContent
+        visible: !root.isCompact
+        anchors.fill: parent
+        implicitWidth: fullColumn.implicitWidth
+        implicitHeight: fullColumn.implicitHeight
+
+        ColumnLayout {
+            id: fullColumn
+            anchors.centerIn: parent
+            spacing: Theme.spacingSmall
+
+            ThemedIcon {
+                Layout.alignment: Qt.AlignHCenter
+                visible: root.displayMode === "icon"
+                source: "qrc:/icons/temperature.svg"
+                iconSize: Theme.scaled(28)
+                color: root.readoutColor
+            }
+
+            Row {
+                Layout.alignment: Qt.AlignHCenter
+                spacing: Theme.scaled(4)
+                Text {
+                    text: Theme.formatTemperature(DE1Device.temperature, 1)
+                    color: root.readoutColor
+                    font: Theme.valueFont
+                    Accessible.ignored: true
+                }
+                Text {
+                    anchors.baseline: parent.children[0].baseline
+                    text: "/ " + Theme.formatTemperature(root.effectiveTargetTemp, 1)
+                    color: root.isRealOverride ? Theme.accentColor : Theme.textSecondaryColor
+                    font.family: Theme.valueFont.family
+                    font.pixelSize: Theme.valueFont.pixelSize / 2
+                    Accessible.ignored: true
+                }
+            }
+
+            Row {
+                Layout.alignment: Qt.AlignHCenter
+                spacing: Theme.scaled(4)
+                Tr {
+                    key: "idle.label.grouptemp"
+                    fallback: "Group Temp"
+                    color: Theme.textSecondaryColor
+                    font: Theme.labelFont
+                    Accessible.ignored: true
+                }
+                Text {
+                    visible: root.isRealOverride
+                    text: TranslationManager.translate("layout.temperature.override", "(override)")
+                    color: Theme.accentColor
+                    font: Theme.labelFont
+                    Accessible.ignored: true
+                }
+            }
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: {
+                if (typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled) {
+                    let announcement = "Group temperature: " + Theme.cToDisplay(DE1Device.temperature).toFixed(1) + " degrees, target: " + Theme.cToDisplay(root.effectiveTargetTemp).toFixed(0) + " degrees"
+                    if (root.isRealOverride) announcement += " (override active)"
+                    AccessibilityManager.announceLabel(announcement)
+                }
+            }
+        }
+    }
+}

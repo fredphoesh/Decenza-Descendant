@@ -1,0 +1,655 @@
+// The zone-item DelegateModel row and the add-item list delegate read this file's ids
+// (`root`, `visualModel`, `addPopup`, `dragLayer`, `addListView`); Bound makes them
+// statically resolvable. Both declare their injected role, `modelData`, required --
+// the zone row already did, and the add-item row does now in the same edit.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import QtQuick.Window
+import QtQml.Models
+import Decenza
+
+Rectangle {
+    id: root
+
+    property string zoneName: ""
+    property string zoneLabel: ""
+    property var items: []
+    property string selectedItemId: ""
+    property bool zoneSelected: false
+    property bool showPositionControls: false
+    property int yOffset: 0
+    property real zoneScale: 1.0
+
+    // True while a chip is being dragged for reorder (suppresses selection
+    // highlight so it doesn't jump during live swaps).
+    property bool _dragging: false
+    // Whether a screen reader is active — gates the accessible-only reorder
+    // fallback buttons (drag has no assistive-tech equivalent).
+    readonly property bool _a11yEnabled: typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+
+    Layout.fillWidth: true
+    implicitHeight: zoneContent.implicitHeight + Theme.scaled(20)
+    color: Theme.surfaceColor
+    radius: Theme.cardRadius
+    border.color: zoneSelected ? Theme.primaryColor : Theme.borderColor
+    border.width: zoneSelected ? 2 : 1
+
+    ColumnLayout {
+        id: zoneContent
+        anchors.fill: parent
+        anchors.margins: Theme.scaled(10)
+        spacing: Theme.spacingSmall
+
+        // Zone label with optional position controls
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: Theme.scaled(8)
+
+            Text {
+                text: root.zoneLabel
+                color: Theme.textSecondaryColor
+                font: Theme.labelFont
+                Accessible.role: Accessible.Heading
+                Accessible.name: TranslationManager.translate("layoutEditor.zoneHeading", "%1 zone").arg(root.zoneLabel)
+
+                // Long-press / double-click the zone label opens zone options.
+                MouseArea {
+                    anchors.fill: parent
+                    onPressAndHold: root.zoneOptionsRequested()
+                    onDoubleClicked: root.zoneOptionsRequested()
+                }
+            }
+
+            // Zone options (distribution / alignment / style / populate)
+            StyledIconButton {
+                implicitWidth: Theme.scaled(32)
+                implicitHeight: Theme.scaled(32)
+                icon.source: "qrc:/icons/more-vertical.svg"
+                accessibleName: TranslationManager.translate("layoutEditor.zoneOptions", "%1 options").arg(root.zoneLabel)
+                onClicked: root.zoneOptionsRequested()
+            }
+
+            Item { Layout.fillWidth: true }
+
+            // Position offset display
+            Text {
+                visible: root.showPositionControls && root.yOffset !== 0
+                text: (root.yOffset > 0 ? "+" : "") + root.yOffset
+                color: Theme.textSecondaryColor
+                font: Theme.captionFont
+            }
+
+            // UP arrow (ArrowLeft rotated to point up \u2014 avoids a new asset)
+            StyledIconButton {
+                visible: root.showPositionControls
+                implicitWidth: Theme.scaled(32)
+                implicitHeight: Theme.scaled(32)
+                icon.source: "qrc:/icons/ArrowLeft.svg"
+                icon.width: Theme.scaled(14)
+                icon.height: Theme.scaled(14)
+                rotation: 90
+                inactiveColor: Theme.primaryColor
+                accessibleName: TranslationManager.translate("layoutEditor.moveZoneUp", "Move %1 up").arg(root.zoneLabel)
+                onClicked: root.moveUp()
+            }
+
+            // DOWN arrow (ArrowLeft rotated to point down)
+            StyledIconButton {
+                visible: root.showPositionControls
+                implicitWidth: Theme.scaled(32)
+                implicitHeight: Theme.scaled(32)
+                icon.source: "qrc:/icons/ArrowLeft.svg"
+                icon.width: Theme.scaled(14)
+                icon.height: Theme.scaled(14)
+                rotation: 270
+                inactiveColor: Theme.primaryColor
+                accessibleName: TranslationManager.translate("layoutEditor.moveZoneDown", "Move %1 down").arg(root.zoneLabel)
+                onClicked: root.moveDown()
+            }
+
+            // Scale separator
+            Rectangle {
+                visible: root.showPositionControls
+                Layout.preferredWidth: 1
+                Layout.preferredHeight: Theme.scaled(20)
+                color: Theme.borderColor
+            }
+
+            // Scale display
+            Text {
+                visible: root.showPositionControls && root.zoneScale !== 1.0
+                text: "\u00D7" + root.zoneScale.toFixed(2)
+                color: Theme.textSecondaryColor
+                font: Theme.captionFont
+            }
+
+            // Scale DOWN (smaller)
+            StyledIconButton {
+                visible: root.showPositionControls
+                implicitWidth: Theme.scaled(32)
+                implicitHeight: Theme.scaled(32)
+                icon.source: "qrc:/icons/minus.svg"
+                icon.width: Theme.scaled(14)
+                icon.height: Theme.scaled(14)
+                inactiveColor: Theme.primaryColor
+                accessibleName: TranslationManager.translate("layoutEditor.makeZoneSmaller", "Make %1 smaller").arg(root.zoneLabel)
+                onClicked: root.scaleDown()
+            }
+
+            // Scale UP (bigger)
+            StyledIconButton {
+                visible: root.showPositionControls
+                implicitWidth: Theme.scaled(32)
+                implicitHeight: Theme.scaled(32)
+                icon.source: "qrc:/icons/plus.svg"
+                icon.width: Theme.scaled(14)
+                icon.height: Theme.scaled(14)
+                inactiveColor: Theme.primaryColor
+                accessibleName: TranslationManager.translate("layoutEditor.makeZoneBigger", "Make %1 bigger").arg(root.zoneLabel)
+                onClicked: root.scaleUp()
+            }
+        }
+
+        // Items in zone
+        Flow {
+            Layout.fillWidth: true
+            spacing: Theme.spacingSmall
+
+            // Animate chips sliding out of the way during a drag reorder.
+            move: Transition {
+                NumberAnimation { properties: "x,y"; duration: 180; easing.type: Easing.OutQuad }
+            }
+
+            // Reorderable widget chips. Drag a chip to a new slot; the
+            // DelegateModel live-swaps and the Flow `move` transition slides the
+            // displaced chips. On release we persist via reorder(from,to).
+            // Pattern adapted from FavoritesListView.qml.
+            Repeater {
+                model: DelegateModel {
+                    id: visualModel
+                    model: root.items
+
+                    delegate: RepeaterDelegateItem {
+                        id: chipDelegate
+                        // Required, not injected: RepeaterDelegateItem declares `itemIndex` required, and a delegate
+                        // with ANY required property stops receiving model roles as context properties — bare
+                        // `modelData` becomes undefined. Declaring it required is what puts it back.
+                        required property var modelData
+
+                        width: chipBody.width
+                        height: chipBody.height
+
+                        itemIndex: chipDelegate.DelegateModel.itemsIndex
+                        readonly property bool isSelected: !root._dragging && (modelData.id === root.selectedItemId)
+                        readonly property bool hasOptions: LayoutService.typeHasOptions(modelData.type)
+                        readonly property string accessibleWidgetName: TranslationManager.translate("layoutEditor.widgetItem", "%1 widget")
+                            .arg(modelData.type === "custom" ? root.getTextChipLabel(modelData) : root.getItemDisplayName(modelData.type))
+
+                        Rectangle {
+                            id: chipBody
+                            Accessible.role: Accessible.Grouping
+                            Accessible.name: chipDelegate.accessibleWidgetName
+                            width: chipRow.implicitWidth + Theme.scaled(16)
+                            height: Theme.scaled(36)
+                            radius: Theme.scaled(8)
+                            color: chipDelegate.isSelected ? Theme.primaryColor : Theme.backgroundColor
+                            // A coloured border marks chips that carry per-instance
+                            // options (custom orange retained; others use accent).
+                            border.color: dragMa.drag.active ? Theme.primaryColor
+                                : (chipDelegate.hasOptions && !chipDelegate.isSelected
+                                    ? (chipDelegate.modelData.type === "custom" ? Theme.sourceBadgeOrangeColor : Theme.primaryColor)
+                                    : Theme.borderColor)
+                            border.width: (dragMa.drag.active || (chipDelegate.hasOptions && !chipDelegate.isSelected)) ? 2 : 1
+                            scale: dragMa.drag.active ? 1.05 : 1.0
+                            opacity: dragMa.drag.active ? 0.95 : 1.0
+                            z: dragMa.drag.active ? 100 : 1
+
+                            Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutQuad } }
+
+                            Drag.active: dragMa.drag.active
+                            Drag.source: chipDelegate
+                            Drag.hotSpot.x: width / 2
+                            Drag.hotSpot.y: height / 2
+
+                            // Lift out to the overlay while dragging so the chip
+                            // renders above siblings and moves freely.
+                            states: State {
+                                when: dragMa.drag.active
+                                ParentChange { target: chipBody; parent: dragLayer }
+                            }
+
+                            RowLayout {
+                                id: chipRow
+                                anchors.centerIn: parent
+                                spacing: Theme.scaled(4)
+
+                                // Accessible-only reorder fallback (drag has no
+                                // screen-reader equivalent). Hidden in normal use.
+                                StyledIconButton {
+                                    visible: root._a11yEnabled && chipDelegate.isSelected && chipDelegate.itemIndex > 0
+                                    implicitWidth: Theme.scaled(28)
+                                    implicitHeight: Theme.scaled(28)
+                                    icon.source: "qrc:/icons/ArrowLeft.svg"
+                                    icon.width: Theme.scaled(14)
+                                    icon.height: Theme.scaled(14)
+                                    active: chipDelegate.isSelected
+                                    activeColor: Theme.primaryContrastColor
+                                    accessibleName: TranslationManager.translate("layoutEditor.moveToStart", "Move toward start")
+                                    onClicked: root.moveLeft(chipDelegate.modelData.id)
+                                }
+
+                                // Selection and its action buttons are siblings in the accessibility tree.
+                                RowLayout {
+                                    id: chipLabel
+                                    activeFocusOnTab: true
+                                    Keys.onReturnPressed: root.itemTapped(chipDelegate.modelData.id)
+                                    Keys.onSpacePressed: root.itemTapped(chipDelegate.modelData.id)
+                                    Accessible.role: Accessible.Button
+                                    Accessible.name: chipDelegate.accessibleWidgetName + (chipDelegate.isSelected
+                                        ? ", " + TranslationManager.translate("layoutEditor.selected", "selected") : "")
+                                    Accessible.focusable: true
+                                    Accessible.onPressAction: root.itemTapped(chipDelegate.modelData.id)
+
+                                    Text {
+                                        visible: chipDelegate.modelData.type !== "custom"
+                                        text: root.getItemDisplayName(chipDelegate.modelData.type)
+                                        color: chipDelegate.isSelected
+                                            ? Theme.primaryContrastColor
+                                            : ((chipDelegate.modelData.type === "spacer" || chipDelegate.modelData.type === "separator" || chipDelegate.modelData.type === "weather") ? Theme.sourceBadgeOrangeColor
+                                            : ((chipDelegate.modelData.type.startsWith("screensaver") || chipDelegate.modelData.type === "lastShot") ? Theme.sourceBadgeBlueColor : Theme.textColor))
+                                        font: Theme.bodyFont
+                                    }
+
+                                    // Mini preview for text items
+                                    Row {
+                                        visible: chipDelegate.modelData.type === "custom"
+                                        spacing: Theme.scaled(3)
+                                        Layout.alignment: Qt.AlignVCenter
+
+                                        Image {
+                                            visible: (chipDelegate.modelData.emoji || "") !== ""
+                                            source: visible ? Theme.emojiToImage(chipDelegate.modelData.emoji || "") : ""
+                                            sourceSize.width: Theme.scaled(18)
+                                            sourceSize.height: Theme.scaled(18)
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+
+                                        Text {
+                                            text: root.getTextChipLabel(chipDelegate.modelData)
+                                            color: chipDelegate.isSelected ? Theme.primaryContrastColor : Theme.sourceBadgeOrangeColor
+                                            font: Theme.captionFont
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+                                }
+
+                                // Accessible-only reorder fallback (toward end).
+                                StyledIconButton {
+                                    visible: root._a11yEnabled && chipDelegate.isSelected && chipDelegate.itemIndex < root.items.length - 1
+                                    implicitWidth: Theme.scaled(28)
+                                    implicitHeight: Theme.scaled(28)
+                                    icon.source: "qrc:/icons/ArrowLeft.svg"
+                                    icon.width: Theme.scaled(14)
+                                    icon.height: Theme.scaled(14)
+                                    rotation: 180
+                                    active: chipDelegate.isSelected
+                                    activeColor: Theme.primaryContrastColor
+                                    accessibleName: TranslationManager.translate("layoutEditor.moveToEnd", "Move toward end")
+                                    onClicked: root.moveRight(chipDelegate.modelData.id)
+                                }
+
+                                // Options button \u2014 persistent has-options indicator
+                                // AND the explicit open-options affordance.
+                                StyledIconButton {
+                                    visible: chipDelegate.hasOptions
+                                    implicitWidth: Theme.scaled(28)
+                                    implicitHeight: Theme.scaled(28)
+                                    icon.source: "qrc:/icons/settings.svg"
+                                    icon.width: Theme.scaled(15)
+                                    icon.height: Theme.scaled(15)
+                                    active: chipDelegate.isSelected
+                                    activeColor: Theme.primaryContrastColor
+                                    accessibleName: TranslationManager.translate("layoutEditor.editOptions", "Edit %1 options").arg(root.getItemDisplayName(chipDelegate.modelData.type))
+                                    onClicked: root.editCustomRequested(chipDelegate.modelData.id, root.zoneName)
+                                }
+
+                                // Remove button. Always occupies its slot so
+                                // selecting a chip never resizes it (no jump);
+                                // it's faint by default and brightens on hover or
+                                // selection — so it's discoverable without a click.
+                                StyledIconButton {
+                                    implicitWidth: Theme.scaled(28)
+                                    implicitHeight: Theme.scaled(28)
+                                    icon.source: "qrc:/icons/cross.svg"
+                                    icon.width: Theme.scaled(14)
+                                    icon.height: Theme.scaled(14)
+                                    inactiveColor: Theme.errorColor
+                                    activeColor: Theme.errorColor
+                                    active: true
+                                    opacity: (chipDelegate.isSelected || chipHover.hovered) ? 1.0 : 0.4
+                                    accessibleName: TranslationManager.translate("layoutEditor.removeWidget", "Remove widget")
+                                    onClicked: root.itemRemoved(chipDelegate.modelData.id)
+                                    Behavior on opacity { NumberAnimation { duration: 100 } }
+                                }
+                            }
+
+                            // Brighten the remove control on mouse hover (desktop);
+                            // on touch the chip's selection state reveals it.
+                            HoverHandler { id: chipHover }
+
+                            // Pointer interaction: drag to reorder, tap to select,
+                            // long-press to open options. A small drag threshold
+                            // keeps quick taps as selection. preventStealing keeps
+                            // the surrounding ScrollView from hijacking the drag.
+                            MouseArea {
+                                id: dragMa
+                                anchors.fill: parent
+                                z: -1
+                                drag.target: chipBody
+                                drag.threshold: Theme.scaled(8)
+                                preventStealing: true
+
+                                property int _startIndex: -1
+                                property bool _held: false
+
+                                onPressed: {
+                                    _startIndex = chipDelegate.itemIndex
+                                    _held = false
+                                }
+                                onPositionChanged: {
+                                    if (drag.active) root._dragging = true
+                                }
+                                onClicked: {
+                                    if (!drag.active && !_held) root.itemTapped(chipDelegate.modelData.id)
+                                }
+                                onPressAndHold: {
+                                    if (!drag.active && chipDelegate.hasOptions) {
+                                        _held = true
+                                        root.editCustomRequested(chipDelegate.modelData.id, root.zoneName)
+                                    }
+                                }
+                                onReleased: {
+                                    if (root._dragging) {
+                                        let endIndex = chipDelegate.itemIndex
+                                        if (_startIndex >= 0 && endIndex !== _startIndex)
+                                            root.reorder(_startIndex, endIndex)
+                                    }
+                                    root._dragging = false
+                                    _startIndex = -1
+                                }
+                                onCanceled: {
+                                    // Roll back any live swaps so the DelegateModel
+                                    // order matches the unchanged backing list.
+                                    if (root._dragging) {
+                                        let cur = chipDelegate.itemIndex
+                                        if (_startIndex >= 0 && cur !== _startIndex)
+                                            visualModel.items.move(cur, _startIndex, 1)
+                                    }
+                                    root._dragging = false
+                                    _startIndex = -1
+                                }
+                            }
+                        }
+
+                        // Live swap: when the dragged chip enters this slot,
+                        // shuffle the DelegateModel so chips animate out of the way.
+                        DropArea {
+                            anchors.fill: parent
+                            onEntered: function(drag) {
+                                var src = drag.source as RepeaterDelegateItem
+                                if (!src || src === chipDelegate) return
+                                var from = src.itemIndex
+                                var to = chipDelegate.itemIndex
+                                if (from !== to) visualModel.items.move(from, to, 1)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Add widget button
+            StyledIconButton {
+                id: addButton
+                implicitWidth: Theme.scaled(36)
+                implicitHeight: Theme.scaled(36)
+                icon.source: "qrc:/icons/plus.svg"
+                inactiveColor: Theme.primaryColor
+                accessibleName: TranslationManager.translate("layoutEditor.addWidgetTo", "Add widget to %1").arg(root.zoneLabel)
+                onClicked: addPopup.open()
+
+                DecenzaDialog {
+                    id: addPopup
+                    modal: true
+                    parent: Overlay.overlay
+                    anchors.centerIn: parent
+                    padding: Theme.scaled(4)
+                    closePolicy: Dialog.CloseOnPressOutside | Dialog.CloseOnEscape
+                    onOpened: widgetFilter.text = ""
+
+                    background: Rectangle {
+                        color: Theme.surfaceColor
+                        radius: Theme.cardRadius
+                        border.color: Theme.borderColor
+                        border.width: 1
+                    }
+
+                    contentItem: ColumnLayout {
+                        spacing: Theme.scaled(4)
+
+                        StyledTextField {
+                            id: widgetFilter
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: Theme.scaled(220)
+                            placeholderText: TranslationManager.translate("layoutEditor.filterWidgets", "Filter widgets…")
+                        }
+
+                        ListView {
+                            id: addListView
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: Theme.scaled(220)
+                            implicitHeight: Math.min(contentHeight, Theme.scaled(380))
+                            boundsBehavior: Flickable.StopAtBounds
+                            clip: true
+
+                            // Category labels and widget catalog from the single
+                            // C++ table (SettingsNetwork::widgetCatalog /
+                            // widgetCategoryNames). Reading translationVersion
+                            // re-resolves labels on a live language switch (the
+                            // old inline arrays lacked this dependency and stayed
+                            // stale until the page was recreated).
+                            readonly property var catNames: {
+                                var _v = TranslationManager.translationVersion
+                                return LayoutService.widgetCategoryNames().map(function(c) {
+                                    return TranslationManager.translate(c.key, c.fallback)
+                                })
+                            }
+
+                            readonly property var catalog: {
+                                var _v = TranslationManager.translationVersion
+                                return LayoutService.widgetCatalog().map(function(e) {
+                                    return { type: e.type, cat: e.cat,
+                                             label: TranslationManager.translate(e.labelKey, e.label) }
+                                })
+                            }
+
+                            // Filtered + sorted (by category, then label) model,
+                            // with explicit header rows so grouping works with a
+                            // plain JS-array model (section.property needs roles).
+                            model: {
+                                var f = widgetFilter.text.trim().toLowerCase()
+                                var list = []
+                                for (let i = 0; i < catalog.length; i++) {
+                                    let e = catalog[i]
+                                    if (f === "" || e.label.toLowerCase().indexOf(f) >= 0)
+                                        list.push(e)
+                                }
+                                list.sort(function(a, b) {
+                                    return a.cat !== b.cat ? a.cat - b.cat : a.label.localeCompare(b.label)
+                                })
+                                var out = []
+                                var lastCat = -1
+                                for (let j = 0; j < list.length; j++) {
+                                    if (list[j].cat !== lastCat) {
+                                        out.push({ isHeader: true, label: catNames[list[j].cat], type: "", cat: list[j].cat })
+                                        lastCat = list[j].cat
+                                    }
+                                    out.push({ isHeader: false, label: list[j].label, type: list[j].type, cat: list[j].cat })
+                                }
+                                return out
+                            }
+
+                            delegate: Rectangle {
+                                id: addItemRow
+                                required property var modelData
+
+                                width: addListView.width
+                                height: addItemRow.modelData.isHeader ? Theme.scaled(24) : Theme.scaled(36)
+                                color: (!addItemRow.modelData.isHeader && delegateMa.containsMouse) ? Qt.rgba(Theme.primaryColor.r, Theme.primaryColor.g, Theme.primaryColor.b, 0.12) : "transparent"
+                                radius: Theme.scaled(4)
+
+                                Accessible.role: addItemRow.modelData.isHeader ? Accessible.StaticText : Accessible.MenuItem
+                                Accessible.name: addItemRow.modelData.isHeader
+                                    ? addItemRow.modelData.label
+                                    : TranslationManager.translate("layoutEditor.addWidget", "Add %1").arg(addItemRow.modelData.label)
+                                Accessible.focusable: !addItemRow.modelData.isHeader
+                                Accessible.onPressAction: {
+                                    if (addItemRow.modelData.isHeader) return
+                                    root.addItemRequested(addItemRow.modelData.type)
+                                    addPopup.close()
+                                }
+
+                                // Category header
+                                Text {
+                                    visible: addItemRow.modelData.isHeader
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: Theme.scaled(10)
+                                    anchors.bottom: parent.bottom
+                                    text: addItemRow.modelData.label
+                                    color: Theme.textSecondaryColor
+                                    font: Theme.captionFont
+                                }
+
+                                // Widget row
+                                Text {
+                                    visible: !addItemRow.modelData.isHeader
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: Theme.scaled(12)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: addItemRow.modelData.label
+                                    color: (addItemRow.modelData.type.startsWith("screensaver") || addItemRow.modelData.type === "lastShot") ? Theme.sourceBadgeBlueColor
+                                        : (addItemRow.modelData.type === "spacer" || addItemRow.modelData.type === "separator" || addItemRow.modelData.type === "custom" || addItemRow.modelData.type === "weather") ? Theme.sourceBadgeOrangeColor : Theme.textColor
+                                    font: Theme.bodyFont
+                                }
+
+                                MouseArea {
+                                    id: delegateMa
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    enabled: !addItemRow.modelData.isHeader
+                                    onClicked: {
+                                        root.addItemRequested(addItemRow.modelData.type)
+                                        addPopup.close()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Tap on zone background to select as target or move item here
+    MouseArea {
+        anchors.fill: parent
+        z: -1
+        onClicked: root.zoneTapped()
+    }
+
+    // Overlay that hosts a chip while it is being dragged, so it renders above
+    // its siblings and can move outside the Flow's layout flow.
+    Item {
+        id: dragLayer
+        anchors.fill: parent
+        z: 100
+    }
+
+    // Build a short label for a text item chip from its content/action
+    function getTextChipLabel(item) {
+        var content = item.content || ""
+
+        // Strip HTML tags to get plain text
+        var plain = content.replace(/<[^>]*>/g, "").trim()
+
+        // Replace variables with short readable labels
+        var varLabels = {
+            "%TEMP%": "92\u00B0", "%STEAM_TEMP%": "155\u00B0",
+            "%PRESSURE%": "9bar", "%FLOW%": "2.1ml",
+            "%WATER%": "78%", "%WATER_ML%": "850ml",
+            "%WEIGHT%": "36g", "%SHOT_TIME%": "28s",
+            "%TARGET_WEIGHT%": "36g", "%VOLUME%": "42ml",
+            "%PROFILE%": TranslationManager.translate("layout.sample.profile", "Profile"),
+            "%STATE%": TranslationManager.translate("layout.sample.state", "Idle"),
+            "%TARGET_TEMP%": "93\u00B0",
+            "%SCALE%": TranslationManager.translate("layout.sample.scale", "Scale"),
+            "%TIME%": "14:30", "%DATE%": "2025-01",
+            "%RATIO%": "2.0", "%DOSE%": "18g",
+            "%CONNECTED%": TranslationManager.translate("layout.sample.connected", "Online"),
+            "%CONNECTED_COLOR%": "",
+            "%DEVICES%": TranslationManager.translate("layout.sample.devices", "Machine")
+        }
+        for (let token in varLabels) {
+            if (plain.indexOf(token) >= 0)
+                plain = plain.replace(new RegExp(token.replace(/%/g, "\\%"), "g"), varLabels[token])
+        }
+
+        if (plain && plain !== "Text" && plain !== "Custom") {
+            return plain.length > 14 ? plain.substring(0, 12) + ".." : plain
+        }
+
+        // Fall back to action target if content is just "Text"
+        var action = item.action || ""
+        if (action) {
+            let actionLabels = {
+                "navigate:settings": "Settings", "navigate:history": "History",
+                "navigate:profiles": "Profiles", "navigate:autofavorites": "Favorites",
+                "navigate:visualizer": "Visualizer", "navigate:dflowEditor": "D-Flow Editor",
+                "command:sleep": "Sleep", "command:quit": "Quit",
+                "command:startEspresso": "Espresso", "command:startSteam": "Steam",
+                "command:startHotWater": "Hot Water", "command:startFlush": "Flush",
+                "command:tare": "Tare", "command:idle": "Stop"
+            }
+            if (actionLabels[action]) return actionLabels[action]
+        }
+
+        return "Custom"
+    }
+
+    // Chip/short names from the single C++ catalog (type → {key, fallback},
+    // includes legacy aliases like connectionStatus). Unknown types fall back
+    // to the raw type string.
+    readonly property var _chipNames: LayoutService.widgetChipNames()
+
+    signal itemTapped(string itemId)
+    signal zoneTapped()
+    signal itemRemoved(string itemId)
+    signal moveLeft(string itemId)
+    signal moveRight(string itemId)
+    signal reorder(int fromIndex, int toIndex)
+    signal addItemRequested(string type)
+    signal moveUp()
+    signal moveDown()
+    signal scaleUp()
+    signal scaleDown()
+    signal editCustomRequested(string itemId, string zoneName)
+    signal zoneOptionsRequested()
+
+    function getItemDisplayName(type) {
+        var e = _chipNames[type]
+        return e ? TranslationManager.translate(e.key, e.fallback) : type
+    }
+
+}

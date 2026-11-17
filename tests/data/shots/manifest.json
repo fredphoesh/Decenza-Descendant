@@ -1,0 +1,196 @@
+{
+  "version": 1,
+  "description": "Regression corpus for ShotAnalysis. Each shot exercises a specific detector path. Changes that shift any of these verdicts break an invariant the algorithm was designed for — read the description and confirm the change is intentional before updating expectations.",
+  "shots": [
+    {
+      "file": "80s_puck_failure.json",
+      "description": "Shot 868 — catastrophic puck failure. 80's Espresso, 0.6 bar peak, 37g in 7s. Puck offered no resistance; channeling + grind detectors are blind to this because conductance saturates and flow tracks preinfusion goal perfectly. detectPourTruncated must catch it. PR #922 promoted this to a red 'Puck failed' badge; the verdict text leads with the meta-action (don't tune off the shot) since the user can't discriminate among the prep failures from the curve.",
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": true,
+        "summaryVerdictContains": "Don't tune off this shot"
+      }
+    },
+    {
+      "file": "80s_choked_moderate.json",
+      "description": "Shot 883 — 80's Espresso on grind 3.5, mean pressurized flow 0.59 ml/s (just above the 0.5 flow threshold) and yield 25.3g of 36g target (0.703 ratio). PR #966 tightened the yield-shortfall arm from 0.85 → 0.70, intentionally excluding 71-76% borderline cases as likely FP. Shot 883 sits just above the new 0.70 threshold and is now correctly classified as a clean (if borderline) shot rather than choked. This fixture guards the FP exclusion: if the threshold ever loosens, this would re-fire and we'd want to know. Hand-added target_weight (visualizer.coffee format doesn't carry it).",
+      "expect": {
+        "channeling": "None",
+        "grindIssue": false,
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "puck_failure_short_gusher.json",
+      "description": "Extreme puck failure — 2.2 s total, 0 g yield. Extracted nothing because the machine bailed out immediately. pourTruncated catches it. Before PR #1141, Arm 1 also fired (reading the pump's 0→8 ml/s ramp as 'flow undershooting goal') and shot_eval reported grindIssue=true. After PR #1141 Arm 1 stays silent on this fixture for two compounding reasons: (1) shot_eval's Decenza-format loader treats `profile.steps[1]='Infuse'` (pump=pressure) as a phase boundary at the 4→8 ml/s flow-goal jump, terminating the only flow-mode range at width 0 — so no t>0 sample is even in `inFlowMode`; (2) the 29 preheat-time samples at t=0 with flow_goal=4 all fail the new stationarity gate because goalFut at t+0.75 s lands in the goal=8 region (|8-4|/4 = 1.0, far above FLOW_GOAL_STATIONARY_REL=0.15). Either gate alone would silence Arm 1 here. Either way, user-visible behavior is unchanged: analyzeShot's pourTruncated cascade always zeroed the grind block before storing badges, so the production grindIssueDetected column was already false for shots like this.",
+      "expect": {
+        "channeling": "None",
+        "grindIssue": false,
+        "pourTruncated": true,
+        "summaryVerdictContains": "Don't tune off this shot"
+      }
+    },
+    {
+      "file": "synthetic_shot_835_gusher.json",
+      "description": "Issue #904 — synthetic gusher modeling shot 835: D-Flow / Q profile, 18g dose → 40g target, 56.3g actual at grind 11 (ratio 1.41). Curves intentionally simplified to a flat ~4.5 bar / ~1.6 mL/s plateau so the other detectors stay silent and the new yield-overshoot arm fires alone. Load-bearing invariants for the expected verdict: peak pressure stays above PRESSURE_FLOOR_BAR (2.5) so pourTruncated stays false; mean pressurized flow stays above CHOKED_FLOW_MAX_MLPS (0.5) so the choked-puck flow arm doesn't co-fire; ratio stays > YIELD_OVERSHOOT_RATIO_MIN (1.20). Replace with captured shot 835 curves when available.",
+      "expect": {
+        "channeling": "None",
+        "grindIssue": true,
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "londinium_gusher.json",
+      "description": "Synthetic Londinium true-positive channeling fixture (PR #1076). 3-bar Infuse soak (t=3–14.5s) excluded by WINDOW_MIN_EXTRACTION_BAR gate. Flow steps 1.5→5.0 mL/s at t=22s and 5.0→1.5 mL/s at t=31s; each step produces raw dC/dt≈25.3 at two adjacent samples, Gaussian kernel elevates 10 positions per transition → sustainedCount=20 → Sustained. Validates that the soak gate does not suppress genuine extraction-phase channeling.",
+      "expect": {
+        "channeling": "Sustained",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "londinium_soak_clean.json",
+      "description": "Synthetic Londinium-style clean shot (PR #1076 regression guard). 3-bar Infuse soak from t=2-12s drives C from 19 down to ~0.08 (puck wetting), producing 11 elevated dC/dt samples in the soak window — baseline would flag Sustained. WINDOW_MIN_EXTRACTION_BAR gate excludes all soak samples (goalNow=3 bar < 4.5 bar threshold); 9-bar extraction phase (t=14-30s) has flat C=0.36 with zero dC/dt. Mode-aware verdict must stay None. Removing or raising the gate would re-trigger Sustained on this fixture.",
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "malabar_grind_too_fine.json",
+      "description": "D-Flow / Malabar pinned at 10 bar for 40+ seconds, flow stuck at 1 ml/s vs goal 1.88. Classic 'too fine' grind. Validates the mode-aware flow-vs-goal check on flow-controlled pour.",
+      "expect": {
+        "channeling": "None",
+        "grindIssue": true,
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "blooming_choker.json",
+      "description": "Blooming Espresso aborted at 7.8s with 0.5g yield. Grind so fine the puck locked up. Blooming has channeling_expected flag so channeling stays silent; grind direction must catch it.",
+      "expect": {
+        "channeling": "None",
+        "grindIssue": true,
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "blooming_choker_renamed_profile.json",
+      "description": "Resolution regression guard (change: resolve-profile-kb-by-shape). Byte-identical to blooming_choker.json except the profile title, renamed 'Blooming Espresso' → 'Blooming Espresso_cris' — the real shape of a user renaming a shipped profile. The expectations below are COPIED from that fixture and hold only while the title still resolves to blooming-espresso and its channeling_expected flag transfers: lose the resolution and channeling fires, so channeling:'None' fails. This asserts the outcome the capability exists to protect — do not report a by-design behaviour as a fault — as a finding the user would have seen, not as an identifier. It failed before the boundary rule became 'any character that is not a letter'; '_' was absent from the old enumerated separator set, which is how the live case reached a user.",
+      "expect": {
+        "channeling": "None",
+        "grindIssue": true,
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "blooming_aborted.json",
+      "description": "Blooming Espresso, 63s / 0g yield. Baseline detector flagged Sustained because of the fill→bloom transition spike; mode-aware + channeling_expected correctly downgrade to Transient.",
+      "expect": {
+        "channeling": "Transient",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "cremina_clean.json",
+      "description": "Cremina lever — clean 32.5s shot, Square Mile beans. Baseline flagged Sustained (false positive on the lever ramp); mode-aware must stay None. Validates the core lever-false-positive suppression.",
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "damian_lrv3_clean.json",
+      "description": "Damian's LRv3 lever — baseline flagged Sustained with peaks as high as 12.5; mode-aware must stay None. Validates D-Flow family lever-ramp suppression.",
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "e61_long_clean.json",
+      "description": "E61 flat 9 bar profile, 41.8s, clean shot. Flat-pressure profiles are where dC/dt is MOST reliable — detector must stay quiet. Validates the happy path.",
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "classic_italian_clean.json",
+      "description": "Classic Italian, 28.1s / 1:2.06 ratio. Clean flat-pressure shot. Must stay None.",
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "classic_italian_fast.json",
+      "description": "Classic Italian 30.3s shot where flow accelerated in the last 2s from puck erosion. Without CHANNELING_DC_POUR_SKIP_END_SEC this flagged Sustained from the tail; with the end-skip it stays None. Regression guard for the end-skip.",
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "gagne_adaptive_clean.json",
+      "description": "Gagné Adaptive Shot — multi-step adaptive profile with scan frames. Clean shot, detector must stay None (no confusion from the scan). Profile title 'Gagné/Adaptive Shot 92C vME 7 bar' is a custom variant that does NOT match the 'gagne-adaptive' KB aliases (which list 'Gagné/Adaptive Shot 92C v1.0' etc.) and is therefore unresolvable. Post skip-grind-arm1-when-kb-unresolved this lands in grindCoverage=\"notAnalyzable\" with verdictCategory=\"cleanGrindNotAnalyzable\" — locked in here so any future KB addition that makes 'vME' resolve would flip the verdict back and surface the corpus shift.",
+      "kbResolvable": false,
+      "expect": {
+        "channeling": "None",
+        "pourTruncated": false,
+        "verdictCategory": "cleanGrindNotAnalyzable"
+      }
+    },
+    {
+      "file": "synthetic_puck_failure_gusher.json",
+      "description": "Synthetic regression guard for the pourTruncated → grindIssue cascade. Peak pressure clamped at 1.8 bar (below PRESSURE_FLOOR_BAR=2.5) so pourTruncated fires, AND 18 g → 50 g of 32 g target = ratio 1.5625 (above YIELD_OVERSHOOT_RATIO_MIN=1.20) so the yield arm of Arm 1 would fire independently. Flow goal flat at 2.0 ml/s with actual matching, so the flow-vs-goal averaging stays at delta≈0 (passing the FLOW_GOAL_STATIONARY gate cleanly). Pressure never reaches CHOKED_PRESSURE_MIN_BAR=4.0 so Arm 2 stays gated out. Flat curves keep dC/dt zero so channeling stays None. EXPECTATION RE-BASELINED (change: route shot_eval through the production analyzeShot + deriveBadgesFromAnalysis pipeline): previously shot_eval ran a standalone analyzeFlowVsGoal with empty flags and reported grindIssue=true here — that was the *tool's* divergence, NOT the app. analyzeShot's pourTruncated cascade dominates and zeroes the grind block, so the production grindIssueDetected badge is **false** for a puck failure (only the red 'Puck failed' badge shows). grindIssue is now asserted as false to match the app exactly; the fixture's real invariant is preserved and strengthened — if the cascade ever loses pourTruncated dominance, grindIssue flips back to true and this fixture catches it.",
+      "kbResolvable": false,
+      "expect": {
+        "channeling": "None",
+        "grindIssue": false,
+        "pourTruncated": true,
+        "summaryVerdictContains": "Don't tune off this shot"
+      }
+    },
+    {
+      "file": "extractamundo_dos_dynamic_bloom_clean.json",
+      "description": "Issue #1128 — real-world Extractamundo Dos! shot 464 captured from the field. 15.7 g → 31.8 g in 27 s, user rated 90/100. Profile has a 'dynamic bloom' frame configured pump=flow with flow=0 and exit_pressure_under=2.2, so the firmware ramps the flow command from ~7.25 ml/s down to ~0.06 ml/s over ~2.5 s (the bloom decay window, frame 2 of 4) while pressure decays naturally from preinfusion. On the live production code path — where the per-sample isFlowMode flag is taken directly from `profile.steps[i].pump` — Arm 1's mode-aware trim used to leave 5 qualifying samples inside that decay window with mean(actual)−mean(goal) ≈ +3.2 ml/s, and the badge fired 'Grind appears too coarse — try finer' on a 90-point shot (the exact wording appears in the issue's screenshot). With the FLOW_GOAL_STATIONARY gate, the goal's >3×-per-half-second drop fails stationarity at every interior point, Arm 1 falls to count=0, and the badge stays silent. Note: shot_eval's Decenza-format loader uses a goal-curve heuristic that produces a different phase decomposition (phaseCount ≈ 11 for this shot) than the production app's frame-based markers, so shot_eval reports `sampleCount: 0, delta: 0` rather than the production app's pre-fix `sampleCount: 5, delta: +3.2`; both paths correctly classify this as `issue: false` after the fix. Locks in that the false positive can't return without somebody disabling the gate.",
+      "expect": {
+        "channeling": "None",
+        "grindIssue": false,
+        "pourTruncated": false
+      }
+    },
+    {
+      "file": "adaptive_v2_in_envelope_clean.json",
+      "description": "Phase C expert-band lock — real community Adaptive v2 shot whose peak pressure sits inside Decent's recommended 6–9 bar envelope. Decent authored the shipped profile (adaptive_v2.json author field), so `[SRC:decent-guide]` is the profile-author authority; the band is 6–9 (it CONTAINS the by-design adaptive 6.8→9 range, so a well-placed shot stays silent). expertBandFired must be false and verdictCategory clean. If the Adaptive v2 row is dropped, mis-keyed, or the band is narrowed back toward 8–9, this shot would wrongly fire — caught here.",
+      "expect": {
+        "expertBandFired": false,
+        "verdictCategory": "clean"
+      }
+    },
+    {
+      "file": "adaptive_v2_too_fine_expertband.json",
+      "description": "Phase C expert-band lock — real community Adaptive v2 shot whose peak pressure is ~9.9 bar (above the 9-bar envelope, pegging toward the profile's 9.5-bar limiter = grind too fine). The observational band MUST fire (`expertBandFired` true, verdictCategory expertBandDeviation): the line is advisory 'outside Decent's recommended band — judge by taste', not a fault on the shot. Locks the Adaptive v2 row + the 6–9 upper edge. If the row is removed or the band ceiling raised, this regresses.",
+      "expect": {
+        "expertBandFired": true,
+        "verdictCategory": "expertBandDeviation"
+      }
+    },
+    {
+      "file": "rao_allonge_sustained_clean.json",
+      "description": "Phase C expert-band lock — real community Rao Allongé shot that sustained ~4.5 ml/s extraction flow (well-made). Canonical `## Allonge`; AnalysisFlags channeling_expected keeps channelingFired false so the band isn't masked by Allongé's by-design needle-stream channeling. The one-sided flow floor must NOT fire (expertBandFired false, verdictCategory clean) when the shot actually reaches the commanded flow.",
+      "expect": {
+        "expertBandFired": false,
+        "verdictCategory": "clean"
+      }
+    },
+    {
+      "file": "rao_allonge_too_fine_medianflow.json",
+      "description": "Phase C expert-band lock AND the median-vs-peak detector-fix regression guard. Real community Rao Allongé shot whose grind was too fine. Flow holds the commanded ~4.5 ml/s for the first ~10 s, then the pressure limiter chokes it for the remaining ~38 s — so the full-shot/pour-window MEDIAN is ~2.4 ml/s while PEAK is still ~4.5. Under the OLD peak-flow measure flowFloor(4.5) was silent here (the structural blindness that earlier got this arm wrongly failed). The ExtractionFlow axis now uses the windowed MEDIAN (an independent absolute-flow measure — see the detector comment), so the floor correctly fires (`expertBandFired` true, verdictCategory expertBandDeviation). This is the real-shot complement to the synthetic unit test `expertBand_flowFloor_usesSustainedNotPeak` (which models the brief-spike variant). If anyone reverts the median measure back to peak, this fixture flips to silent and fails — exactly the guard we want.",
+      "expect": {
+        "expertBandFired": true,
+        "verdictCategory": "expertBandDeviation"
+      }
+    }
+  ]
+}

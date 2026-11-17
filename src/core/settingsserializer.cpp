@@ -1,0 +1,1047 @@
+#include "core/diagnosticlogging.h"
+#include "settingsserializer.h"
+#include "appsettings.h"
+#include "settings.h"
+#include "settings_app.h"
+#include "settings_brew.h"
+#include "steamcalculations.h"
+#include "settings_dye.h"
+#include "settings_network.h"
+#include "settings_mqtt.h"
+#include "settings_autowake.h"
+#include "settings_hardware.h"
+#include "settings_ai.h"
+#include "settings_theme.h"
+#include "settings_visualizer.h"
+#include "settings_calibration.h"
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QSettings>
+#include <QDebug>
+
+#include <optional>
+
+QStringList SettingsSerializer::sensitiveKeys()
+{
+    return {
+        "visualizerPassword",
+        "openaiApiKey",
+        "anthropicApiKey",
+        "geminiApiKey",
+        "openrouterApiKey",
+        "mqttPassword"
+    };
+}
+
+QJsonObject SettingsSerializer::exportToJson(Settings* settings, bool includeSensitive)
+{
+    QJsonObject root;
+
+    // Machine settings
+    QJsonObject machine;
+    machine["address"] = settings->machineAddress();
+    root["machine"] = machine;
+
+    // Scale settings
+    QJsonObject scale;
+    scale["address"] = settings->scaleAddress();
+    scale["type"] = settings->scaleType();
+    scale["name"] = settings->scaleName();
+    scale["useFlowScale"] = settings->useFlowScale();
+    root["scale"] = scale;
+
+    // Refractometer settings
+    QJsonObject refractometer;
+    refractometer["address"] = settings->savedRefractometerAddress();
+    refractometer["name"] = settings->savedRefractometerName();
+    root["refractometer"] = refractometer;
+
+    root["portal"] = QJsonObject{{"address", settings->hardware()->portalAddress()},
+        {"name", settings->hardware()->portalName()},
+        {"syncDisplay", settings->hardware()->portalSyncDisplay()},
+        {"mountingMode", settings->hardware()->portalMountingMode()}};
+
+    // Espresso settings
+    QJsonObject espresso;
+    espresso["temperature"] = settings->brew()->espressoTemperature();
+    espresso["targetWeight"] = settings->brew()->targetWeight();
+    espresso["lastUsedRatio"] = settings->brew()->lastUsedRatio();
+    espresso["doseCupTareWeight"] = settings->brew()->doseCupTareWeight();
+    espresso["doseCaptureSoundEnabled"] = settings->brew()->doseCaptureSoundEnabled();
+    root["espresso"] = espresso;
+
+    // Steam settings
+    QJsonObject steam;
+    steam["temperature"] = settings->brew()->steamTemperature();
+    steam["timeout"] = settings->brew()->steamTimeout();
+    steam["flow"] = settings->brew()->steamFlow();
+    steam["keepWarmWhenIdle"] = settings->brew()->keepWarmWhenIdle();
+    steam["letRecipeDecide"] = settings->brew()->letRecipeDecide();
+    steam["disabled"] = settings->brew()->steamDisabled();
+    steam["autoFlushSeconds"] = settings->brew()->steamAutoFlushSeconds();
+    steam["twoTapStop"] = settings->hardware()->steamTwoTapStop();
+    steam["selectedPitcher"] = settings->brew()->selectedSteamPitcher();
+    steam["milkAutoCaptureEnabled"] = settings->brew()->milkAutoCaptureEnabled();
+
+    // Steam pitcher presets
+    QJsonArray pitcherPresets;
+    for (const QVariant& preset : settings->brew()->steamPitcherPresets()) {
+        QJsonObject p;
+        QVariantMap m = preset.toMap();
+        // The built-in "Heater off" entry is synthetic and every install has
+        // its own — exporting it would import as a duplicate (or, on an older
+        // build, as a user-created Off preset).
+        if (m.value("builtin").toBool()) continue;
+        p["name"] = m["name"].toString();
+        p["duration"] = m["duration"].toInt();
+        p["flow"] = m["flow"].toInt();
+        // Per-pitcher steam temperature; legacy presets (and pre-temperature
+        // backups) fall back to the current global steam temperature. Disabled
+        // presets carry no temperature — the heater is off for them.
+        if (!SettingsBrew::isHeaterOffPitcher(m))
+            p["temperature"] = m.contains("temperature") ? m["temperature"].toDouble()
+                                                         : settings->brew()->steamTemperature();
+        if (m.contains("pitcherWeightG")) p["pitcherWeightG"] = m["pitcherWeightG"].toDouble();
+        if (m.contains("calibMilkG")) p["calibMilkG"] = m["calibMilkG"].toDouble();
+        // Always written, 0 included: its presence is what tells an import this
+        // backup has per-pitcher rates and must not be seeded from a global one.
+        p["secondsPerGram"] = SteamCalculations::presetSecondsPerGram(m);
+        if (m.contains("disabled")) p["disabled"] = m["disabled"].toBool();
+        pitcherPresets.append(p);
+    }
+    steam["pitcherPresets"] = pitcherPresets;
+    root["steam"] = steam;
+
+    // Launcher mode
+    root["launcherMode"] = settings->app()->launcherMode();
+
+    // Hot water settings
+    QJsonObject water;
+    water["temperature"] = settings->brew()->waterTemperature();
+    water["volume"] = settings->brew()->waterVolume();
+    water["volumeMode"] = settings->brew()->waterVolumeMode();
+    water["selectedVessel"] = settings->brew()->selectedWaterVessel();
+
+    // Water vessel presets
+    QJsonArray vesselPresets;
+    for (const QVariant& preset : settings->brew()->waterVesselPresets()) {
+        QJsonObject p;
+        QVariantMap m = preset.toMap();
+        p["name"] = m["name"].toString();
+        p["volume"] = m["volume"].toInt();
+        p["mode"] = m["mode"].toString();
+        p["flowRate"] = m["flowRate"].toInt();
+        p["temperature"] = m.contains("temperature") ? m["temperature"].toDouble()
+                                                      : settings->brew()->waterTemperature();
+        vesselPresets.append(p);
+    }
+    water["vesselPresets"] = vesselPresets;
+    root["water"] = water;
+
+    // Flush settings
+    QJsonObject flush;
+    flush["flow"] = settings->brew()->flushFlow();
+    flush["seconds"] = settings->brew()->flushSeconds();
+    flush["selectedPreset"] = settings->brew()->selectedFlushPreset();
+
+    // Flush presets
+    QJsonArray flushPresets;
+    for (const QVariant& preset : settings->brew()->flushPresets()) {
+        QJsonObject p;
+        QVariantMap m = preset.toMap();
+        p["name"] = m["name"].toString();
+        p["flow"] = m["flow"].toDouble();
+        p["seconds"] = m["seconds"].toDouble();
+        flushPresets.append(p);
+    }
+    flush["presets"] = flushPresets;
+    root["flush"] = flush;
+
+    // Bean presets were replaced by coffee bags (bean-bag-inventory). Bags
+    // live in the shot history database, which transfers via the DB import
+    // path (with id remapping) — not through settings JSON. dye/activeBagId,
+    // dye/activeEquipmentId (the active equipment package), dye/activeRecipeId,
+    // and dye/autoLoadRecipeId (recipe-auto-load) are likewise deliberately
+    // NOT exported: all are device-local DB row ids, meaningless on another
+    // device unless the referenced row was itself transferred. The profile
+    // side of auto-load (autoLoadFilename below) is portable because a
+    // profile is identified by a stable filename, not a local id.
+
+    // Profile favorites
+    QJsonObject profile;
+    profile["current"] = settings->app()->currentProfile();
+    profile["selectedFavorite"] = settings->app()->selectedFavoriteProfile();
+
+    QJsonArray favorites;
+    for (const QVariant& fav : settings->app()->favoriteProfiles()) {
+        QJsonObject f;
+        QVariantMap m = fav.toMap();
+        f["name"] = m["name"].toString();
+        f["filename"] = m["filename"].toString();
+        favorites.append(f);
+    }
+    profile["favorites"] = favorites;
+    profile["favoriteOrder"] = settings->app()->favoriteProfileOrder();
+    profile["autoLoadFilename"] = settings->app()->autoLoadProfileFilename();
+    profile["autoLoadRevertMinutes"] = settings->app()->autoLoadRevertMinutes();
+    root["profile"] = profile;
+
+    // Shot history settings
+    QJsonObject shotHistory;
+    QJsonArray savedSearchesArr;
+    for (const QString& s : settings->network()->savedSearches()) {
+        savedSearchesArr.append(s);
+    }
+    shotHistory["savedSearches"] = savedSearchesArr;
+    shotHistory["sortField"] = settings->network()->shotHistorySortField();
+    shotHistory["sortDirection"] = settings->network()->shotHistorySortDirection();
+    root["shotHistory"] = shotHistory;
+
+    // Recipes page settings (recipe-list-organization)
+    QJsonObject recipes;
+    recipes["sortField"] = settings->network()->recipeSortField();
+    recipes["sortDirection"] = settings->network()->recipeSortDirection();
+    root["recipes"] = recipes;
+
+    // Beans page settings
+    QJsonObject bags;
+    bags["sortField"] = settings->network()->bagSortField();
+    bags["sortDirection"] = settings->network()->bagSortDirection();
+    root["bags"] = bags;
+
+    // UI settings
+    QJsonObject ui;
+    ui["skin"] = settings->theme()->skin();
+    // screenBrightness is intentionally NOT exported — it's a device-local
+    // runtime state (e.g. dimmed during screensaver) that would cause the
+    // importing device to inherit an inappropriate brightness level (#495)
+    ui["waterLevelDisplayUnit"] = settings->app()->waterLevelDisplayUnit();
+    ui["temperatureUnit"] = settings->app()->temperatureUnit();
+
+    // Custom font sizes
+    QJsonObject fontSizes;
+    QVariantMap sizes = settings->theme()->customFontSizes();
+    for (auto it = sizes.begin(); it != sizes.end(); ++it) {
+        fontSizes[it.key()] = it.value().toDouble();
+    }
+    ui["customFontSizes"] = fontSizes;
+
+    // Shader settings
+    ui["activeShader"] = settings->theme()->activeShader();
+    QJsonObject shaderParams;
+    QVariantMap params = settings->theme()->shaderParams();
+    for (auto it = params.begin(); it != params.end(); ++it) {
+        shaderParams[it.key()] = QJsonValue::fromVariant(it.value());
+    }
+    ui["shaderParams"] = shaderParams;
+    root["ui"] = ui;
+
+    // Theme settings
+    QJsonObject theme;
+    theme["activeThemeName"] = settings->theme()->activeThemeName();
+    theme["themeMode"] = settings->theme()->themeMode();
+    // Device-independent, unlike backgroundImagePath (a local filesystem path, which is
+    // deliberately not exported) — a preset id means the same thing on the target device.
+    theme["backgroundPreset"] = settings->theme()->backgroundPreset();
+    // As device-independent as the colour, and half the user's choice — omitting it meant a
+    // migration restored the colour and silently dropped its pattern.
+    theme["backgroundPattern"] = settings->theme()->backgroundPattern();
+    // WHICH KIND of background is chosen. Needed because a shot-chart background has no
+    // parameter of its own to infer it from — omit this and a restore of a device using
+    // one comes back with no background at all, reporting success. Same omission the
+    // pattern suffered above; it is exported for the same reason.
+    theme["backgroundSource"] = settings->theme()->backgroundSource();
+    theme["backgroundShotAdvanced"] = settings->theme()->backgroundShotAdvanced();
+    theme["glassChrome"] = settings->theme()->glassChrome();
+
+    // The stored palettes only: a device that never customised one exports
+    // nothing, so a restore leaves the destination's own palette alone.
+    QByteArray darkData = settings->value("theme/customColorsDark").toByteArray();
+    if (!darkData.isEmpty()) {
+        theme["customColorsDark"] = QJsonDocument::fromJson(darkData).object();
+    }
+    QByteArray lightData = settings->value("theme/customColorsLight").toByteArray();
+    if (!lightData.isEmpty()) {
+        theme["customColorsLight"] = QJsonDocument::fromJson(lightData).object();
+    }
+
+    // Color groups
+    QJsonArray colorGroups;
+    for (const QVariant& group : settings->theme()->colorGroups()) {
+        colorGroups.append(QJsonValue::fromVariant(group));
+    }
+    theme["colorGroups"] = colorGroups;
+    root["theme"] = theme;
+
+    // Visualizer settings
+    QJsonObject visualizer;
+    // Username AND password are gated behind includeSensitive. The username is a
+    // credential (often an email) and must not be emitted by the LAN backup/migration
+    // endpoints (handleBackupSettings / handleBackupFull force includeSensitive=false),
+    // which are UNauthenticated when webSecurityEnabled is off (the default). Every
+    // current caller passes includeSensitive=false; the flag exists for a future
+    // credential-complete backup that never leaves the device.
+    if (includeSensitive) {
+        visualizer["username"] = settings->visualizer()->visualizerUsername();
+        visualizer["password"] = settings->visualizer()->visualizerPassword();
+    }
+    // The shared upload settings (SettingsUpload) stay in this section, where
+    // backups from before the split carry them.
+    visualizer["enabled"] = settings->visualizer()->visualizerEnabled();
+    visualizer["autoUpload"] = settings->upload()->autoUpload();
+    visualizer["autoUpdate"] = settings->upload()->autoUpdate();
+    visualizer["minDuration"] = settings->upload()->minDuration();
+    visualizer["extendedMetadata"] = settings->visualizer()->visualizerExtendedMetadata();
+    visualizer["showAfterShot"] = settings->visualizer()->visualizerShowAfterShot();
+    visualizer["clearNotesOnStart"] = settings->visualizer()->visualizerClearNotesOnStart();
+    visualizer["communityMinEnjoyment"] = settings->visualizer()->communityMinEnjoyment();
+    root["visualizer"] = visualizer;
+
+    // Decent account settings. The email and encrypted password are never
+    // exported, not even with includeSensitive: the account is re-linked on each
+    // device (data-transfer-coverage, "Decent account credentials never transfer").
+    QJsonObject decent;
+    decent["enabled"] = settings->decent()->enabled();
+    root["decent"] = decent;
+
+    // AI settings
+    QJsonObject ai;
+    auto* aiSettings = settings->ai();
+    ai["provider"] = aiSettings->aiProvider();
+    if (includeSensitive) {
+        ai["openaiApiKey"] = aiSettings->openaiApiKey();
+        ai["anthropicApiKey"] = aiSettings->anthropicApiKey();
+        ai["geminiApiKey"] = aiSettings->geminiApiKey();
+    }
+    ai["ollamaEndpoint"] = aiSettings->ollamaEndpoint();
+    ai["ollamaModel"] = aiSettings->ollamaModel();
+    ai["openaiEndpoint"] = aiSettings->openaiEndpoint();
+    ai["anthropicEndpoint"] = aiSettings->anthropicEndpoint();
+    if (includeSensitive) {
+        ai["openrouterApiKey"] = aiSettings->openrouterApiKey();
+    }
+    ai["providerModels"] = aiSettings->providerModels();
+    root["ai"] = ai;
+
+    // DYE (Describe Your Espresso) metadata. Bean identity fields (brand,
+    // type, roast date/level, Bean Base link) and the grinder (identity and
+    // dial) are NOT exported — they are read-throughs of the active bag and
+    // equipment package, and both travel in the database.
+    QJsonObject dye;
+    dye["beanWeight"] = settings->dye()->dyeBeanWeight();
+    dye["drinkWeight"] = settings->dye()->dyeDrinkWeight();
+    // drinkTds/drinkEy are session-scratch (not persisted), so skip backup/restore.
+    dye["shotNotes"] = settings->dye()->dyeShotNotes();
+    dye["barista"] = settings->dye()->dyeBarista();
+    dye["shotDateTime"] = settings->dye()->dyeShotDateTime();
+    root["dye"] = dye;
+
+    // Shot server settings
+    QJsonObject shotServer;
+    shotServer["enabled"] = settings->network()->shotServerEnabled();
+    shotServer["hostname"] = settings->network()->shotServerHostname();
+    shotServer["port"] = settings->network()->shotServerPort();
+    shotServer["webSecurityEnabled"] = settings->network()->webSecurityEnabled();
+    root["shotServer"] = shotServer;
+
+    // Auto-update settings
+    QJsonObject updates;
+    updates["autoCheck"] = settings->app()->autoCheckUpdates();
+    updates["betaUpdatesEnabled"] = settings->app()->betaUpdatesEnabled();
+    root["updates"] = updates;
+
+    // Developer settings - intentionally not exported (session-only Easter eggs)
+
+    // Auto-wake schedule
+    QJsonObject autoWake;
+    auto* autoWakeSettings = settings->autoWake();
+    autoWake["enabled"] = autoWakeSettings->autoWakeEnabled();
+    QJsonArray schedule;
+    for (const QVariant& day : autoWakeSettings->autoWakeSchedule()) {
+        schedule.append(QJsonValue::fromVariant(day));
+    }
+    autoWake["schedule"] = schedule;
+    autoWake["stayAwakeEnabled"] = autoWakeSettings->autoWakeStayAwakeEnabled();
+    autoWake["stayAwakeMinutes"] = autoWakeSettings->autoWakeStayAwakeMinutes();
+    root["autoWake"] = autoWake;
+
+    // Auto-favorites settings
+    QJsonObject autoFavorites;
+    autoFavorites["groupBy"] = settings->network()->autoFavoritesGroupBy();
+    autoFavorites["maxItems"] = settings->network()->autoFavoritesMaxItems();
+    autoFavorites["openBrewSettings"] = settings->network()->autoFavoritesOpenBrewSettings();
+    autoFavorites["hideUnrated"] = settings->network()->autoFavoritesHideUnrated();
+    root["autoFavorites"] = autoFavorites;
+
+    // MQTT settings (Home Automation)
+    QJsonObject mqtt;
+    auto* mqttSettings = settings->mqtt();
+    mqtt["enabled"] = mqttSettings->mqttEnabled();
+    mqtt["brokerHost"] = mqttSettings->mqttBrokerHost();
+    mqtt["brokerPort"] = mqttSettings->mqttBrokerPort();
+    // Username and password are both gated behind includeSensitive so the
+    // unauthenticated LAN backup/migration endpoints never emit them (see visualizer
+    // above for the rationale).
+    if (includeSensitive) {
+        mqtt["username"] = mqttSettings->mqttUsername();
+        mqtt["password"] = mqttSettings->mqttPassword();
+    }
+    mqtt["baseTopic"] = mqttSettings->mqttBaseTopic();
+    mqtt["publishInterval"] = mqttSettings->mqttPublishInterval();
+    mqtt["retainMessages"] = mqttSettings->mqttRetainMessages();
+    mqtt["homeAssistantDiscovery"] = mqttSettings->mqttHomeAssistantDiscovery();
+    // Not the client ID: it is the broker's session key and must stay unique to each
+    // install. The device ID is the Home Assistant identity a replacement tablet keeps.
+    mqtt["deviceId"] = mqttSettings->mqttDeviceId();
+    mqtt["useTls"] = mqttSettings->mqttUseTls();
+    mqtt["caCertificate"] = mqttSettings->mqttCaCertificate();
+    root["mqtt"] = mqtt;
+
+    // Layout configuration
+    root["layoutConfiguration"] = settings->network()->layoutConfiguration();
+
+    // Machine tuning
+    QJsonObject machineTuning;
+    machineTuning["waterRefillPoint"] = settings->app()->waterRefillPoint();
+    machineTuning["refillKitOverride"] = settings->app()->refillKitOverride();
+    {
+        auto* hw = settings->hardware();
+        machineTuning["heaterIdleTemp"] = hw->heaterIdleTemp();
+        machineTuning["heaterWarmupFlow"] = hw->heaterWarmupFlow();
+        machineTuning["heaterTestFlow"] = hw->heaterTestFlow();
+        machineTuning["heaterWarmupTimeout"] = hw->heaterWarmupTimeout();
+        machineTuning["hotWaterFlowRate"] = hw->hotWaterFlowRate();
+    }
+    machineTuning["flowCalibrationMultiplier"] = settings->calibration()->flowCalibrationMultiplier();
+    machineTuning["autoFlowCalibration"] = settings->calibration()->autoFlowCalibration();
+    machineTuning["ignoreVolumeWithScale"] = settings->brew()->ignoreVolumeWithScale();
+    QJsonObject perProfileMap = settings->calibration()->allProfileFlowCalibrations();
+    if (!perProfileMap.isEmpty()) {
+        machineTuning["perProfileFlowCalibration"] = perProfileMap;
+    }
+    root["machineTuning"] = machineTuning;
+
+    // SAW (stop-at-weight) learning — its own top-level section, NOT under
+    // machineTuning: unlike flow calibration (machine-specific, excluded on
+    // import) SAW learning is scale+profile specific and portable, so it must
+    // survive device transfer / backup (finish-recipes-first-class).
+    const QJsonObject sawLearning = settings->calibration()->sawLearningExport();
+    if (!sawLearning.isEmpty())
+        root["sawLearning"] = sawLearning;
+
+    // Daily backup hour
+    root["dailyBackupHour"] = settings->app()->dailyBackupHour();
+
+    return root;
+}
+
+bool SettingsSerializer::importFromJson(Settings* settings, const QJsonObject& json,
+                                        const QStringList& excludeKeys)
+{
+    if (json.contains("portal") && !excludeKeys.contains("portal")) {
+        const auto portal = json.value("portal").toObject();
+        // Per-field like every sibling block: a partial object must leave the
+        // fields it omits alone, not overwrite the saved device with "" (which
+        // would also tear down a live connection via portalDeviceChanged).
+        if (portal.contains("syncDisplay"))
+            settings->hardware()->setPortalSyncDisplay(portal.value("syncDisplay").toBool(true));
+        if (portal.contains("mountingMode"))
+            settings->hardware()->setPortalMountingMode(portal.value("mountingMode").toString());
+        if (portal.contains("address") || portal.contains("name"))
+            settings->hardware()->setPortalDevice(
+                portal.value("address").toString(settings->hardware()->portalAddress()),
+                portal.value("name").toString(settings->hardware()->portalName()));
+    }
+    // Set false by any step that could not apply what the backup asked for.
+    // The single `return true` this function used to end on made every failure
+    // unreportable by construction.
+    bool importOk = true;
+    // Machine settings
+    if (json.contains("machine") && !excludeKeys.contains("machine")) {
+        QJsonObject machine = json["machine"].toObject();
+        if (machine.contains("address")) {
+            settings->setMachineAddress(machine["address"].toString());
+        }
+    }
+
+    // Scale settings
+    if (json.contains("scale") && !excludeKeys.contains("scale")) {
+        QJsonObject scale = json["scale"].toObject();
+        if (scale.contains("address")) settings->setScaleAddress(scale["address"].toString());
+        if (scale.contains("type")) settings->setScaleType(scale["type"].toString());
+        if (scale.contains("name")) settings->setScaleName(scale["name"].toString());
+        if (scale.contains("useFlowScale")) settings->setUseFlowScale(scale["useFlowScale"].toBool());
+    }
+
+    // Refractometer settings
+    if (json.contains("refractometer") && !excludeKeys.contains("refractometer")) {
+        QJsonObject refractometer = json["refractometer"].toObject();
+        if (refractometer.contains("address")) settings->setSavedRefractometerAddress(refractometer["address"].toString());
+        if (refractometer.contains("name")) settings->setSavedRefractometerName(refractometer["name"].toString());
+    }
+
+    // Espresso settings
+    if (json.contains("espresso") && !excludeKeys.contains("espresso")) {
+        QJsonObject espresso = json["espresso"].toObject();
+        if (espresso.contains("temperature")) settings->brew()->setEspressoTemperature(espresso["temperature"].toDouble());
+        if (espresso.contains("targetWeight")) settings->brew()->setTargetWeight(espresso["targetWeight"].toDouble());
+        if (espresso.contains("lastUsedRatio")) settings->brew()->setLastUsedRatio(espresso["lastUsedRatio"].toDouble());
+        if (espresso.contains("doseCupTareWeight")) settings->brew()->setDoseCupTareWeight(espresso["doseCupTareWeight"].toDouble());
+        if (espresso.contains("doseCaptureSoundEnabled")) settings->brew()->setDoseCaptureSoundEnabled(espresso["doseCaptureSoundEnabled"].toBool());
+    }
+
+    // Steam settings
+    if (json.contains("steam") && !excludeKeys.contains("steam")) {
+        QJsonObject steam = json["steam"].toObject();
+        if (steam.contains("temperature")) settings->brew()->setSteamTemperature(steam["temperature"].toDouble());
+        if (steam.contains("timeout")) settings->brew()->setSteamTimeout(steam["timeout"].toInt());
+        if (steam.contains("flow")) settings->brew()->setSteamFlow(steam["flow"].toInt());
+        if (steam.contains("keepWarmWhenIdle")) settings->brew()->setKeepWarmWhenIdle(steam["keepWarmWhenIdle"].toBool());
+        if (steam.contains("letRecipeDecide")) settings->brew()->setLetRecipeDecide(steam["letRecipeDecide"].toBool());
+        if (steam.contains("disabled")) settings->brew()->setSteamDisabled(steam["disabled"].toBool());
+        if (steam.contains("autoFlushSeconds")) settings->brew()->setSteamAutoFlushSeconds(steam["autoFlushSeconds"].toInt());
+        if (steam.contains("twoTapStop")) settings->hardware()->setSteamTwoTapStop(steam["twoTapStop"].toBool());
+
+        // Import pitcher presets
+        if (steam.contains("pitcherPresets")) {
+            // Clear existing presets first by removing them in reverse order
+            // steamPitcherCount(), not steamPitcherPresets().size(): the latter
+            // includes the synthetic "Heater off" entry, which has no stored row
+            // to remove.
+            for (int i = settings->brew()->steamPitcherCount() - 1; i >= 0; --i) {
+                settings->brew()->removeSteamPitcherPreset(i);
+            }
+            // Add imported presets
+            QJsonArray presets = steam["pitcherPresets"].toArray();
+            for (const QJsonValue& v : presets) {
+                QJsonObject p = v.toObject();
+                // Legacy presets predate the per-pitcher temperature field; fall
+                // back to the device's current global steam temperature.
+                const double presetTemp = p.contains("temperature") ? p["temperature"].toDouble()
+                                                                    : settings->brew()->steamTemperature();
+                // A rate that is not a number is treated as absent, so the old
+                // global rate below can still fill it.
+                std::optional<double> rate;
+                if (p["secondsPerGram"].isDouble())
+                    rate = p["secondsPerGram"].toDouble();
+                const auto added = settings->brew()->tryAddSteamPitcherPreset(
+                    p["name"].toString(), p["duration"].toInt(), p["flow"].toInt(), presetTemp, rate);
+                if (added != SettingsBrew::PresetMutationResult::Applied) {
+                    // Weight and calibration go only onto the pitcher just
+                    // appended, never onto the previous one. A refused name
+                    // (a duplicate, or the built-in "Heater off" row) is logged by the add;
+                    // an unreadable store loses every pitcher and fails the import.
+                    if (added == SettingsBrew::PresetMutationResult::Unreadable) {
+                        importOk = false;
+                        DIAG_WARN(STORAGE, "SettingsSerializer") << "steam pitcher" << p["name"].toString()
+                                   << "not imported: the stored pitcher list could not be read";
+                    }
+                    continue;
+                }
+                const int idx = settings->brew()->steamPitcherCount() - 1;
+                if (p.contains("pitcherWeightG")) settings->brew()->setSteamPitcherWeight(idx, p["pitcherWeightG"].toDouble());
+                if (p.contains("calibMilkG")) settings->brew()->setSteamPitcherCalibration(idx, p["calibMilkG"].toDouble());
+            }
+        }
+        // Apply the master toggle AFTER the preset loop: setSteamPitcherCalibration()
+        // auto-enables weight-timed steaming, so applying it earlier would let a
+        // calibrated preset clobber a backup where the user had the feature OFF.
+        // The serialized value must win.
+        if (steam.contains("milkAutoCaptureEnabled")) settings->brew()->setMilkAutoCaptureEnabled(steam["milkAutoCaptureEnabled"].toBool());
+        // A backup from before per-pitcher rates carries one global rate: give
+        // it to every pitcher that came without its own.
+        if (steam.contains("steamSecondsPerGram")
+            && !settings->brew()->seedSteamPitcherRates(steam["steamSecondsPerGram"].toDouble())) {
+            importOk = false;
+            DIAG_WARN(STORAGE, "SettingsSerializer")
+                << "imported steam rate not applied: the stored pitcher list could not be read";
+        }
+        // Apply the selected pitcher AFTER any preset rebuild (and regardless of
+        // whether this JSON carried a presets array) — setting it mid-rebuild would
+        // leave it clamped to a stale index. Out-of-range is dropped with a log.
+        if (steam.contains("selectedPitcher")) {
+            const int sel = steam["selectedPitcher"].toInt();
+            if (sel == SettingsBrew::HeaterOffPitcherIndex
+                || (sel >= 0 && sel < settings->brew()->steamPitcherCount()))
+                settings->brew()->setSelectedSteamCup(sel);
+            else {
+                // Reportable, not just logged. importFromJson returned an
+                // unconditional true, so the caller's `if (!import…)` branch was
+                // dead code and a restore that left the steam selection wrong
+                // still announced "Settings restored from backup".
+                importOk = false;
+                DIAG_WARN(STORAGE, "SettingsSerializer") << "imported selectedPitcher" << sel
+                           << "out of range after import; leaving current selection";
+            }
+        }
+    }
+
+    // Launcher mode
+    if (json.contains("launcherMode") && !excludeKeys.contains("launcherMode")) {
+        settings->app()->setLauncherMode(json["launcherMode"].toBool());
+    }
+
+    // Hot water settings
+    if (json.contains("water") && !excludeKeys.contains("water")) {
+        QJsonObject water = json["water"].toObject();
+        if (water.contains("temperature")) settings->brew()->setWaterTemperature(water["temperature"].toDouble());
+        if (water.contains("volume")) settings->brew()->setWaterVolume(water["volume"].toInt());
+        if (water.contains("volumeMode")) settings->brew()->setWaterVolumeMode(water["volumeMode"].toString());
+        if (water.contains("selectedVessel")) settings->brew()->setSelectedWaterCup(water["selectedVessel"].toInt());
+
+        // Import vessel presets
+        if (water.contains("vesselPresets")) {
+            QVariantList existingPresets = settings->brew()->waterVesselPresets();
+            for (qsizetype i = existingPresets.size() - 1; i >= 0; --i) {
+                settings->brew()->removeWaterVesselPreset(static_cast<int>(i));
+            }
+            QJsonArray presets = water["vesselPresets"].toArray();
+            for (const QJsonValue& v : presets) {
+                QJsonObject p = v.toObject();
+                // Legacy presets predate the per-preset temperature field; fall back to
+                // the device's current global hot-water temperature (matches the export
+                // side) rather than a hard-coded literal.
+                double presetTemp = p.contains("temperature") ? p["temperature"].toDouble()
+                                                              : settings->brew()->waterTemperature();
+                settings->brew()->addWaterVesselPreset(p["name"].toString(), p["volume"].toInt(),
+                                               p["mode"].toString("weight"), p["flowRate"].toInt(40),
+                                               presetTemp);
+            }
+        }
+    }
+
+    // Flush settings
+    if (json.contains("flush") && !excludeKeys.contains("flush")) {
+        QJsonObject flush = json["flush"].toObject();
+        if (flush.contains("flow")) settings->brew()->setFlushFlow(flush["flow"].toDouble());
+        if (flush.contains("seconds")) settings->brew()->setFlushSeconds(flush["seconds"].toDouble());
+        if (flush.contains("selectedPreset")) settings->brew()->setSelectedFlushPreset(flush["selectedPreset"].toInt());
+
+        // Import flush presets
+        if (flush.contains("presets")) {
+            QVariantList existingPresets = settings->brew()->flushPresets();
+            for (qsizetype i = existingPresets.size() - 1; i >= 0; --i) {
+                settings->brew()->removeFlushPreset(static_cast<int>(i));
+            }
+            QJsonArray presets = flush["presets"].toArray();
+            for (const QJsonValue& v : presets) {
+                QJsonObject p = v.toObject();
+                settings->brew()->addFlushPreset(p["name"].toString(), p["flow"].toDouble(), p["seconds"].toDouble());
+            }
+        }
+    }
+
+    // Profile favorites
+    if (json.contains("profile") && !excludeKeys.contains("profile")) {
+        QJsonObject profile = json["profile"].toObject();
+        if (profile.contains("current")) settings->app()->setCurrentProfile(profile["current"].toString());
+
+        if (profile.contains("favorites")) {
+            QJsonArray favorites = profile["favorites"].toArray();
+            DIAG_WARN(STORAGE, "SettingsSerializer") << "importFromJson replacing" << settings->app()->favoriteProfiles().size()
+                       << "favorites with" << favorites.size() << "from import";
+            // removeFavoriteProfile() clears the auto-load when its profile is
+            // un-favorited; a wholesale replace is not that, so the pin is put
+            // back unless the payload carries its own value below.
+            const QString autoLoadBefore = settings->app()->autoLoadProfileFilename();
+            // Remove existing favorites in reverse
+            QVariantList existingFavs = settings->app()->favoriteProfiles();
+            for (qsizetype i = existingFavs.size() - 1; i >= 0; --i) {
+                settings->app()->removeFavoriteProfile(static_cast<int>(i));
+            }
+            for (const QJsonValue& v : favorites) {
+                QJsonObject f = v.toObject();
+                settings->app()->addFavoriteProfile(f["name"].toString(), f["filename"].toString());
+            }
+            if (!profile.contains("autoLoadFilename"))
+                settings->app()->setAutoLoadProfileFilename(autoLoadBefore);
+        }
+        // Positional index into the list rebuilt above; written earlier, the
+        // remove loop would have clamped it to -1.
+        if (profile.contains("selectedFavorite")) settings->app()->setSelectedFavoriteProfile(profile["selectedFavorite"].toInt());
+
+        if (profile.contains("favoriteOrder")) {
+            settings->app()->setFavoriteProfileOrder(profile["favoriteOrder"].toString());
+        }
+
+        if (profile.contains("autoLoadFilename")) {
+            settings->app()->setAutoLoadProfileFilename(profile["autoLoadFilename"].toString());
+        }
+        if (profile.contains("autoLoadRevertMinutes")) {
+            settings->app()->setAutoLoadRevertMinutes(profile["autoLoadRevertMinutes"].toInt());
+        }
+    }
+
+    // Shot history settings
+    if (json.contains("shotHistory") && !excludeKeys.contains("shotHistory")) {
+        QJsonObject shotHistory = json["shotHistory"].toObject();
+        if (shotHistory.contains("savedSearches")) {
+            QStringList searches;
+            QJsonArray arr = shotHistory["savedSearches"].toArray();
+            for (const QJsonValue& v : arr) {
+                searches.append(v.toString());
+            }
+            settings->network()->setSavedSearches(searches);
+        }
+        if (shotHistory.contains("sortField"))
+            settings->network()->setShotHistorySortField(shotHistory["sortField"].toString());
+        if (shotHistory.contains("sortDirection"))
+            settings->network()->setShotHistorySortDirection(shotHistory["sortDirection"].toString());
+    }
+
+    // Recipes page settings
+    if (json.contains("recipes") && !excludeKeys.contains("recipes")) {
+        QJsonObject recipes = json["recipes"].toObject();
+        if (recipes.contains("sortField"))
+            settings->network()->setRecipeSortField(recipes["sortField"].toString());
+        if (recipes.contains("sortDirection"))
+            settings->network()->setRecipeSortDirection(recipes["sortDirection"].toString());
+    }
+
+    // Beans page settings
+    if (json.contains("bags") && !excludeKeys.contains("bags")) {
+        QJsonObject bags = json["bags"].toObject();
+        if (bags.contains("sortField"))
+            settings->network()->setBagSortField(bags["sortField"].toString());
+        if (bags.contains("sortDirection"))
+            settings->network()->setBagSortDirection(bags["sortDirection"].toString());
+    }
+
+    // UI settings
+    if (json.contains("ui") && !excludeKeys.contains("ui")) {
+        QJsonObject ui = json["ui"].toObject();
+        if (ui.contains("skin")) settings->theme()->setSkin(ui["skin"].toString());
+        // screenBrightness intentionally skipped on import — device-local runtime state (#495)
+        if (ui.contains("waterLevelDisplayUnit")) settings->app()->setWaterLevelDisplayUnit(ui["waterLevelDisplayUnit"].toString());
+        if (ui.contains("temperatureUnit")) settings->app()->setTemperatureUnit(ui["temperatureUnit"].toString());
+
+        if (ui.contains("customFontSizes")) {
+            QVariantMap sizes;
+            QJsonObject fontSizes = ui["customFontSizes"].toObject();
+            for (auto it = fontSizes.begin(); it != fontSizes.end(); ++it) {
+                sizes[it.key()] = it.value().toDouble();
+            }
+            settings->theme()->setCustomFontSizes(sizes);
+        }
+
+        if (ui.contains("activeShader")) settings->theme()->setActiveShader(ui["activeShader"].toString());
+        if (ui.contains("shaderParams")) {
+            QJsonObject sp = ui["shaderParams"].toObject();
+            for (auto it = sp.begin(); it != sp.end(); ++it) {
+                settings->theme()->setShaderParam(it.key(), it.value().toDouble());
+            }
+        }
+    }
+
+    // Theme settings
+    if (json.contains("theme") && !excludeKeys.contains("theme")) {
+        QJsonObject theme = json["theme"].toObject();
+        if (theme.contains("activeThemeName")) settings->theme()->setActiveThemeName(theme["activeThemeName"].toString());
+        if (theme.contains("themeMode")) settings->theme()->setThemeMode(theme["themeMode"].toString());
+        if (theme.contains("backgroundPreset")) settings->theme()->setBackgroundPreset(theme["backgroundPreset"].toString());
+        if (theme.contains("backgroundPattern")) settings->theme()->setBackgroundPattern(theme["backgroundPattern"].toString());
+        // AFTER the colour, deliberately: selecting the shot chart clears the colour, so
+        // restoring it last is what makes the imported source win rather than be stomped
+        // by the colour line above.
+        //
+        // Every source is handled, not just "shot". Acting only on "shot" meant a backup
+        // saying "none" restored onto a device using the shot chart left the chart in place
+        // and reported success — the same silent-divergence bug the pattern once had, in the
+        // opposite direction. Gated on contains(): a legacy backup carries no source at all,
+        // and must not be read as a request to clear a device-local image.
+        if (theme.contains("backgroundSource")) {
+            const QString source = theme["backgroundSource"].toString();
+            if (source == QStringLiteral("shot")) {
+                settings->theme()->selectShotChartBackground(theme["backgroundShotAdvanced"].toBool());
+            } else if (source == QStringLiteral("none")) {
+                settings->theme()->clearBackground();
+            } else if (source == QStringLiteral("image")) {
+                // backgroundImagePath is deliberately not exported (a local filesystem path
+                // means nothing on the target), so this one cannot be restored. Clear to a
+                // DEFINED state that matches the message below: log-and-do-nothing left the
+                // device half-applied — the unconditional setBackgroundPreset("") above had
+                // already wiped its colour, while a shot source survived untouched, so the
+                // restore diverged from the backup in a different way per device.
+                settings->theme()->clearBackground();
+                DIAG_INFO(STORAGE, "SettingsSerializer") << "Backup used a background image; image paths are "
+                           "device-local and are not restored. Pick a background again.";
+            }
+        }
+        if (theme.contains("glassChrome")) settings->theme()->setGlassChrome(theme["glassChrome"].toBool());
+
+        // Restore dual palettes if present (new format)
+        if (theme.contains("customColorsDark")) {
+            settings->setValue("theme/customColorsDark",
+                QJsonDocument(theme["customColorsDark"].toObject()).toJson());
+        }
+        if (theme.contains("customColorsLight")) {
+            settings->setValue("theme/customColorsLight",
+                QJsonDocument(theme["customColorsLight"].toObject()).toJson());
+        }
+
+        if (theme.contains("colorGroups")) {
+            QVariantList groups;
+            QJsonArray arr = theme["colorGroups"].toArray();
+            for (const QJsonValue& v : arr) {
+                groups.append(v.toVariant());
+            }
+            settings->theme()->setColorGroups(groups);
+        }
+    }
+
+    // Visualizer settings
+    if (json.contains("visualizer") && !excludeKeys.contains("visualizer")) {
+        QJsonObject visualizer = json["visualizer"].toObject();
+        if (visualizer.contains("username")) settings->visualizer()->setVisualizerUsername(visualizer["username"].toString());
+        if (visualizer.contains("password") && !excludeKeys.contains("visualizerPassword")) {
+            settings->visualizer()->setVisualizerPassword(visualizer["password"].toString());
+        }
+        if (visualizer.contains("enabled")) settings->visualizer()->setVisualizerEnabled(visualizer["enabled"].toBool());
+        if (visualizer.contains("autoUpload")) settings->upload()->setAutoUpload(visualizer["autoUpload"].toBool());
+        if (visualizer.contains("autoUpdate")) settings->upload()->setAutoUpdate(visualizer["autoUpdate"].toBool());
+        if (visualizer.contains("minDuration")) settings->upload()->setMinDuration(visualizer["minDuration"].toDouble());
+        if (visualizer.contains("extendedMetadata")) settings->visualizer()->setVisualizerExtendedMetadata(visualizer["extendedMetadata"].toBool());
+        if (visualizer.contains("showAfterShot")) settings->visualizer()->setVisualizerShowAfterShot(visualizer["showAfterShot"].toBool());
+        if (visualizer.contains("clearNotesOnStart")) settings->visualizer()->setVisualizerClearNotesOnStart(visualizer["clearNotesOnStart"].toBool());
+        if (visualizer.contains("communityMinEnjoyment")) settings->visualizer()->setCommunityMinEnjoyment(visualizer["communityMinEnjoyment"].toInt());
+    }
+
+    // Decent account settings. Credentials are never read from an import, even
+    // a hand-edited one that contains them.
+    if (json.contains("decent") && !excludeKeys.contains("decent")) {
+        QJsonObject decent = json["decent"].toObject();
+        if (decent.contains("enabled")) settings->decent()->setEnabled(decent["enabled"].toBool());
+    }
+
+    // AI settings
+    if (json.contains("ai") && !excludeKeys.contains("ai")) {
+        QJsonObject ai = json["ai"].toObject();
+        auto* aiSettings = settings->ai();
+        if (ai.contains("provider")) aiSettings->setAiProvider(ai["provider"].toString());
+        if (ai.contains("openaiApiKey") && !excludeKeys.contains("openaiApiKey")) {
+            aiSettings->setOpenaiApiKey(ai["openaiApiKey"].toString());
+        }
+        if (ai.contains("anthropicApiKey") && !excludeKeys.contains("anthropicApiKey")) {
+            aiSettings->setAnthropicApiKey(ai["anthropicApiKey"].toString());
+        }
+        if (ai.contains("geminiApiKey") && !excludeKeys.contains("geminiApiKey")) {
+            aiSettings->setGeminiApiKey(ai["geminiApiKey"].toString());
+        }
+        if (ai.contains("ollamaEndpoint")) aiSettings->setOllamaEndpoint(ai["ollamaEndpoint"].toString());
+        if (ai.contains("ollamaModel")) aiSettings->setOllamaModel(ai["ollamaModel"].toString());
+        if (ai.contains("openaiEndpoint")) aiSettings->setOpenaiEndpoint(ai["openaiEndpoint"].toString());
+        if (ai.contains("anthropicEndpoint")) aiSettings->setAnthropicEndpoint(ai["anthropicEndpoint"].toString());
+        if (ai.contains("openrouterApiKey") && !excludeKeys.contains("openrouterApiKey")) {
+            aiSettings->setOpenrouterApiKey(ai["openrouterApiKey"].toString());
+        }
+        if (ai["providerModels"].isObject()) aiSettings->setProviderModels(ai["providerModels"].toObject());
+    }
+
+    // DYE metadata. Bean identity fields (beanBrand/beanType/roastDate/
+    // roastLevel/beanBaseId/beanBaseData) and grinder fields (grinderBrand/
+    // Model/Burrs/Setting) from legacy exports are skipped — bean fields are
+    // read-throughs of the active bag, grinder fields of the active equipment
+    // package. Writing them would put another device's bean into the bag and
+    // its grinder and grind into the package active here. Both arrive via the
+    // database import instead.
+    if (json.contains("dye") && !excludeKeys.contains("dye")) {
+        QJsonObject dye = json["dye"].toObject();
+        if (dye.contains("beanWeight")) settings->dye()->setDyeBeanWeight(dye["beanWeight"].toDouble());
+        if (dye.contains("drinkWeight")) settings->dye()->setDyeDrinkWeight(dye["drinkWeight"].toDouble());
+        // drinkTds/drinkEy are session-scratch (not persisted); ignore on restore.
+        // espressoEnjoyment in an older backup is ignored — see settings_dye.h.
+        if (dye.contains("shotNotes")) settings->dye()->setDyeShotNotes(dye["shotNotes"].toString());
+        if (dye.contains("barista")) settings->dye()->setDyeBarista(dye["barista"].toString());
+        if (dye.contains("shotDateTime")) settings->dye()->setDyeShotDateTime(dye["shotDateTime"].toString());
+    }
+
+    // Shot server settings
+    if (json.contains("shotServer") && !excludeKeys.contains("shotServer")) {
+        QJsonObject shotServer = json["shotServer"].toObject();
+        if (shotServer.contains("enabled")) settings->network()->setShotServerEnabled(shotServer["enabled"].toBool());
+        if (shotServer.contains("hostname")) settings->network()->setShotServerHostname(shotServer["hostname"].toString());
+        if (shotServer.contains("port")) settings->network()->setShotServerPort(shotServer["port"].toInt());
+        if (shotServer.contains("webSecurityEnabled")) settings->network()->setWebSecurityEnabled(shotServer["webSecurityEnabled"].toBool());
+    }
+
+    // Auto-update settings
+    if (json.contains("updates") && !excludeKeys.contains("updates")) {
+        QJsonObject updates = json["updates"].toObject();
+        if (updates.contains("autoCheck")) settings->app()->setAutoCheckUpdates(updates["autoCheck"].toBool());
+        if (updates.contains("betaUpdatesEnabled")) settings->app()->setBetaUpdatesEnabled(updates["betaUpdatesEnabled"].toBool());
+    }
+
+    // Developer settings
+    if (json.contains("developer") && !excludeKeys.contains("developer")) {
+        QJsonObject developer = json["developer"].toObject();
+        if (developer.contains("translationUpload")) {
+            settings->app()->setDeveloperTranslationUpload(developer["translationUpload"].toBool());
+        }
+    }
+
+    // Auto-wake schedule
+    if (json.contains("autoWake") && !excludeKeys.contains("autoWake")) {
+        QJsonObject autoWake = json["autoWake"].toObject();
+        auto* autoWakeSettings = settings->autoWake();
+        if (autoWake.contains("enabled")) autoWakeSettings->setAutoWakeEnabled(autoWake["enabled"].toBool());
+        if (autoWake.contains("schedule")) {
+            QVariantList schedule;
+            QJsonArray arr = autoWake["schedule"].toArray();
+            for (const QJsonValue& v : arr) {
+                schedule.append(v.toVariant());
+            }
+            autoWakeSettings->setAutoWakeSchedule(schedule);
+        }
+        if (autoWake.contains("stayAwakeEnabled")) autoWakeSettings->setAutoWakeStayAwakeEnabled(autoWake["stayAwakeEnabled"].toBool());
+        if (autoWake.contains("stayAwakeMinutes")) autoWakeSettings->setAutoWakeStayAwakeMinutes(autoWake["stayAwakeMinutes"].toInt());
+    }
+
+    // Auto-favorites settings
+    if (json.contains("autoFavorites") && !excludeKeys.contains("autoFavorites")) {
+        QJsonObject af = json["autoFavorites"].toObject();
+        if (af.contains("groupBy")) settings->network()->setAutoFavoritesGroupBy(af["groupBy"].toString());
+        if (af.contains("maxItems")) settings->network()->setAutoFavoritesMaxItems(af["maxItems"].toInt());
+        if (af.contains("openBrewSettings")) settings->network()->setAutoFavoritesOpenBrewSettings(af["openBrewSettings"].toBool());
+        if (af.contains("hideUnrated")) settings->network()->setAutoFavoritesHideUnrated(af["hideUnrated"].toBool());
+    }
+
+    // MQTT settings
+    if (json.contains("mqtt") && !excludeKeys.contains("mqtt")) {
+        QJsonObject mqtt = json["mqtt"].toObject();
+        auto* mqttSettings = settings->mqtt();
+
+        // A restore without the password must not send the stored one to another broker or
+        // in the clear — the rule the settings page and MCP apply. With a password, the
+        // credentials go first: every setter below reconnects at once.
+        QStringList keptBrokerKeys;
+        const bool bringsPassword = mqtt.contains("password") && !excludeKeys.contains("mqttPassword");
+        if (bringsPassword) {
+            if (mqtt.contains("username")) mqttSettings->setMqttUsername(mqtt["username"].toString());
+            mqttSettings->setMqttPassword(mqtt["password"].toString());
+        } else {
+            QJsonObject asSettings;
+            if (mqtt.contains("brokerHost")) asSettings["mqttBrokerHost"] = mqtt["brokerHost"];
+            if (mqtt.contains("brokerPort")) asSettings["mqttBrokerPort"] = mqtt["brokerPort"];
+            if (mqtt.contains("useTls")) asSettings["mqttUseTls"] = mqtt["useTls"];
+            if (mqtt.contains("caCertificate")) asSettings["mqttCaCertificate"] = mqtt["caCertificate"];
+            keptBrokerKeys = mqttSettings->passwordExposingChanges(asSettings);
+            if (!keptBrokerKeys.isEmpty()) {
+                DIAG_WARN(STORAGE, "SettingsSerializer") << "Settings import kept this device's"
+                    << keptBrokerKeys << "- the backup has no MQTT password, so it may not redirect the stored one";
+            }
+        }
+        const auto allowed = [&keptBrokerKeys](const char* key) {
+            return !keptBrokerKeys.contains(QLatin1String(key));
+        };
+
+        if (mqtt.contains("enabled")) mqttSettings->setMqttEnabled(mqtt["enabled"].toBool());
+        if (mqtt.contains("brokerHost") && allowed("mqttBrokerHost"))
+            mqttSettings->setMqttBrokerHost(mqtt["brokerHost"].toString());
+        if (mqtt.contains("brokerPort") && allowed("mqttBrokerPort"))
+            mqttSettings->setMqttBrokerPort(mqtt["brokerPort"].toInt());
+        if (!bringsPassword && mqtt.contains("username"))
+            mqttSettings->setMqttUsername(mqtt["username"].toString());
+        if (mqtt.contains("baseTopic")) mqttSettings->setMqttBaseTopic(mqtt["baseTopic"].toString());
+        if (mqtt.contains("publishInterval")) mqttSettings->setMqttPublishInterval(mqtt["publishInterval"].toInt());
+        if (mqtt.contains("retainMessages")) mqttSettings->setMqttRetainMessages(mqtt["retainMessages"].toBool());
+        if (mqtt.contains("homeAssistantDiscovery")) mqttSettings->setMqttHomeAssistantDiscovery(mqtt["homeAssistantDiscovery"].toBool());
+        // A backup from before the device ID carries only the client ID, which is what built
+        // that install's Home Assistant unique_ids: it becomes the device ID, never this
+        // install's client ID.
+        if (mqtt.contains("deviceId"))
+            mqttSettings->importMqttDeviceId(mqtt["deviceId"].toString());
+        else if (mqtt.contains("clientId"))
+            mqttSettings->importMqttDeviceId(mqtt["clientId"].toString());
+        if (mqtt.contains("useTls") && allowed("mqttUseTls"))
+            mqttSettings->setMqttUseTls(mqtt["useTls"].toBool());
+        if (mqtt.contains("caCertificate") && allowed("mqttCaCertificate"))
+            mqttSettings->setMqttCaCertificate(mqtt["caCertificate"].toString());
+    }
+
+    // Layout configuration
+    if (json.contains("layoutConfiguration") && !excludeKeys.contains("layoutConfiguration")) {
+        settings->network()->setLayoutConfiguration(json["layoutConfiguration"].toString());
+    }
+
+    // Machine tuning
+    if (json.contains("machineTuning") && !excludeKeys.contains("machineTuning")) {
+        QJsonObject mt = json["machineTuning"].toObject();
+        if (mt.contains("waterRefillPoint")) settings->app()->setWaterRefillPoint(mt["waterRefillPoint"].toInt());
+        if (mt.contains("refillKitOverride")) settings->app()->setRefillKitOverride(mt["refillKitOverride"].toInt());
+        {
+            auto* hw = settings->hardware();
+            if (mt.contains("heaterIdleTemp")) hw->setHeaterIdleTemp(mt["heaterIdleTemp"].toInt());
+            if (mt.contains("heaterWarmupFlow")) hw->setHeaterWarmupFlow(mt["heaterWarmupFlow"].toInt());
+            if (mt.contains("heaterTestFlow")) hw->setHeaterTestFlow(mt["heaterTestFlow"].toInt());
+            if (mt.contains("heaterWarmupTimeout")) hw->setHeaterWarmupTimeout(mt["heaterWarmupTimeout"].toInt());
+            if (mt.contains("hotWaterFlowRate")) hw->setHotWaterFlowRate(mt["hotWaterFlowRate"].toInt());
+        }
+        // Flow calibration is machine-specific — skip during cross-device migration
+        // but restore from same-machine backups (caller passes excludeKeys to control this)
+        if (mt.contains("flowCalibrationMultiplier") && !excludeKeys.contains("flowCalibration")) {
+            settings->calibration()->setFlowCalibrationMultiplier(mt["flowCalibrationMultiplier"].toDouble());
+        }
+        if (mt.contains("autoFlowCalibration") && !excludeKeys.contains("flowCalibration")) {
+            settings->calibration()->setAutoFlowCalibration(mt["autoFlowCalibration"].toBool());
+        }
+        if (mt.contains("ignoreVolumeWithScale")) {
+            settings->brew()->setIgnoreVolumeWithScale(mt["ignoreVolumeWithScale"].toBool());
+        }
+        if (mt.contains("perProfileFlowCalibration") && !excludeKeys.contains("flowCalibration")) {
+            QJsonObject perProfile = mt["perProfileFlowCalibration"].toObject();
+            int imported = 0, rejected = 0;
+            for (auto it = perProfile.begin(); it != perProfile.end(); ++it) {
+                if (!it.value().isDouble()) {
+                    DIAG_WARN(STORAGE, "SettingsSerializer") << "Settings import: flow calibration for" << it.key()
+                               << "is not a number (type:" << it.value().type() << "), skipping";
+                    rejected++;
+                    continue;
+                }
+                double val = it.value().toDouble();
+                if (val >= SettingsCalibration::kProfileFlowCalMin
+                    && val <= SettingsCalibration::kProfileFlowCalMax) {
+                    settings->calibration()->setProfileFlowCalibration(it.key(), val);
+                    imported++;
+                } else {
+                    DIAG_WARN(STORAGE, "SettingsSerializer") << "Settings import: flow calibration out of bounds for"
+                               << it.key() << ":" << val << "(expected ["
+                               << SettingsCalibration::kProfileFlowCalMin << ","
+                               << SettingsCalibration::kProfileFlowCalMax << "])";
+                    rejected++;
+                }
+            }
+            if (rejected > 0) {
+                DIAG_WARN(STORAGE, "SettingsSerializer") << "Settings import: per-profile flow calibration -"
+                           << imported << "imported," << rejected << "rejected";
+            }
+        }
+    }
+
+    // SAW learning (scale+profile specific, portable) — imported on LAN too;
+    // NOT gated by the flowCalibration excludeKey (that guards machine-specific
+    // tuning). A dedicated "sawLearning" excludeKey can still opt out.
+    if (json.contains("sawLearning") && !excludeKeys.contains("sawLearning")) {
+        settings->calibration()->sawLearningImport(json["sawLearning"].toObject());
+    }
+
+    // Daily backup hour
+    if (json.contains("dailyBackupHour") && !excludeKeys.contains("dailyBackupHour")) {
+        settings->app()->setDailyBackupHour(json["dailyBackupHour"].toInt());
+    }
+
+    // Sync to disk
+    settings->sync();
+
+    return importOk;
+}
+
+QJsonValue SettingsSerializer::variantToJson(const QVariant& value)
+{
+    return QJsonValue::fromVariant(value);
+}
+
+QVariant SettingsSerializer::jsonToVariant(const QJsonValue& value, const QString& key)
+{
+    Q_UNUSED(key)
+    return value.toVariant();
+}

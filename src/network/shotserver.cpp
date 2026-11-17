@@ -1,0 +1,2544 @@
+#include <QRemoteObjectHost>
+#include "core/diagnosticlogging.h"
+#include "core/settings_app.h"
+#include "shotserver.h"
+#include "shotserver_webroute.h"
+#include "ble/belkaportaldevice.h"
+#include "steampitchersnapshot.h"
+#include "remotesessionserver.h"
+#include "shotuploads.h"
+#include "webrequestguard.h"
+#include "visualizeruploader.h"
+#include "relayclient.h"
+#include "localnetworkaccess.h"
+#include "webdebuglogger.h"
+#include "../history/shothistorystorage.h"
+#include "../history/equipmentstorage.h"
+#include "../ble/de1device.h"
+#include "../machine/machinestate.h"
+#include "../screensaver/screensavervideomanager.h"
+#include "../core/settings.h"
+#include "../core/settings_brew.h"
+#include "../core/settings_dye.h"
+#include "../core/settings_network.h"
+#include "../core/settings_theme.h"
+#include "../core/settings_mcp.h"
+#include "../core/profilestorage.h"
+#include "../core/settingsserializer.h"
+#include "../core/dbutils.h"
+#include "../ai/aimanager.h"
+#include "../core/batterymanager.h"
+#include "../core/memorymonitor.h"
+#include "../mcp/mcpserver.h"
+#include "../mcp/mcptoolregistry.h"
+#include "../controllers/maincontroller.h"
+#include "version.h"
+
+#include <QThread>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QNetworkInterface>
+#include <QUdpSocket>
+#include <QSet>
+#include <QFile>
+#include <QBuffer>
+#include "core/ziparchive.h"
+#include <algorithm>
+#include <utility>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QDateTime>
+#include <QLocale>
+#include <QUrl>
+#include <QUrlQuery>
+#include <QStandardPaths>
+#include <QDir>
+#include <QFileInfo>
+#include <QImage>
+#include <QPainter>
+#include <QCoreApplication>
+#include <QRegularExpression>
+#include <QRandomGenerator>
+#include <QUuid>
+#include <QSslServer>
+#include <QSocketNotifier>
+
+#ifdef Q_OS_WIN
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+#ifdef Q_OS_DARWIN
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#else
+#include "tlspemwriter.h"
+#include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/rand.h>
+#include <openssl/err.h>
+#endif
+
+#include "shotservertls.h"
+
+namespace {
+#ifndef Q_OS_DARWIN
+void logOpenSslFailure(const char* operation)
+{
+    const unsigned long error = ERR_peek_last_error();
+    char description[256] = {};
+    if (error)
+        ERR_error_string_n(error, description, sizeof(description));
+    DIAG_WARN(NETWORK, "ShotServer") << "TLS operation failed:" << operation
+             << "OpenSSL error=" << Qt::hex << error << Qt::dec << description;
+}
+#endif
+}
+
+// Query shot list from DB. Returns true on success, false on query failure.
+static bool queryShotList(QSqlDatabase& db, QVariantList& result) {
+    QSqlQuery query(db);
+    // Recipe identity is joined in, matching the in-app history list
+    // (history-recipe-identity): live from `recipes` by id, never snapshotted
+    // onto the shot, so renaming a recipe relabels its whole history. LEFT so a
+    // recipe-less shot is still listed. Every column is qualified because the
+    // two tables collide on ten names — deliberately not enumerated here: an
+    // enumerated copy of that list went stale, omitted `profile_json`, and that
+    // omission is what silently emptied the MCP shots_list query.
+    if (!query.prepare(R"(
+        SELECT shots.id, shots.uuid, shots.timestamp, shots.profile_name, shots.duration_seconds,
+               shots.final_weight, shots.dose_weight, shots.bean_brand, shots.bean_type,
+               shots.enjoyment, shots.visualizer_id, shots.grinder_setting,
+               shots.temperature_override, shots.yield_override, shots.beverage_type,
+               shots.drink_tds, shots.drink_ey, shots.rpm,
+               shots.recipe_id, r.name, r.drink_type, r.archived
+        FROM shots LEFT JOIN recipes r ON r.id = shots.recipe_id
+        ORDER BY shots.timestamp DESC LIMIT 1000
+    )") || !query.exec()) {
+        DIAG_WARN(NETWORK, "ShotServer") << "Shot list query failed:" << query.lastError().text();
+        return false;
+    }
+    while (query.next()) {
+        QVariantMap row;
+        row["id"] = query.value(0).toLongLong();
+        row["uuid"] = query.value(1).toString();
+        row["timestamp"] = query.value(2).toLongLong();
+        row["profileName"] = query.value(3).toString();
+        row["durationSec"] = query.value(4).toDouble();
+        row["finalWeightG"] = query.value(5).toDouble();
+        row["doseWeightG"] = query.value(6).toDouble();
+        row["beanBrand"] = query.value(7).toString();
+        row["beanType"] = query.value(8).toString();
+        row["enjoyment0to100"] = query.value(9).toDouble();
+        row["hasVisualizerUpload"] = !query.value(10).toString().isEmpty();
+        row["grinderSetting"] = query.value(11).toString();
+        row["rpm"] = query.value(17).toLongLong();  // RPM half of the dial-in
+        row["temperatureOverrideC"] = query.value(12).toDouble();
+        row["targetWeightG"] = query.value(13).toDouble();
+        row["beverageType"] = query.value(14).toString();
+        row["drinkTdsPct"] = query.value(15).toDouble();
+        row["drinkEyPct"] = query.value(16).toDouble();
+        row["recipeId"] = query.value(18).toLongLong();
+        row["recipeName"] = query.value(19).toString();
+        row["recipeDrinkType"] = query.value(20).toString();
+        row["recipeArchived"] = query.value(21).toInt() != 0;
+        QDateTime dt = QDateTime::fromSecsSinceEpoch(query.value(2).toLongLong());
+        static const bool use12h = QLocale::system().timeFormat(QLocale::ShortFormat).contains("AP", Qt::CaseInsensitive);
+        row["dateTime"] = dt.toString(use12h ? "yyyy-MM-dd h:mm AP" : "yyyy-MM-dd HH:mm");
+        result.append(row);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+
+ShotServer::ShotServer(ShotHistoryStorage* storage, DE1Device* device, QObject* parent)
+    : QObject(parent)
+    , m_storage(storage)
+    , m_device(device)
+{
+    m_sessionBackgroundImageRevision = QUuid::createUuid().toString(QUuid::Id128).toLower();
+    // Timer to cleanup stale connections
+    m_cleanupTimer = new QTimer(this);
+    m_cleanupTimer->setInterval(30000);  // Check every 30 seconds
+    connect(m_cleanupTimer, &QTimer::timeout, this, &ShotServer::onCleanupTimerTick);
+}
+
+ShotServer::~ShotServer()
+{
+    *m_destroyed = true;
+    stop();
+    const auto backgroundThreads = m_backgroundReadThreads;
+    for (const QPointer<QThread>& thread : backgroundThreads) {
+        if (thread)
+            thread->wait();
+    }
+    // Cleanup any pending requests
+    for (auto it = m_pendingRequests.begin(); it != m_pendingRequests.end(); ++it) {
+        cleanupPendingRequest(it.key());
+    }
+    m_pendingRequests.clear();
+}
+
+void ShotServer::setSettings(Settings* settings)
+{
+    m_settings = settings;
+    if (m_settings) {
+        auto* theme = m_settings->theme();
+        const auto rotateBackgroundRevision = [this]() {
+            m_sessionBackgroundImageRevision = QUuid::createUuid().toString(QUuid::Id128).toLower();
+            emit sessionBackgroundImageRevisionChanged();
+        };
+        connect(theme, &SettingsTheme::backgroundImagePathChanged,
+                this, rotateBackgroundRevision);
+        connect(theme, &SettingsTheme::backgroundSourceChanged,
+                this, rotateBackgroundRevision);
+    }
+}
+
+void ShotServer::setMainController(MainController* mainController)
+{
+    m_mainController = mainController;
+}
+
+// Retire one socket: clear it out of every container that can hold it, then
+// close and delete it. See the header for why this cannot be left to
+// onDisconnected() firing — close() does not always emit disconnected(), and the
+// states where it does not are precisely the ones the dead-client checks look
+// for.
+//
+// Idempotent: every removal is a no-op on an absent key, close() on a closed
+// socket does nothing, and Qt collapses repeated deleteLater() into one event.
+// So a call that DOES synchronously re-enter through onDisconnected() is safe.
+void ShotServer::retireSocket(QTcpSocket* socket)
+{
+    if (!socket)
+        return;
+
+    m_clients.remove(socket);
+    m_remoteWebClients.remove(socket);
+    m_uploadProgressLog.remove(socket);
+    m_screensaverTransfers.remove(socket);
+
+    // The timer is a child of `socket` and dies with it; stopping it here keeps
+    // its lambda from firing in the window before deleteLater() runs. Taking it
+    // out of the map is what stops stop() from dereferencing a freed pointer.
+    if (QTimer* t = m_keepAliveTimers.take(socket))
+        t->stop();
+
+    cleanupPendingRequest(socket);
+    m_pendingRequests.remove(socket);
+
+    socket->close();
+    socket->deleteLater();
+
+    noteConnectionLimitRecovery();
+}
+
+qsizetype ShotServer::lanClientCount() const
+{
+    return m_clients.size() - m_remoteWebClients.size();
+}
+
+// Report the recovery, once, with what the silence cost. A limit that was hit
+// and cleared is a different story from one still being hit, and without this
+// the log shows only the "limit reached" line — indistinguishable from a server
+// still refusing everyone.
+void ShotServer::noteConnectionLimitRecovery()
+{
+    if (m_atConnectionLimit && lanClientCount() < MAX_CONNECTIONS) {
+        m_atConnectionLimit = false;
+        DIAG_WARN(NETWORK, "ShotServer") << "below connection limit again after refusing"
+                   << m_refusedConnections << "connection(s)";
+        m_refusedConnections = 0;
+    }
+}
+
+QString ShotServer::url() const
+{
+    if (!isRunning()) return QString();
+    return QString("https://%1:%2").arg(getLocalIpAddress()).arg(m_port);
+}
+
+bool ShotServer::isSecurityEnabled() const
+{
+    return m_settings && m_settings->network()->webSecurityEnabled();
+}
+
+void ShotServer::setPort(int port)
+{
+    if (m_port != port) {
+        m_port = port;
+        emit portChanged();
+    }
+}
+
+bool ShotServer::start()
+{
+    LocalNetworkAccess::request(LocalNetworkAccess::Feature::WebServer);
+    if (m_server) {
+        stop();
+    }
+
+    if (!setupTls()) {
+        DIAG_WARN(NETWORK, "ShotServer") << "TLS setup failed, cannot start secure server";
+        return false;
+    }
+    auto* sslServer = new HttpRedirectSslServer([this](QSslServer* server) {
+        if (m_sslCert.expiryDate() > QDateTime::currentDateTime()
+            && ShotServerTls::coversAddresses(m_sslCert.subjectAlternativeNames(),
+                                             ShotServerTls::localAddresses()))
+            return true;
+        if (!setupTls()) return false;
+        auto config = server->sslConfiguration();
+        config.setLocalCertificate(m_sslCert);
+        config.setPrivateKey(m_sslKey);
+        server->setSslConfiguration(config);
+        emit urlChanged();
+        return true;
+    }, this);
+    QSslConfiguration sslConfig;
+    sslConfig.setLocalCertificate(m_sslCert);
+    sslConfig.setPrivateKey(m_sslKey);
+    sslConfig.setPeerVerifyMode(QSslSocket::VerifyNone);
+    sslServer->setSslConfiguration(sslConfig);
+    m_server = sslServer;
+    // Use pendingConnectionAvailable (not newConnection) for QSslServer:
+    // newConnection fires on TCP accept (before SSL handshake), when hasPendingConnections() is still false.
+    // pendingConnectionAvailable fires after handshake completes and socket is added to the pending queue.
+    connect(m_server, &QTcpServer::pendingConnectionAvailable, this, &ShotServer::onNewConnection);
+    connect(m_server, &QTcpServer::acceptError, this, [this](QAbstractSocket::SocketError err) {
+        DIAG_WARN(NETWORK, "ShotServer") << "accept error:" << err
+                   << "socketDescriptor:" << m_server->socketDescriptor()
+                   << "isListening:" << m_server->isListening();
+    });
+    connect(sslServer, &QSslServer::sslErrors, this, [](QSslSocket* /*socket*/, const QList<QSslError>& errors) {
+        for (const auto& err : errors)
+            DIAG_WARN(NETWORK, "ShotServer") << "SSL error:" << err.errorString();
+    });
+    connect(sslServer, &QSslServer::handshakeInterruptedOnError, this, [](QSslSocket* /*socket*/, const QSslError& error) {
+        DIAG_WARN(NETWORK, "ShotServer") << "SSL handshake interrupted:" << error.errorString();
+    });
+    connect(sslServer, &QSslServer::peerVerifyError, this, [](QSslSocket* /*socket*/, const QSslError& error) {
+        DIAG_WARN(NETWORK, "ShotServer") << "SSL peer verify error:" << error.errorString();
+    });
+
+    if (!m_server->listen(QHostAddress::Any, m_port)) {
+        DIAG_WARN(NETWORK, "ShotServer") << "Failed to start TLS on port" << m_port << m_server->errorString();
+        delete m_server;
+        m_server = nullptr;
+        return false;
+    }
+
+    // Load persisted sessions
+    loadSessions(m_sessions, kAuthSessionsKey);
+    loadSessions(m_remoteWebSessions, kRemoteWebSessionsKey);
+
+    DIAG_DEBUG(NETWORK, "ShotServer") << "HTTPS mode enabled";
+
+    m_sessionHostId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    delete m_remoteSessionServer;
+    m_remoteSessionServer = new RemoteSessionServer(
+        [this](const QByteArray& request) {
+            return !isSecurityEnabled() || checkSession(request);
+        },
+        true, this);
+    connect(m_remoteSessionServer, &RemoteSessionServer::remoteObjectClientOpened,
+            this, &ShotServer::remoteObjectClientOpened);
+    connect(m_remoteSessionServer, &RemoteSessionServer::remoteObjectClientClosed,
+            this, &ShotServer::remoteObjectClientClosed);
+    if (m_remoteObjectHost)
+        setRemoteObjectHost(m_remoteObjectHost);
+    connect(m_remoteSessionServer, &RemoteSessionServer::connectionClosed,
+            this, &ShotServer::handleRemoteSessionConnectionClosed);
+
+    // Start UDP discovery socket
+    m_discoverySocket = new QUdpSocket(this);
+    if (m_discoverySocket->bind(QHostAddress::Any, DISCOVERY_PORT, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
+        connect(m_discoverySocket, &QUdpSocket::readyRead, this, &ShotServer::onDiscoveryDatagram);
+        DIAG_DEBUG(NETWORK, "ShotServer") << "Discovery listener started on UDP port" << DISCOVERY_PORT;
+        m_multicastLock = std::make_unique<MulticastLock::Holder>();
+    } else {
+        DIAG_WARN(NETWORK, "ShotServer") << "Failed to bind discovery socket on port" << DISCOVERY_PORT << m_discoverySocket->errorString();
+        delete m_discoverySocket;
+        m_discoverySocket = nullptr;
+        // Continue anyway - discovery is optional
+    }
+
+    m_cleanupTimer->start();
+    DIAG_DEBUG(NETWORK, "ShotServer") << "Started on" << url();
+    emit runningChanged();
+    emit urlChanged();
+    return true;
+}
+
+void ShotServer::stop()
+{
+    // The request log's run ends with the server. Its keys are request lines,
+    // which nothing here enumerates, and a tally left behind would be printed by
+    // whatever request first repeats after the NEXT start — a count from the
+    // previous run dated to the new one.
+    for (const auto& [line, collapsed] :
+         m_requestLog.flushAll(QDateTime::currentMSecsSinceEpoch())) {
+        DIAG_DEBUG(NETWORK, "ShotServer").noquote() << line + LogCollapse::suffix(collapsed);
+    }
+
+    if (m_discoverySocket) {
+        m_discoverySocket->close();
+        delete m_discoverySocket;
+        m_discoverySocket = nullptr;
+    }
+    m_multicastLock.reset();
+
+    if (m_server) {
+        m_cleanupTimer->stop();
+        // Stop all keep-alive timers BEFORE closing any sockets. This ensures
+        // every timer pointer is still valid (sockets haven't been destroyed yet).
+        // Closing sockets afterwards may trigger onDisconnected() → deleteLater(),
+        // which could destroy timers; clearing the map first avoids dangling pointers.
+        for (QTimer* t : std::as_const(m_keepAliveTimers))
+            t->stop();
+        // m_clients holds every accepted socket, so it is the superset of the SSE
+        // sets and m_pendingRequests — one pass retires the lot. Iterate a COPY:
+        // retireSocket() mutates m_clients, and close() inside it can re-enter
+        // through onDisconnected().
+        //
+        // This is what closes in-flight upload sockets, which matters beyond
+        // tidiness: an APK or media upload socket that survives stop() still has
+        // its QSocketNotifier around when Android takes over for the
+        // PackageInstaller handover (#865).
+        if (m_remoteSessionServer)
+            m_remoteSessionServer->closeAll();
+        const auto clients = m_clients;
+        for (QTcpSocket* s : clients) {
+            if (m_remoteSessionServer && m_remoteSessionServer->ownsSocket(s)) {
+                // Qt's QWebSocketServer now owns the handed-off socket. Keep
+                // its cleanup path intact; remove only ShotServer's tracking.
+                disconnect(s, &QTcpSocket::readyRead, this, &ShotServer::onReadyRead);
+                disconnect(s, &QTcpSocket::disconnected, this, &ShotServer::onDisconnected);
+                m_remoteSessionServer->forgetSocket(s);
+                m_clients.remove(s);
+                m_remoteWebClients.remove(s);
+                if (QTimer* t = m_keepAliveTimers.take(s))
+                    t->stop();
+                cleanupPendingRequest(s);
+                m_pendingRequests.remove(s);
+                s->deleteLater();
+            } else {
+                retireSocket(s);
+            }
+        }
+        // Defensive: retireSocket has emptied all of these for every socket it
+        // saw. Anything left is a pointer that was never in m_clients, which
+        // would be a bug elsewhere — drop it rather than carry it into the next
+        // start().
+        m_keepAliveTimers.clear();
+        m_pendingRequests.clear();
+        m_clients.clear();
+        m_remoteWebClients.clear();
+        m_server->close();
+        delete m_server;
+        m_server = nullptr;
+        delete m_remoteSessionServer;
+        m_remoteSessionServer = nullptr;
+        emit runningChanged();
+        emit urlChanged();
+        DIAG_DEBUG(NETWORK, "ShotServer") << "Stopped";
+    }
+}
+
+void ShotServer::onNewConnection()
+{
+    while (m_server->hasPendingConnections()) {
+        QTcpSocket* socket = m_server->nextPendingConnection();
+
+        // Fail closed above the ceiling. Dropping the newest arrival keeps the
+        // clients already being served, which is the opposite of what running
+        // out of descriptors does — that takes down BLE, the database and
+        // everything else in the process along with the web server.
+        if (lanClientCount() >= MAX_CONNECTIONS) {
+            // Answer, don't just hang up. A bare close reaches the browser as
+            // ERR_EMPTY_RESPONSE, which is byte-identical to the app being dead,
+            // the wrong port, or a bad certificate — and whoever hits this is far
+            // more likely to be the owner on their phone than anything hostile.
+            //
+            // Written straight to the socket rather than through sendResponse():
+            // that arms a keep-alive timer keyed on the socket, and this socket
+            // is deliberately never wired to onDisconnected, so the entry would
+            // outlive it. flush() normally pushes a body this small straight into
+            // the kernel buffer, leaving close() nothing to drain — a peer that
+            // never reads and has a full receive window instead gets a truncated
+            // 503, which is an acceptable answer to give a client that is not
+            // listening.
+            const QByteArray body =
+                "Decenza is already serving its maximum number of connections. "
+                "Close other tabs or devices and try again in a moment.\n";
+            socket->write("HTTP/1.1 503 Service Unavailable\r\n"
+                          "Content-Type: text/plain\r\n"
+                          "Retry-After: 5\r\n"
+                          "Connection: close\r\n"
+                          "Content-Length: " + QByteArray::number(body.size()) + "\r\n"
+                          "\r\n" + body);
+            socket->flush();
+            socket->close();
+            socket->deleteLater();
+
+            // Log the TRANSITION, not the event. One warning per refusal is one
+            // warning per SYN on a path an attacker controls, and the debug log
+            // is a bounded ring buffer that crash reports carry — flooding it
+            // would evict the fd-pressure evidence this same change adds, which
+            // is the diagnostic losing to the denial of service in the one
+            // buffer they share.
+            ++m_refusedConnections;
+            if (!m_atConnectionLimit) {
+                m_atConnectionLimit = true;
+                DIAG_WARN(NETWORK, "ShotServer") << "connection limit reached ("
+                           << MAX_CONNECTIONS << ") — refusing new clients, most recent from"
+                           << socket->peerAddress().toString();
+            }
+            continue;
+        }
+        m_clients.insert(socket);
+
+        connect(socket, &QTcpSocket::readyRead, this, &ShotServer::onReadyRead);
+        connect(socket, &QTcpSocket::disconnected, this, &ShotServer::onDisconnected);
+        // Start the idle clock HERE, not at the first readyRead. A peer that
+        // connects and then sends nothing was previously tracked nowhere: no
+        // m_pendingRequests entry (created on first read), no keep-alive timer
+        // (created when a response is sent), not in either SSE set — so
+        // onCleanupTimerTick's stale sweep could not see it and the descriptor
+        // was held until the peer closed, which a vanished peer never does. On a
+        // LAN where this server advertises itself over mDNS that is a steady
+        // trickle (scanners, browser pre-connects, discovery agents), and the fd
+        // count only goes up. Registering at accept puts such a socket under
+        // SILENT_TIMEOUT_MS — 30 s, not the 5-minute CONNECTION_TIMEOUT_MS, which
+        // is reserved for sockets with a request actually in flight (see the
+        // two-deadline check in onCleanupTimerTick). onReadyRead reuses this
+        // same entry.
+        m_pendingRequests[socket].lastActivity.start();
+        emit clientConnected(socket->peerAddress().toString());
+    }
+}
+
+void ShotServer::onReadyRead()
+{
+    QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
+    if (!socket) return;
+
+    // After sleep/wake or network changes, readyRead can fire for sockets that
+    // are closing or already disconnected. Processing such a socket would create
+    // a new keep-alive timer (via sendResponse → resetKeepAliveTimer) whose map
+    // entry becomes dangling once deleteLater destroys the socket and its child timer.
+    if (socket->state() != QAbstractSocket::ConnectedState) return;
+
+    // SSE clients keep connections open — ignore further data from them.
+    // MCP SSE sockets live in McpServer's set, not ours, so route the check
+    // through the accessor.
+    if (m_mcpServer && m_mcpServer->isSseClient(socket)) return;
+
+    // Stop keep-alive idle timer while processing incoming request data
+    if (QTimer* t = m_keepAliveTimers.value(socket))
+        t->stop();
+
+    // The WebSocket handshake must still be in QTcpSocket's read buffer when
+    // QWebSocketServer::handleConnection() takes ownership. This narrow route
+    // peeks at the exact endpoint and leaves partial or complete upgrade bytes
+    // untouched for Qt's parser.
+    if (m_remoteWebClients.contains(socket) && holdRemoteWebRequest(socket))
+        return;
+    if (tryUpgradeSessionWebSocket(socket))
+        return;
+
+    // Safety net for the "QIODevice::read (QSslSocket): device not open"
+    // warning Qt emits when readAll() runs against a closed underlying device.
+    // The state guard above catches sockets that fully transitioned to a
+    // non-Connected state, but there is a window where state still reads
+    // Connected (Qt hasn't propagated the close yet) while the underlying
+    // QIODevice is already closed — `isOpen()` is the stricter check.
+    //
+    // Kept defensively even though investigation in #1295 did not observe
+    // shotserver tripping this race in practice; a future sleep/wake or
+    // abrupt peer teardown could still hit it, and one branch costs nothing.
+    //
+    // Note: the warning we actually see in production logs comes from a
+    // different code path — Qt-internal HTTP/2 channel teardown on the
+    // auto-update checker's outbound request, not this server's incoming
+    // socket. See QTBUG-129316 / QTBUG-144492. That source is unrelated to
+    // this guard; don't delete this guard if those bugs close.
+    if (!socket->isOpen()) {
+        cleanupPendingRequest(socket);
+        m_pendingRequests.remove(socket);
+        return;
+    }
+
+    try {
+        PendingRequest& pending = m_pendingRequests[socket];
+        pending.lastActivity.start();
+
+        // Read available data
+        QByteArray chunk = socket->readAll();
+
+        // If we haven't found headers yet, accumulate header data
+        if (pending.headerEnd < 0) {
+            pending.headerData.append(chunk);
+
+            // Check header size limit
+            if (pending.headerData.size() > MAX_HEADER_SIZE) {
+                DIAG_WARN(NETWORK, "ShotServer") << "Headers too large, rejecting";
+                sendResponse(socket, 413, "text/plain", "Headers too large");
+                cleanupPendingRequest(socket);
+                m_pendingRequests.remove(socket);
+                socket->close();
+                return;
+            }
+
+            pending.headerEnd = static_cast<int>(pending.headerData.indexOf("\r\n\r\n"));
+            if (pending.headerEnd < 0) {
+                // Headers not complete yet
+                return;
+            }
+
+            // Parse headers
+            QString headers = QString::fromUtf8(pending.headerData.left(pending.headerEnd));
+            QStringList lines = headers.split("\r\n");
+            QString requestLine = lines.isEmpty() ? "" : lines.first();
+
+            // Parse Content-Length
+            for (const QString& line : std::as_const(lines)) {
+                if (line.startsWith("Content-Length:", Qt::CaseInsensitive)) {
+                    pending.contentLength = line.mid(15).trimmed().toLongLong();
+                    break;
+                }
+            }
+
+            if (pending.contentLength < 0) {
+                pending.contentLength = 0;
+            }
+
+            // A Remote Web Access socket's request was checked when it began;
+            // this repeats it on the complete header block it is parsed from.
+            if (m_remoteWebClients.contains(socket)) {
+                const QByteArray headerBlock = pending.headerData.left(pending.headerEnd);
+                const RemoteWebVerdict verdict = remoteWebVerdict(headerBlock);
+                if (verdict != RemoteWebVerdict::Allow) {
+                    cleanupPendingRequest(socket);
+                    m_pendingRequests.remove(socket);
+                    refuseRemoteWebRequest(socket, verdict, headerBlock);
+                    return;
+                }
+            }
+
+            // Refused here, before a body is buffered or streamed, so a page on
+            // another site cannot write to this server through the user's browser.
+            {
+                const QStringList requestParts = requestLine.split(' ');
+                const QString crossSite = WebRequestGuard::crossSiteReason(
+                    requestParts.value(0), requestParts.value(1), pending.headerData.left(pending.headerEnd));
+                if (!crossSite.isEmpty()) {
+                    DIAG_WARN(NETWORK, "ShotServer") << "Refused request:" << crossSite;
+                    sendResponse(socket, 403, "text/plain; charset=utf-8", ("Refused: " + crossSite).toUtf8());
+                    cleanupPendingRequest(socket);
+                    m_pendingRequests.remove(socket);
+                    socket->close();
+                    return;
+                }
+            }
+
+            // For large request bodies, stream to a temporary file instead of memory
+            if (pending.contentLength > MAX_SMALL_BODY_SIZE) {
+                QString tempDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+                pending.tempFilePath = tempDir + "/upload_stream_" + QString::number(QDateTime::currentMSecsSinceEpoch()) + ".tmp";
+                pending.tempFile = new QFile(pending.tempFilePath);
+                if (!pending.tempFile->open(QIODevice::WriteOnly)) {
+                    DIAG_WARN(NETWORK, "ShotServer") << "Failed to create temp file for streaming";
+                    sendResponse(socket, 500, "text/plain", "Server error: cannot create temp file");
+                    cleanupPendingRequest(socket);
+                    m_pendingRequests.remove(socket);
+                    socket->close();
+                    return;
+                }
+                DIAG_DEBUG(NETWORK, "ShotServer") << "Streaming large upload to" << pending.tempFilePath;
+            }
+
+            // Handle any body data that came with headers
+            int bodyStart = pending.headerEnd + 4;
+            if (bodyStart < pending.headerData.size()) {
+                QByteArray bodyPart = pending.headerData.mid(bodyStart);
+                if (pending.tempFile) {
+                    // Write body to temp file and truncate headerData to just headers
+                    pending.tempFile->write(bodyPart);
+                    pending.headerData.truncate(pending.headerEnd);
+                }
+                // For small requests without temp file, keep everything in headerData
+                pending.bodyReceived = bodyPart.size();
+            }
+
+            chunk.clear();  // Already processed
+        } else {
+            // Headers already received, this is body data
+            if (pending.tempFile) {
+                // Stream to temp file
+                pending.tempFile->write(chunk);
+            } else {
+                // Append to header buffer (for small requests)
+                pending.headerData.append(chunk);
+            }
+            pending.bodyReceived += chunk.size();
+        }
+
+        // Log progress for large uploads
+        if (pending.contentLength > 5 * 1024 * 1024) {
+            qint64& last = m_uploadProgressLog[socket];
+            if (pending.bodyReceived - last > 5 * 1024 * 1024) {
+                DIAG_DEBUG(NETWORK, "ShotServer") << "Upload progress:" << pending.bodyReceived / (1024*1024) << "MB /" << pending.contentLength / (1024*1024) << "MB";
+                last = pending.bodyReceived;
+            }
+        }
+
+        // Check if we have all the body data
+        if (pending.bodyReceived < pending.contentLength) {
+            return;  // Still waiting for more data
+        }
+
+        // Clean up upload progress tracking for this socket
+        m_uploadProgressLog.remove(socket);
+
+        // Request complete
+        if (pending.tempFile) {
+            // Use the QFile's write position instead of QFileInfo::size() — pos()
+            // is a pure in-memory read, avoiding a main-thread stat/fstat syscall
+            // (CLAUDE.md "Never run disk I/O on the main thread").
+            const qint64 tempFileSize = pending.tempFile->pos();
+            pending.tempFile->close();
+            DIAG_DEBUG(NETWORK, "ShotServer") << "Upload complete, temp file:" << pending.tempFilePath
+                     << "size:" << tempFileSize << "bytes";
+        }
+
+        // Handle the request
+        if (pending.tempFilePath.isEmpty()) {
+            // Small request — headerData contains the full
+            // request (headers + \r\n\r\n + body), nothing on disk.
+            QByteArray request = pending.headerData;
+            cleanupPendingRequest(socket);
+            m_pendingRequests.remove(socket);
+            handleRequest(socket, request);
+        } else {
+            // Large non-media request that was streamed to a temp file.
+            // Reconstruct on a background thread to keep main-thread disk I/O
+            // off the event loop (CLAUDE.md: "Never run disk I/O on the main
+            // thread"). We take ownership of the temp file removal here so we
+            // clear pending.tempFilePath before cleanupPendingRequest to stop
+            // it from queueing its own remove.
+            QByteArray headerData = pending.headerData;
+            QString tempPath = pending.tempFilePath;
+            pending.tempFilePath.clear();
+            cleanupPendingRequest(socket);
+            m_pendingRequests.remove(socket);
+            QPointer<QTcpSocket> safeSocket = socket;
+            QPointer<ShotServer> safeThis = this;
+            QThread* t = QThread::create([safeThis, safeSocket, headerData, tempPath]() {
+                QByteArray request = headerData + "\r\n\r\n";
+                QFile f(tempPath);
+                if (f.open(QIODevice::ReadOnly)) {
+                    request.append(f.readAll());
+                    f.close();
+                }
+                QFile::remove(tempPath);
+                QMetaObject::invokeMethod(safeThis, [safeThis, safeSocket, request]() {
+                    if (safeThis && safeSocket)
+                        safeThis->handleRequest(safeSocket, request);
+                }, Qt::QueuedConnection);
+            });
+            connect(t, &QThread::finished, t, &QThread::deleteLater);
+            t->start();
+        }
+
+    } catch (const std::exception& e) {
+        DIAG_WARN(NETWORK, "ShotServer") << "Exception in onReadyRead:" << e.what();
+        m_uploadProgressLog.remove(socket);
+        cleanupPendingRequest(socket);
+        m_pendingRequests.remove(socket);
+        socket->close();
+    } catch (...) {
+        DIAG_WARN(NETWORK, "ShotServer") << "Unknown exception in onReadyRead";
+        m_uploadProgressLog.remove(socket);
+        cleanupPendingRequest(socket);
+        m_pendingRequests.remove(socket);
+        socket->close();
+    }
+}
+
+void ShotServer::onDisconnected()
+{
+    auto* socket = qobject_cast<QTcpSocket*>(sender());
+    if (m_remoteSessionServer && m_remoteSessionServer->ownsSocket(socket)) {
+        handleRemoteSessionConnectionClosed(socket);
+        return; // QWebSocketServer owns and retires this socket.
+    }
+    retireSocket(socket);
+}
+
+void ShotServer::handleRemoteSessionConnectionClosed(QTcpSocket* socketIdentity)
+{
+    if (!socketIdentity || !m_clients.remove(socketIdentity))
+        return;
+    m_remoteWebClients.remove(socketIdentity);
+
+    if (m_remoteSessionServer)
+        m_remoteSessionServer->forgetSocket(socketIdentity);
+    if (QTimer* timer = m_keepAliveTimers.take(socketIdentity))
+        timer->stop();
+    cleanupPendingRequest(socketIdentity);
+    m_pendingRequests.remove(socketIdentity);
+    m_uploadProgressLog.remove(socketIdentity);
+    noteConnectionLimitRecovery();
+}
+
+void ShotServer::cleanupPendingRequest(QTcpSocket* socket)
+{
+    if (!m_pendingRequests.contains(socket)) return;
+
+    m_uploadProgressLog.remove(socket);
+    PendingRequest& pending = m_pendingRequests[socket];
+    if (pending.tempFile) {
+        pending.tempFile->close();
+        delete pending.tempFile;
+        pending.tempFile = nullptr;
+    }
+    if (!pending.tempFilePath.isEmpty()) {
+        QString tmpPath = pending.tempFilePath;
+        QThread* cleanup = QThread::create([tmpPath]() {
+            if (QFile::remove(tmpPath))
+                DIAG_DEBUG(NETWORK, "ShotServer") << "Cleaned up temp file:" << tmpPath;
+        });
+        connect(cleanup, &QThread::finished, cleanup, &QThread::deleteLater);
+        cleanup->start();
+    }
+
+}
+
+void ShotServer::onCleanupTimerTick()
+{
+    if (m_server) {
+        qintptr fd = m_server->socketDescriptor();
+        bool listening = m_server->isListening();
+        if (fd == -1 && listening) {
+            // The bug we're hunting — always log this when it happens, no
+            // de-dup, so consecutive ticks paint a clear timeline.
+            DIAG_WARN(NETWORK, "ShotServer") << "socketDescriptor() == -1 while isListening() == true — listen socket may have been invalidated by OS";
+        } else if (fd != m_lastHealthFd || listening != m_lastHealthListening) {
+            // Only log when state changes (incl. the first tick after startup).
+            // Steady-state was burning ~120 lines/hr without surfacing any new
+            // signal; a flip in either field is the actual breadcrumb.
+            DIAG_DEBUG(NETWORK, "ShotServer") << "health check — isListening:" << listening << "socketDescriptor:" << fd;
+        }
+        m_lastHealthFd = fd;
+        m_lastHealthListening = listening;
+    }
+
+    QList<QPair<QTcpSocket*, bool>> staleConnections;   // socket, sent nothing
+    for (auto it = m_pendingRequests.begin(); it != m_pendingRequests.end(); ++it) {
+        if (!it.value().lastActivity.isValid())
+            continue;
+        // Two deadlines, because "connected and said nothing" and "halfway
+        // through a 400 MB upload" are not the same client. Giving a socket that
+        // has never sent a byte the full five minutes means 64 of them wedge the
+        // server for five minutes, and the wedge is what every real user then
+        // meets as a 503. A client with a request in flight keeps the long
+        // deadline it needs.
+        const bool sentNothing = it.value().headerData.isEmpty() && it.value().headerEnd < 0;
+        const int deadline = sentNothing ? SILENT_TIMEOUT_MS : CONNECTION_TIMEOUT_MS;
+        if (it.value().lastActivity.elapsed() > deadline)
+            staleConnections.append({it.key(), sentNothing});
+    }
+
+    for (const auto& [socket, sentNothing] : std::as_const(staleConnections)) {
+        QString addr = (socket->state() != QAbstractSocket::UnconnectedState)
+            ? socket->peerAddress().toString() : "unknown";
+        // A client that connects and never speaks is a LAN scanner or an idle
+        // keep-alive, handled as designed; one that stalls mid-request lost data.
+        if (sentNothing)
+            DIAG_DEBUG(NETWORK, "ShotServer") << "Closing silent connection from" << addr;
+        else
+            DIAG_WARN(NETWORK, "ShotServer") << "Closing connection stalled mid-request from" << addr;
+        retireSocket(socket);
+    }
+
+    // MCP SSE clients live in McpServer's set; have it run its own probe so
+    // silently-dropped MCP connections are detected on the same 30 s cadence.
+    // McpServer only close()s — ShotServer remains the sole destroyer via
+    // onDisconnected → deleteLater. That contract relies on onNewConnection
+    // wiring `disconnected → onDisconnected` for every accepted socket; if
+    // that connect is ever removed, McpServer::probeSseKeepalives() will leak
+    // the socket because close() will fire disconnected with no slot to
+    // schedule deleteLater().
+    if (m_mcpServer)
+        m_mcpServer->probeSseKeepalives();
+}
+
+void ShotServer::onDiscoveryDatagram()
+{
+    while (m_discoverySocket && m_discoverySocket->hasPendingDatagrams()) {
+        QByteArray datagram;
+        datagram.resize(m_discoverySocket->pendingDatagramSize());
+        QHostAddress senderAddress;
+        quint16 senderPort;
+
+        m_discoverySocket->readDatagram(datagram.data(), datagram.size(), &senderAddress, &senderPort);
+
+        // Check if this is a discovery request
+        if (datagram.trimmed() == "DECENZA_DISCOVER") {
+            DIAG_DEBUG(NETWORK, "ShotServer") << "Discovery request from" << senderAddress.toString() << ":" << senderPort;
+
+            // Build response with device info
+            QString deviceName = QSysInfo::machineHostName();
+            if (deviceName.isEmpty() || deviceName == "localhost") {
+                QString productName = QSysInfo::prettyProductName();
+                if (!productName.isEmpty()) {
+                    deviceName = productName;
+                } else {
+                    deviceName = QSysInfo::productType() + " device";
+                }
+            }
+
+            QJsonObject response;
+            response["type"] = "DECENZA_SERVER";
+            response["deviceName"] = deviceName;
+            response["platform"] = QSysInfo::productType();
+            response["appVersion"] = QString(VERSION_STRING);
+            response["serverUrl"] = url();
+            response["port"] = m_port;
+            response["secure"] = true;
+
+            QByteArray responseData = QJsonDocument(response).toJson(QJsonDocument::Compact);
+            m_discoverySocket->writeDatagram(responseData, senderAddress, senderPort);
+            DIAG_DEBUG(NETWORK, "ShotServer") << "Sent discovery response to" << senderAddress.toString();
+        }
+    }
+}
+
+void ShotServer::handleRequest(QTcpSocket* socket, const QByteArray& request)
+{
+    QString requestStr = QString::fromUtf8(request);
+    QStringList lines = requestStr.split("\r\n");
+    if (lines.isEmpty()) {
+        socket->close();
+        return;
+    }
+
+    QStringList requestLine = lines.first().split(" ");
+    if (requestLine.size() < 2) {
+        socket->close();
+        return;
+    }
+
+    QString method = requestLine[0];
+    QString path = requestLine[1];
+    const QUrl requestUrl = QUrl::fromEncoded(path.toUtf8(), QUrl::StrictMode);
+    const QString routePath = requestUrl.isValid()
+        ? requestUrl.path(QUrl::FullyEncoded) : QString();
+
+    // Keep-alive must not turn the plaintext /mcp exemption into plaintext access to
+    // every other route. tryUpgradeSessionWebSocket() refuses the upgrade path.
+    if (ShotServerTls::refusesPlaintextRequest(socket, requestLine[1].toUtf8())) {
+        socket->disconnectFromHost();
+        return;
+    }
+
+    // Two tiers, because "too noisy" covers two different things.
+    //
+    // Tier 1, never logged: endpoints a page polls on a fixed interval purely to refresh a readout.
+    // Nothing about the Nth identical status GET is diagnostic. /api/power/status joined this list
+    // after a 48-hour capture where a 5 s poll from an open page produced 431 log lines — the
+    // single largest entry under this tag — while the hand-maintained list above it happened not to
+    // mention it. A blocklist only suppresses what somebody remembered to add.
+    //
+    // Tier 2, collapsed: everything else. Real navigation and MCP calls stay visible and prompt (a
+    // path not seen in the last minute logs immediately), while a burst of the same request folds
+    // into one line with a count. That is the general rule, so the next endpoint someone polls
+    // costs one line a minute instead of thousands, with no list to update.
+    const bool neverLog = path.startsWith("/api/debug")
+                          || path == "/api/settings/mqtt/status"
+                          || path == "/api/telemetry"
+                          || path == "/api/power/status";
+    if (!neverLog) {
+        const QString line = QStringLiteral("%1 %2").arg(method, path);
+        LogCollapse::Collapsed collapsed;
+        if (m_requestLog.shouldLog(line, line, QDateTime::currentMSecsSinceEpoch(), &collapsed))
+            DIAG_DEBUG(NETWORK, "ShotServer").noquote() << line + m_requestLog.suffix(collapsed);
+    }
+
+    if (!requestSignedIn(routePath, request)) {
+        sendSignInRequired(socket);
+        return;
+    }
+
+    // Handle auth API routes (only while sign-in is on)
+    if (isSecurityEnabled() && isSignInRoute(routePath)) {
+        // Extract body for POST requests
+        QByteArray body;
+        qsizetype bodyStart = request.indexOf("\r\n\r\n");
+        if (bodyStart != -1) {
+            body = request.mid(bodyStart + 4);
+        }
+        // Store full request on socket for auth handlers that need cookie access
+        socket->setProperty("fullRequest", request);
+        handleAuthRoute(socket, method, path, body);
+        return;
+    }
+
+    // MCP Server routes
+    if (routePath == "/mcp" || routePath.startsWith("/mcp/")) {
+        if (routePath == "/mcp/certificate.pem" && method == "GET") {
+            sendResponse(socket, 200, "application/x-pem-file", m_sslCert.toPem(),
+                         "Content-Disposition: attachment; filename=decenza-server.pem\r\nCache-Control: no-store\r\n");
+            return;
+        }
+        // Install scripts (platform-specific, auto-configure everything)
+        if (routePath == "/mcp/install.sh") {
+            QString serverUrl = url();
+            QString mcpUrl = serverUrl + "/mcp";
+            QString script = QString(R"BASH(#!/bin/bash
+set -e
+echo "Configuring Claude Desktop for Decenza MCP..."
+
+# Check for Node.js (needed for npx/mcp-remote)
+if ! command -v npx &>/dev/null; then
+    echo "Node.js is required but not installed."
+    if command -v brew &>/dev/null; then
+        printf "Install Node.js via Homebrew? (Y/n) "
+        read choice < /dev/tty || true
+        choice=${choice:-Y}
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            echo "Installing Node.js..."
+            if ! brew install node; then
+                echo "Homebrew install failed. Install Node.js from https://nodejs.org then re-run."
+                exit 1
+            fi
+            if ! command -v npx &>/dev/null; then
+                echo "Node.js installed but npx not found. Close and reopen your terminal, then re-run."
+                exit 1
+            fi
+        else
+            echo "Install Node.js from https://nodejs.org then re-run."
+            exit 1
+        fi
+    else
+        echo "Install Node.js from https://nodejs.org then re-run."
+        exit 1
+    fi
+fi
+
+# Configure Claude Desktop
+CONFIG_DIR="$HOME/Library/Application Support/Claude"
+if [ ! -d "$CONFIG_DIR" ]; then
+    echo "Creating config directory: $CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR"
+fi
+CONFIG="$CONFIG_DIR/claude_desktop_config.json"
+
+# Read existing config or create new, then add decenza MCP server
+node -e "
+const fs = require('fs');
+const p = '$CONFIG';
+const certPath = require('path').join(require('path').dirname(p), 'decenza-server.pem');
+fs.writeFileSync(certPath, Buffer.from('%2', 'base64'));
+let config = {};
+try { config = JSON.parse(fs.readFileSync(p, 'utf8')); } catch(e) {
+    if (e.code !== 'ENOENT') { console.error('Could not parse existing config:', e.message); process.exit(1); }
+}
+if (!config.mcpServers) config.mcpServers = {};
+config.mcpServers.decenza = {
+    command: 'npx',
+    args: ['-y', 'mcp-remote', '%1'],
+    env: { NODE_EXTRA_CA_CERTS: certPath }
+};
+fs.writeFileSync(p, JSON.stringify(config, null, 2));
+console.log('Updated:', p);
+"
+
+echo ""
+echo "Done! Restart Claude Desktop and ask:"
+echo '  "What is the state of my espresso machine?"'
+)BASH").arg(mcpUrl, QString::fromLatin1(m_sslCert.toPem().toBase64()));
+
+            sendResponse(socket, 200, "text/plain; charset=utf-8", script.toUtf8());
+            return;
+        }
+
+        if (routePath == "/mcp/install.ps1") {
+            QString serverUrl = url();
+            QString mcpUrl = serverUrl + "/mcp";
+            QString script = QString(R"PS1(
+Write-Host "Configuring Claude Desktop for Decenza MCP..."
+
+# Warn if running as Administrator
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdmin) {
+    Write-Host "WARNING: Running as Administrator. Config will be written to the admin profile." -ForegroundColor Yellow
+    Write-Host "If Claude Desktop runs as your normal user, close this and re-run without 'Run as Administrator'." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# Refresh PATH from registry (picks up Node.js installed in a prior run)
+$env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+
+# Check for Node.js (needed for npx/mcp-remote)
+if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
+    Write-Host "Node.js is required but not installed." -ForegroundColor Yellow
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $choice = Read-Host "Install Node.js via winget? (Y/n)"
+        if ($choice -eq '' -or $choice -match '^[Yy]') {
+            Write-Host "Installing Node.js LTS..."
+            winget install OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements
+            # Refresh PATH for current session
+            $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+            if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
+                Write-Host "Node.js installed but npx not in PATH yet. Close and reopen PowerShell, then re-run." -ForegroundColor Yellow
+                exit 1
+            }
+        } else {
+            Write-Host "Install Node.js from https://nodejs.org then re-run."
+            exit 1
+        }
+    } else {
+        Write-Host "Install Node.js from https://nodejs.org then re-run."
+        exit 1
+    }
+}
+
+# Detect config path - Windows Store vs standard installation
+$configDir = $null
+$storeDir = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter "Claude_*" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($storeDir) {
+    $storeConfigDir = Join-Path $storeDir.FullName "LocalCache\Roaming\Claude"
+    if (Test-Path (Join-Path $storeConfigDir "claude_desktop_config.json")) {
+        $configDir = $storeConfigDir
+    }
+}
+if (-not $configDir -and (Test-Path "$env:APPDATA\Claude\claude_desktop_config.json")) {
+    $configDir = "$env:APPDATA\Claude"
+}
+if (-not $configDir) {
+    # Neither config exists yet - prefer Store path if Store is installed, else standard
+    if ($storeDir) {
+        $configDir = Join-Path $storeDir.FullName "LocalCache\Roaming\Claude"
+        Write-Host "Detected Windows Store installation of Claude Desktop" -ForegroundColor Cyan
+    } else {
+        $configDir = "$env:APPDATA\Claude"
+    }
+}
+if (-not (Test-Path $configDir)) {
+    Write-Host "Creating config directory: $configDir"
+    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+}
+$configPath = "$configDir\claude_desktop_config.json"
+
+if (Test-Path $configPath) {
+    $config = Get-Content $configPath | ConvertFrom-Json
+} else {
+    $config = [PSCustomObject]@{}
+}
+if (-not $config.mcpServers) { $config | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([PSCustomObject]@{}) }
+$certPath = Join-Path $configDir "decenza-server.pem"
+[IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String("%2"))
+$decenza = @{
+    command = "npx"
+    args = @("-y", "mcp-remote", "%1")
+    env = @{ NODE_EXTRA_CA_CERTS = $certPath }
+}
+$config.mcpServers | Add-Member -NotePropertyName decenza -NotePropertyValue $decenza -Force
+$config | ConvertTo-Json -Depth 10 | Set-Content $configPath
+Write-Host "Config updated: $configPath"
+
+# Clean up stale config from wrong path (old script wrote to %APPDATA% for MSIX installs)
+if ($storeDir) {
+    $wrongPath = "$env:APPDATA\Claude\claude_desktop_config.json"
+    if ($configPath -ne $wrongPath -and (Test-Path $wrongPath)) {
+        $wrongConfig = Get-Content $wrongPath | ConvertFrom-Json
+        if ($wrongConfig.mcpServers -and $wrongConfig.mcpServers.decenza) {
+            $wrongConfig.mcpServers.PSObject.Properties.Remove('decenza')
+            if (($wrongConfig.mcpServers.PSObject.Properties | Measure-Object).Count -eq 0) {
+                $wrongConfig.PSObject.Properties.Remove('mcpServers')
+            }
+            $wrongConfig | ConvertTo-Json -Depth 10 | Set-Content $wrongPath
+            Write-Host "Cleaned up stale config from: $wrongPath" -ForegroundColor Yellow
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "Done! Restart Claude Desktop and ask:"
+Write-Host '  "What is the state of my espresso machine?"'
+)PS1").arg(mcpUrl, QString::fromLatin1(m_sslCert.toPem().toBase64()));
+
+            sendResponse(socket, 200, "text/plain; charset=utf-8", script.toUtf8());
+            return;
+        }
+
+        if (routePath == "/mcp/uninstall.sh") {
+            QString script = R"BASH(#!/bin/bash
+set -e
+echo "Removing Decenza MCP from Claude Desktop..."
+
+CONFIG_DIR="$HOME/Library/Application Support/Claude"
+CONFIG="$CONFIG_DIR/claude_desktop_config.json"
+
+if [ ! -f "$CONFIG" ]; then
+    echo "Claude Desktop config not found — nothing to remove."
+    exit 0
+fi
+
+if command -v node &>/dev/null; then
+    node -e "
+const fs = require('fs');
+const p = '$CONFIG';
+try {
+    const config = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (config.mcpServers && config.mcpServers.decenza) {
+        delete config.mcpServers.decenza;
+        if (Object.keys(config.mcpServers).length === 0) delete config.mcpServers;
+        fs.writeFileSync(p, JSON.stringify(config, null, 2));
+        console.log('Removed decenza from:', p);
+    } else {
+        console.log('Decenza not found in config - nothing to remove.');
+    }
+} catch(e) {
+    console.error('Error reading config:', e.message);
+    process.exit(1);
+}
+"
+elif command -v python3 &>/dev/null; then
+    python3 -c "
+import json, sys
+try:
+    with open('$CONFIG') as f:
+        config = json.load(f)
+except Exception as e:
+    print('Error reading config:', e, file=sys.stderr)
+    sys.exit(1)
+if 'mcpServers' in config and 'decenza' in config['mcpServers']:
+    del config['mcpServers']['decenza']
+    if not config['mcpServers']:
+        del config['mcpServers']
+    with open('$CONFIG', 'w') as f:
+        json.dump(config, f, indent=2)
+    print('Removed decenza from:', '$CONFIG')
+else:
+    print('Decenza not found in config - nothing to remove.')
+"
+else
+    echo "ERROR: Neither node nor python3 found. Remove 'decenza' manually from:"
+    echo "  $CONFIG"
+    exit 1
+fi
+
+echo ""
+echo "Done! Restart Claude Desktop to apply."
+)BASH";
+            sendResponse(socket, 200, "text/plain; charset=utf-8", script.toUtf8());
+            return;
+        }
+
+        if (routePath == "/mcp/uninstall.ps1") {
+            QString script = R"PS1(
+Write-Host "Removing Decenza MCP from Claude Desktop..."
+
+# Detect config path - Windows Store vs standard installation
+$configPath = $null
+$storeDir = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter "Claude_*" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($storeDir) {
+    $storePath = Join-Path $storeDir.FullName "LocalCache\Roaming\Claude\claude_desktop_config.json"
+    if (Test-Path $storePath) { $configPath = $storePath }
+}
+if (-not $configPath -and (Test-Path "$env:APPDATA\Claude\claude_desktop_config.json")) {
+    $configPath = "$env:APPDATA\Claude\claude_desktop_config.json"
+}
+if (-not $configPath) {
+    Write-Host "Claude Desktop config not found - nothing to remove."
+    exit 0
+}
+
+$config = Get-Content $configPath | ConvertFrom-Json
+if ($config.mcpServers -and $config.mcpServers.decenza) {
+    $config.mcpServers.PSObject.Properties.Remove('decenza')
+    if (($config.mcpServers.PSObject.Properties | Measure-Object).Count -eq 0) {
+        $config.PSObject.Properties.Remove('mcpServers')
+    }
+    $config | ConvertTo-Json -Depth 10 | Set-Content $configPath
+    Write-Host "Removed decenza from: $configPath"
+} else {
+    Write-Host "Decenza not found in config - nothing to remove."
+}
+
+Write-Host ""
+Write-Host "Done! Restart Claude Desktop to apply."
+)PS1";
+            sendResponse(socket, 200, "text/plain; charset=utf-8", script.toUtf8());
+            return;
+        }
+
+        // Setup guide page (available even when MCP is disabled)
+        if (routePath == "/mcp/setup") {
+            QString html = QString::fromUtf8(R"HTML(<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Decenza MCP Setup</title>
+<style>
+body{font-family:-apple-system,system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;
+background:#1a1a2e;color:#e0e0e0;line-height:1.6}
+h1{color:#6c8cff}h2{color:#8ca0ff;margin-top:32px}
+pre{background:#0d0d1a;padding:16px;border-radius:8px;overflow-x:auto;border:1px solid #333;
+font-size:14px;position:relative}
+code{color:#a0cfff}
+.copy-btn{position:absolute;top:8px;right:8px;background:#6c8cff;color:white;border:none;
+padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px}
+.copy-btn:hover{background:#8ca0ff}
+.step{background:#0d0d1a;padding:16px;border-radius:8px;margin:12px 0;border-left:3px solid #6c8cff}
+.step-num{color:#6c8cff;font-weight:bold;font-size:18px}
+.status{padding:12px;border-radius:8px;margin:16px 0;font-weight:bold}
+.enabled{background:rgba(46,125,50,0.2);border:1px solid #2e7d32;color:#81c784}
+.disabled{background:rgba(198,40,40,0.2);border:1px solid #c62828;color:#ef9a9a}
+a{color:#6c8cff}
+</style></head><body>
+<h1>Decenza MCP Server Setup</h1>
+<div class="status %1">MCP Server: %2</div>
+<p>Connect Claude Desktop to your DE1 espresso machine for AI-powered shot analysis, dial-in advice, and remote control.</p>
+
+<h2>How It Works</h2>
+<p>The MCP server runs inside Decenza on <strong>any platform</strong> (Android tablet, iOS, Windows, macOS, Linux). Claude Desktop on your computer connects to it over your local WiFi network.</p>
+
+<h2>Platform Compatibility</h2>
+<table style="width:100%;border-collapse:collapse;margin:12px 0">
+<tr style="border-bottom:1px solid #333"><td style="padding:8px"><strong>Decenza runs on</strong></td><td style="padding:8px">Any platform &mdash; tablet, phone, or desktop</td></tr>
+<tr style="border-bottom:1px solid #333"><td style="padding:8px"><strong>Claude Desktop connects from</strong></td><td style="padding:8px">macOS or Windows (same WiFi network)</td></tr>
+)HTML"
+#ifdef QT_DEBUG
+R"HTML(
+<tr style="border-bottom:1px solid #333"><td style="padding:8px"><strong>Claude iOS/Android apps</strong></td><td style="padding:8px">Connect via Claude Code Remote Control &mdash; see <em>AI Chat</em> section below</td></tr>
+</table>
+<p><strong>Tip:</strong> You can also use the <em>Discuss</em> button on any shot review page to open any AI (Claude Web, ChatGPT, Gemini, Grok, or a persistent Claude Code Remote Control session) with your shot data &mdash; this works on all platforms.</p>
+)HTML"
+#else
+R"HTML(
+<tr style="border-bottom:1px solid #333"><td style="padding:8px"><strong>Claude iOS/Android apps</strong></td><td style="padding:8px">Connect via Claude Code Remote Control &mdash; see <a href="https://docs.anthropic.com/en/docs/claude-code/remote-control">Remote Control docs</a></td></tr>
+</table>
+<p><strong>Tip:</strong> You can also use the <em>Discuss</em> button on any shot review page to open any AI (Claude Web, ChatGPT, Gemini, Grok, or a persistent Claude Code Remote Control session) with your shot data &mdash; this works on all platforms.</p>
+)HTML"
+#endif
+R"HTML(
+
+<h2>Available Tools (%3)</h2>
+<p>At <strong>Full Automation</strong> access level, Claude can:</p>
+<ul>
+<li>Read machine state, telemetry, water level</li>
+<li>Browse and analyze shot history</li>
+<li>Get dial-in context and suggest improvements</li>
+<li>Start/stop espresso, steam, hot water, flush (DE1 v1.0 headless machines only &mdash; most machines with GHC require physical button press)</li>
+<li>Change profiles, settings, and grinder parameters</li>
+</ul>
+
+<h2>Access Levels</h2>
+<ul>
+<li><strong>Monitor Only</strong> &mdash; read state, history, profiles (no control)</li>
+<li><strong>Control</strong> &mdash; + start/stop operations, wake/sleep</li>
+<li><strong>Full Automation</strong> &mdash; + change profiles, settings, parameters</li>
+</ul>
+
+<h2>Prerequisites</h2>
+<div class="step"><a href="https://nodejs.org">Node.js</a> is required (the install script will offer to install it automatically if missing).</div>
+
+<h2>Setup Steps</h2>
+<div class="step"><span class="step-num">1.</span> Enable MCP in Decenza: Settings &gt; AI &gt; MCP Server &gt; toggle ON</div>
+<div class="step"><span class="step-num">2.</span> On your computer, install <a href="https://claude.ai/download">Claude Desktop</a></div>
+<div class="step"><span class="step-num">3.</span> <a id="installScriptLink" download>Download the installer</a> through this browser, then run it from your Downloads folder to configure Claude Desktop:
+<pre id="installCmd"><code id="installCmdText">Loading...</code><button class="copy-btn" onclick="copyCmd('installCmdText',this)">Copy</button></pre></div>
+<div class="step"><span class="step-num">4.</span> Restart Claude Desktop (Quit &amp; reopen)</div>
+<div class="step"><span class="step-num">5.</span> Ask Claude: <em>"What's the current state of my espresso machine?"</em></div>
+
+<h2>Uninstall</h2>
+<p>To remove the Decenza MCP server from Claude Desktop, <a id="uninstallScriptLink" download>download the uninstaller</a>, then run it:</p>
+<pre id="uninstallCmd"><code id="uninstallCmdText">Loading...</code><button class="copy-btn" onclick="copyCmd('uninstallCmdText',this)">Copy</button></pre>
+<p style="color:#999;font-size:13px">Then restart Claude Desktop.</p>
+
+)HTML"
+#ifdef QT_DEBUG
+R"HTML(
+<h2>AI Chat (Claude Code Remote Control)</h2>
+<p>Start a persistent Decenza dialing-journal session you can talk to from the Claude iOS, Android, or desktop app. Claude reads live bean and shot data from MCP and maintains a per-bean log file on your computer across sessions.</p>
+
+<div class="step"><span class="step-num">1.</span> Install <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code CLI</a> on your Mac, Windows, or Linux computer</div>
+
+<div class="step"><span class="step-num">2.</span> Create a working directory (Claude uses this for <code>CLAUDE.md</code> and the <code>dialing/</code> log folder):
+<pre><code>mkdir ~/Decenza-AI &amp;&amp; cd ~/Decenza-AI</code></pre></div>
+
+<div class="step"><span class="step-num">3.</span> Create a <code>.mcp.json</code> file in that directory &mdash; Claude Code auto-loads MCP servers from this file in the current working directory:
+<p><a href="/mcp/certificate.pem" download="decenza-server.pem">Download this device's certificate</a>, then replace the certificate path below with its absolute saved path.</p>
+<pre id="rcMcpJson"><code id="rcMcpJsonText">Loading...</code><button class="copy-btn" onclick="copyCmd('rcMcpJsonText',this)">Copy</button></pre></div>
+
+<div class="step"><span class="step-num">4.</span> Run <code>claude</code> once in that directory to accept two first-time prompts &mdash; Claude Code blocks <code>remote-control</code> until both are answered:
+<pre><code>claude</code></pre>
+<ol style="margin:8px 0 0 20px;padding:0;color:#c0c0c0;font-size:13px">
+<li><strong>Workspace trust dialog</strong> &mdash; accept that you trust this folder</li>
+<li><strong>MCP server approval</strong> (<em>"New MCP server found in .mcp.json: decenza"</em>) &mdash; select <strong>"1. Use this and all future MCP servers in this project"</strong> so Decenza is enabled for all future sessions in this directory</li>
+</ol>
+<p style="margin:8px 0 0 0;color:#999;font-size:13px">Then type <code>/exit</code> or press Ctrl+C to return to your shell.</p></div>
+
+<div class="step"><span class="step-num">5.</span> Start the Remote Control session:
+<pre><code>claude remote-control --name "Decenza_REMOTE" --spawn=session</code></pre>
+<p style="margin:8px 0 0 0;color:#c0c0c0;font-size:13px"><code>--spawn=session</code> keeps it to one persistent session named <strong>Decenza_REMOTE</strong> in your Claude session list &mdash; without this flag the default server mode spawns sessions on demand and names them after your hostname.</p>
+<p style="margin:4px 0 0 0;color:#c0c0c0;font-size:13px">Claude Code prints a session URL to the terminal &mdash; keep this terminal open so the session stays alive.</p></div>
+
+<div class="step"><span class="step-num">6.</span> In Decenza: Settings &rarr; AI &rarr; Discuss app &rarr; <strong>Claude Desktop</strong>, then paste the session URL into the field</div>
+
+<div class="step"><span class="step-num">7.</span> Open the session from any Claude client (iOS, Android, desktop app, or browser) and ask: <em>"Set up Decenza AI chat"</em> &mdash; Claude will call <code>get_agent_file</code>, write <code>CLAUDE.md</code>, and create the <code>dialing/</code> folder automatically.</div>
+
+<p style="color:#999;font-size:13px">After setup, tapping <em>Discuss</em> on any shot review page opens the same session directly, with live bean and shot context already available.</p>
+)HTML"
+#endif
+R"HTML(
+
+<script>
+(function(){
+var p=navigator.platform||navigator.userAgent||'';
+var isMac=p.indexOf('Mac')>=0;
+var isWin=p.indexOf('Win')>=0;
+var o=location.origin;
+
+var extension=isWin?'ps1':'sh';
+['install','uninstall'].forEach(function(action){
+var filename='decenza-mcp-'+action+'.'+extension;
+var link=document.getElementById(action+'ScriptLink');
+link.href=o+'/mcp/'+action+'.'+extension;
+link.download=filename;
+document.getElementById(action+'CmdText').textContent=isWin
+? 'Get-Content -Raw "$HOME\\Downloads\\'+filename+'" | Invoke-Expression'
+: 'bash "$HOME/Downloads/'+filename+'"';
+});
+
+)HTML"
+#ifdef QT_DEBUG
+R"HTML(
+// .mcp.json payload for `claude remote-control`
+var rcMcpJson =
+'{\n' +
+'  "mcpServers": {\n' +
+'    "decenza": {\n' +
+'      "command": "npx",\n' +
+'      "args": ["-y", "mcp-remote", "'+o+'/mcp"],\n' +
+'      "env": {"NODE_EXTRA_CA_CERTS": "/absolute/path/to/decenza-server.pem"}\n' +
+'    }\n' +
+'  }\n' +
+'}';
+document.getElementById('rcMcpJsonText').textContent = rcMcpJson;
+)HTML"
+#endif
+R"HTML(
+})();
+</script>
+
+<script>
+function copyCmd(id,btn){
+var text=document.getElementById(id).textContent;
+if(navigator.clipboard&&window.isSecureContext){
+navigator.clipboard.writeText(text).then(function(){btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy'},2000)});
+}else{
+var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';
+document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);
+btn.textContent='Copied!';setTimeout(function(){btn.textContent='Copy'},2000);
+}
+}
+</script>
+</body></html>)HTML");
+
+            bool mcpOn = m_settings && m_settings->mcp()->mcpEnabled();
+            qsizetype toolCount = m_mcpServer
+                ? m_mcpServer->toolRegistry()->listTools(2, QStringLiteral("2025-11-25")).size()
+                : 0;
+
+            html = html.arg(mcpOn ? "enabled" : "disabled",
+                           mcpOn ? "Enabled" : "Disabled",
+                           QString::number(toolCount));
+
+            sendHtml(socket, html);
+            return;
+        }
+
+        if (!m_mcpServer || !m_settings || !m_settings->mcp()->mcpEnabled()) {
+            sendResponse(socket, 404, "text/plain", "Not Found");
+            return;
+        }
+        // Extract headers from the raw request
+        qsizetype headerEnd = request.indexOf("\r\n\r\n");
+        QByteArray headers = (headerEnd > 0) ? request.left(headerEnd) : QByteArray();
+        QByteArray body;
+        if (headerEnd > 0 && headerEnd + 4 < request.size())
+            body = request.mid(headerEnd + 4);
+        m_mcpServer->handleHttpRequest(socket, method, path, headers, body);
+        return;
+    }
+
+    // Route requests
+    if (const QString iconPath = ShotServerWebRoute::iconResource(routePath); !iconPath.isEmpty()) {
+        if (method != "GET") {
+            sendResponse(socket, 405, "text/plain", "Use GET", "Allow: GET\r\n");
+            return;
+        }
+        QFile icon(iconPath);
+        if (!icon.open(QIODevice::ReadOnly)) {
+            sendResponse(socket, 404, "text/plain", "Not Found");
+            return;
+        }
+        sendResponse(socket, 200, "image/png", icon.readAll(),
+                     "Cache-Control: public, max-age=86400\r\nX-Content-Type-Options: nosniff\r\n");
+        return;
+    }
+    if (routePath == QStringLiteral("/")) {
+        handleWebClientAsset(socket, method, ShotServerWebRoute::wasmRootTarget(path), request);
+        return;
+    }
+    if (routePath == "/wasm" || routePath.startsWith("/wasm/")) {
+        handleWebClientAsset(socket, method, path, request);
+        return;
+    }
+    if (path == "/api/shots") {
+        QPointer<QTcpSocket> socketGuard(socket);
+        QString dbPath = m_storage->databasePath();
+        auto destroyed = m_destroyed;
+        QThread* thread = QThread::create([this, socketGuard, dbPath, destroyed]() {
+            QVariantList shots;
+            bool success = false;
+            withTempDb(dbPath, "shs_web_api", [&](QSqlDatabase& db) {
+                success = queryShotList(db, shots);
+            });
+
+            if (*destroyed) return;
+            QMetaObject::invokeMethod(this, [this, socketGuard, destroyed, success,
+                                             ownedShots = std::move(shots)]() {
+                if (*destroyed || !socketGuard) return;
+                if (!success) {
+                    sendResponse(socketGuard, 500, "application/json", R"({"error":"Database unavailable"})");
+                } else {
+                    QJsonArray arr;
+                    for (const QVariant& v : ownedShots)
+                        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+                    sendJson(socketGuard, QJsonDocument(arr).toJson(QJsonDocument::Compact));
+                }
+            }, Qt::QueuedConnection);
+        });
+        connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+        thread->start();
+    }
+    else if (path.startsWith("/api/shot/")) {
+        bool ok;
+        qint64 shotId = path.mid(10).toLongLong(&ok);
+        if (!ok) {
+            sendResponse(socket, 400, "application/json", R"({"error":"Invalid shot ID"})");
+            return;
+        }
+        QPointer<QTcpSocket> socketGuard(socket);
+        QString dbPath = m_storage->databasePath();
+        auto destroyed = m_destroyed;
+        QThread* thread = QThread::create([this, socketGuard, dbPath, shotId, destroyed]() {
+            ShotProjection shot;
+            bool dbOpened = withTempDb(dbPath, "shs_web_get", [&](QSqlDatabase& db) {
+                ShotRecord record = ShotHistoryStorage::loadShotRecordStatic(db, shotId, nullptr, Q_FUNC_INFO);
+                shot = ShotHistoryStorage::convertShotRecord(record);
+            });
+
+            if (*destroyed) return;
+            QMetaObject::invokeMethod(this, [this, socketGuard, destroyed, dbOpened,
+                                             ownedShot = std::move(shot)]() {
+                if (*destroyed || !socketGuard) return;
+                if (!dbOpened) {
+                    sendResponse(socketGuard, 500, "application/json", R"({"error":"Database unavailable"})");
+                } else if (ownedShot.id == 0) {
+                    sendResponse(socketGuard, 404, "application/json", R"({"error":"Shot not found"})");
+                } else {
+                    sendJson(socketGuard, QJsonDocument(ownedShot.toJsonObject()).toJson());
+                }
+            }, Qt::QueuedConnection);
+        });
+        connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+        thread->start();
+    }
+    else if (path == "/api/debug/file/zip") {
+        // Return persisted log as a ZIP file for smaller downloads
+        QString log = WebDebugLogger::instance() ? WebDebugLogger::instance()->getPersistedLog() : QString();
+        if (m_memoryMonitor)
+            log += m_memoryMonitor->toSummaryString();
+
+        QBuffer zipBuffer;
+        zipBuffer.open(QIODevice::WriteOnly);
+        bool zipOk = false;
+        {
+            QuaZip writer(&zipBuffer);
+            zipOk = writer.open(QuaZip::mdCreate)
+                && ZipArchive::addFile(writer, QStringLiteral("debug.log"), log.toUtf8());
+            writer.close();
+            zipOk = zipOk && writer.getZipError() == UNZ_OK;
+        }
+
+        if (zipOk) {
+            sendResponse(socket, 200, "application/zip", zipBuffer.data(),
+                         "Content-Disposition: attachment; filename=\"debug.zip\"\r\n");
+        } else {
+            DIAG_WARN(NETWORK, "ShotServer") << "Failed to create debug ZIP";
+            sendResponse(socket, 500, "text/plain", "Failed to create ZIP file");
+        }
+    }
+    else if (path == "/api/power" || path == "/api/power/status") {
+        // Return current power state
+        QJsonObject result;
+        if (m_device) {
+            bool isAwake = m_device->isConnected() &&
+                          (m_device->state() != DE1::State::Sleep &&
+                           m_device->state() != DE1::State::GoingToSleep);
+            result["connected"] = m_device->isConnected();
+            result["state"] = m_device->stateString();
+            result["substate"] = m_device->subStateString();
+            result["awake"] = isAwake;
+        } else {
+            result["connected"] = false;
+            result["state"] = "Unknown";
+            result["awake"] = false;
+        }
+        sendJson(socket, QJsonDocument(result).toJson(QJsonDocument::Compact));
+    }
+    // Wake and sleep take POST only: over plain HTTP a GET from an <img> on another
+    // site is indistinguishable from curl (webrequestguard.h), and POST carries Origin.
+    else if (path == "/api/power/wake" || path == "/api/power/sleep") {
+        if (method != "POST") {
+            sendResponse(socket, 405, "application/json",
+                         R"JSON({"error":"Use POST (also POST /api/command with {\"command\":\"wake\"|\"sleep\"})"})JSON",
+                         "Allow: POST\r\n");
+            return;
+        }
+        if (path == "/api/power/wake" && m_device) {
+            m_device->wakeUp();
+            DIAG_DEBUG(NETWORK, "ShotServer") << "Wake command sent via web";
+        }
+        if (path == "/api/power/sleep" && m_device) {
+            m_device->goToSleep();
+            DIAG_DEBUG(NETWORK, "ShotServer") << "Sleep command sent via web";
+        }
+        sendJson(socket, path == "/api/power/wake" ? R"({"success":true,"action":"wake"})"
+                                                   : R"({"success":true,"action":"sleep"})");
+    }
+    // Home Automation API endpoints
+    else if (path == "/api/state") {
+        sendJson(socket, QJsonDocument(sessionStateSnapshot()).toJson(QJsonDocument::Compact));
+    }
+    else if (path == "/api/telemetry") {
+        sendJson(socket, QJsonDocument(sessionTelemetrySnapshot()).toJson(QJsonDocument::Compact));
+    }
+    else if (path.startsWith("/api/session/bean-image/")) {
+        handleSessionBeanImage(socket, method, path);
+    }
+    else if (path.startsWith("/api/session/background-image")
+             || path.startsWith("/api/session/background-preview/")) {
+        handleSessionBackgroundImage(socket, method, path);
+    }
+    else if (path.startsWith("/api/screensaver/media/")) {
+        handleScreensaverMedia(socket, method, path, request);
+    }
+    else if (path == "/api/command" && method == "POST") {
+        // Parse JSON body from request
+        qsizetype bodyStart = request.indexOf("\r\n\r\n");
+        if (bodyStart >= 0) {
+            QByteArray body = request.mid(bodyStart + 4);
+            QJsonDocument doc = QJsonDocument::fromJson(body);
+            QString command = doc.object()["command"].toString().toLower();
+
+            if (command == "wake") {
+                if (m_device) {
+                    m_device->wakeUp();
+                    DIAG_DEBUG(NETWORK, "ShotServer") << "Wake command sent via /api/command";
+                }
+                sendJson(socket, R"({"success":true,"command":"wake"})");
+            } else if (command == "sleep") {
+                if (m_device) {
+                    m_device->goToSleep();
+                    DIAG_DEBUG(NETWORK, "ShotServer") << "Sleep command sent via /api/command";
+                }
+                sendJson(socket, R"({"success":true,"command":"sleep"})");
+            } else {
+                sendResponse(socket, 400, "application/json",
+                    R"({"error":"Invalid command. Valid commands: wake, sleep"})");
+            }
+        } else {
+            sendResponse(socket, 400, "application/json", R"({"error":"Missing request body"})");
+        }
+    }
+    else if (path == "/api/pocket/pair" && method == "POST") {
+        qsizetype bodyStart = request.indexOf("\r\n\r\n");
+        if (bodyStart >= 0) {
+            QByteArray body = request.mid(bodyStart + 4);
+            handlePocketPair(socket, body);
+        } else {
+            sendResponse(socket, 400, "application/json", R"({"error":"Missing request body"})");
+        }
+    }
+    else if (path == "/api/pocket/status") {
+        handlePocketStatus(socket);
+    }
+    else if (path == "/api/backup/manifest") {
+        handleBackupManifest(socket);
+    }
+    else if (path == "/api/backup/settings" || path.startsWith("/api/backup/settings?")) {
+        bool includeSensitive = path.contains("includeSensitive=true");
+        handleBackupSettings(socket, includeSensitive);
+    }
+    else if (path == "/api/backup/extra-settings") {
+        handleBackupExtraSettings(socket);
+    }
+    else if (path == "/api/backup/profiles") {
+        handleBackupProfilesList(socket);
+    }
+    else if (path.startsWith("/api/backup/profile/")) {
+        // /api/backup/profile/{category}/{filename} - download individual profile
+        // Category can be compound (e.g., "external/user"), so split on LAST slash
+        QString remainder = path.mid(20);  // After "/api/backup/profile/"
+        qsizetype slashIdx = remainder.lastIndexOf('/');
+        if (slashIdx > 0) {
+            QString category = remainder.left(slashIdx);
+            QString filename = QUrl::fromPercentEncoding(remainder.mid(slashIdx + 1).toUtf8());
+            handleBackupProfileFile(socket, category, filename);
+        } else {
+            sendResponse(socket, 400, "application/json", R"({"error":"Invalid profile path"})");
+        }
+    }
+    else if (path == "/api/backup/shots") {
+        // Create a safe backup copy on background thread, then send it
+        QPointer<QTcpSocket> socketGuard(socket);
+        QString dbPath = m_storage->databasePath();
+        auto destroyed = m_destroyed;
+        QThread* thread = QThread::create([this, socketGuard, dbPath, destroyed]() {
+            QString tempDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+            QString tempPath = tempDir + "/backup_web_" + QString::number(QDateTime::currentMSecsSinceEpoch()) + ".db";
+
+            QString result = ShotHistoryStorage::createBackupStatic(dbPath, tempPath);
+            QByteArray fileData;
+            if (!result.isEmpty()) {
+                QFile f(tempPath);
+                if (f.open(QIODevice::ReadOnly)) {
+                    fileData = f.readAll();
+                } else {
+                    DIAG_WARN(NETWORK, "ShotServer") << "Failed to read backup file:" << f.errorString();
+                }
+            } else {
+                DIAG_WARN(NETWORK, "ShotServer") << "createBackupStatic failed for" << dbPath << "->" << tempPath;
+            }
+            if (QFile::exists(tempPath))
+                QFile::remove(tempPath);
+
+            if (*destroyed) return;
+            QMetaObject::invokeMethod(this, [this, socketGuard, destroyed,
+                                             ownedFileData = std::move(fileData)]() {
+                if (*destroyed || !socketGuard) return;
+                if (!ownedFileData.isEmpty()) {
+                    sendResponse(socketGuard, 200, "application/x-sqlite3", ownedFileData);
+                } else {
+                    sendResponse(socketGuard, 500, "application/json", R"({"error":"Failed to create backup"})");
+                }
+            }, Qt::QueuedConnection);
+        });
+        connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+        thread->start();
+    }
+    else if (path == "/api/backup/media") {
+        handleBackupMediaList(socket);
+    }
+    else if (path.startsWith("/api/backup/media/")) {
+        // /api/backup/media/{filename} - download individual media file
+        QString filename = QUrl::fromPercentEncoding(path.mid(18).toUtf8());
+        handleBackupMediaFile(socket, filename);
+    }
+    else if (path == "/api/backup/ai-conversations") {
+        handleBackupAIConversations(socket);
+    }
+    // Full backup download/restore
+    else if (path == "/api/backup/full") {
+        handleBackupFull(socket);
+    }
+    else if (path.startsWith("/api/library/thumbnail")) {
+        handleLayoutApi(socket, method, path);
+    }
+    else {
+        sendResponse(socket, 404, "text/plain", "Not Found");
+    }
+}
+
+void ShotServer::sendResponse(QTcpSocket* rawSocket, int statusCode, const QString& contentType,
+                               const QByteArray& body, const QByteArray& extraHeaders)
+{
+    // Raw socket pointers reach this function via posted QMetaCallEvents and
+    // multiple synchronous frames. If the peer drops the TCP connection while a
+    // queued event is in flight, onDisconnected → deleteLater can destroy the
+    // socket before/while we write. Wrap once in QPointer so a mid-call
+    // destruction reads as null rather than a UAF on the underlying QIODevice.
+    QPointer<QTcpSocket> socket(rawSocket);
+    if (!socket || socket->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+
+    QString statusText;
+    switch (statusCode) {
+        case 200: statusText = "OK"; break;
+        case 302: statusText = "Found"; break;
+        case 400: statusText = "Bad Request"; break;
+        case 401: statusText = "Unauthorized"; break;
+        case 403: statusText = "Forbidden"; break;
+        case 404: statusText = "Not Found"; break;
+        case 405: statusText = "Method Not Allowed"; break;
+        case 406: statusText = "Not Acceptable"; break;
+        case 409: statusText = "Conflict"; break;
+        case 413: statusText = "Payload Too Large"; break;
+        case 416: statusText = "Range Not Satisfiable"; break;
+        case 429: statusText = "Too Many Requests"; break;
+        case 503: statusText = "Service Unavailable"; break;
+        default: statusText = "Unknown"; break;
+    }
+
+    QByteArray response;
+    response.append(QString("HTTP/1.1 %1 %2\r\n").arg(statusCode).arg(statusText).toUtf8());
+    response.append(QString("Content-Type: %1\r\n").arg(contentType).toUtf8());
+    response.append(QString("Content-Length: %1\r\n").arg(body.size()).toUtf8());
+    // A page framed by another site can be clicked through an overlay, and its
+    // own fetches are same-origin, so the cross-site guard would let them pass.
+    if (contentType.startsWith(QLatin1String("text/html")))
+        response.append("X-Frame-Options: SAMEORIGIN\r\nContent-Security-Policy: frame-ancestors 'self'\r\n");
+    response.append("Connection: keep-alive\r\n");
+    response.append(QString("Keep-Alive: timeout=%1\r\n").arg(KEEPALIVE_TIMEOUT_S).toUtf8());
+    if (!extraHeaders.isEmpty()) {
+        response.append(extraHeaders);
+    }
+    response.append("\r\n");
+    response.append(body);
+
+    if (!socket) return;
+    socket->write(response);
+    if (!socket) return;
+    socket->flush();
+    if (!socket) return;
+    // Arm the idle-close timer for HTTP keep-alive: drop the connection if no
+    // further request arrives within KEEPALIVE_TIMEOUT_S seconds.
+    resetKeepAliveTimer(socket);
+}
+
+void ShotServer::resetKeepAliveTimer(QTcpSocket* socket)
+{
+    // Don't create timers for sockets that are already disconnecting/closed —
+    // the timer (parented to the socket) would be destroyed by deleteLater()
+    // while the pointer remains in m_keepAliveTimers, causing a dangling access.
+    if (socket->state() != QAbstractSocket::ConnectedState) return;
+
+    QTimer* timer = m_keepAliveTimers.value(socket);
+    if (!timer) {
+        timer = new QTimer(socket);
+        timer->setSingleShot(true);
+        connect(timer, &QTimer::timeout, socket, [this, socket]() {
+            m_keepAliveTimers.remove(socket);
+            socket->disconnectFromHost();
+        });
+        m_keepAliveTimers[socket] = timer;
+    }
+    timer->start(KEEPALIVE_TIMEOUT_S * 1000);
+}
+
+void ShotServer::sendJson(QTcpSocket* socket, const QByteArray& json)
+{
+    sendResponse(socket, 200, "application/json", json);
+}
+
+
+
+void ShotServer::sendHtml(QTcpSocket* socket, const QString& html)
+{
+    sendResponse(socket, 200, "text/html; charset=utf-8", html.toUtf8());
+}
+
+void ShotServer::sendFile(QTcpSocket* rawSocket, const QString& path, const QString& contentType)
+{
+    // waitForBytesWritten() below spins a local event loop, so unlike
+    // sendResponse the socket really can be destroyed mid-function via a
+    // deleteLater queued from onDisconnected. Hold a QPointer and re-check it
+    // after every operation that yields to the event loop.
+    QPointer<QTcpSocket> socket(rawSocket);
+    if (!socket || socket->state() != QAbstractSocket::ConnectedState) return;
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        sendResponse(socket, 404, "text/plain", "File not found");
+        return;
+    }
+
+    qint64 fileSize = file.size();
+    QString filename = QFileInfo(path).fileName();
+    filename.replace(QRegularExpression("[^a-zA-Z0-9_.-]"), "_");
+
+    // Send headers
+    QByteArray headers = QString(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %1\r\n"
+        "Content-Length: %2\r\n"
+        "Content-Disposition: attachment; filename=\"%3\"\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).arg(contentType).arg(fileSize).arg(filename).toUtf8();
+
+    if (!socket) return;
+    if (socket->write(headers) == -1) {
+        DIAG_WARN(NETWORK, "ShotServer") << "sendFile: Failed to write headers -" << socket->errorString();
+        if (socket) socket->abort();
+        return;
+    }
+
+    // Stream file in 64KB chunks to avoid OOM on large databases
+    const qint64 chunkSize = 64 * 1024;
+    bool success = true;
+    while (!file.atEnd()) {
+        QByteArray chunk = file.read(chunkSize);
+        if (chunk.isEmpty() && !file.atEnd()) {
+            DIAG_WARN(NETWORK, "ShotServer") << "sendFile: File read error -" << file.errorString();
+            success = false;
+            break;
+        }
+        if (!socket) return;
+        if (socket->write(chunk) == -1) {
+            DIAG_WARN(NETWORK, "ShotServer") << "sendFile: Socket write failed -" << socket->errorString();
+            success = false;
+            break;
+        }
+        if (!socket) return;
+        if (!socket->waitForBytesWritten(5000)) {
+            // Either a write timeout OR the socket was destroyed by a
+            // deleteLater fired from the nested event loop above.
+            if (socket) DIAG_WARN(NETWORK, "ShotServer") << "sendFile: Write timed out";
+            success = false;
+            break;
+        }
+    }
+
+    if (!socket) return;
+    if (success) {
+        socket->flush();
+        if (socket) socket->disconnectFromHost();
+    } else {
+        socket->abort();
+    }
+}
+
+
+
+bool ShotServer::setupTls()
+{
+    QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dataDir);
+    QString certPath = dataDir + "/server.crt";
+    QString keyPath = dataDir + "/server.key";
+
+    // Apple platforms use RSA keys (SecureTransport requires RSA/DSA for PKCS12), others use EC.
+    // An EC key left by an older macOS build fails to load as RSA and is regenerated below.
+#ifdef Q_OS_DARWIN
+    const auto keyAlgo = QSsl::Rsa;
+#else
+    const auto keyAlgo = QSsl::Ec;
+#endif
+
+    const auto loadCertificate = [&]() {
+        QFile certFile(certPath);
+        QFile keyFile(keyPath);
+        if (!certFile.open(QIODevice::ReadOnly) || !keyFile.open(QIODevice::ReadOnly)) {
+            DIAG_WARN(NETWORK, "ShotServer") << "Cannot open TLS files: certificateOpen="
+                     << certFile.isOpen() << "error=" << certFile.errorString()
+                     << "keyOpen=" << keyFile.isOpen() << "error=" << keyFile.errorString();
+            return false;
+        }
+        const QByteArray certPem = certFile.readAll();
+        const QByteArray keyPem = keyFile.readAll();
+        if (certFile.error() != QFileDevice::NoError || keyFile.error() != QFileDevice::NoError) {
+            DIAG_WARN(NETWORK, "ShotServer") << "TLS file read errors: certificate="
+                     << certFile.errorString() << "key=" << keyFile.errorString();
+        }
+
+        m_sslCert = QSslCertificate(certPem, QSsl::Pem);
+        m_sslKey = QSslKey(keyPem, keyAlgo, QSsl::Pem);
+        return !m_sslCert.isNull() && !m_sslKey.isNull();
+    };
+
+    // Check if cert/key already exist
+    if (QFile::exists(certPath) && QFile::exists(keyPath)) {
+        if (loadCertificate()) {
+            if (m_sslCert.expiryDate() <= QDateTime::currentDateTime()) {
+                DIAG_DEBUG(NETWORK, "ShotServer") << "TLS certificate expired, regenerating";
+            } else if (!ShotServerTls::coversAddresses(m_sslCert.subjectAlternativeNames(),
+                                                     ShotServerTls::localAddresses())) {
+                DIAG_INFO(NETWORK, "ShotServer") << "Regenerating HTTPS certificate to cover current network addresses";
+            } else {
+                DIAG_DEBUG(NETWORK, "ShotServer") << "Loaded existing TLS certificate, expires" << m_sslCert.expiryDate().toString();
+                return true;
+            }
+        } else {
+            DIAG_DEBUG(NETWORK, "ShotServer") << "Existing cert/key invalid or wrong type, regenerating";
+        }
+    }
+
+    // Generate new self-signed certificate
+    if (!generateSelfSignedCert(certPath, keyPath)) {
+        DIAG_WARN(NETWORK, "ShotServer") << "Failed to generate self-signed certificate";
+        return false;
+    }
+
+    // Load the newly generated cert/key
+    if (!loadCertificate()) {
+        DIAG_WARN(NETWORK, "ShotServer") << "Generated certificate or key is invalid";
+        return false;
+    }
+
+    DIAG_DEBUG(NETWORK, "ShotServer") << "Generated new TLS certificate, expires" << m_sslCert.expiryDate().toString();
+    return true;
+}
+
+#ifdef Q_OS_DARWIN
+// ---------------------------------------------------------------------------
+// Apple: Self-signed certificate generation using Apple Security.framework
+// Uses SecKeyCreateRandomKey for RSA-2048 and manual DER/ASN.1 encoding
+// for X509v3 with Subject Alternative Names. No OpenSSL dependency.
+// ---------------------------------------------------------------------------
+
+// ASN.1 DER encoding helpers
+// qsizetype, not int: callers pass QByteArray::size(). Only Apple builds compile this,
+// and only iOS reported the narrowing.
+static QByteArray derLength(qsizetype len)
+{
+    QByteArray out;
+    if (len < 128) {
+        out.append(static_cast<char>(len));
+    } else if (len < 256) {
+        out.append(static_cast<char>(0x81));
+        out.append(static_cast<char>(len));
+    } else {
+        out.append(static_cast<char>(0x82));
+        out.append(static_cast<char>((len >> 8) & 0xFF));
+        out.append(static_cast<char>(len & 0xFF));
+    }
+    return out;
+}
+
+static QByteArray derTag(unsigned char tag, const QByteArray& content)
+{
+    QByteArray out;
+    out.append(static_cast<char>(tag));
+    out.append(derLength(content.size()));
+    out.append(content);
+    return out;
+}
+
+static QByteArray derSequence(const QByteArray& content) { return derTag(0x30, content); }
+static QByteArray derSet(const QByteArray& content) { return derTag(0x31, content); }
+static QByteArray derOctetString(const QByteArray& content) { return derTag(0x04, content); }
+
+static QByteArray derInteger(const QByteArray& val)
+{
+    QByteArray v = val;
+    // Ensure positive by prepending 0x00 if high bit is set
+    if (!v.isEmpty() && (static_cast<unsigned char>(v[0]) & 0x80))
+        v.prepend(static_cast<char>(0x00));
+    return derTag(0x02, v);
+}
+
+static QByteArray derBitString(const QByteArray& content)
+{
+    QByteArray v;
+    v.append(static_cast<char>(0x00)); // no unused bits
+    v.append(content);
+    return derTag(0x03, v);
+}
+
+static QByteArray derOid(const char* bytes, int len)
+{
+    return derTag(0x06, QByteArray(bytes, len));
+}
+
+static QByteArray derUtf8String(const QByteArray& s) { return derTag(0x0C, s); }
+
+static QByteArray derTime(const QDateTime& dt)
+{
+    // RFC 5280 §4.1.2.5: UTCTime for years through 2049, GeneralizedTime for 2050+
+    QDateTime utc = dt.toUTC();
+    if (utc.date().year() >= 2050) {
+        // GeneralizedTime format: YYYYMMDDHHMMSSZ
+        QByteArray s = utc.toString("yyyyMMddHHmmss").toLatin1() + "Z";
+        return derTag(0x18, s);
+    }
+    // UTCTime format: YYMMDDHHMMSSZ
+    QByteArray s = utc.toString("yyMMddHHmmss").toLatin1() + "Z";
+    return derTag(0x17, s);
+}
+
+static QByteArray derExplicitTag(int tagNum, const QByteArray& content)
+{
+    return derTag(static_cast<unsigned char>(0xA0 | tagNum), content);
+}
+
+// OID constants
+// Not OID_*: macOS's Security/oidsbase.h defines OID_RSA as a macro.
+static const char kOidSha256Rsa[]      = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b"; // 1.2.840.113549.1.1.11
+static const char kOidRsa[]            = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"; // 1.2.840.113549.1.1.1
+static const char kOidCommonName[]     = "\x55\x04\x03";                           // 2.5.4.3
+static const char kOidSubjectAltName[] = "\x55\x1d\x11";                           // 2.5.29.17
+
+static QByteArray sha256RsaAlgorithm()
+{
+    return derSequence(derOid(kOidSha256Rsa, 9) + derTag(0x05, QByteArray())); // AlgorithmIdentifier { sha256WithRSA, NULL }
+}
+
+static QByteArray buildSanExtension(const QStringList& sanEntries)
+{
+    QByteArray generalNames;
+    for (const QString& entry : sanEntries) {
+        if (entry.startsWith("DNS:")) {
+            QByteArray dns = entry.mid(4).toLatin1();
+            generalNames.append(derTag(0x82, dns)); // [2] dNSName
+        } else if (entry.startsWith("IP:")) {
+            QHostAddress addr(entry.mid(3));
+            quint32 ip4 = addr.toIPv4Address();
+            QByteArray ipBytes;
+            ipBytes.append(static_cast<char>((ip4 >> 24) & 0xFF));
+            ipBytes.append(static_cast<char>((ip4 >> 16) & 0xFF));
+            ipBytes.append(static_cast<char>((ip4 >> 8) & 0xFF));
+            ipBytes.append(static_cast<char>(ip4 & 0xFF));
+            generalNames.append(derTag(0x87, ipBytes)); // [7] iPAddress
+        }
+    }
+    // Extension: OID + critical=false + OCTET STRING wrapping the GeneralNames SEQUENCE
+    return derSequence(derOid(kOidSubjectAltName, 3) + derOctetString(derSequence(generalNames)));
+}
+
+// Describes and releases a CFError the Security calls above returned. Null when the call
+// failed without one.
+static QString takeCfErrorText(CFErrorRef error)
+{
+    if (!error) return QStringLiteral("(no error detail)");
+    CFStringRef description = CFErrorCopyDescription(error);
+    const QString text = QString::fromCFString(description);
+    CFRelease(description);
+    CFRelease(error);
+    return text;
+}
+
+bool ShotServer::generateSelfSignedCert(const QString& certPath, const QString& keyPath)
+{
+    // Generate RSA-2048 key pair using Security.framework
+    const int keyBits = 2048;
+    CFNumberRef keySize = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &keyBits);
+    const void* attrKeys[] = { kSecAttrKeyType, kSecAttrKeySizeInBits };
+    const void* attrValues[] = { kSecAttrKeyTypeRSA, keySize };
+    CFDictionaryRef keyAttrs = CFDictionaryCreate(kCFAllocatorDefault, attrKeys, attrValues, 2,
+                                                  &kCFTypeDictionaryKeyCallBacks,
+                                                  &kCFTypeDictionaryValueCallBacks);
+    CFRelease(keySize);
+    CFErrorRef error = nullptr;
+    SecKeyRef privateKey = SecKeyCreateRandomKey(keyAttrs, &error);
+    CFRelease(keyAttrs);
+    if (!privateKey) {
+        if (error) {
+            DIAG_WARN(NETWORK, "ShotServer") << "SecKeyCreateRandomKey failed:" << takeCfErrorText(error);
+        }
+        return false;
+    }
+
+    SecKeyRef publicKey = SecKeyCopyPublicKey(privateKey);
+    if (!publicKey) {
+        CFRelease(privateKey);
+        DIAG_WARN(NETWORK, "ShotServer") << "Failed to extract public key";
+        return false;
+    }
+
+    // Export public key (PKCS#1 DER format)
+    CFDataRef pubKeyData = SecKeyCopyExternalRepresentation(publicKey, &error);
+    CFRelease(publicKey);
+    if (!pubKeyData) {
+        CFRelease(privateKey);
+        DIAG_WARN(NETWORK, "ShotServer") << "Failed to export public key:" << takeCfErrorText(error);
+        return false;
+    }
+    QByteArray pubKeyDer(reinterpret_cast<const char*>(CFDataGetBytePtr(pubKeyData)),
+                          static_cast<int>(CFDataGetLength(pubKeyData)));
+    CFRelease(pubKeyData);
+
+    // Export private key (PKCS#1 DER format)
+    CFDataRef privKeyData = SecKeyCopyExternalRepresentation(privateKey, &error);
+    if (!privKeyData) {
+        CFRelease(privateKey);
+        DIAG_WARN(NETWORK, "ShotServer") << "Failed to export private key:" << takeCfErrorText(error);
+        return false;
+    }
+    QByteArray privKeyDer(reinterpret_cast<const char*>(CFDataGetBytePtr(privKeyData)),
+                           static_cast<int>(CFDataGetLength(privKeyData)));
+    CFRelease(privKeyData);
+
+    // Build SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier, BIT STRING { pubkey } }
+    QByteArray spki = derSequence(
+        derSequence(derOid(kOidRsa, 9) + derTag(0x05, QByteArray())) +
+        derBitString(pubKeyDer)
+    );
+
+    // Build issuer/subject: RDNSequence with CN=Decenza
+    QByteArray rdnSeq = derSequence(
+        derSet(derSequence(derOid(kOidCommonName, 3) + derUtf8String("Decenza")))
+    );
+
+    // Serial number (16 random bytes).
+    //
+    // The buffer is deliberately Qt::Uninitialized, so on a failed draw the serial would be
+    // whatever heap bytes were already there — plausibly all-zero, and so identical across
+    // devices and across regenerations, when RFC 5280 §4.1.2.2 wants it unique per issuer.
+    // Failing cert generation is the better outcome: setupTls() and start() both propagate it,
+    // and the server declines to start rather than serving an identity that is quietly garbage.
+    QByteArray serialBytes(16, Qt::Uninitialized);
+    if (SecRandomCopyBytes(kSecRandomDefault, serialBytes.size(),
+                           reinterpret_cast<uint8_t*>(serialBytes.data())) != errSecSuccess) {
+        CFRelease(privateKey);
+        DIAG_WARN(NETWORK, "ShotServer") << "could not draw random bytes for the certificate serial number";
+        return false;
+    }
+    // Ensure positive
+    serialBytes[0] = serialBytes[0] & 0x7F;
+
+    // Validity: now to 10 years
+    QDateTime notBefore = QDateTime::currentDateTimeUtc();
+    QDateTime notAfter = notBefore.addYears(10);
+
+    // Subject Alternative Names
+    const QStringList sanEntries = ShotServerTls::certificateNames(ShotServerTls::localAddresses());
+
+    // Extensions: SAN only
+    QByteArray extensions = derSequence(buildSanExtension(sanEntries));
+
+    // Build TBSCertificate
+    QByteArray tbs = derSequence(
+        derExplicitTag(0, derInteger(QByteArray(1, 0x02))) +  // version v3
+        derInteger(serialBytes) +
+        sha256RsaAlgorithm() +
+        rdnSeq +                                               // issuer
+        derSequence(derTime(notBefore) + derTime(notAfter)) +
+        rdnSeq +                                               // subject (self-signed)
+        spki +
+        derExplicitTag(3, extensions)
+    );
+
+    // Sign TBSCertificate with private key
+    CFDataRef tbsData = CFDataCreate(kCFAllocatorDefault,
+                                      reinterpret_cast<const UInt8*>(tbs.constData()),
+                                      tbs.size());
+    CFDataRef signature = SecKeyCreateSignature(privateKey,
+                                                 kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256,
+                                                 tbsData, &error);
+    CFRelease(tbsData);
+    CFRelease(privateKey);
+
+    if (!signature) {
+        DIAG_WARN(NETWORK, "ShotServer") << "SecKeyCreateSignature failed:" << takeCfErrorText(error);
+        return false;
+    }
+
+    QByteArray sigBytes(reinterpret_cast<const char*>(CFDataGetBytePtr(signature)),
+                         static_cast<int>(CFDataGetLength(signature)));
+    CFRelease(signature);
+
+    // Build final Certificate DER
+    QByteArray certDer = derSequence(tbs + sha256RsaAlgorithm() + derBitString(sigBytes));
+
+    // Write certificate as PEM (RFC 7468 requires 64-char line wrapping)
+    auto base64Wrapped = [](const QByteArray& der) {
+        QByteArray b64 = der.toBase64(QByteArray::Base64Encoding);
+        QByteArray wrapped;
+        for (qsizetype i = 0; i < b64.size(); i += 64) {
+            wrapped.append(b64.mid(i, 64));
+            wrapped.append('\n');
+        }
+        return wrapped;
+    };
+    QByteArray certPem = "-----BEGIN CERTIFICATE-----\n" +
+                          base64Wrapped(certDer) +
+                          "-----END CERTIFICATE-----\n";
+
+    // Write private key as PEM (PKCS#1 RSA format)
+    QByteArray keyPem = "-----BEGIN RSA PRIVATE KEY-----\n" +
+                         base64Wrapped(privKeyDer) +
+                         "-----END RSA PRIVATE KEY-----\n";
+
+    // open() was checked but write() was not, and the function then returned true
+    // unconditionally — so a full disk or a hit quota produced a truncated cert or key on disk
+    // and reported success. setupTls() would then load the fragment and fail somewhere further
+    // away, with nothing pointing back at the write. Check the byte count and the device's error
+    // state (close() flushes, so a deferred write error surfaces there, not at write()).
+    QFile certFile(certPath);
+    if (!certFile.open(QIODevice::WriteOnly)) return false;
+    const bool certWritten = certFile.write(certPem) == certPem.size();
+    certFile.close();
+    if (!certWritten || certFile.error() != QFileDevice::NoError) {
+        DIAG_WARN(NETWORK, "ShotServer") << "could not write the certificate to" << certPath
+                   << "-" << certFile.errorString();
+        return false;
+    }
+
+    QFile keyFile(keyPath);
+    if (!keyFile.open(QIODevice::WriteOnly)) return false;
+    const bool keyWritten = keyFile.write(keyPem) == keyPem.size();
+    keyFile.close();
+    if (!keyWritten || keyFile.error() != QFileDevice::NoError) {
+        DIAG_WARN(NETWORK, "ShotServer") << "could not write the private key to" << keyPath
+                   << "-" << keyFile.errorString();
+        return false;
+    }
+
+    // Warn rather than fail: the key is usable, just less protected than intended, and refusing
+    // to serve over a permissions quirk would be a worse outcome than saying so. On iOS the app
+    // sandbox already isolates this file; the warning matters on a shared Mac account.
+    if (!QFile::setPermissions(keyPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+        DIAG_WARN(NETWORK, "ShotServer") << "could not restrict permissions on the private key" << keyPath
+                   << "- it may be readable by other users of this machine";
+    }
+    return true;
+}
+
+#else // !Q_OS_DARWIN
+// ---------------------------------------------------------------------------
+// Windows/Linux/Android: Self-signed certificate generation using OpenSSL
+// ---------------------------------------------------------------------------
+
+bool ShotServer::generateSelfSignedCert(const QString& certPath, const QString& keyPath)
+{
+    // Generate EC P-256 key pair using OpenSSL EVP API
+    const auto succeeded = [](bool ok, const char* operation) {
+        if (!ok)
+            logOpenSslFailure(operation);
+        return ok;
+    };
+
+    EVP_PKEY* pkey = nullptr;
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    if (!pctx) {
+        logOpenSslFailure("create EC key context");
+        return false;
+    }
+
+    bool success = false;
+    X509* x509 = nullptr;
+
+    do {
+        if (!succeeded(EVP_PKEY_keygen_init(pctx) > 0, "initialize EC key generation")) break;
+        if (!succeeded(EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) > 0, "select EC curve")) break;
+        if (!succeeded(EVP_PKEY_keygen(pctx, &pkey) > 0, "generate EC key pair")) break;
+
+        // Create X509 certificate
+        x509 = X509_new();
+        if (!succeeded(x509 != nullptr, "allocate X509 certificate")) break;
+
+        // Set version to v3
+        X509_set_version(x509, 2);
+
+        // Set serial number (random).
+        //
+        // Same rule as the iOS branch above, and the same reason: serial_bytes is a bare stack
+        // array, so a failed draw leaves stack residue as the certificate's identity when
+        // RFC 5280 §4.1.2.2 wants it unique per issuer. RAND_bytes returns 1 for success —
+        // 0 or -1 mean it could not produce the bytes, not that it produced weak ones.
+        //
+        // -Werror=unused-result did NOT catch this one: OpenSSL does not mark RAND_bytes
+        // warn_unused_result the way Apple marks SecRandomCopyBytes. The flag found the iOS
+        // instance and was silent on the branch that five of the six platforms actually build.
+        ASN1_INTEGER* serialNumber = X509_get_serialNumber(x509);
+        unsigned char serial_bytes[16];
+        if (!succeeded(RAND_bytes(serial_bytes, sizeof(serial_bytes)) == 1, "generate certificate serial")) break;
+        BIGNUM* bn = BN_bin2bn(serial_bytes, sizeof(serial_bytes), nullptr);
+        BN_to_ASN1_INTEGER(bn, serialNumber);
+        BN_free(bn);
+
+        // Set validity: now to 10 years from now
+        X509_gmtime_adj(X509_get_notBefore(x509), 0);
+        X509_gmtime_adj(X509_get_notAfter(x509), 10L * 365 * 24 * 60 * 60);
+
+        // Set subject and issuer (self-signed)
+        // Cast away const: newer OpenSSL (3.4+) returns const X509_NAME*, but
+        // X509_NAME_add_entry_by_txt still needs a mutable pointer.
+        X509_NAME* name = const_cast<X509_NAME*>(X509_get_subject_name(x509));
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                    reinterpret_cast<const unsigned char*>("Decenza"), -1, -1, 0);
+        X509_set_issuer_name(x509, name);
+
+        // Set public key
+        X509_set_pubkey(x509, pkey);
+
+        // Add Subject Alternative Names (required by modern browsers)
+        // Include all local IP addresses so the cert works regardless of which interface is used
+        const QStringList sanEntries = ShotServerTls::certificateNames(ShotServerTls::localAddresses());
+        QByteArray sanStr = sanEntries.join(",").toUtf8();
+
+        X509V3_CTX ctx;
+        X509V3_set_ctx(&ctx, x509, x509, nullptr, nullptr, 0);
+        X509_EXTENSION* sanExt = X509V3_EXT_conf_nid(nullptr, &ctx, NID_subject_alt_name, sanStr.constData());
+        if (sanExt) {
+            X509_add_ext(x509, sanExt, -1);
+            X509_EXTENSION_free(sanExt);
+        }
+
+        // Sign with our private key
+        if (!succeeded(X509_sign(x509, pkey, EVP_sha256()) > 0, "sign X509 certificate")) break;
+
+        QString writeError;
+        if (!TlsPemWriter::write(certPath, [&](BIO* buffer) {
+                return succeeded(PEM_write_bio_X509(buffer, x509) == 1, "encode certificate PEM");
+            }, &writeError)) {
+            DIAG_WARN(NETWORK, "ShotServer") << "could not write the certificate to" << certPath << writeError;
+            break;
+        }
+
+        if (!TlsPemWriter::write(keyPath, [&](BIO* buffer) {
+                return succeeded(PEM_write_bio_PrivateKey(buffer, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1,
+                                 "encode private key PEM");
+            }, &writeError)) {
+            DIAG_WARN(NETWORK, "ShotServer") << "could not write the private key to" << keyPath << writeError;
+            break;
+        }
+
+        // Restrict private key file permissions (owner-only). Warn rather than break, for the
+        // reason given on the iOS branch: the key works, it is just less protected, and this
+        // matters most on a shared desktop account.
+        if (!QFile::setPermissions(keyPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+            DIAG_WARN(NETWORK, "ShotServer") << "could not restrict permissions on the private key" << keyPath
+                       << "- it may be readable by other users of this machine";
+        }
+
+        success = true;
+    } while (false);
+
+    if (x509) X509_free(x509);
+    if (pkey) EVP_PKEY_free(pkey);
+    EVP_PKEY_CTX_free(pctx);
+
+    return success;
+}
+#endif // Q_OS_DARWIN
+
+// Session management, extractCookie, checkSession, createSession, hasStoredTotpSecret,
+// loadSessions, saveSessions are all in shotserver_auth.cpp
+
+QString ShotServer::getLocalIpAddress() const
+{
+    // First, try to determine the primary IP by checking which local address
+    // would be used for an outbound connection (most reliable method)
+    QUdpSocket testSocket;
+    testSocket.connectToHost(QHostAddress("8.8.8.8"), 53);
+    if (testSocket.waitForConnected(100)) {
+        QHostAddress localAddr = testSocket.localAddress();
+        testSocket.close();
+        if (!localAddr.isNull() && !localAddr.isLoopback() &&
+            localAddr.protocol() == QAbstractSocket::IPv4Protocol) {
+            return localAddr.toString();
+        }
+    }
+    testSocket.close();
+
+    // Fallback: iterate through interfaces
+    QString fallbackAddress;
+
+    const auto interfaces = QNetworkInterface::allInterfaces();
+    for (const QNetworkInterface& iface : interfaces) {
+        // Skip down, loopback, or virtual interfaces
+        if (!(iface.flags() & QNetworkInterface::IsUp) ||
+            !(iface.flags() & QNetworkInterface::IsRunning) ||
+            (iface.flags() & QNetworkInterface::IsLoopBack)) {
+            continue;
+        }
+
+        // Skip known virtual interface names (WSL, Docker, Hyper-V, VirtualBox, VMware)
+        QString name = iface.name().toLower() + iface.humanReadableName().toLower();
+        if (name.contains("wsl") || name.contains("docker") || name.contains("vethernet") ||
+            name.contains("virtualbox") || name.contains("vmware") || name.contains("vmnet") ||
+            name.contains("hyper-v") || name.contains("vbox")) {
+            continue;
+        }
+
+        for (const QNetworkAddressEntry& entry : iface.addressEntries()) {
+            QHostAddress addr = entry.ip();
+            if (addr.protocol() != QAbstractSocket::IPv4Protocol || addr.isLoopback()) {
+                continue;
+            }
+
+            QString ip = addr.toString();
+
+            // Prefer 192.168.x.x and 10.x.x.x (typical home/office LANs)
+            if (ip.startsWith("192.168.") || ip.startsWith("10.")) {
+                return ip;
+            }
+
+            // Keep 172.x.x.x as fallback (could be legitimate but often virtual)
+            if (fallbackAddress.isEmpty()) {
+                fallbackAddress = ip;
+            }
+        }
+    }
+
+    return fallbackAddress.isEmpty() ? "127.0.0.1" : fallbackAddress;
+}
+
+void ShotServer::handlePocketPair(QTcpSocket* socket, const QByteArray& body)
+{
+    QJsonDocument doc = QJsonDocument::fromJson(body);
+    QString pairingToken = doc.object()["pairingToken"].toString();
+
+    if (pairingToken.isEmpty()) {
+        sendResponse(socket, 400, "application/json",
+            R"({"error":"Missing pairingToken"})");
+        return;
+    }
+
+    if (m_settings) {
+        m_settings->app()->setPocketPairingToken(pairingToken);
+    }
+
+    // Enable relay client if available
+    if (m_relayClient) {
+        m_relayClient->setEnabled(true);
+    }
+
+    QJsonObject result;
+    result["success"] = true;
+    result["deviceId"] = m_settings ? m_settings->app()->deviceId() : QString();
+    result["deviceName"] = QSysInfo::machineHostName();
+    sendJson(socket, QJsonDocument(result).toJson(QJsonDocument::Compact));
+
+    DIAG_DEBUG(NETWORK, "ShotServer") << "Pocket app paired successfully";
+}
+
+void ShotServer::handlePocketStatus(QTcpSocket* socket)
+{
+    QJsonObject result;
+    if (m_device) {
+        result["connected"] = m_device->isConnected();
+        result["state"] = m_device->stateString();
+        result["temperature"] = m_device->temperature();
+        result["goalTemperature"] = m_device->goalTemperature();
+        result["waterLevelMl"] = m_device->waterLevelMl();
+        bool isAwake = m_device->isConnected() &&
+                      (m_device->state() != DE1::State::Sleep &&
+                       m_device->state() != DE1::State::GoingToSleep);
+        result["isAwake"] = isAwake;
+    }
+    if (m_machineState) {
+        result["phase"] = m_machineState->phaseString();
+        result["isHeating"] = m_machineState->isHeating();
+        result["isReady"] = m_machineState->isReady();
+    }
+    sendJson(socket, QJsonDocument(result).toJson(QJsonDocument::Compact));
+}

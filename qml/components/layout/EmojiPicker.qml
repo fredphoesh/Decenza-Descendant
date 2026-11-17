@@ -1,0 +1,216 @@
+// The category-tab Repeater and the emoji GridView delegate both read this file's ids
+// (`root`, `grid`); Bound makes them statically resolvable. Each declares every
+// injected role it uses required in the same edit -- without that, Bound stops role
+// injection and the tabs and the whole emoji grid render blank at RUNTIME, silently.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Layouts
+import Decenza
+import "EmojiData.js" as EmojiData
+
+Item {
+    id: root
+
+    property string selectedValue: ""
+
+    implicitHeight: pickerColumn.implicitHeight
+
+    property int _activeCategory: 0
+
+    // Decenza SVG icons (first category)
+    readonly property var decenzaCategory: ({
+        name: "Decenza",
+        isSvg: true,
+        items: [
+            { value: "qrc:/icons/espresso.svg", label: TranslationManager.translate("emojiPicker.espresso", "Espresso") },
+            { value: "qrc:/icons/steam.svg", label: TranslationManager.translate("emojiPicker.steam", "Steam") },
+            { value: "qrc:/icons/water.svg", label: TranslationManager.translate("emojiPicker.water", "Water") },
+            { value: "qrc:/icons/flush.svg", label: TranslationManager.translate("emojiPicker.flush", "Flush") },
+            { value: "qrc:/icons/coffeebeans.svg", label: TranslationManager.translate("emojiPicker.beans", "Beans") },
+            { value: "qrc:/icons/sleep.svg", label: TranslationManager.translate("emojiPicker.sleep", "Sleep") },
+            { value: "qrc:/icons/settings.svg", label: TranslationManager.translate("emojiPicker.settings", "Settings") },
+            { value: "qrc:/icons/history.svg", label: TranslationManager.translate("emojiPicker.history", "History") },
+            { value: "qrc:/icons/star.svg", label: TranslationManager.translate("emojiPicker.star", "Star") },
+            { value: "qrc:/icons/star-outline.svg", label: TranslationManager.translate("emojiPicker.star", "Star") },
+            { value: "qrc:/icons/temperature.svg", label: TranslationManager.translate("emojiPicker.temp", "Temp") },
+            { value: "qrc:/icons/tea.svg", label: TranslationManager.translate("emojiPicker.tea", "Tea") },
+            { value: "qrc:/icons/grind.svg", label: TranslationManager.translate("emojiPicker.grind", "Grind") },
+            { value: "qrc:/icons/filter.svg", label: TranslationManager.translate("emojiPicker.filter", "Filter") },
+            { value: "qrc:/icons/bluetooth.svg", label: TranslationManager.translate("emojiPicker.bluetooth", "BT") },
+            { value: "qrc:/icons/wifi.svg", label: TranslationManager.translate("emojiPicker.wifi", "WiFi") },
+            { value: "qrc:/icons/edit.svg", label: TranslationManager.translate("emojiPicker.edit", "Edit") },
+            { value: "qrc:/icons/sparkle.svg", label: TranslationManager.translate("emojiPicker.ai", "AI") },
+            { value: "qrc:/icons/hand.svg", label: TranslationManager.translate("emojiPicker.hand", "Hand") },
+            { value: "qrc:/icons/tick.svg", label: TranslationManager.translate("emojiPicker.tick", "Tick") },
+            { value: "qrc:/icons/cross.svg", label: TranslationManager.translate("emojiPicker.cross", "Cross") },
+            { value: "qrc:/icons/decent-de1.svg", label: TranslationManager.translate("emojiPicker.de1", "DE1") },
+            { value: "qrc:/icons/scale.svg", label: TranslationManager.translate("emojiPicker.scale", "Scale") },
+            { value: "qrc:/icons/quit.svg", label: TranslationManager.translate("emojiPicker.quit", "Quit") },
+            { value: "qrc:/icons/Graph.svg", label: TranslationManager.translate("emojiPicker.graph", "Graph") }
+        ]
+    })
+
+    // Build all categories: Decenza SVGs + emoji from EmojiData.js
+    readonly property var categories: {
+        var result = [decenzaCategory]
+        for (let i = 0; i < EmojiData.categories.length; i++) {
+            result.push({
+                name: EmojiData.categories[i].name,
+                isSvg: false,
+                items: EmojiData.categories[i].emoji
+            })
+        }
+        return result
+    }
+
+    signal selected(string value)
+    signal cleared()
+
+    ColumnLayout {
+        id: pickerColumn
+        anchors.fill: parent
+        spacing: Theme.scaled(4)
+
+        // Category tabs (scrollable for many categories)
+        Flickable {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Theme.scaled(28)
+            contentWidth: tabRow.implicitWidth
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            flickableDirection: Flickable.HorizontalFlick
+
+            RowLayout {
+                id: tabRow
+                spacing: Theme.scaled(2)
+
+                Repeater {
+                    model: root.categories
+                    Rectangle {
+                        id: categoryTab
+                        required property var modelData
+                        required property int index
+
+                        implicitWidth: tabLabel.implicitWidth + Theme.scaled(16)
+                        height: Theme.scaled(28)
+                        radius: Theme.scaled(4)
+                        color: root._activeCategory === categoryTab.index ? Theme.primaryColor : Theme.backgroundColor
+                        border.color: Theme.borderColor
+                        border.width: 1
+
+                        Accessible.role: Accessible.Button
+                        Accessible.name: categoryTab.modelData.name + " category" + (root._activeCategory === categoryTab.index ? ", selected" : "")
+                        Accessible.focusable: true
+                        Accessible.onPressAction: emojiTabMa.clicked(null)
+
+                        Text {
+                            id: tabLabel
+                            anchors.centerIn: parent
+                            text: categoryTab.modelData.name
+                            color: root._activeCategory === categoryTab.index ? Theme.primaryContrastColor : Theme.textColor
+                            font: Theme.captionFont
+                            Accessible.ignored: true
+                        }
+
+                        MouseArea {
+                            id: emojiTabMa
+                            anchors.fill: parent
+                            onClicked: root._activeCategory = categoryTab.index
+                        }
+                    }
+                }
+
+                // Clear button
+                Rectangle {
+                    Layout.preferredWidth: Theme.scaled(28)
+                    Layout.preferredHeight: Theme.scaled(28)
+                    radius: Theme.scaled(4)
+                    color: clearMa.pressed ? Theme.errorColor : Theme.backgroundColor
+                    border.color: Theme.errorColor
+                    border.width: 1
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("emojiPicker.clearEmoji", "Clear emoji")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: clearMa.clicked(null)
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "\u00D7"
+                        color: clearMa.pressed ? Theme.primaryContrastColor : Theme.errorColor
+                        font.pixelSize: Theme.scaled(16)
+                        font.bold: true
+                        Accessible.ignored: true
+                    }
+
+                    MouseArea {
+                        id: clearMa
+                        anchors.fill: parent
+                        onClicked: {
+                            root.cleared()
+                        }
+                    }
+                }
+            }
+        }
+
+        // Grid of icons/emoji
+        GridView {
+            id: grid
+            Layout.fillWidth: true
+            Layout.preferredHeight: Theme.scaled(160)
+            cellWidth: root.categories[root._activeCategory].isSvg ? Theme.scaled(52) : Theme.scaled(44)
+            cellHeight: root.categories[root._activeCategory].isSvg ? Theme.scaled(52) : Theme.scaled(44)
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            model: root.categories[root._activeCategory].items
+
+            delegate: Rectangle {
+                id: emojiCell
+                required property var modelData
+
+                // Handle both object items (SVG: {value, label}) and string items (emoji)
+                readonly property string itemValue: typeof modelData === "object" ? modelData.value : modelData
+                readonly property bool isSelected: root.selectedValue === itemValue
+
+                activeFocusOnTab: true
+                Accessible.role: Accessible.Button
+                Accessible.name: typeof emojiCell.modelData === "object" ? emojiCell.modelData.label : emojiCell.itemValue
+                Accessible.selected: emojiCell.isSelected
+                Accessible.focusable: true
+                Accessible.onPressAction: itemMa.clicked(null)
+                Keys.onReturnPressed: itemMa.clicked(null)
+                Keys.onSpacePressed: itemMa.clicked(null)
+
+                width: grid.cellWidth - Theme.scaled(4)
+                height: grid.cellHeight - Theme.scaled(4)
+                radius: Theme.scaled(6)
+                color: isSelected
+                    ? Theme.primaryColor
+                    : (itemMa.containsMouse ? Qt.rgba(Theme.primaryColor.r, Theme.primaryColor.g, Theme.primaryColor.b, 0.12) : "transparent")
+                border.color: isSelected ? Theme.primaryColor : "transparent"
+                border.width: 1
+
+                // Emoji/icon image (both SVG icons and emoji use Image now)
+                Image {
+                    Accessible.ignored: true
+                    anchors.centerIn: parent
+                    source: Theme.emojiToImage(emojiCell.itemValue)
+                    sourceSize.width: Theme.scaled(28)
+                    sourceSize.height: Theme.scaled(28)
+                }
+
+                MouseArea {
+                    id: itemMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: {
+                        root.selected(emojiCell.itemValue)
+                    }
+                }
+            }
+        }
+    }
+}

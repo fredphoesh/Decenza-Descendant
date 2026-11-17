@@ -1,0 +1,253 @@
+// `sourceComponent: HistoryShotGraph { ... }` wraps its value in an implicit Component,
+// so this file's `root` id is not statically resolvable inside either graph without
+// this pragma. Neither Component takes an injected model role, so nothing here needs
+// a `required property`.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Layouts
+import QtQuick.Effects
+import Decenza
+
+LayoutWidgetItem {
+    id: root
+
+    implicitWidth: isCompact ? compactContent.implicitWidth : fullContent.implicitWidth
+    implicitHeight: isCompact ? compactContent.implicitHeight : fullContent.implicitHeight
+
+    // User-configurable properties (from settings popup)
+    readonly property real shotScale: typeof modelData.shotScale === "number" ? modelData.shotScale : 1.0
+    readonly property bool shotShowLabels: typeof modelData.shotShowLabels === "boolean" ? modelData.shotShowLabels : false
+    // Default off — the widget tile is too small for rotated phase-label text
+    // to read cleanly. Opt in via the widget settings popup.
+    readonly property bool shotShowPhaseLabels: typeof modelData.shotShowPhaseLabels === "boolean" ? modelData.shotShowPhaseLabels : false
+
+    // Shot data cache
+    property var shotData: ({})
+    readonly property bool hasData: !!(shotData && shotData.pressure && shotData.pressure.length > 0)
+
+    property int _pendingShotId: 0
+    property string _pendingMostRecentRequestId: ""
+
+    function loadLastShot() {
+        var shotId = HistoryService.lastSavedShotId
+        if (shotId > 0) {
+            _pendingMostRecentRequestId = ""
+            _pendingShotId = shotId
+            HistoryService.requestShot(shotId)
+        } else {
+            _pendingShotId = 0
+            shotData = ({})
+            _pendingMostRecentRequestId = HistoryService.requestMostRecentShotId()
+        }
+    }
+
+    Component.onCompleted: loadLastShot()
+
+    Connections {
+        target: HistoryService
+        function onHistoryChanged() { root.loadLastShot() }
+    }
+
+    // Handle async shot data
+    Connections {
+        target: HistoryService
+        function onShotReady(shotId, shot) {
+            if (shotId !== root._pendingShotId) return
+            root.shotData = shot
+        }
+        function onOperationCompleted(requestId, operation, success, result) {
+            if (requestId !== root._pendingMostRecentRequestId
+                    || operation !== "mostRecentShotId") return
+            root._pendingMostRecentRequestId = ""
+            const shotId = success ? Number(result.shotId) : 0
+            if (shotId > 0 && root._pendingShotId <= 0) {
+                root._pendingShotId = shotId
+                HistoryService.requestShot(shotId)
+            }
+        }
+    }
+
+    function goToShotDetail() {
+        if (hasData && shotData.id) {
+            AppShell.shotDetailRequested(shotData.id, [])
+        }
+    }
+
+    // --- COMPACT MODE (bar zones) ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: root.hasData ? Theme.bottomBarHeight * 2.5 * root.shotScale : compactPlaceholder.implicitWidth + Theme.scaled(16)
+        implicitHeight: Theme.bottomBarHeight
+
+        Loader {
+            anchors.fill: parent
+            anchors.margins: Theme.scaled(4)
+            active: root.isCompact && root.hasData
+            sourceComponent: HistoryShotGraph {
+                pressureData: root.shotData.pressure || []
+                flowData: root.shotData.flow || []
+                temperatureData: root.shotData.temperature || []
+                weightData: root.shotData.weight || []
+                weightFlowRateData: root.shotData.weightFlowRate || []
+                resistanceData: root.shotData.resistance || []
+                pressureGoalData: root.shotData.pressureGoal || []
+                flowGoalData: root.shotData.flowGoal || []
+                temperatureGoalData: root.shotData.temperatureGoal || []
+                temperatureMixData: root.shotData.temperatureMix || []
+                portalSamples: root.shotData.portalSamples || []
+                temperatureMixGoalData: root.shotData.temperatureMixGoal || []
+                phaseMarkers: root.shotData.phases || []
+                maxTime: root.shotData.durationSec || 60
+                showLabels: root.shotShowLabels
+                showPhaseLabels: false
+            }
+        }
+
+        Text {
+            id: compactPlaceholder
+            anchors.centerIn: parent
+            visible: !root.hasData
+            text: TranslationManager.translate("lastShot.noShots", "No shots")
+            color: Theme.textSecondaryColor
+            font: Theme.captionFont
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: root.goToShotDetail()
+        }
+    }
+
+    // --- FULL MODE (center zones) ---
+    Item {
+        id: fullContent
+        visible: !root.isCompact
+        anchors.fill: parent
+        implicitWidth: Theme.scaled(200)
+        implicitHeight: Theme.scaled(120)
+
+        Rectangle {
+            anchors.fill: parent
+            color: Theme.cardBackgroundColor
+            radius: Theme.cardRadius
+        }
+
+        // Graph fills the card above the metadata bar
+        Item {
+            anchors.fill: parent
+            anchors.margins: 1
+            anchors.bottomMargin: root.hasData ? Theme.scaled(20) : 1
+            clip: true
+
+            Loader {
+                anchors.fill: parent
+                active: !root.isCompact && root.hasData
+                sourceComponent: HistoryShotGraph {
+                    pressureData: root.shotData.pressure || []
+                    flowData: root.shotData.flow || []
+                    temperatureData: root.shotData.temperature || []
+                    weightData: root.shotData.weight || []
+                    weightFlowRateData: root.shotData.weightFlowRate || []
+                    resistanceData: root.shotData.resistance || []
+                    pressureGoalData: root.shotData.pressureGoal || []
+                    flowGoalData: root.shotData.flowGoal || []
+                    temperatureGoalData: root.shotData.temperatureGoal || []
+                    temperatureMixData: root.shotData.temperatureMix || []
+                    portalSamples: root.shotData.portalSamples || []
+                    temperatureMixGoalData: root.shotData.temperatureMixGoal || []
+                    phaseMarkers: root.shotData.phases || []
+                    maxTime: root.shotData.durationSec || 60
+                    showLabels: root.shotShowLabels
+                    showPhaseLabels: root.shotShowPhaseLabels
+                }
+            }
+        }
+
+        // Metadata overlay at bottom
+        Rectangle {
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Theme.scaled(20)
+            color: Qt.rgba(0, 0, 0, 0.6)
+            radius: Theme.cardRadius
+            visible: root.hasData
+
+            // Cover top corners so only bottom is rounded
+            Rectangle {
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: parent.radius
+                color: parent.color
+            }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Theme.scaled(6)
+                anchors.rightMargin: Theme.scaled(6)
+
+                Text {
+                    text: root.shotData.profileName || ""
+                    color: Theme.textColor
+                    font: Theme.captionFont
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+                Text {
+                    text: (root.shotData.finalWeightG || 0).toFixed(1) + "g"
+                    color: Theme.weightColor
+                    font: Theme.captionFont
+                }
+                Text {
+                    text: Math.round(root.shotData.durationSec || 0) + "s"
+                    color: Theme.textSecondaryColor
+                    font: Theme.captionFont
+                }
+            }
+        }
+
+        // No-data placeholder
+        Column {
+            anchors.centerIn: parent
+            visible: !root.hasData
+            spacing: Theme.scaled(4)
+
+            Image {
+                anchors.horizontalCenter: parent.horizontalCenter
+                source: "qrc:/icons/history.svg"
+                sourceSize.height: Theme.scaled(24)
+                opacity: 0.5
+
+                layer.enabled: true
+                layer.smooth: true
+                layer.effect: MultiEffect {
+                    colorization: 1.0
+                    colorizationColor: Theme.textSecondaryColor
+                }
+            }
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: TranslationManager.translate("lastShot.noShotsYet", "No shots yet")
+                color: Theme.textSecondaryColor
+                font: Theme.captionFont
+            }
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: root.goToShotDetail()
+        }
+    }
+
+    Accessible.role: Accessible.Button
+    Accessible.name: root.hasData
+        ? TranslationManager.translate("lastShot.accessibleLastShot", "Last shot") + ": " + (root.shotData.profileName || "")
+          + ", " + (root.shotData.finalWeightG || 0).toFixed(1) + " " + TranslationManager.translate("lastShot.accessibleGrams", "grams")
+        : TranslationManager.translate("lastShot.noShotsYet", "No shots yet")
+    Accessible.focusable: true
+    Accessible.onPressAction: root.goToShotDetail()
+}

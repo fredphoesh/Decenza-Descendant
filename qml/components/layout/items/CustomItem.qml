@@ -1,0 +1,442 @@
+// `layer.effect` declares an inline component, so ids from this file are not statically
+// resolvable inside it without this pragma. No Repeater/delegate in this file, so no
+// `required property` is needed — see PresetPillRow.qml for the case that does.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Layouts
+import QtQuick.Effects
+import Decenza
+
+LayoutWidgetItem {
+    id: root
+
+    // %STEAM_TEMP% resolves to "Off" from the RESOLVED heater state, not from
+    // the measured temperature — a boiler switched off minutes ago still reads
+    // hot on its way down.
+    //
+    // Cache the policy result so formatting never resolves heater settings itself.
+    readonly property bool _steamHeaterOff:
+        typeof MainController !== "undefined" && MainController !== null && !MainController.steamHeaterOn
+
+    readonly property string content: modelData.content || "Text"
+    readonly property string textAlign: modelData.align || "center"
+    readonly property string action: modelData.action || ""
+    readonly property string longPressAction: modelData.longPressAction || ""
+    readonly property string doubleclickAction: modelData.doubleclickAction || ""
+    readonly property string emoji: modelData.emoji || ""
+    readonly property string bgColor: modelData.backgroundColor || ""
+    readonly property bool hasAction: action !== "" || longPressAction !== "" || doubleclickAction !== ""
+    readonly property bool hideBackground: modelData.hideBackground === true
+    readonly property bool hasEmoji: emoji !== ""
+    readonly property bool emojiIsSvg: hasEmoji && emoji.indexOf("qrc:") === 0
+
+    // Accessibility hint describing configured secondary actions (for TalkBack/VoiceOver).
+    // The sentence itself lives in LayoutActions, which is where the dedicated action
+    // widgets can reach it too -- they need the identical hint and cannot read a
+    // property on this file.
+    readonly property string _accessibleHint: LayoutActions.gestureHint(root.modelData)
+
+    // Action tiles use Theme.actionTileColor (neutral over a custom background
+    // image so they match the bars/cards, standard accent otherwise); an explicit
+    // per-widget bgColor still wins. (zoneFillOverride is inherited from LayoutWidgetItem;
+    // see there for who sets it.)
+    readonly property color _themeTileColor: hasAction ? Theme.actionTileColor : Theme.surfaceColor
+    readonly property color _parsedBgColor: bgColor !== "" ? bgColor
+        : (zoneFillOverride.a > 0 ? zoneFillOverride : _themeTileColor)
+
+    // A brew-settings widget highlights (Theme.highlightColor) whenever a real
+    // brew override is in effect — temperature or target yield deviating from the
+    // ACTIVE baseline. When a recipe is active that baseline is the recipe's own
+    // yield/temp, so a recipe's designed values don't light this up
+    // (recipe-baseline-not-override, #1485); the shared MainController flags fold
+    // in the recipe-vs-profile choice, matching Brew Settings and the Shot Plan.
+    readonly property bool _isBrewSettingsWidget: action === "brewSettings"
+        || longPressAction === "brewSettings" || doubleclickAction === "brewSettings"
+    readonly property bool _brewOverrideActive:
+        MainController.temperatureIsRealOverride || MainController.yieldIsRealOverride
+    readonly property color _baseBackground:
+        (_isBrewSettingsWidget && _brewOverrideActive) ? Theme.highlightColor : _parsedBgColor
+    // Idle-screen action tiles (Recipes/Beans/Steam/Hot Water/Flush/Equipment/
+    // etc. — all compiled to CustomItem, see LayoutActions.compiledTile)
+    // and user-authored Custom widgets share this rendering path; scrim
+    // uniformly like every other fill in the app when the glass chrome is on.
+    readonly property color _effectiveBackground:
+        Theme.glassChrome ? Theme.chromeFill(_baseBackground) : _baseBackground
+    // Content color for text and icon tinting on the button background
+    readonly property color _contentColor: Theme.contentColorOn(_effectiveBackground, Theme.primaryContrastColor)
+
+    // Active-mode highlight: a togglePreset:<mode> button shows a contrasting ring
+    // while its preset row is expanded, so you can see which mode is selected. In
+    // practice these are the compiled action buttons (Espresso/Steam/Hot Water/
+    // Flush/Beans/Equipment) — neither the in-app nor the web widget editor exposes
+    // togglePreset for hand-made custom widgets, though a raw action string in a
+    // layout config is honored the same way.
+    readonly property string _toggleMode:
+        action.indexOf("togglePreset:") === 0 ? action.substring("togglePreset:".length) : ""
+    property var idlePage: {
+        var p = root.parent
+        while (p) {
+            if (p.objectName === "idlePage") return p
+            p = p.parent
+        }
+        // Hosts outside IdlePage (the persistent status bar lives beside the page
+        // stack in main.qml): fall back to the stack's current page. togglePreset
+        // and the active ring then work exactly while the home screen is showing —
+        // the only time the preset row exists — and stay inert elsewhere.
+        if (AppShell.currentPage && AppShell.currentPage.objectName === "idlePage")
+            return AppShell.currentPage
+        return null
+    }
+    readonly property bool isActive: _toggleMode !== ""
+        && idlePage !== null && idlePage.activePresetFunction === _toggleMode
+    // Ring must contrast with both the button fill and the page background: a darker
+    // shade vanishes against a dark background, a lighter one against a light background.
+    readonly property color _activeRingColor: Settings.theme.isDarkMode
+        ? Qt.lighter(_effectiveBackground, 1.6) : Qt.darker(_effectiveBackground, 1.5)
+
+    readonly property int qtAlignment: {
+        switch (textAlign) {
+            case "left": return Text.AlignLeft
+            case "right": return Text.AlignRight
+            default: return Text.AlignHCenter
+        }
+    }
+
+    implicitWidth: isCompact ? compactContent.implicitWidth : fullContent.implicitWidth
+    implicitHeight: isCompact ? compactContent.implicitHeight : fullContent.implicitHeight
+
+    UiWorkProbe { id: workProbe }
+
+    // Trigger counter to force re-evaluation of resolvedText (only used for %TIME%/%DATE%)
+    property int _refreshTick: 0
+
+    // Reads made by the selected token helpers establish the binding dependencies.
+    readonly property string resolvedText: {
+        var _tick = _refreshTick
+        workProbe.begin()
+        return workProbe.finish(substituteVariables(content))
+    }
+
+    // Timer to update time/date variables (and any other periodic refresh)
+    Timer {
+        id: refreshTimer
+        interval: 1000
+        running: root.content.indexOf("%TIME%") >= 0 || root.content.indexOf("%DATE%") >= 0
+        repeat: true
+        onTriggered: root._refreshTick++
+    }
+
+    // Detect malformed HTML (e.g. tags inside attribute values) and strip to plain text
+    function sanitizeHtml(html) {
+        if (!html || html.indexOf("<") < 0) return html
+        var inTag = false
+        var inQuote = false
+        for (let i = 0; i < html.length; i++) {
+            let ch = html[i]
+            if (inQuote) {
+                if (ch === '"') inQuote = false
+                else if (ch === '<') {
+                    // Tag inside a quoted attribute — HTML is broken, strip all tags
+                    root._warn("Malformed HTML detected, stripping tags: " + html.substring(0, 80))
+                    return html.replace(/<[^>]*>/g, "")
+                }
+            } else if (inTag) {
+                if (ch === '"') inQuote = true
+                else if (ch === '>') inTag = false
+            } else {
+                if (ch === '<') inTag = true
+            }
+        }
+        return html
+    }
+
+    function substituteVariables(text) {
+        if (!text) return ""
+        var result = sanitizeHtml(text)
+        // One pass, and a value is computed only for a token the text contains. This runs at
+        // telemetry rate for a widget showing a live value; a replace() per known token cost
+        // ~350 µs per evaluation on an M-series Mac debug build (#1976 profile).
+        if (result.indexOf("%") < 0)
+            return Theme.replaceEmojiWithImg(result, Theme.bodyFont.pixelSize, true)
+        var hasDevice = typeof DE1Device !== "undefined" && DE1Device !== null
+        var hasState = typeof MachineState !== "undefined" && MachineState !== null
+        var hasProfiles = typeof ProfileManager !== "undefined" && ProfileManager !== null
+        var hasSettings = typeof Settings !== "undefined" && Settings !== null
+        var machineReady = function() { return hasState && MachineState.isReady }
+        var machineOn = function() { return hasDevice && DE1Device.connected }
+        var statusImg = function(connected) {
+            var size = Theme.bodyFont.pixelSize
+            // align="middle" centres the icon in Text.StyledText (which ignores the
+            // CSS style= attribute); style keeps it centred under any RichText caller.
+            return "<img src=\"" + (connected ? Theme.emojiToImage("\u2705") : "qrc:/icons/cross-filled.svg")
+                + "\" width=\"" + size + "\" height=\"" + size + "\" align=\"middle\" style=\"vertical-align: middle\">"
+        }
+        var values = {
+            // Machine
+            TEMP: function() { return hasDevice ? Theme.cToDisplay(DE1Device.temperature).toFixed(1) : "—" },
+            // "Off" when the heater is off — same rule as SteamTemperatureItem, and for
+            // the same reason: the measured boiler temperature cannot tell a hot
+            // boiler from one that is cooling because the heater was switched off.
+            STEAM_TEMP: function() {
+                return hasDevice ? (root._steamHeaterOff ? SteamLabels.offReadout
+                                    : Theme.cToDisplay(DE1Device.steamTemperature).toFixed(0) + "\u00B0") : "—"
+            },
+            PRESSURE: function() { return hasDevice ? DE1Device.pressure.toFixed(1) : "—" },
+            FLOW: function() { return hasDevice ? DE1Device.flow.toFixed(1) : "—" },
+            WATER: function() { return hasDevice ? DE1Device.waterLevel.toFixed(0) : "—" },
+            WATER_ML: function() { return hasDevice ? DE1Device.waterLevelMl.toFixed(0) : "—" },
+            STATE: function() { return hasDevice ? DE1Device.stateString : "—" },
+            // Scale / Shot
+            WEIGHT: function() { return hasState ? MachineState.scaleWeight.toFixed(1) : "—" },
+            SHOT_TIME: function() { return hasState ? MachineState.shotTime.toFixed(1) : "—" },
+            VOLUME: function() { return hasState ? MachineState.cumulativeVolume.toFixed(0) : "—" },
+            POUR_VOLUME: function() { return hasState ? MachineState.pourVolume.toFixed(0) : "—" },
+            PREINFUSION_VOLUME: function() { return hasState ? MachineState.preinfusionVolume.toFixed(0) : "—" },
+            // Profile (ProfileManager)
+            TARGET_WEIGHT: function() { return hasProfiles ? ProfileManager.targetWeight.toFixed(1) : "—" },
+            PROFILE: function() { return hasProfiles ? (ProfileService.currentProfileSummary.name || "—") : "—" },
+            // The EFFECTIVE brew temp — the per-brew override when set (which, with a
+            // recipe active, is the recipe's own temp), else the profile default. This
+            // matches %TARGET_WEIGHT% (which reads the effective ProfileManager.targetWeight)
+            // so temp and yield stay aligned (recipe-baseline-not-override, #1485).
+            TARGET_TEMP: function() {
+                return hasSettings ? Theme.cToDisplay(Settings.brew.hasTemperatureOverride
+                    ? Settings.brew.temperatureOverride : ProfileManager.profileTargetTemperature).toFixed(1) : "—"
+            },
+            RATIO: function() { return hasProfiles ? ProfileManager.brewByRatio.toFixed(1) : "—" },
+            DOSE: function() { return hasProfiles ? ProfileManager.brewByRatioDose.toFixed(1) : "—" },
+            // Scale device
+            SCALE: function() { return ScaleDevice.name || "—" },
+            // Grinder
+            GRIND: function() { return hasSettings && RecipeContext.preferences.dyeGrinderSetting ? RecipeContext.preferences.dyeGrinderSetting : "—" },
+            RPM: function() { return hasSettings && RecipeContext.preferences.dyeGrinderRpm > 0 ? String(RecipeContext.preferences.dyeGrinderRpm) : "—" },
+            GRINDER: function() { return hasSettings && RecipeContext.preferences.dyeGrinderModel ? RecipeContext.preferences.dyeGrinderModel : "—" },
+            // Machine ready status
+            MACHINE_READY: function() {
+                return machineReady() ? TranslationManager.translate("customitem.status.ready", "Ready")
+                                      : TranslationManager.translate("customitem.status.notReady", "Not ready")
+            },
+            MACHINE_READY_COLOR: function() { return machineReady() ? Theme.successColor : Theme.errorColor },
+            // Connection status
+            CONNECTED: function() {
+                return machineOn() ? TranslationManager.translate("customitem.status.online", "Online")
+                                   : TranslationManager.translate("customitem.status.offline", "Offline")
+            },
+            CONNECTED_COLOR: function() { return machineOn() ? Theme.successColor : Theme.errorColor },
+            DEVICES: function() {
+                if (machineOn() && ScaleDevice.connected && !ScaleDevice.isFlowScale)
+                    return TranslationManager.translate("customitem.devices.machineScale", "Machine + Scale")
+                if (machineOn() && ScaleDevice.isFlowScale)
+                    return TranslationManager.translate("customitem.devices.machineSimScale", "Machine + Simulated Scale")
+                return TranslationManager.translate("customitem.devices.machine", "Machine")
+            },
+            // Individual connection indicators (✅ = emoji/2705, ❌ = icons/cross-filled)
+            MACHINE_CONNECTED: function() { return statusImg(machineOn()) },
+            SCALE_CONNECTED: function() { return statusImg(ScaleDevice.connected && !ScaleDevice.isFlowScale) },
+            // Time
+            TIME: function() { return Theme.clockTime(new Date()) },
+            DATE: function() { return Qt.formatDate(new Date(), "yyyy-MM-dd") }
+        }
+        result = result.replace(/%([A-Z_]+)%/g, function(token, name) {
+            var value = values[name]
+            return value ? value() : token
+        })
+        // Convert any emoji Unicode in the result to <img> tags to avoid
+        // CoreText/ImageIO crash from Apple Color Emoji PNG decoding on render thread
+        // allowMarkup: user-authored widget templates may deliberately contain formatting.
+        return Theme.replaceEmojiWithImg(result, Theme.bodyFont.pixelSize, true)
+    }
+
+
+    // Dispatch lives in the LayoutActions singleton, not here: the built-in action
+    // widgets whose gestures a user can override need the same switch, and they
+    // cannot reach a function that lives on this component.
+    //
+    // The gesture handlers below go through LayoutActions.runGestureOrReserved, the
+    // same entry point the ten built-ins use — one read path for all eleven widget
+    // types. "custom" reserves no destination, so for this widget it is exactly
+    // "run the stored action if there is one", which is what it always did.
+    function executeActionString(actionStr) {
+        LayoutActions.execute(actionStr, { idlePage: root.idlePage })
+    }
+
+    function _runGesture(gestureKey) {
+        LayoutActions.runGestureOrReserved(root.modelData, gestureKey, { idlePage: root.idlePage })
+    }
+
+    // The malformed-HTML path below is the one diagnostic this file still owns.
+    function _warn(msg) {
+        WebDebugLogger.warn("App", "CustomItem", ["" + msg].map(String).join(" "))
+    }
+
+    // --- COMPACT MODE (bar rendering) ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: compactRow.implicitWidth + (root.hasAction || root.bgColor !== "" ? Theme.scaled(16) : 0)
+        implicitHeight: Theme.bottomBarHeight
+
+        Rectangle {
+            visible: !root.hideBackground && (root.hasAction || root.bgColor !== "")
+            anchors.fill: parent
+            anchors.topMargin: Theme.spacingSmall
+            anchors.bottomMargin: Theme.spacingSmall
+            color: compactTap.isPressed ? Qt.darker(root._effectiveBackground, 1.2) : root._effectiveBackground
+            radius: Theme.cardRadius
+            opacity: root.hasAction && typeof DE1Device !== "undefined" && DE1Device !== null && !DE1Device.guiEnabled ? 0.5 : 1.0
+            // A hairline edge whenever the page is a flat preset colour. Fill contrast
+            // alone is not enough there: the tile is a lifted shade of the very colour
+            // behind it, so on the lighter colours it reads as a smudge rather than a
+            // button. Over an image the scrim and the photo already give the edge away.
+            border.width: root.isActive ? Theme.scaled(3) : (Theme.hasBackgroundPreset ? 1 : 0)
+            border.color: root.isActive ? root._activeRingColor : Theme.borderColor
+        }
+
+        RowLayout {
+            id: compactRow
+            anchors.centerIn: parent
+            spacing: Theme.spacingSmall
+
+            // Emoji/icon in compact mode
+            Image {
+                visible: root.hasEmoji
+                source: visible ? Theme.emojiToImage(root.emoji) : ""
+                sourceSize.width: Theme.scaled(28)
+                sourceSize.height: Theme.scaled(28)
+                Layout.alignment: Qt.AlignVCenter
+                Accessible.ignored: true
+            }
+
+            Text {
+                text: root.resolvedText
+                // RichText, because the editor saves per-range styling as CSS spans
+                // (`<span style="color:…; font-size:…px">`, documentformatter.cpp:400-411) and
+                // StyledText has no `<span>` handler and never reads a
+                // `style=` attribute. The only tag whose attributes reach the character format
+                // is `<font>` (qquickstyledtext.cpp:450-451); `<a>`, `<img>`, `<ol>` and `<ul>`
+                // attributes are parsed too but carry no styling — and `<img>` is why emoji
+                // (Theme.replaceEmojiWithImg) rendered correctly here all along.
+                // So the span was dropped and every custom widget rendered at the default
+                // colour and size no matter what was saved.
+                //
+                // Qt ignores BOTH `elide` and `maximumLineCount` on RichText — the rich path
+                // in QQuickTextPrivate::updateSize() never reaches setupTextLayout(), which is
+                // the only place either is consulted. So neither is declared here: a property
+                // that provably does nothing is the thing this branch is removing elsewhere.
+                // `clip` bounds the paint instead, and content with a line break grows the row
+                // rather than being clamped — the trade for rendering the styling the editor
+                // promises.
+                textFormat: Text.RichText
+                clip: true
+                color: Theme.textColor
+                font: Theme.bodyFont
+                horizontalAlignment: root.qtAlignment
+                Accessible.ignored: true
+            }
+        }
+
+        AccessibleTapHandler {
+            id: compactTap
+            anchors.fill: parent
+            accessibleName: Theme.toAccessibleText(root.resolvedText) + (root.isActive ? ", " + TranslationManager.translate("accessibility.selected", "selected") : "")
+            accessibleDescription: root._accessibleHint
+            supportLongPress: root.longPressAction !== ""
+            supportDoubleClick: LayoutActions.hasGesture(root.modelData, "doubleclickAction")
+            onAccessibleClicked: root._runGesture("action")
+            onAccessibleLongPressed: root._runGesture("longPressAction")
+            onAccessibleDoubleClicked: root._runGesture("doubleclickAction")
+        }
+    }
+
+    // --- FULL MODE (center rendering) ---
+    Item {
+        id: fullContent
+        visible: !root.isCompact
+        anchors.fill: parent
+        implicitWidth: root.hasEmoji ? Math.max(Theme.scaled(150), emojiText.implicitWidth + Theme.scaled(24)) : (fullText.implicitWidth + Theme.scaled(16) + (root.hasAction ? Theme.scaled(16) : 0))
+        implicitHeight: root.hasEmoji ? Theme.scaled(120) : (fullText.implicitHeight + Theme.scaled(16) + (root.hasAction ? Theme.scaled(8) : 0))
+
+        Rectangle {
+            id: fullBgRect
+            visible: !root.hideBackground && (root.hasAction || root.hasEmoji)
+            anchors.fill: parent
+            color: fullTap.isPressed ? Qt.darker(root._effectiveBackground, 1.2) : root._effectiveBackground
+            radius: Theme.cardRadius
+            opacity: root.hasAction && typeof DE1Device !== "undefined" && DE1Device !== null && !DE1Device.guiEnabled ? 0.5 : 1.0
+            // A hairline edge whenever the page is a flat preset colour. Fill contrast
+            // alone is not enough there: the tile is a lifted shade of the very colour
+            // behind it, so on the lighter colours it reads as a smudge rather than a
+            // button. Over an image the scrim and the photo already give the edge away.
+            border.width: root.isActive ? Theme.scaled(3) : (Theme.hasBackgroundPreset ? 1 : 0)
+            border.color: root.isActive ? root._activeRingColor : Theme.borderColor
+        }
+
+        // Layout with emoji: icon above text (like ActionButton)
+        Column {
+            visible: root.hasEmoji
+            anchors.centerIn: parent
+            spacing: Theme.spacingSmall
+
+            // Emoji/icon
+            Image {
+                source: Theme.emojiToImage(root.emoji)
+                sourceSize.width: Theme.scaled(48)
+                sourceSize.height: Theme.scaled(48)
+                anchors.horizontalCenter: parent.horizontalCenter
+                opacity: root.hasAction && typeof DE1Device !== "undefined" && DE1Device !== null && !DE1Device.guiEnabled ? 0.5 : 1.0
+                Accessible.ignored: true
+                // Tint SVG icons to match text color in both modes
+                layer.enabled: root.emojiIsSvg
+                layer.smooth: true
+                layer.effect: MultiEffect {
+                    colorization: 1.0
+                    colorizationColor: root._contentColor
+                }
+            }
+
+            Text {
+                id: emojiText
+                text: root.resolvedText
+                // RichText — see the compact-mode Text above. Neither of these two centre
+                // renderings elides, so nothing is given up here.
+                textFormat: Text.RichText
+                color: root._contentColor
+                font: Theme.bodyFont
+                horizontalAlignment: Text.AlignHCenter
+                anchors.horizontalCenter: parent.horizontalCenter
+                Accessible.ignored: true
+            }
+        }
+
+        // Layout without emoji: text only (original behavior)
+        Text {
+            id: fullText
+            visible: !root.hasEmoji
+            anchors.centerIn: parent
+            width: Math.max(0, parent.width - (root.hasAction ? Theme.scaled(24) : 0))
+            text: root.resolvedText
+            textFormat: Text.RichText
+            // On a drawn tile, the same content colour the icon layout uses (emojiText).
+            color: fullBgRect.visible ? root._contentColor : Theme.textColor
+            font: Theme.bodyFont
+            horizontalAlignment: root.qtAlignment
+            wrapMode: Text.Wrap
+            Accessible.ignored: true
+        }
+
+        AccessibleTapHandler {
+            id: fullTap
+            anchors.fill: parent
+            accessibleName: Theme.toAccessibleText(root.resolvedText) + (root.isActive ? ", " + TranslationManager.translate("accessibility.selected", "selected") : "")
+            accessibleDescription: root._accessibleHint
+            supportLongPress: root.longPressAction !== ""
+            supportDoubleClick: LayoutActions.hasGesture(root.modelData, "doubleclickAction")
+            onAccessibleClicked: root._runGesture("action")
+            onAccessibleLongPressed: root._runGesture("longPressAction")
+            onAccessibleDoubleClicked: root._runGesture("doubleclickAction")
+        }
+
+    }
+}

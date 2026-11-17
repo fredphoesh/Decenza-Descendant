@@ -1,0 +1,511 @@
+#include "core/diagnosticlogging.h"
+#include "memorymonitor.h"
+#include "sanitizers.h"
+#include <QCoreApplication>
+#include <QDateTime>
+#include <cmath>
+#include <QDebug>
+#include <QJsonDocument>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQmlEngine>
+#include <QQuickItem>
+#include <QRegularExpression>
+#include <QSet>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <psapi.h>
+#endif
+
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+#include <mach/mach.h>
+#endif
+
+#ifdef Q_OS_ANDROID
+#include <QJniObject>
+#elif defined(Q_OS_LINUX)
+#include <QFile>
+#include <QTextStream>
+#endif
+
+#ifndef QT_NO_DEBUG
+#include <QQuickItem>
+#endif
+
+MemoryMonitor::MemoryMonitor(QObject* parent)
+    : QObject(parent)
+{
+    m_uptime.start();
+
+    m_timer.setInterval(60000);
+    connect(&m_timer, &QTimer::timeout, this, &MemoryMonitor::onSampleTimerTick);
+    m_timer.start();
+
+    // Take initial sample
+    onSampleTimerTick();
+}
+
+void MemoryMonitor::onSampleTimerTick()
+{
+    quint64 rss = readRss();
+    int objCount = countQObjects();
+
+    m_lastRss = rss;
+    m_lastQObjectCount = objCount;
+
+    if (m_firstSample && rss > 0) {
+        m_startupRss = rss;
+        m_firstSample = false;
+    }
+
+    // TRACKING the peak is exact and unconditional — peakRssMB() and the JSON
+    // snapshot report it, and a threshold there would make them wrong.
+    if (rss > m_peakRss)
+        m_peakRss = rss;
+
+    MemorySample sample;
+    sample.timestampMs = QDateTime::currentMSecsSinceEpoch();
+    sample.rssBytes = rss;
+    sample.qobjectCount = objCount;
+
+    if (m_samples.size() >= MAX_SAMPLES)
+        m_samples.removeFirst();
+    m_samples.append(sample);
+
+    if (const auto growth = MemoryTrend::sustainedGrowth(m_samples)) {
+        if (m_lastLoggedGrowthMB < 0 || growth->lastMB >= m_lastLoggedGrowthMB + 5.0)
+            m_lastLoggedGrowthMB = growth->lastMB;
+        LogCollapse::Collapsed collapsed;
+        if (m_logCollapse.shouldLog(QStringLiteral("growth"),
+                QString::number(m_lastLoggedGrowthMB, 'f', 1), sample.timestampMs, &collapsed)) {
+            DIAG_DEBUG(MEMORY, "MemoryMonitor")
+                << QStringLiteral("Sustained growth: medianMB=%1,%2,%3 spanMin=%4 currentMB=%5 QObjects=%6")
+                    .arg(growth->firstMB, 0, 'f', 1).arg(growth->middleMB, 0, 'f', 1)
+                    .arg(growth->lastMB, 0, 'f', 1).arg(growth->spanMs / 60000)
+                    .arg(currentRssMB(), 0, 'f', 1).arg(objCount)
+                    + m_logCollapse.suffixSimilar(collapsed);
+        }
+    }
+    // No reset when a sample breaks the trend: a one-sample flicker used to forget
+    // the level and re-print the same growth line minutes later. A new line needs
+    // 5 MB above the last one printed.
+
+    emit sampleTaken();
+
+#ifndef QT_NO_DEBUG
+    scanForEmojiText();
+#endif
+}
+
+quint64 MemoryMonitor::readRss() const
+{
+#ifdef Q_OS_WIN
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        return pmc.WorkingSetSize;
+    DIAG_WARN(MEMORY, "MemoryMonitor") << QString::asprintf("GetProcessMemoryInfo failed");
+    return 0;
+#elif defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO,
+                                 reinterpret_cast<task_info_t>(&info), &count);
+    if (kr == KERN_SUCCESS)
+        return info.phys_footprint;  // phys_footprint is the "real" memory cost (compressed + swapped), more accurate than resident_size
+    DIAG_WARN(MEMORY, "MemoryMonitor") << QString::asprintf("task_info failed: %d", kr);
+    return 0;
+#elif defined(Q_OS_ANDROID)
+    // VmRSS from /proc/self/status is unreliable on Android (SELinux policy may
+    // zero it out). Use android.os.Debug.getNativeHeapAllocatedSize() which
+    // reports the native (C++) heap reliably via the Android runtime.
+    jlong nativeBytes = QJniObject::callStaticMethod<jlong>(
+        "android/os/Debug", "getNativeHeapAllocatedSize");
+    return static_cast<quint64>(nativeBytes);
+#elif defined(Q_OS_LINUX)
+    QFile f("/proc/self/status");
+    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&f);
+        while (!in.atEnd()) {
+            QString line = in.readLine();
+            if (line.startsWith("VmRSS:")) {
+                // Format: "VmRSS:    12345 kB"
+                QStringList parts = line.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+                if (parts.size() >= 2) {
+                    bool ok;
+                    quint64 kb = parts[1].toULongLong(&ok);
+                    if (ok)
+                        return kb * 1024;
+                }
+                DIAG_WARN(MEMORY, "MemoryMonitor") << QString::asprintf("Failed to parse VmRSS line: %s", qPrintable(line));
+                break;
+            }
+        }
+    } else {
+        DIAG_WARN(MEMORY, "MemoryMonitor") << QString::asprintf("Failed to open /proc/self/status");
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+QSet<QObject*> MemoryMonitor::collectAllQObjects() const
+{
+    // Walk both QApplication and QML engine trees to get a meaningful count.
+    // Most QObjects are parented under the engine (QML items), not the app.
+    QSet<QObject*> seen;
+
+    auto* app = QCoreApplication::instance();
+    if (app) {
+        const auto appChildren = app->findChildren<QObject*>();
+        for (auto* obj : appChildren)
+            seen.insert(obj);
+        seen.insert(app);
+    }
+
+    if (m_engine) {
+        const auto engineChildren = m_engine->findChildren<QObject*>();
+        for (auto* obj : engineChildren)
+            seen.insert(obj);
+        seen.insert(m_engine);
+
+        const auto roots = m_engine->rootObjects();
+        for (auto* root : roots) {
+            if (!root) continue;
+            seen.insert(root);
+            const auto rootChildren = root->findChildren<QObject*>();
+            for (auto* obj : rootChildren)
+                seen.insert(obj);
+        }
+    }
+
+    return seen;
+}
+
+int MemoryMonitor::countQObjects()
+{
+    const auto all = collectAllQObjects();
+
+    // Build per-class counts for on-demand diagnostics.
+    m_prevClassCounts = m_classCounts;
+    m_classCounts.clear();
+    for (auto* obj : all) {
+        const char* name = obj->metaObject()->className();
+        m_classCounts[QString::fromLatin1(name)]++;
+    }
+
+    // Capture baseline on first sample after engine is set (when QML tree is populated)
+    if (!m_baselineCaptured && m_engine) {
+        m_baselineClassCounts = m_classCounts;
+        m_baselineCaptured = true;
+    }
+
+    collectRunningAnimations(all);
+
+    return static_cast<int>(all.size());
+}
+
+namespace {
+// "Foo.qml" for an object declared in QML, else its C++ class.
+QString qmlFileOf(const QObject* obj)
+{
+    if (const QQmlContext* ctx = qmlContext(obj)) {
+        const QString file = ctx->baseUrl().fileName();
+        if (!file.isEmpty())
+            return file;
+    }
+    return QString::fromLatin1(obj->metaObject()->className());
+}
+
+// "id" when the object has one in its own file, else its type.
+QString nameOf(const QObject* obj)
+{
+    if (const QQmlContext* ctx = qmlContext(obj)) {
+        const QString id = ctx->nameForObject(obj);
+        if (!id.isEmpty())
+            return id;
+    }
+    return QString::fromLatin1(obj->metaObject()->className());
+}
+} // namespace
+
+void MemoryMonitor::collectRunningAnimations(const QSet<QObject*>& all)
+{
+    QStringList running;
+    QStringList firstSeen;
+    for (QObject* obj : all) {
+        // Timer is listed because it IS an animation job (QPauseAnimationJob, qqmltimer.cpp:40):
+        // the QML profiler counts running Timers as running animations.
+        const bool timer = obj->inherits("QQmlTimer");
+        const bool busy = !timer && obj->inherits("QQuickBusyIndicator");
+        const bool anim = !timer && !busy && (obj->inherits("QQuickAbstractAnimation")
+                                              || obj->inherits("QQuickFrameAnimation"));
+        if (!timer && !anim && !busy)
+            continue;
+        if (!obj->property("running").toBool())
+            continue;
+        // A group's children report the group's state; the group is the one entry.
+        if (anim && obj->parent() && obj->parent()->inherits("QQuickAnimationGroup"))
+            continue;
+
+        // An "on <property>" animation targets its parent. The file that USES a reusable
+        // component (FocusIndicator, a widget) is the one that locates it, so walk up to the
+        // first ancestor declared somewhere else.
+        const QString ownFile = qmlFileOf(obj);
+        QString usedIn;
+        for (QObject* p = obj->parent(); p && usedIn.isEmpty(); p = p->parent()) {
+            const QString f = qmlFileOf(p);
+            if (f != ownFile && f.endsWith(QLatin1String(".qml")))
+                usedIn = f;
+        }
+        const QString objectName = nameOf(obj);
+        QString entry = QStringLiteral("%1 %2").arg(ownFile, objectName);
+        if (timer) {
+            entry += QStringLiteral(" Timer %1 ms%2").arg(obj->property("interval").toInt())
+                         .arg(obj->property("repeat").toBool() ? QStringLiteral(" repeating") : QString());
+        } else if (anim) {
+            const QString prop = obj->property("property").toString();
+            if (!prop.isEmpty())
+                entry += QStringLiteral(" on ") + prop;
+        } else if (const auto* item = qobject_cast<const QQuickItem*>(obj); item && !item->isVisible()) {
+            entry += QStringLiteral(" (hidden)");
+        }
+        if (!usedIn.isEmpty())
+            entry += QStringLiteral(" in ") + usedIn;
+        running << entry;
+        // A changing settle-timer interval is the same work; the snapshot keeps its exact value.
+        QString identity = QStringLiteral("%1|%2|%3|%4")
+            .arg(ownFile, objectName, usedIn, obj->property("property").toString());
+        // Anonymous timers have no id to distinguish the clock from the video-rotation timer.
+        if (timer && objectName == QString::fromLatin1(obj->metaObject()->className()))
+            identity += QStringLiteral("|interval=%1").arg(obj->property("interval").toInt());
+        if (!m_reportedRunningWork.contains(identity)) {
+            m_reportedRunningWork.insert(identity);
+            firstSeen << entry;
+        }
+    }
+    running.sort();
+
+    if (!firstSeen.isEmpty()) {
+        firstSeen.sort();
+        DIAG_DEBUG(MEMORY, "MemoryMonitor").noquote()
+            << QStringLiteral("First seen running work: %1 (full current inventory available in memory snapshot)")
+                .arg(firstSeen.join(QStringLiteral("; ")));
+    }
+    m_runningAnimations = running;
+}
+
+double MemoryMonitor::currentRssMB() const
+{
+    return m_lastRss / (1024.0 * 1024.0);
+}
+
+bool MemoryMonitor::instrumentedBuild() const
+{
+    // Broader than "has a sanitizer": callers use this to relax memory
+    // thresholds, and an unoptimised Debug build is heavier than Release even
+    // with no sanitizer attached.
+#if defined(DECENZA_SANITIZERS_PRESENT) || !defined(QT_NO_DEBUG)
+    return true;
+#else
+    return false;
+#endif
+}
+
+double MemoryMonitor::liveRssMB() const
+{
+    return readRss() / (1024.0 * 1024.0);
+}
+
+double MemoryMonitor::peakRssMB() const
+{
+    return m_peakRss / (1024.0 * 1024.0);
+}
+
+double MemoryMonitor::startupRssMB() const
+{
+    return m_startupRss / (1024.0 * 1024.0);
+}
+
+QString MemoryMonitor::toSummaryString() const
+{
+    qint64 uptimeMin = m_uptime.elapsed() / 60000;
+    QString out;
+    QTextStream s(&out);
+
+    s << "\n=== MEMORY SNAPSHOT (at download time) ===\n";
+    s << QString("Uptime: %1h %2m\n").arg(uptimeMin / 60).arg(uptimeMin % 60);
+    s << QString("RSS: %1 MB  peak: %2 MB  startup: %3 MB\n")
+             .arg(currentRssMB(), 0, 'f', 1)
+             .arg(peakRssMB(), 0, 'f', 1)
+             .arg(startupRssMB(), 0, 'f', 1);
+    s << QString("QObjects: %1\n").arg(m_lastQObjectCount);
+
+    // Top 20 classes sorted by count, with delta vs baseline
+    if (!m_classCounts.isEmpty()) {
+        QVector<QPair<QString, int>> sorted;
+        sorted.reserve(m_classCounts.size());
+        for (auto it = m_classCounts.constBegin(); it != m_classCounts.constEnd(); ++it)
+            sorted.append({it.key(), it.value()});
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        const auto& deltaBase = m_baselineCaptured ? m_baselineClassCounts : m_prevClassCounts;
+        s << "Top QObject classes (count / delta vs startup):\n";
+        qsizetype limit = qMin(sorted.size(), qsizetype(20));
+        for (qsizetype i = 0; i < limit; ++i) {
+            int delta = sorted[i].second - deltaBase.value(sorted[i].first, 0);
+            s << QString("  %1  (%2%3)  %4\n")
+                     .arg(sorted[i].second, 5)
+                     .arg(delta >= 0 ? "+" : "")
+                     .arg(delta)
+                     .arg(sorted[i].first);
+        }
+    }
+
+    s << QString("Running animations and timers (last sample): %1\n").arg(m_runningAnimations.size());
+    for (const QString& a : m_runningAnimations)
+        s << "  " << a << "\n";
+
+    // Last 20 samples
+    if (!m_samples.isEmpty()) {
+        s << "Recent samples (time / QObjects / RSS MB):\n";
+        qsizetype start = qMax(qsizetype(0), m_samples.size() - 20);
+        for (qsizetype i = start; i < m_samples.size(); ++i) {
+            const auto& sample = m_samples[i];
+            QDateTime dt = QDateTime::fromMSecsSinceEpoch(sample.timestampMs);
+            s << QString("  [%1]  QObj=%2  RSS=%3 MB\n")
+                     .arg(dt.toString("HH:mm:ss"))
+                     .arg(sample.qobjectCount)
+                     .arg(sample.rssBytes / (1024.0 * 1024.0), 0, 'f', 1);
+        }
+    }
+    s << "===========================================\n";
+
+    return out;
+}
+
+QJsonObject MemoryMonitor::toJson() const
+{
+    QJsonObject current;
+    current["rssBytes"] = static_cast<qint64>(m_lastRss);
+    current["rssMB"] = qRound(currentRssMB() * 10) / 10.0;
+    current["qobjectCount"] = m_lastQObjectCount;
+
+    QJsonObject peak;
+    peak["rssBytes"] = static_cast<qint64>(m_peakRss);
+    peak["rssMB"] = qRound(peakRssMB() * 10) / 10.0;
+
+    QJsonObject startup;
+    startup["rssBytes"] = static_cast<qint64>(m_startupRss);
+    startup["rssMB"] = qRound(startupRssMB() * 10) / 10.0;
+
+    QJsonArray samplesArr;
+    for (const auto& s : m_samples) {
+        QJsonObject obj;
+        obj["t"] = s.timestampMs;
+        obj["rss"] = qRound(s.rssBytes / (1024.0 * 1024.0) * 10) / 10.0;
+        obj["obj"] = s.qobjectCount;
+        samplesArr.append(obj);
+    }
+
+    // Per-class breakdown: sort by count descending, return top 30
+    QVector<QPair<QString, int>> sorted;
+    sorted.reserve(m_classCounts.size());
+    for (auto it = m_classCounts.constBegin(); it != m_classCounts.constEnd(); ++it)
+        sorted.append({it.key(), it.value()});
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+
+    // Delta is vs. baseline (first sample after engine set) — shows growth since startup
+    const auto& deltaBase = m_baselineCaptured ? m_baselineClassCounts : m_prevClassCounts;
+
+    QJsonArray classesArr;
+    qsizetype classLimit = qMin(sorted.size(), qsizetype(30));
+    for (qsizetype i = 0; i < classLimit; ++i) {
+        QJsonObject cls;
+        cls["name"] = sorted[i].first;
+        cls["count"] = sorted[i].second;
+        int base = deltaBase.value(sorted[i].first, 0);
+        cls["delta"] = sorted[i].second - base;
+        classesArr.append(cls);
+    }
+
+    QJsonObject root;
+    root["current"] = current;
+    root["peak"] = peak;
+    root["startup"] = startup;
+    root["uptimeMinutes"] = static_cast<qint64>(m_uptime.elapsed() / 60000);
+    root["samples"] = samplesArr;
+    root["topClasses"] = classesArr;
+
+    return root;
+}
+
+#ifndef QT_NO_DEBUG
+static bool isEmojiCodepoint(uint cp) {
+    if (cp >= 0x2600 && cp <= 0x26FF) return true;   // Miscellaneous Symbols (☀☁⚡ etc.)
+    if (cp >= 0x2700 && cp <= 0x27BF) return true;   // Dingbats
+    if (cp >= 0x1F600 && cp <= 0x1F64F) return true;  // Emoticons
+    if (cp >= 0x1F300 && cp <= 0x1F5FF) return true;  // Miscellaneous Symbols and Pictographs
+    if (cp >= 0x1F680 && cp <= 0x1F6FF) return true;  // Transport and Map Symbols
+    if (cp >= 0x1F900 && cp <= 0x1F9FF) return true;  // Supplemental Symbols
+    if (cp >= 0x1FA00 && cp <= 0x1FA6F) return true;  // Symbols and Pictographs Extended-A
+    if (cp == 0xFE0F) return true;                     // Emoji presentation selector
+    return false;
+}
+
+void MemoryMonitor::scanForEmojiText()
+{
+    if (!m_engine) return;
+
+    const auto roots = m_engine->rootObjects();
+    for (auto* root : roots) {
+        if (!root) continue;
+        const auto items = root->findChildren<QQuickItem*>();
+        for (auto* item : items) {
+            if (!item->isVisible()) continue;
+
+            int textPropIdx = item->metaObject()->indexOfProperty("text");
+            if (textPropIdx < 0) continue;
+
+            QString text = item->property("text").toString();
+            if (text.isEmpty()) continue;
+
+            bool hasEmoji = false;
+            QString emojiChars;
+            for (auto it = text.cbegin(); it != text.cend(); ++it) {
+                uint cp = it->unicode();
+                if (it->isHighSurrogate()) {
+                    auto next = it + 1;
+                    if (next != text.cend() && next->isLowSurrogate()) {
+                        cp = QChar::surrogateToUcs4(it->unicode(), next->unicode());
+                        ++it;
+                    }
+                }
+                if (isEmojiCodepoint(cp)) {
+                    hasEmoji = true;
+                    emojiChars += QString("U+%1 ").arg(cp, 4, 16, QChar('0')).toUpper();
+                }
+            }
+
+            if (hasEmoji) {
+                QString preview = text.left(80);
+                if (text.length() > 80) preview += "...";
+                QString key = QString("%1:%2").arg(item->metaObject()->className(), preview);
+
+                if (!m_reportedEmojiTexts.contains(key)) {
+                    m_reportedEmojiTexts.insert(key);
+                    DIAG_WARN(FONT, "MemoryMonitor") << QString::asprintf("Text with emoji codepoints: class=%s objectName=\"%s\" emoji=[%s] text=\"%s\"",
+                             item->metaObject()->className(),
+                             qPrintable(item->objectName()),
+                             qPrintable(emojiChars.trimmed()),
+                             qPrintable(preview));
+                }
+            }
+        }
+    }
+}
+#endif

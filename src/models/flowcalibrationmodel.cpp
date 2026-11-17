@@ -1,0 +1,278 @@
+#include "core/diagnosticlogging.h"
+#include "flowcalibrationmodel.h"
+#include "flowcalibrationmath.h"
+#include "../history/shothistorystorage.h"
+#include "../core/settings_calibration.h"
+#include "../ble/de1device.h"
+
+#include <QDateTime>
+#include <QDebug>
+#include <QThread>
+#include <QSqlDatabase>
+#include "../core/dbutils.h"
+#include <QSqlError>
+#include <QSqlQuery>
+
+FlowCalibrationModel::FlowCalibrationModel(QObject* parent)
+    : QObject(parent)
+{
+}
+
+FlowCalibrationModel::~FlowCalibrationModel()
+{
+    *m_destroyed = true;
+}
+
+void FlowCalibrationModel::setStorage(ShotHistoryStorage* storage) {
+    m_storage = storage;
+}
+
+void FlowCalibrationModel::setSettings(SettingsCalibration* settings) {
+    m_settings = settings;
+}
+
+void FlowCalibrationModel::setDevice(DE1Device* device) {
+    m_device = device;
+}
+
+void FlowCalibrationModel::setMultiplier(double m) {
+    m = qBound(0.35, m, 3.0);
+    if (qAbs(m_multiplier - m) > 0.001) {
+        m_multiplier = m;
+        recalculateFlow();
+        emit multiplierChanged();
+    }
+}
+
+void FlowCalibrationModel::setLoading(bool loading) {
+    if (m_loading != loading) {
+        m_loading = loading;
+        emit loadingChanged();
+    }
+}
+
+void FlowCalibrationModel::loadRecentShots() {
+    if (!m_storage || m_loading) return;
+
+    setLoading(true);
+
+    const QString dbPath = m_storage->databasePath();
+    auto destroyed = m_destroyed;
+
+    QThread* thread = QThread::create([this, dbPath, destroyed]() {
+        QVector<qint64> shotIds;
+        ShotRecord firstRecord;
+        bool dbFailed = !withTempDb(dbPath, "fcm_recent", [&](QSqlDatabase& db) {
+            QSqlQuery query(db);
+            if (!query.prepare("SELECT id FROM shots ORDER BY timestamp DESC LIMIT 50")) {
+                DIAG_WARN(CALIBRATION, "FlowCalibrationModel") << "query prepare failed:" << query.lastError().text();
+            } else if (query.exec()) {
+                while (query.next()) {
+                    qint64 id = query.value(0).toLongLong();
+                    ShotRecord record = ShotHistoryStorage::loadShotRecordStatic(db, id, nullptr, Q_FUNC_INFO, ShotHistoryStorage::PortalCalibration::Skip);
+                    if (!record.weightFlowRate.isEmpty()) {
+                        shotIds.append(id);
+                        if (shotIds.size() == 1) {
+                            firstRecord = std::move(record);
+                        }
+                    }
+                    if (shotIds.size() >= 20) break;
+                }
+            } else {
+                DIAG_WARN(CALIBRATION, "FlowCalibrationModel") << "query exec failed:" << query.lastError().text();
+            }
+        });
+
+        QMetaObject::invokeMethod(this, [this, ownedShotIds = std::move(shotIds),
+                                         ownedFirstRecord = std::move(firstRecord), dbFailed, destroyed]() {
+            if (*destroyed) {
+                DIAG_DEBUG(CALIBRATION, "FlowCalibrationModel") << "loadRecentShots callback dropped (object destroyed)";
+                return;
+            }
+
+            m_shotIds = ownedShotIds;
+            ++m_shotListRevision;
+
+            if (m_shotIds.isEmpty()) {
+                m_errorMessage = dbFailed
+                    ? tr("Could not access shot database. Try restarting the app.")
+                    : tr("No shots with scale data found. Run a shot with a Bluetooth scale connected.");
+                m_currentIndex = -1;
+                m_originalFlow.clear();
+                m_recalculatedFlow.clear();
+                m_weightFlowRate.clear();
+                m_pressure.clear();
+                m_shotInfo.clear();
+                emit errorChanged();
+                emit dataChanged();
+            } else {
+                m_errorMessage.clear();
+                m_currentIndex = 0;
+                m_multiplier = m_settings ? m_settings->flowCalibrationMultiplier() : 1.0;
+                emit multiplierChanged();
+                emit errorChanged();
+
+                applyShotRecord(ownedFirstRecord);
+            }
+
+            emit navigationChanged();
+            setLoading(false);
+        }, Qt::QueuedConnection);
+    });
+
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
+}
+
+void FlowCalibrationModel::previousShot() {
+    selectShot(m_currentIndex - 1);
+}
+
+void FlowCalibrationModel::nextShot() {
+    selectShot(m_currentIndex + 1);
+}
+
+void FlowCalibrationModel::selectShot(int index) {
+    if (m_loading || index < 0 || index >= m_shotIds.size() || index == m_currentIndex) return;
+    m_currentIndex = index;
+    m_shotInfo.clear();
+    emit navigationChanged();
+    loadCurrentShot();
+}
+
+void FlowCalibrationModel::save() {
+    if (m_settings) {
+        m_settings->setFlowCalibrationMultiplier(m_multiplier);
+        // Signal connection in MainController sends it to the machine
+    }
+}
+
+void FlowCalibrationModel::resetToFactory() {
+    setMultiplier(1.0);
+}
+
+void FlowCalibrationModel::loadCurrentShot() {
+    if (m_currentIndex < 0 || m_currentIndex >= m_shotIds.size() || !m_storage || m_loading) return;
+
+    // Once selection changes, the previous shot is no longer the selected
+    // result. Clear its curves before the asynchronous read so a database
+    // failure cannot leave a successful-looking overlay for the wrong index.
+    m_originalFlow.clear();
+    m_recalculatedFlow.clear();
+    m_weightFlowRate.clear();
+    m_pressure.clear();
+    m_shotInfo.clear();
+    m_maxTime = 60.0;
+    emit dataChanged();
+    setLoading(true);
+
+    const QString dbPath = m_storage->databasePath();
+    const qint64 shotId = m_shotIds[m_currentIndex];
+    auto destroyed = m_destroyed;
+
+    QThread* thread = QThread::create([this, dbPath, shotId, destroyed]() {
+        ShotRecord record;
+        bool dbFailed = !withTempDb(dbPath, "fcm_shot", [&](QSqlDatabase& db) {
+            record = ShotHistoryStorage::loadShotRecordStatic(db, shotId, nullptr, Q_FUNC_INFO, ShotHistoryStorage::PortalCalibration::Skip);
+        });
+
+        QMetaObject::invokeMethod(this, [this, ownedRecord = std::move(record), dbFailed, destroyed]() {
+            if (*destroyed) {
+                DIAG_DEBUG(CALIBRATION, "FlowCalibrationModel") << "loadCurrentShot callback dropped (object destroyed)";
+                return;
+            }
+
+            if (dbFailed || ownedRecord.summary.id == 0) {
+                m_errorMessage = tr("Failed to load shot data. The database may be unavailable.");
+                emit errorChanged();
+                setLoading(false);
+                return;
+            }
+
+            applyShotRecord(ownedRecord);
+            setLoading(false);
+        }, Qt::QueuedConnection);
+    });
+
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
+}
+
+void FlowCalibrationModel::applyShotRecord(const ShotRecord& record) {
+    if (record.flow.isEmpty()) {
+        m_originalFlow.clear();
+        m_recalculatedFlow.clear();
+        m_weightFlowRate.clear();
+        m_pressure.clear();
+        m_shotInfo.clear();
+        m_maxTime = 60.0;
+        m_errorMessage = tr("This shot has no flow data to display.");
+        emit errorChanged();
+        emit dataChanged();
+        return;
+    }
+    if (!m_errorMessage.isEmpty()) {
+        m_errorMessage.clear();
+        emit errorChanged();
+    }
+    m_originalFlow = record.flow;
+    m_weightFlowRate = record.weightFlowRate;
+    m_pressure = record.pressure;
+    // The multiplier this shot actually POURED under (shots.flow_calibration,
+    // migration 39). recalculateFlow() below divides the stored flow curve by it
+    // and multiplies by the slider's value — the same replay Decent's own
+    // Graphical Flow Calibrator does. Without it every shot was replayed as if
+    // it had been recorded at 1.0, so on any machine whose multiplier is not 1.0
+    // the two curves were being overlaid at the wrong scale — on this page,
+    // whose entire purpose is judging that overlay by eye.
+    //
+    // 0.0 means the shot predates the column (or was imported, or is a dev fake).
+    // The guard in recalculateFlow() falls back to 1.0 there, which is the old
+    // behaviour and the only defensible guess; shotRecordedMultiplier lets the
+    // UI say so rather than implying it knows.
+    m_shotMultiplier = record.flowCalibration;
+
+    m_maxTime = 60.0;
+    if (!m_pressure.isEmpty()) {
+        m_maxTime = m_pressure.last().x();
+    } else if (!m_originalFlow.isEmpty()) {
+        m_maxTime = m_originalFlow.last().x();
+    }
+
+    QDateTime dt = QDateTime::fromSecsSinceEpoch(record.summary.timestamp);
+    m_shotInfo = record.summary.profileName + " \u2014 " + dt.toString("MMM d, yyyy");
+
+    recalculateFlow();
+}
+
+void FlowCalibrationModel::recalculateFlow() {
+    m_recalculatedFlow = FlowCalibrationMath::replay(m_originalFlow, m_shotMultiplier, m_multiplier);
+    emit dataChanged();
+}
+
+QVariantList FlowCalibrationModel::flowData() const {
+    return pointsToVariant(m_recalculatedFlow);
+}
+
+QVariantList FlowCalibrationModel::originalFlowData() const {
+    return pointsToVariant(m_originalFlow);
+}
+
+QVariantList FlowCalibrationModel::weightFlowData() const {
+    return pointsToVariant(m_weightFlowRate);
+}
+
+QVariantList FlowCalibrationModel::pressureData() const {
+    return pointsToVariant(m_pressure);
+}
+
+QVariantList FlowCalibrationModel::pointsToVariant(const QVector<QPointF>& points) const {
+    QVariantList result;
+    for (const auto& pt : points) {
+        QVariantMap p;
+        p["x"] = pt.x();
+        p["y"] = pt.y();
+        result.append(p);
+    }
+    return result;
+}

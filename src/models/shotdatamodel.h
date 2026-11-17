@@ -1,0 +1,225 @@
+#pragma once
+
+#include <QList>
+#include <QObject>
+#include <QPointF>
+#include <QPointer>
+#include <QTimer>
+#include <QVariantList>
+#include <QVector>
+#include "portalsample.h"
+
+class FastLineRenderer;
+
+struct PhaseMarker {
+    double time;
+    QString label;
+    int frameNumber;
+    bool isFlowMode = false;  // true = flow control, false = pressure control
+    QString transitionReason;  // "weight", "pressure", "flow", "time", or "" (unknown/old data)
+};
+
+class ShotDataModel : public QObject {
+    Q_OBJECT
+
+    Q_PROPERTY(QVariantList phaseMarkers READ phaseMarkersVariant NOTIFY phaseMarkersChanged)
+    Q_PROPERTY(double maxTime READ maxTime NOTIFY maxTimeChanged)
+    Q_PROPERTY(double rawTime READ rawTime NOTIFY rawTimeChanged)
+    Q_PROPERTY(double stopTime READ stopTime NOTIFY stopTimeChanged)
+    Q_PROPERTY(double weightAtStop READ weightAtStop NOTIFY weightAtStopChanged)
+    Q_PROPERTY(double finalWeight READ finalWeight NOTIFY finalWeightChanged)
+    Q_PROPERTY(QVariantList portalSamples READ portalSamplesVariant NOTIFY portalSamplesChanged)
+    Q_PROPERTY(qsizetype portalSampleCount READ portalSampleCount NOTIFY portalSamplesChanged)
+    Q_PROPERTY(double portalEcMin READ portalEcMin NOTIFY portalSamplesChanged)
+    Q_PROPERTY(double portalEcMax READ portalEcMax NOTIFY portalSamplesChanged)
+    // Goal curves as lists of QPointF, bound straight to LineSeries.values.
+    Q_PROPERTY(QVariantList pressureGoalPoints READ pressureGoalPointsVariant NOTIFY goalCurvesChanged)
+    Q_PROPERTY(QVariantList flowGoalPoints READ flowGoalPointsVariant NOTIFY goalCurvesChanged)
+    Q_PROPERTY(QVariantList temperatureGoalPoints READ temperatureGoalPointsVariant NOTIFY goalCurvesChanged)
+    Q_PROPERTY(QVariantList temperatureMixGoalPoints READ temperatureMixGoalPointsVariant NOTIFY goalCurvesChanged)
+
+public:
+    explicit ShotDataModel(QObject* parent = nullptr);
+    ~ShotDataModel();
+
+    double maxTime() const { return m_maxTime; }
+    double rawTime() const { return m_rawTime; }
+    double stopTime() const { return m_stopTime; }
+    double weightAtStop() const { return m_weightAtStop; }
+    double finalWeight() const;
+    qsizetype portalSampleCount() const { return m_portalSamples.size(); }
+    Q_PROPERTY(double portalEcAxisPadding READ portalEcAxisPadding CONSTANT)
+    double portalEcAxisPadding() const { return PortalSamples::EcAxisPadding; }
+    double portalEcMin() const { return m_portalEcBounds.minimum; }
+    double portalEcMax() const { return m_portalEcBounds.maximum; }
+    Q_INVOKABLE QVariantList portalEcBounds(const QVariantList& samples) const;
+    QVariantList portalSamplesVariant() const { return PortalSamples::toVariant(m_portalSamples); }
+    const QVector<PortalSample>& portalSamples() const { return m_portalSamples; }
+    QVariantList phaseMarkersVariant() const;
+    QVariantList pressureGoalPointsVariant() const;
+    QVariantList flowGoalPointsVariant() const;
+    QVariantList temperatureGoalPointsVariant() const;
+    QVariantList temperatureMixGoalPointsVariant() const;
+
+    // Register fast renderers for live data series (QSGGeometryNode - pre-allocated VBO)
+    Q_INVOKABLE void registerFastSeries(FastLineRenderer* pressure, FastLineRenderer* flow,
+                                         FastLineRenderer* temperature,
+                                         FastLineRenderer* weight, FastLineRenderer* weightFlow,
+                                         FastLineRenderer* resistance = nullptr,
+                                         FastLineRenderer* conductance = nullptr,
+                                         FastLineRenderer* darcyResistance = nullptr,
+                                         FastLineRenderer* temperatureMix = nullptr);
+
+    // Data export for visualizer upload
+    const QVector<QPointF>& pressureData() const { return m_pressurePoints; }
+    const QVector<QPointF>& flowData() const { return m_flowPoints; }
+    const QVector<QPointF>& temperatureData() const { return m_temperaturePoints; }
+    const QVector<QPointF>& temperatureMixData() const { return m_temperatureMixPoints; }
+    const QVector<QPointF>& resistanceData() const { return m_resistancePoints; }
+    const QVector<QPointF>& conductanceData() const { return m_conductancePoints; }
+    const QVector<QPointF>& darcyResistanceData() const { return m_darcyResistancePoints; }
+    const QVector<QPointF>& conductanceDerivativeData() const { return m_conductanceDerivativePoints; }
+    const QVector<QPointF>& waterDispensedData() const { return m_waterDispensedPoints; }
+    QVector<QPointF> pressureGoalData() const;  // Combines all segments
+    QVector<QPointF> flowGoalData() const;      // Combines all segments
+    const QVector<QVector<QPointF>>& pressureGoalSegmentsData() const { return m_pressureGoalSegments; }
+    const QVector<QVector<QPointF>>& flowGoalSegmentsData() const { return m_flowGoalSegments; }
+    const QVector<QPointF>& temperatureGoalData() const { return m_temperatureGoalPoints; }
+    const QVector<QPointF>& temperatureMixGoalData() const { return m_temperatureMixGoalPoints; }
+    const QVector<QPointF>& weightData() const { return m_weightPoints; }  // Cumulative weight (g) for graph
+    const QVector<QPointF>& cumulativeWeightData() const { return m_cumulativeWeightPoints; }  // Cumulative weight for export
+    const QVector<QPointF>& weightFlowRateData() const { return m_weightFlowRatePoints; }  // Flow rate from scale (g/s) for export
+    const QVector<QPointF>& weightFlowRateRawData() const { return m_weightFlowRateRawPoints; }  // Raw (pre-smoothing) flow rate
+
+    // Phase markers for state_change export
+    const QList<PhaseMarker>& phaseMarkersList() const { return m_phaseMarkers; }
+
+public slots:
+    const QString& weightSource() const { return m_weightSource; }
+    void recordWeightSource(const QString& source);
+    const QString& portalMountingMode() const { return m_portalMountingMode; }
+    void setPortalMountingMode(const QString& mode) { m_portalMountingMode = mode; }
+    void clear();
+    void clearWeightData();  // Clear only weight samples (call when tare completes)
+    void addPortalSample(double time, double ecRaw, double temperatureC,
+                         std::optional<double> auxiliaryTemperatureRaw = std::nullopt);
+    void markPortalGap() { m_portalGap = true; }
+
+    // Data ingestion - vector append, chart update deferred to 33ms timer
+    void addSample(double time, double pressure, double flow, double temperature,
+                   double mixTemp,
+                   double pressureGoal, double flowGoal, double temperatureGoal,
+                   double temperatureMixGoal,
+                   int frameNumber = -1, bool isFlowMode = false);
+    void addWeightSample(double time, double weight, double flowRate);
+    void addWeightSample(double time, double weight);  // Overload without flowRate (from ShotTimingController)
+    void markExtractionStart(double time);
+    // Mark when STOP-AT-WEIGHT stopped the shot. SAW only, despite what this
+    // comment used to say ("SAW or user"): the sole caller is main.cpp's
+    // WeightProcessor::stopNow lambda, so a manual stop, a profile end or a
+    // volume stop never reaches here and stopTime() keeps its -1 sentinel.
+    // Reading stopTime() as "how long the shot ran" is what broke the Home
+    // Screen widget's last-shot tile — see MainController::shotPersisted for
+    // the finalized duration consumers should use instead (#1658).
+    void markStopAt(double time);
+    void smoothWeightFlowRate(int window = 5);  // Apply centered moving average to weight flow rate
+    void computeConductanceDerivative();  // Compute dC/dt with 9-point Gaussian smoothing (post-shot only)
+    void trimSettlingData();  // Remove trailing zero-pressure samples recorded during SAW settling
+    void addPhaseMarker(double time, const QString& label, int frameNumber = -1, bool isFlowMode = false, const QString& transitionReason = QString());
+
+signals:
+    void cleared();
+    void portalSamplesChanged();
+    void portalSampleAdded(double time, double ecRaw, double temperatureC, bool breakBefore);
+    void maxTimeChanged();
+    void rawTimeChanged();
+    void phaseMarkersChanged();
+    void stopTimeChanged();
+    void weightAtStopChanged();
+    void finalWeightChanged();
+    void weightDataCleared();
+    void graphDataCorrected();
+    // Emitted after all post-shot in-place graph changes (trim + smoothing) finish.
+    // Remote live graphs use this as the atomic replacement boundary.
+    void graphCorrectionFinished();
+    void goalCurvesChanged();
+    void flushed();  // Emitted after 33ms timer flushes new data to renderers
+
+private slots:
+    void onFlushTimerTick();  // Called by timer - batched update to chart
+
+private:
+    // Data storage - fast vector appends
+    QVector<QPointF> m_pressurePoints;
+    QString m_weightSource;
+    QString m_portalMountingMode;
+    QVector<PortalSample> m_portalSamples;
+    bool m_portalGap = true;
+    bool m_portalDirty = false;
+    PortalSamples::EcBounds m_portalEcBounds;
+    QVector<QPointF> m_flowPoints;
+    QVector<QPointF> m_temperaturePoints;
+    QVector<QPointF> m_temperatureMixPoints;
+    QVector<QPointF> m_resistancePoints;
+    QVector<QPointF> m_conductancePoints;          // F^2 / P (Darcy conductance)
+    QVector<QPointF> m_darcyResistancePoints;      // P / F^2 (Darcy resistance)
+    QVector<QPointF> m_conductanceDerivativePoints; // dC/dt, Gaussian smoothed (post-shot only)
+    QVector<QPointF> m_waterDispensedPoints;
+    QVector<QVector<QPointF>> m_pressureGoalSegments;  // Separate segments for clean breaks
+    QVector<QVector<QPointF>> m_flowGoalSegments;      // Separate segments for clean breaks
+    QVector<QPointF> m_temperatureGoalPoints;      // SetHeadTemp (basket target)
+    QVector<QPointF> m_temperatureMixGoalPoints;   // SetMixTemp (water-in target)
+    QVector<QPointF> m_weightPoints;  // Cumulative weight (g) - for graphing
+    QVector<QPointF> m_cumulativeWeightPoints;  // Cumulative weight (g) - for export
+    QVector<QPointF> m_weightFlowRatePoints;  // Flow rate from scale (g/s) - for visualizer export
+    QVector<QPointF> m_weightFlowRateRawPoints;  // Raw (pre-smoothing) copy for by_weight_raw export
+
+    // Spike-filter burst state — see addWeightSample(). The filter compares each sample against
+    // the last ACCEPTED point, so a run of rejections keeps measuring against an ever-staler
+    // anchor; these two track the run so it can be broken and reported once instead of per sample.
+    int m_consecutiveSpikeRejections = 0;
+    double m_firstRejectedWeight = 0.0;
+
+    // Fast renderers for live data series (QSGGeometryNode, pre-allocated VBO)
+    QPointer<FastLineRenderer> m_fastPressure;
+    QPointer<FastLineRenderer> m_fastFlow;
+    QPointer<FastLineRenderer> m_fastTemperature;
+    QPointer<FastLineRenderer> m_fastWeight;
+    QPointer<FastLineRenderer> m_fastWeightFlow;
+    QPointer<FastLineRenderer> m_fastResistance;
+    QPointer<FastLineRenderer> m_fastConductance;
+    QPointer<FastLineRenderer> m_fastDarcyResistance;
+    QPointer<FastLineRenderer> m_fastTemperatureMix;
+
+    // Last-flushed index per fast series (for incremental appends)
+    qsizetype m_lastFlushedPressure = 0;
+    qsizetype m_lastFlushedFlow = 0;
+    qsizetype m_lastFlushedTemp = 0;
+    qsizetype m_lastFlushedWeight = 0;
+    qsizetype m_lastFlushedWeightFlow = 0;
+    qsizetype m_lastFlushedResistance = 0;
+    qsizetype m_lastFlushedConductance = 0;
+    qsizetype m_lastFlushedDarcyResistance = 0;
+    qsizetype m_lastFlushedTemperatureMix = 0;
+
+    // Batched update timer (30fps)
+    QTimer* m_flushTimer = nullptr;
+    bool m_dirty = false;
+    bool m_goalCurvesDirty = false;
+
+    double m_maxTime = 5.0;
+    double m_rawTime = 0.0;
+    bool m_rawTimeDirty = false;  // Deferred: emit rawTimeChanged in onFlushTimerTick()
+    bool m_lastPumpModeIsFlow = false;  // Track for starting new goal segments
+    bool m_hasPumpModeData = false;     // True after first sample with pump mode
+    int m_currentPressureGoalSegment = 0;  // Current segment index
+    int m_currentFlowGoalSegment = 0;      // Current segment index
+
+    // Phase markers for QML labels
+    QList<PhaseMarker> m_phaseMarkers;
+    double m_stopTime = -1;          // Recorded stop time for accessibility
+    double m_weightAtStop = 0.0;     // Weight when stop was triggered
+
+    static constexpr int FLUSH_INTERVAL_MS = 33;  // Chart update timer (~30fps); batches BLE and scale samples
+    static constexpr int INITIAL_CAPACITY = 6000;  // Pre-allocate for 10min at 10Hz (WiFi scale rate; BLE ~5Hz) — covers filter profiles
+};

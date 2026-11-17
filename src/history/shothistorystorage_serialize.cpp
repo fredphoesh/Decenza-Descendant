@@ -1,0 +1,313 @@
+// ShotHistoryStorage::convertShotRecord — builds a typed ShotProjection from
+// a fully-loaded ShotRecord. The body sits next to shothistorystorage.cpp
+// rather than in shotprojection.cpp because it depends on the internal-detail
+// helpers in shothistorystorage_internal.cpp (prepareAnalysisInputs, use12h).
+// Co-locating the call sites means tests that pull in shotprojection.cpp
+// don't transitively need internal.cpp — the dependency edge stays inside
+// the history TU set that already pulls in internal.cpp anyway.
+
+#include "shothistorystorage.h"
+#include "shotwaterresult.h"
+#include "shothistorystorage_internal.h"
+#include "shotprojection.h"
+#include "equipmentstorage.h"
+#include "machine/frameexitreason.h"
+
+#include "ai/portaltailanalyzer.h"
+#include "ai/shotanalysis.h"
+#include "ai/shotsummarizer.h"   // canonicalNameForKbId
+
+#include <QDateTime>
+#include <QJsonDocument>
+
+namespace {
+
+QVariantList pointsToVariant(const QVector<QPointF>& points)
+{
+    QVariantList list;
+    list.reserve(points.size());
+    for (const auto& pt : points) {
+        QVariantMap p;
+        p["x"] = pt.x();
+        p["y"] = pt.y();
+        list.append(p);
+    }
+    return list;
+}
+
+} // namespace
+
+QString ShotHistoryStorage::shortDateTime(qint64 secsSinceEpoch)
+{
+    return QDateTime::fromSecsSinceEpoch(secsSinceEpoch)
+        .toString(decenza::storage::detail::use12h() ? QStringLiteral("MMM d, h:mm AP") : QStringLiteral("MMM d, HH:mm"));
+}
+
+ShotProjection ShotHistoryStorage::convertShotRecord(const ShotRecord& record)
+{
+    using decenza::storage::detail::AnalysisInputs;
+    using decenza::storage::detail::prepareAnalysisInputs;
+    using decenza::storage::detail::use12h;
+
+    ShotProjection p;
+    if (record.summary.id == 0) return p;
+
+    p.id = record.summary.id;
+    p.uuid = record.summary.uuid;
+    p.timestamp = record.summary.timestamp;
+    auto isodt = QDateTime::fromSecsSinceEpoch(record.summary.timestamp);
+    p.timestampIso = isodt.toOffsetFromUtc(isodt.offsetFromUtc()).toString(Qt::ISODate);
+    p.profileName = record.summary.profileName;
+    p.durationSec = record.summary.duration;
+    p.finalWeightG = record.summary.finalWeight;
+    p.doseWeightG = record.summary.doseWeight;
+    p.beanBrand = record.summary.beanBrand;
+    p.beanType = record.summary.beanType;
+    p.enjoyment0to100 = record.summary.enjoyment;
+    p.hasVisualizerUpload = record.summary.hasVisualizerUpload;
+    p.beverageType = record.summary.beverageType;
+    p.roastDate = record.roastDate;
+    p.roastLevel = record.roastLevel;
+    p.grinderBrand = record.grinderBrand;
+    p.grinderModel = record.grinderModel;
+    p.grinderBurrs = record.grinderBurrs;
+    p.basketBrand = record.basketBrand;
+    p.basketModel = record.basketModel;
+    p.puckPrep = record.puckPrep;
+    p.grinderSetting = record.grinderSetting;
+    p.rpm = record.rpm;
+    p.rpmCapable = EquipmentStorage::deriveRpmCapable(record.grinderBrand, record.grinderModel);
+    p.equipmentId = record.equipmentId;
+    p.equipmentState = record.equipmentState;
+    p.equipmentName = record.equipmentName;
+    p.drinkTdsPct = record.drinkTds;
+    p.drinkEyPct = record.drinkEy;
+    p.espressoNotes = record.espressoNotes;
+    p.beanNotes = record.beanNotes;
+    p.barista = record.barista;
+    p.profileNotes = record.profileNotes;
+    p.visualizerId = record.visualizerId;
+    p.visualizerUrl = record.visualizerUrl;
+    p.debugLog = record.debugLog;
+    p.temperatureOverrideC = record.temperatureOverride;
+    p.targetWeightG = record.targetWeight;
+    p.yieldMode = record.yieldMode;
+    p.yieldAnchorValue = record.yieldAnchorValue;
+    p.flowCalibration = record.flowCalibration;
+    p.stoppedBy = record.stoppedBy;
+    p.profileJson = record.profileJson;
+    p.profileKbId = record.profileKbId;
+    p.beanBaseJson = record.beanBaseJson;
+    p.bagId = record.bagId;
+    p.frozenDate = record.frozenDate;
+    p.defrostDate = record.defrostDate;
+    p.storageHint = record.storageHint;
+    p.openedDate = record.openedDate;
+    p.tasteBalance = record.tasteBalance;
+    p.tasteBody = record.tasteBody;
+    p.recipeId = record.recipeId;
+    p.steamJson = record.steamJson;
+    p.hotWaterJson = record.hotWaterJson;
+    p.hotWaterResult = ShotWaterResult::fromJson(record.hotWaterResultJson).toMap();
+
+    p.pressure = pointsToVariant(record.pressure);
+    p.flow = pointsToVariant(record.flow);
+    p.temperature = pointsToVariant(record.temperature);
+    p.temperatureMix = pointsToVariant(record.temperatureMix);
+    p.weightSource = record.weightSource;
+    p.portalMountingMode = record.portalMountingMode;
+    p.portalSamples = PortalSamples::toVariant(record.portalSamples);
+    p.resistance = pointsToVariant(record.resistance);
+    p.conductance = pointsToVariant(record.conductance);
+    p.darcyResistance = pointsToVariant(record.darcyResistance);
+    p.conductanceDerivative = pointsToVariant(record.conductanceDerivative);
+    p.waterDispensed = pointsToVariant(record.waterDispensed);
+    p.pressureGoal = pointsToVariant(record.pressureGoal);
+    p.flowGoal = pointsToVariant(record.flowGoal);
+    p.temperatureGoal = pointsToVariant(record.temperatureGoal);
+    p.temperatureMixGoal = pointsToVariant(record.temperatureMixGoal);
+    p.weight = pointsToVariant(record.weight);
+    p.weightFlowRate = pointsToVariant(record.weightFlowRate);
+    p.weightFlowRateRaw = pointsToVariant(record.weightFlowRateRaw);
+
+    if (!record.portalSamples.isEmpty()) {
+        auto portalRes = PortalTailAnalyzer::analyzeShot(record.portalSamples, record.weight, record.weightSource,
+            record.portalMountingMode, record.summary.doseWeight, record.summary.finalWeight, record.pressure);
+        PortalTailAnalyzer::evaluateRatioAdvice(
+            &portalRes, record.portalCalibrationPoints, record.summary.id, record.bagId,
+            record.summary.beanBrand, record.summary.beanType,
+            record.summary.doseWeight, record.tasteBalance, record.tasteBody,
+            record.equipmentId, record.summary.profileName);
+        const auto calFit = PortalTailAnalyzer::fitCalibration(
+            record.portalCalibrationPoints, record.bagId,
+            record.summary.beanBrand, record.summary.beanType, record.summary.id, portalRes.mountingMode);
+        PortalTailAnalyzer::applyCalibration(
+            &portalRes, calFit, record.summary.finalWeight,
+            record.summary.doseWeight, record.drinkTds);
+        p.portalAnalysis = portalRes.toVariantMap();
+        if (record.portalCalibrationFailed)
+            p.portalAnalysis.insert(QStringLiteral("calibrationError"), QStringLiteral("queryFailed"));
+    }
+
+    p.channelingDetected = record.channelingDetected;
+    p.grindIssueDetected = record.grindIssueDetected;
+    p.skipFirstFrameDetected = record.skipFirstFrameDetected;
+    p.pourTruncatedDetected = record.pourTruncatedDetected;
+
+    // Run the full shot-summary detector pipeline once and expose both the
+    // prose lines (rendered by the in-app dialog) and the structured detector
+    // outputs (consumed by external MCP agents). Sharing one analyzeShot()
+    // call guarantees the prose and the structured fields describe the same
+    // evaluation — no chance for them to drift across consumers.
+    //
+    // Fast path: when the ShotRecord came out of loadShotRecordStatic, the
+    // AnalysisResult is already cached on `record.cachedAnalysis` (populated
+    // alongside the badge projection). Read from there to avoid running
+    // analyzeShot a second time on identical inputs.
+    //
+    // Slow path: ShotRecords without a cached analysis (test fixtures, direct
+    // construction) own a fresh AnalysisResult in `analysisOwned`, and
+    // `analysisPtr` points at it — keeping the address stable across the
+    // dereference below.
+    {
+        ShotAnalysis::AnalysisResult analysisOwned;
+        const ShotAnalysis::AnalysisResult* analysisPtr = nullptr;
+        if (record.cachedAnalysis.has_value()) {
+            analysisPtr = &record.cachedAnalysis.value();
+            // Cached beside the analysis, because re-deriving it here means
+            // redoing the AnalysisInputs walk the cache exists to skip. This
+            // used to be computed ONLY in the else branch below, which the
+            // production path never takes — loadShotRecordStatic always
+            // caches — so the "Based on X" line was dead everywhere except in
+            // tests that build a ShotRecord by hand.
+            p.profileKbDerivedFrom = record.cachedKbDerivedFrom;
+        } else {
+            const AnalysisInputs inputs = prepareAnalysisInputs(record.profileKbId, record.profileJson);
+            // Off AnalysisInputs, not the persisted id — the id holds a TITLE
+            // resolution only, so a shape-resolved profile carries an empty
+            // one while having full context. Three of the FOUR sites that
+            // derived this by hand read this field; the fourth is
+            // ShotSummarizer::runShotAnalysisAndPopulate, which cannot reach
+            // AnalysisInputs (wrong layer — it is called from the AI module,
+            // not the storage one) and instead takes the resolved id set as a
+            // parameter from its caller. Both routes derive the bit from a
+            // resolution rather than from the persisted column, which is the
+            // property that matters; neither derives it locally.
+            const bool profileKbResolved = inputs.profileKbResolved;
+            analysisOwned = ShotAnalysis::analyzeShot(
+                record.pressure, record.flow, record.weight,
+                record.conductanceDerivative,
+                record.phases, record.summary.beverageType, record.summary.duration,
+                record.pressureGoal, record.flowGoal,
+                inputs.analysisFlags, inputs.firstFrameSeconds,
+                record.targetWeight, record.summary.finalWeight,
+                inputs.frameCount, inputs.expertBand,
+                profileKbResolved);
+            analysisPtr = &analysisOwned;
+
+            // The shot's OWN derivation, for the "Based on X" line. Only a
+            // SHAPE match is a derivation worth explaining: a title match
+            // needs no explanation (the profile's own name said so) and an
+            // ambiguous match has no single entry to name.
+            if (inputs.identityFromShape && !inputs.identityKbId.isEmpty())
+                p.profileKbDerivedFrom =
+                    ShotSummarizer::canonicalNameForKbId(inputs.identityKbId);
+        }
+        const ShotAnalysis::AnalysisResult& analysis = *analysisPtr;
+        p.summaryLines = analysis.lines;
+
+        const auto& d = analysis.detectors;
+        QVariantMap detectorResults;
+
+        QVariantMap channeling;
+        channeling["checked"] = d.channelingChecked;
+        if (d.channelingChecked) {
+            channeling["severity"] = d.channelingSeverity;
+            channeling["spikeTimeSec"] = d.channelingSpikeTimeSec;
+        }
+        detectorResults["channeling"] = channeling;
+
+        QVariantMap flowTrend;
+        flowTrend["checked"] = d.flowTrendChecked;
+        if (d.flowTrendChecked) {
+            flowTrend["direction"] = d.flowTrend;
+            flowTrend["deltaMlPerSec"] = d.flowTrendDeltaMlPerSec;
+        }
+        detectorResults["flowTrend"] = flowTrend;
+
+        QVariantMap preinfusion;
+        preinfusion["observed"] = d.preinfusionObserved;
+        if (d.preinfusionObserved) {
+            preinfusion["dripWeightG"] = d.preinfusionDripWeightG;
+            preinfusion["durationSec"] = d.preinfusionDripDurationSec;
+        }
+        detectorResults["preinfusion"] = preinfusion;
+
+        QVariantMap grind;
+        grind["checked"] = d.grindChecked;
+        grind["hasData"] = d.grindHasData;
+        if (d.grindHasData) {
+            grind["direction"] = d.grindDirection;
+            grind["deltaMlPerSec"] = d.grindFlowDeltaMlPerSec;
+            grind["sampleCount"] = static_cast<qlonglong>(d.grindSampleCount);
+            grind["chokedPuck"] = d.grindChokedPuck;
+            grind["yieldOvershoot"] = d.grindYieldOvershoot;
+            grind["verifiedClean"] = d.grindVerifiedClean;
+            if (d.grindGateYieldRatio > 0.0) {
+                grind["yieldRatio"] = d.grindGateYieldRatio;
+            }
+        }
+        if (!d.grindCoverage.isEmpty()) {
+            grind["coverage"] = d.grindCoverage;
+        }
+        if (d.grindGateRan) {
+            QVariantMap gates;
+            gates["passed"] = d.grindGatePassed;
+            gates["flowSamples"] = static_cast<qlonglong>(d.grindGateFlowSamples);
+            gates["pressurizedDurationSec"] = d.grindGatePressurizedDurationSec;
+            gates["meanPressurizedFlowMlPerSec"] = d.grindGateMeanPressurizedFlowMlPerSec;
+            gates["yieldRatio"] = d.grindGateYieldRatio;
+            gates["minSamples"] = 5;
+            gates["minPressurizedSec"] = ShotAnalysis::CHOKED_DURATION_MIN_SEC;
+            gates["minPressureBar"] = ShotAnalysis::CHOKED_PRESSURE_MIN_BAR;
+            gates["chokedFlowMaxMlPerSec"] = ShotAnalysis::CHOKED_FLOW_MAX_MLPS;
+            gates["chokedYieldRatioMax"] = ShotAnalysis::CHOKED_YIELD_RATIO_MAX;
+            gates["yieldOvershootRatioMin"] = ShotAnalysis::YIELD_OVERSHOOT_RATIO_MIN;
+            grind["gates"] = gates;
+        }
+        detectorResults["grind"] = grind;
+
+        detectorResults["pourTruncated"] = d.pourTruncated;
+        if (d.pourTruncated) detectorResults["peakPressureBar"] = d.peakPressureBar;
+        detectorResults["pourStartSec"] = d.pourStartSec;
+        detectorResults["pourEndSec"] = d.pourEndSec;
+        detectorResults["skipFirstFrame"] = d.skipFirstFrame;
+        detectorResults["verdictCategory"] = d.verdictCategory;
+
+        p.detectorResults = detectorResults;
+    }
+
+    if (!record.phaseSummariesJson.isEmpty()) {
+        QJsonDocument phaseSummariesDoc = QJsonDocument::fromJson(record.phaseSummariesJson.toUtf8());
+        p.phaseSummaries = phaseSummariesDoc.toVariant();
+    }
+
+    QVariantList phases;
+    phases.reserve(record.phases.size());
+    for (const auto& phase : record.phases) {
+        QVariantMap phaseMap;
+        phaseMap["time"] = phase.time;
+        phaseMap["label"] = phase.label;
+        phaseMap["frameNumber"] = phase.frameNumber;
+        phaseMap["isFlowMode"] = phase.isFlowMode;
+        phaseMap["transitionReason"] = phase.transitionReason;
+        phaseMap["transitionSuffix"] = FrameExit::markerSuffix(phase.transitionReason);
+        phases.append(phaseMap);
+    }
+    p.phases = phases;
+
+    QDateTime dt = QDateTime::fromSecsSinceEpoch(record.summary.timestamp);
+    p.dateTime = dt.toString(use12h() ? "yyyy-MM-dd h:mm:ss AP" : "yyyy-MM-dd HH:mm:ss");
+
+    return p;
+}

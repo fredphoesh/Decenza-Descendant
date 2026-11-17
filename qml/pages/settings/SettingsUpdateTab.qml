@@ -1,0 +1,1120 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Decenza
+
+Item {
+    id: updateTab
+
+    // Easter egg: tap version card 7 times to enable translation upload
+    property int versionTapCount: 0
+    property var lastTapTime: 0
+    property string translationUploadRequestId: ""
+    property bool translationUploadTarget: false
+    property string updateRequestId: ""
+    property string updateOperation: ""
+
+    readonly property var updateSnapshot: {
+        const value = UpdateService.ready ? UpdateService.snapshot : null
+        return value && typeof value === "object" ? value : ({})
+    }
+    readonly property var fw: {
+        const value = updateTab.updateSnapshot.firmware
+        return value || null
+    }
+    // The replica snapshot is intentionally empty while disconnected. Keep
+    // defaults for fields used by controls whose QML property type is strict.
+    readonly property var app: {
+        const defaults = {
+            currentVersion: "", currentVersionCode: 0, platformName: "", releasePageUrl: "",
+            canCheckForUpdates: false, checking: false, downloading: false, installing: false,
+            downloadReady: false, updateAvailable: false, canDownloadUpdate: false,
+            releaseNotes: "", latestVersion: "", latestVersionCode: 0, latestIsBeta: false,
+            downloadProgress: 0, errorMessage: ""
+        }
+        return Object.assign(defaults, updateTab.updateSnapshot.app || ({}))
+    }
+
+    readonly property bool developerTranslationUpload:
+        updateTab.updateSnapshot.developerTranslationUpload === true
+    readonly property var preferenceSnapshot: {
+        const value = SettingsPreferencesService.ready
+            ? SettingsPreferencesService.preferences : null
+        return value && typeof value === "object" ? value : ({})
+    }
+
+    ExternalUrlOpener { id: releasePageOpener }
+    StatusToast { id: releasePageToast; error: true }
+
+    SharedMarkdownSource {
+        id: releaseNotesContent
+        markdown: updateTab.app.releaseNotes
+    }
+
+    function requestUpdate(operation) {
+        if (!UpdateService.ready || updateRequestId !== "") return false
+        updateOperation = operation
+        updateRequestId = UpdateService.execute(operation)
+        return updateRequestId !== ""
+    }
+
+    function completeUpdate(requestId, operation, success, reason) {
+        if (requestId !== updateRequestId || operation !== updateOperation) return
+        updateRequestId = ""
+        updateOperation = ""
+        if (!success) {
+            const message = reason === "machineBusy"
+                ? TranslationManager.translate("update.localApk.machineBusy", "Finish the current machine operation before installing an APK.")
+                : TranslationManager.translate("update.requestFailed", "The update request could not start. Check the host connection and update status, then try again.")
+            releasePageToast.show(message)
+            AccessibilityManager.announce(message, true)
+        }
+    }
+
+    function openReleasePage() {
+        const reservation = releasePageOpener.reserve()
+        if (!reservation || !releasePageOpener.openReserved(reservation, app.releasePageUrl || "")) {
+            const message = TranslationManager.translate("settings.update.releasePageOpenFailed",
+                "Could not open the release page. Check that pop-ups are allowed.")
+            releasePageToast.show(message)
+            AccessibilityManager.announce(message)
+        }
+    }
+
+    PreferenceWrite {
+        id: autoCheckPreference
+        domain: "app"
+        onFailed: function(message) { AccessibilityManager.announce(message) }
+    }
+    PreferenceWrite {
+        id: betaUpdatesPreference
+        domain: "app"
+        onFailed: function(message) { AccessibilityManager.announce(message) }
+    }
+
+    function toggleTranslationUpload() {
+        if (translationUploadRequestId.length > 0) return
+        translationUploadTarget = !developerTranslationUpload
+        translationUploadRequestId = UpdateService.execute("setTranslationUploadEnabled",
+            { enabled: translationUploadTarget })
+    }
+
+    Connections {
+        target: UpdateService
+        function onOperationCompleted(requestId, operation, success, result, reason) {
+            updateTab.completeUpdate(requestId, operation, success, reason)
+            if (requestId !== updateTab.translationUploadRequestId
+                    || operation !== "setTranslationUploadEnabled") return
+            updateTab.translationUploadRequestId = ""
+            const message = !success
+                ? TranslationManager.translate("settings.update.translationUploadFailed", "Could not change translation upload. Try again.")
+                : updateTab.translationUploadTarget
+                ? TranslationManager.translate("settings.update.translationUploadEnabled", "Translation upload enabled! Go to Settings, Language to upload.")
+                : TranslationManager.translate("settings.update.translationUploadDisabled", "Translation upload disabled.")
+            translationUploadToast.show(message)
+            AccessibilityManager.announce(message)
+        }
+    }
+
+
+    RowLayout {
+        anchors.fill: parent
+        spacing: Theme.scaled(15)
+
+        // Left column: Current version info
+        SettingsCard {
+            searchId: "checkUpdates"
+            title: TranslationManager.translate("settings.update.currentversion", "Current Version")
+            description: TranslationManager.translate("settings.search.checkUpdatesDesc", "Auto-check and download app updates")
+            keywords: ["update", "version", "download", "beta", "release", "donate", "paypal", "support", "money", "tip"]
+            showHeader: false
+            fillContent: true
+            spacing: Theme.scaled(10)
+            Layout.fillWidth: false
+            Layout.preferredWidth: Theme.scaled(280)
+
+            Tr {
+                key: "settings.update.currentversion"
+                fallback: "Current Version"
+                color: Theme.textColor
+                font.pixelSize: Theme.scaled(14)
+                font.bold: true
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(65)
+                color: Theme.insetBackgroundColor
+                radius: Theme.scaled(8)
+
+                // Centered within the region left of the Manual button
+                // (not the whole card) so long platform strings / large
+                // text scaling can never collide with the button.
+                ColumnLayout {
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.left: parent.left
+                    anchors.right: manualButton.left
+                    anchors.rightMargin: Theme.scaled(6)
+                    spacing: Theme.scaled(1)
+
+                    Text {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "Decenza"
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(14)
+                    }
+
+                    Text {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "v" + updateTab.app.currentVersion
+                        color: Theme.accentColor
+                        font.pixelSize: Theme.scaled(18)
+                        font.bold: true
+                    }
+
+                    Text {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: TranslationManager.translate("update.build", "Build %1").arg(updateTab.app.currentVersionCode)
+                        color: Theme.textSecondaryColor
+                        font.pixelSize: Theme.scaled(12)
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                        text: updateTab.fw && updateTab.fw.isSimulated ? "SIMULATION MODE" : updateTab.app.platformName
+                        color: updateTab.fw && updateTab.fw.isSimulated ? Theme.primaryColor : Theme.textSecondaryColor
+                        font.pixelSize: Theme.scaled(11)
+                        font.bold: updateTab.fw && updateTab.fw.isSimulated
+                    }
+                }
+
+                // Easter egg: tap 7 times to enable translation upload.
+                // Bounds stop at the Manual button's left edge so the two
+                // accessible elements never overlap — ACCESSIBILITY.md
+                // forbids nesting accessible elements (TalkBack would
+                // otherwise expose only one).
+                AccessibleMouseArea {
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    anchors.right: manualButton.left
+                    anchors.rightMargin: Theme.scaled(6)
+                    SettingsSearch.title: TranslationManager.translate("settings.search.versionBuild", "Version and build")
+                    accessibleName: TranslationManager.translate("update.versionBuild", "Version %1, Build %2").arg(updateTab.app.currentVersion).arg(updateTab.app.currentVersionCode)
+                    enabled: UpdateService.ready && updateTab.translationUploadRequestId.length === 0
+                    onAccessibleClicked: {
+                        var now = Date.now()
+                        // Reset counter if more than 2 seconds since last tap
+                        if (now - updateTab.lastTapTime > 2000) {
+                            updateTab.versionTapCount = 0
+                        }
+                        updateTab.lastTapTime = now
+                        updateTab.versionTapCount++
+
+                        if (updateTab.versionTapCount >= 7) {
+                            updateTab.versionTapCount = 0
+                            updateTab.toggleTranslationUpload()
+                        } else if (updateTab.versionTapCount >= 4) {
+                            let remaining = (7 - updateTab.versionTapCount) + " more taps"
+                            translationUploadToast.show(remaining + "...")
+                            AccessibilityManager.announce(remaining)
+                        }
+                    }
+                }
+
+                // Opens the user manual (GitHub wiki) in the default
+                // browser. AccessibleButton (a Control) gives keyboard
+                // Tab focus, announce-first screen-reader behavior and
+                // press feedback for free; its bounds are disjoint from
+                // the easter-egg area above, which is anchored to stop at
+                // this button's left edge.
+                AccessibleButton {
+                    id: manualButton
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.rightMargin: Theme.scaled(10)
+                    primary: true
+                    text: TranslationManager.translate("settings.update.manual", "Manual")
+                    accessibleName: TranslationManager.translate("settings.update.manualAccessible", "Open the Decenza user manual")
+                    onClicked: Qt.openUrlExternally("https://github.com/Kulitorum/Decenza/wiki")
+                }
+            }
+
+            // Auto-check toggle
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.scaled(8)
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(1)
+
+                    Tr {
+                        key: "settings.update.autocheck"
+                        fallback: "Auto-check for updates"
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(13)
+                    }
+
+                    Tr {
+                        Layout.fillWidth: true
+                        key: "settings.update.checkeveryhour"
+                        fallback: "Check every hour"
+                        color: Theme.textSecondaryColor
+                        font.pixelSize: Theme.scaled(11)
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
+                Item { Layout.fillWidth: true }
+
+                StyledSwitch {
+                    checked: autoCheckPreference.displayedValue("autoCheckUpdates",
+                        updateTab.preferenceSnapshot["app.autoCheckUpdates"] === true)
+                    enabled: autoCheckPreference.ready
+                    accessibleName: TranslationManager.translate("settings.update.autocheck", "Auto-check for updates")
+                    onToggled: autoCheckPreference.submit("autoCheckUpdates", checked)
+                }
+            }
+
+            // Beta updates toggle
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.scaled(8)
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(1)
+
+                    Tr {
+                        key: "settings.update.betaupdates"
+                        fallback: "Include beta versions"
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(13)
+                    }
+
+                    Tr {
+                        Layout.fillWidth: true
+                        key: "settings.update.betadesc"
+                        fallback: "Get early access to new features"
+                        color: Theme.textSecondaryColor
+                        font.pixelSize: Theme.scaled(11)
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
+                Item { Layout.fillWidth: true }
+
+                StyledSwitch {
+                    checked: betaUpdatesPreference.displayedValue("betaUpdatesEnabled",
+                        updateTab.preferenceSnapshot["app.betaUpdatesEnabled"] === true)
+                    enabled: betaUpdatesPreference.ready
+                    accessibleName: TranslationManager.translate("settings.update.betaupdates", "Include beta versions")
+                    onToggled: betaUpdatesPreference.submit("betaUpdatesEnabled", checked)
+                }
+            }
+
+
+            // Divider
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 1
+                color: Theme.borderColor
+                Layout.topMargin: Theme.spacingSmall
+                Layout.bottomMargin: Theme.spacingSmall
+            }
+
+            // About section
+            Text {
+                Layout.fillWidth: true
+                text: TranslationManager.translate("about.credits", "Built by Michael Holm (Kulitorum) during Christmas 2025. Three weeks, lots of coffee, one app.")
+                font.family: Theme.bodyFont.family
+                font.pixelSize: Theme.scaled(13)
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: TranslationManager.translate("about.communityThanks", "Thanks to the Decent community and the de1app developers for inspiration.")
+                font.family: Theme.bodyFont.family
+                font.pixelSize: Theme.scaled(11)
+                color: Theme.textSecondaryColor
+                wrapMode: Text.Wrap
+            }
+
+            Item { Layout.fillHeight: true }
+
+            // Support button
+            AccessibleButton {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(44)
+                text: TranslationManager.translate("about.supportProject", "Support This Project")
+                accessibleName: TranslationManager.translate("about.supportProject", "Support This Project")
+                primary: true
+                onClicked: donateDialog.open()
+            }
+        }
+
+        // Right column: Firmware card + Software Updates
+        ColumnLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: Theme.scaled(8)
+
+            // Firmware card (DE1 firmware update entry point)
+            SettingsCard {
+                searchId: "firmwareUpdate"
+                title: TranslationManager.translate("firmware.card.title", "DE1 Firmware")
+                description: TranslationManager.translate("settings.search.firmwareDesc", "Check, update, or downgrade the DE1 machine firmware")
+                keywords: ["firmware", "de1", "update", "downgrade", "nightly", "stable", "flash", "serial", "serial number"]
+                showHeader: false
+                contentMargins: Theme.scaled(10)
+                spacing: Theme.scaled(4)
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.scaled(8)
+
+                    Tr {
+                        key: "firmware.card.title"
+                        fallback: "DE1 Firmware"
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(14)
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        Layout.preferredWidth: Theme.scaled(10)
+                        Layout.preferredHeight: Theme.scaled(10)
+                        radius: Theme.scaled(5)
+                        Layout.leftMargin: Theme.scaled(4)
+                        color: {
+                            if (!updateTab.fw) return Theme.textSecondaryColor
+                            if (updateTab.fw.updateAvailable)
+                                return updateTab.fw.isDowngrade ? Theme.warningColor : Theme.primaryColor
+                            if (updateTab.fw.installedVersion > 0) return Theme.successColor
+                            return Theme.textSecondaryColor
+                        }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: {
+                            if (!updateTab.fw) return ""
+                            if (updateTab.fw.updateAvailable) {
+                                if (updateTab.fw.isDowngrade) {
+                                    return TranslationManager.translate(
+                                        "firmware.card.downgradeAvailable",
+                                        "Downgrade available: v%1 (installed v%2)")
+                                        .arg(updateTab.fw.availableVersion)
+                                        .arg(updateTab.fw.installedVersion > 0 ? updateTab.fw.installedVersion : "—")
+                                }
+                                return TranslationManager.translate(
+                                    "firmware.card.updateAvailable",
+                                    "Update available: v%1 (installed v%2)")
+                                    .arg(updateTab.fw.availableVersion)
+                                    .arg(updateTab.fw.installedVersion > 0 ? updateTab.fw.installedVersion : "—")
+                            }
+                            if (updateTab.fw.installedVersion > 0) {
+                                return TranslationManager.translate(
+                                    "firmware.card.upToDate",
+                                    "Up to date — v%1")
+                                    .arg(updateTab.fw.installedVersion)
+                            }
+                            return TranslationManager.translate(
+                                "firmware.card.unknown",
+                                "Firmware version unknown — connect DE1 and check")
+                        }
+                        color: updateTab.fw && updateTab.fw.updateAvailable
+                               ? (updateTab.fw.isDowngrade ? Theme.warningColor : Theme.textColor)
+                               : Theme.textColor
+                        font.pixelSize: Theme.scaled(13)
+                        font.bold: updateTab.fw && updateTab.fw.updateAvailable
+                        elide: Text.ElideRight
+                    }
+
+                    Text {
+                        id: firmwareManageText
+                        text: TranslationManager.translate("firmware.card.manage", "Manage...")
+                        color: Theme.primaryColor
+                        font.pixelSize: Theme.scaled(13)
+                        Accessible.ignored: true
+                        AccessibleMouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -Theme.scaled(6)
+                            accessibleName: TranslationManager.translate("firmware.card.manageAccessible", "Open DE1 firmware update")
+                            accessibleItem: firmwareManageText
+                            onAccessibleClicked: firmwareDialog.open()
+                        }
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: TranslationManager.translate(
+                        "firmware.card.description",
+                        "Check, update, or downgrade the DE1 firmware.")
+                    color: Theme.textSecondaryColor
+                    font.pixelSize: Theme.scaled(12)
+                    wrapMode: Text.WordWrap
+                }
+
+                // Selectable so the serial can be copied into a support message.
+                TextEdit {
+                    readonly property string serial: typeof updateTab.updateSnapshot.deviceSerialNumber === "string"
+                                                     ? updateTab.updateSnapshot.deviceSerialNumber : ""
+                    Layout.fillWidth: true
+                    text: serial !== ""
+                          ? TranslationManager.translate("settings.about.serialNumber", "Serial number: %1").arg(serial)
+                          : TranslationManager.translate("settings.about.serialUnknown", "Serial number unknown — connect DE1")
+                    readOnly: true
+                    selectByMouse: true
+                    font: Theme.captionFont
+                    color: Theme.textSecondaryColor
+                    wrapMode: TextEdit.Wrap
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: text
+                }
+            }
+
+            // Software Updates card (app updates + release notes)
+            SettingsCard {
+                searchId: "releaseNotes"
+                title: TranslationManager.translate("settings.search.releaseNotesTitle", "Release Notes")
+                description: TranslationManager.translate("settings.search.releaseNotesDesc", "What's new in this version")
+                keywords: ["release", "notes", "changelog", "new", "version"]
+                showHeader: false
+                fillContent: true
+                contentMargins: Theme.scaled(10)
+                spacing: Theme.scaled(6)
+
+                // Title + inline action buttons
+                RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.scaled(8)
+
+                Tr {
+                    key: "settings.update.softwareupdates"
+                    fallback: "Software Updates"
+                    color: Theme.textColor
+                    font.pixelSize: Theme.scaled(14)
+                    font.bold: true
+                }
+
+                Item { Layout.fillWidth: true }
+
+                // False while the status area shows its own progress UI, and
+                // on platforms where canCheckForUpdates is false (e.g. iOS,
+                // which handles app updates through the App Store).
+                readonly property bool idleState: updateTab.app.canCheckForUpdates
+                                                  && !updateTab.app.checking
+                                                  && !updateTab.app.downloading
+                                                  && !updateTab.app.installing
+
+                AccessibleButton {
+                    text: TranslationManager.translate("settings.update.checknow", "Check Now")
+                    accessibleName: TranslationManager.translate("settings.update.checkNowAccessible", "Check for app and scale firmware updates")
+                    visible: parent.idleState
+                    enabled: UpdateService.ready && !updateTab.app.checking && updateTab.updateRequestId === ""
+                    // Also refreshes the HDS scale-firmware catalog — this
+                    // is the one manual "check now" for both software
+                    // kinds the app tracks. This page's own status UI only
+                    // reflects the app-update half; the scale-firmware
+                    // half surfaces on the Connections tab.
+                    onClicked: updateTab.requestUpdate("checkAll")
+                }
+
+                AccessibleButton {
+                    primary: true
+                    text: updateTab.app.downloadReady
+                          ? TranslationManager.translate("settings.update.install", "Install")
+                          : TranslationManager.translate("settings.update.downloadinstall", "Download & Install")
+                    SettingsSearch.title: TranslationManager.translate("settings.update.downloadinstall", "Download & Install")
+                    accessibleName: updateTab.app.downloadReady
+                          ? TranslationManager.translate("settings.update.installAccessible", "Install the downloaded update")
+                          : TranslationManager.translate("settings.update.downloadInstallAccessible", "Download and install the available update")
+                    visible: parent.idleState && updateTab.app.updateAvailable && updateTab.app.canDownloadUpdate
+                    enabled: UpdateService.ready && updateTab.updateRequestId === ""
+                    onClicked: updateTab.requestUpdate("downloadAndInstall")
+                }
+
+                AccessibleButton {
+                    primary: true
+                    text: TranslationManager.translate("settings.update.viewongithub", "View on GitHub")
+                    accessibleName: TranslationManager.translate("settings.update.viewOnGithubAccessible", "Open the release page on GitHub")
+                    visible: parent.idleState && updateTab.app.updateAvailable && !updateTab.app.canDownloadUpdate
+                    onClicked: updateTab.openReleasePage()
+                }
+
+                AccessibleButton {
+                    text: TranslationManager.translate("settings.update.whatsnew", "What's New?")
+                    accessibleName: TranslationManager.translate("settings.update.whatsNewAccessible", "View release notes for this update")
+                    visible: parent.idleState && updateTab.app.releaseNotes !== ""
+                    onClicked: releaseNotesPopup.open()
+                }
+                }
+
+                // Status area
+                Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: statusColumn.height + Theme.scaled(12)
+                color: Theme.insetBackgroundColor
+                radius: Theme.scaled(8)
+
+                ColumnLayout {
+                    id: statusColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Theme.scaled(8)
+                    spacing: Theme.scaled(4)
+
+                    // Status row
+                    RowLayout {
+                        spacing: Theme.scaled(8)
+                        visible: !updateTab.app.checking && !updateTab.app.downloading && !updateTab.app.installing
+
+                        Rectangle {
+                            Layout.preferredWidth: Theme.scaled(10)
+                            Layout.preferredHeight: Theme.scaled(10)
+                            radius: Theme.scaled(5)
+                            color: updateTab.app.updateAvailable ? Theme.primaryColor : Theme.successColor
+                        }
+
+                        Text {
+                            text: {
+                                if (updateTab.app.updateAvailable) {
+                                    let betaTag = updateTab.app.latestIsBeta ? " (Beta)" : ""
+                                    // 0 means the release notes state no build number, so there is
+                                    // none to show — printing "(Build 0)" would read as a real one.
+                                    let buildTag = updateTab.app.latestVersionCode > 0
+                                                 ? " (Build " + updateTab.app.latestVersionCode + ")"
+                                                 : ""
+                                    let msg = TranslationManager.translate("settings.update.updateavailable", "Update available:") +
+                                           " v" + updateTab.app.latestVersion + betaTag + buildTag
+                                    // Add platform-specific note for iOS
+                                    if (Qt.platform.os === "ios") {
+                                        msg += "\n" + TranslationManager.translate("settings.update.appstoreupdate", "Update via App Store")
+                                    }
+                                    return msg
+                                } else if (updateTab.app.latestVersion) {
+                                    return TranslationManager.translate("settings.update.uptodate", "You're up to date")
+                                } else {
+                                    return TranslationManager.translate("settings.update.checktostart", "Check for updates to get started")
+                                }
+                            }
+                            color: Theme.textColor
+                            font.pixelSize: Theme.scaled(13)
+                        }
+                    }
+
+                    // Checking indicator
+                    RowLayout {
+                        spacing: Theme.scaled(8)
+                        visible: updateTab.app.checking
+
+                        BusyIndicator {
+                            running: true
+                            Layout.preferredWidth: Theme.scaled(20)
+                            Layout.preferredHeight: Theme.scaled(20)
+                        }
+
+                        Tr {
+                            key: "settings.update.checking"
+                            fallback: "Checking for updates..."
+                            color: Theme.textColor
+                            font.pixelSize: Theme.scaled(13)
+                        }
+                    }
+
+                    // Installing (PackageInstaller session write in progress)
+                    RowLayout {
+                        spacing: Theme.scaled(8)
+                        visible: updateTab.app.installing
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: trInstalling.text
+                        Accessible.focusable: true
+
+                        BusyIndicator {
+                            running: true
+                            Layout.preferredWidth: Theme.scaled(20)
+                            Layout.preferredHeight: Theme.scaled(20)
+                        }
+
+                        Tr {
+                            id: trInstalling
+                            key: "settings.update.installing"
+                            fallback: "Installing update..."
+                            color: Theme.textColor
+                            font.pixelSize: Theme.scaled(13)
+                        }
+                    }
+
+                    // Download progress
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.scaled(6)
+                        visible: updateTab.app.downloading
+
+                        RowLayout {
+                            spacing: Theme.scaled(8)
+
+                            Tr {
+                                key: "settings.update.downloading"
+                                fallback: "Downloading update..."
+                                color: Theme.textColor
+                                font.pixelSize: Theme.scaled(13)
+                            }
+
+                            Text {
+                                text: updateTab.app.downloadProgress + "%"
+                                color: Theme.textSecondaryColor
+                                font.pixelSize: Theme.scaled(12)
+                            }
+                        }
+
+                        ProgressBar {
+                            Layout.fillWidth: true
+                            value: updateTab.app.downloadProgress / 100
+                        }
+                    }
+
+                    // Error message
+                    Text {
+                        Layout.fillWidth: true
+                        visible: updateTab.app.errorMessage !== ""
+                        text: updateTab.app.errorMessage
+                        color: Theme.errorColor
+                        font.pixelSize: Theme.scaled(11)
+                        wrapMode: Text.WordWrap
+                    }
+                }
+                }
+
+                // iOS App Store message
+                Text {
+                Layout.fillWidth: true
+                visible: !updateTab.app.canCheckForUpdates
+                text: TranslationManager.translate("settings.update.appstoreonly", "Updates are handled by the App Store. Check for updates in the App Store app.")
+                color: Theme.textSecondaryColor
+                font.pixelSize: Theme.scaled(12)
+                wrapMode: Text.WordWrap
+                }
+
+                // Inline release notes preview
+                Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                color: Theme.insetBackgroundColor
+                radius: Theme.scaled(8)
+                visible: updateTab.app.releaseNotes !== ""
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(10)
+                    spacing: Theme.scaled(6)
+
+                    Text {
+                        text: updateTab.app.updateAvailable
+                              ? TranslationManager.translate("settings.update.pendingNotes", "What's New in v%1").arg(updateTab.app.latestVersion)
+                              : TranslationManager.translate("settings.update.currentNotes", "Release Notes — v%1").arg(updateTab.app.currentVersion)
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(12)
+                        font.bold: true
+                    }
+
+                    ScrollView {
+                        id: inlineNotesScrollView
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+                        TextArea {
+                            width: inlineNotesScrollView.width
+                            readOnly: true
+                            // Release notes are remote GitHub markdown and routinely contain
+                            // emoji. Rendered as plain text, a colour emoji reaches Apple Color
+                            // Emoji -> CopyEmojiImage -> ImageIO PNG decode, which crashes the
+                            // render thread on macOS. Route them through the SVG emoji path
+                            // instead, exactly as every other externally-sourced string does.
+                            //
+                            // Markdown -> HTML FIRST, then inject emoji, then render as
+                            // RichText. Rewriting emoji before the markdown parse truncates the
+                            // document at the first emoji (see markdownrenderer.h); doing it
+                            // after means the parser never sees an <img>. allowMarkup is safe
+                            // because toHtml() escapes text content AND parses with
+                            // MarkdownNoHTML, so raw HTML in the notes cannot become markup.
+                            textFormat: TextEdit.RichText
+                            text: Theme.replaceEmojiWithImg(
+                                      releaseNotesContent.html,
+                                      Theme.scaled(12), true)
+                            color: Theme.textSecondaryColor
+                            font.pixelSize: Theme.scaled(12)
+                            wrapMode: Text.WordWrap
+                            background: null
+                            selectByMouse: true
+
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: TranslationManager.translate("settings.update.releaseNotesContent", "Release notes")
+                            // toAccessibleText: `text` is HTML now, so tags and the emoji
+                            // <img>s are what need stripping, not markdown syntax.
+                            Accessible.description: Theme.toAccessibleText(text)
+                            Accessible.focusable: true
+                            activeFocusOnTab: true
+                        }
+                    }
+                }
+                }
+
+                // Spacer when no release notes
+                Item {
+                Layout.fillHeight: true
+                visible: updateTab.app.releaseNotes === ""
+                }
+            }
+        }
+    }
+
+    // Firmware update dialog (full-screen) — hosts the SettingsFirmwareTab panel
+    DecenzaDialog {
+        id: firmwareDialog
+        inhibitScreensaver: true
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: parent ? parent.width - Theme.scaled(40) : Theme.scaled(800)
+        height: parent ? parent.height - Theme.scaled(40) : Theme.scaled(600)
+        modal: true
+        dim: true
+        padding: 0
+        // Block Escape while a flash is in progress — otherwise the user can
+        // dismiss the dialog and lose sight of the progress UI while the BLE
+        // upload keeps running in the background. The close (×) button is
+        // gated the same way below.
+        readonly property SettingsFirmwareTab firmwarePanel: firmwarePanelLoader.item as SettingsFirmwareTab
+
+        closePolicy: (firmwareDialog.firmwarePanel && firmwareDialog.firmwarePanel.isFlashing)
+                     ? Dialog.NoAutoClose
+                     : Dialog.CloseOnEscape
+
+        // Latch: keep the panel loaded after the first open so state/progress
+        // isn't lost when the user closes and reopens the dialog.
+        property bool panelLoaded: false
+        onOpened: panelLoaded = true
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 1
+            border.color: Theme.borderColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 0
+
+            // Header bar with title + close button
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(48)
+                color: Theme.backgroundColor
+                radius: Theme.cardRadius
+
+                // Square off bottom corners so header sits flush with content
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: Theme.cardRadius
+                    color: Theme.backgroundColor
+                }
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Theme.scaled(16)
+                    anchors.rightMargin: Theme.scaled(10)
+                    spacing: Theme.scaled(8)
+
+                    Tr {
+                        key: "firmware.dialog.title"
+                        fallback: "DE1 Firmware Update"
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(15)
+                        font.bold: true
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    StyledIconButton {
+                        text: "×"
+                        accessibleName: TranslationManager.translate("firmware.dialog.close", "Close firmware dialog")
+                        enabled: !firmwareDialog.firmwarePanel || !firmwareDialog.firmwarePanel.isFlashing
+                        onClicked: firmwareDialog.close()
+                    }
+                }
+            }
+
+            // Firmware panel content (lazy-loaded on first open, stays loaded)
+            Loader {
+                id: firmwarePanelLoader
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.margins: Theme.scaled(8)
+                asynchronous: true
+                active: firmwareDialog.panelLoaded
+                source: "SettingsFirmwareTab.qml"
+            }
+        }
+    }
+
+    // Release notes popup
+    DecenzaDialog {
+        id: releaseNotesPopup
+        modal: true
+        dim: true
+        anchors.centerIn: parent
+        closePolicy: Dialog.CloseOnEscape | Dialog.CloseOnPressOutside
+        width: Math.min(600, updateTab.width - 40)
+        height: Math.min(400, updateTab.height - 40)
+        padding: 0
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 1
+            border.color: Theme.borderColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Theme.scaled(0)
+
+            // Header
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(44)
+                color: Theme.backgroundColor
+                radius: Theme.cardRadius
+
+                // Square off bottom corners
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: Theme.cardRadius
+                    color: Theme.backgroundColor
+                }
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Theme.scaled(15)
+                    anchors.rightMargin: Theme.scaled(10)
+
+                    Text {
+                        text: {
+                            var version = updateTab.app.updateAvailable
+                                ? updateTab.app.latestVersion
+                                : updateTab.app.currentVersion
+                            return TranslationManager.translate("settings.update.whatsnew", "What's New?") +
+                                  (version ? " - v" + version : "")
+                        }
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(14)
+                        font.bold: true
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    StyledIconButton {
+                        text: "\u00D7"
+                        accessibleName: TranslationManager.translate("settings.update.closeReleaseNotes", "Close release notes")
+                        onClicked: releaseNotesPopup.close()
+                    }
+                }
+            }
+
+            // Scrollable content
+            Item {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.margins: Theme.scaled(15)
+
+                ScrollView {
+                    id: notesScrollView
+                    anchors.fill: parent
+                    clip: true
+                    ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+                    TextArea {
+                        id: notesText
+                        width: notesScrollView.width
+                        readOnly: true
+                        // Same treatment as the inline notes above. This one was missed and
+                        // was still rendering release notes as PLAIN TEXT — the exact crash
+                        // path main.cpp describes (a colour emoji reaching the platform
+                        // renderer takes down the macOS render thread), and the site that
+                        // comment calls "the remaining exposure".
+                        textFormat: TextEdit.RichText
+                        text: Theme.replaceEmojiWithImg(
+                                  releaseNotesContent.html,
+                                  Theme.scaled(13), true)
+                        color: Theme.textColor
+                        font.pixelSize: Theme.scaled(13)
+                        wrapMode: Text.WordWrap
+                        background: null
+                        selectByMouse: true
+
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: TranslationManager.translate("settings.update.releaseNotesContent", "Release notes")
+                        Accessible.description: Theme.stripMarkdown(text)
+                        Accessible.focusable: true
+                        activeFocusOnTab: true
+                    }
+                }
+
+                ScrollDownIndicator {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: Theme.scaled(5)
+                    flickable: notesScrollView.contentItem as Flickable
+                }
+            }
+        }
+    }
+
+    // Toast for Easter egg feedback
+    Rectangle {
+        id: translationUploadToast
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Theme.scaled(20)
+        width: toastText.width + Theme.scaled(24)
+        height: toastText.height + Theme.scaled(16)
+        color: Theme.surfaceColor
+        radius: Theme.scaled(8)
+        opacity: 0
+        visible: opacity > 0
+        z: 1000
+
+        border.width: 1
+        border.color: Theme.borderColor
+
+        Text {
+            id: toastText
+            anchors.centerIn: parent
+            color: Theme.textColor
+            font.pixelSize: Theme.scaled(13)
+        }
+
+        function show(message) {
+            toastText.text = message
+            toastAnimation.restart()
+        }
+
+        SequentialAnimation {
+            id: toastAnimation
+            NumberAnimation { target: translationUploadToast; property: "opacity"; to: 1; duration: 150 }
+            PauseAnimation { duration: 2000 }
+            NumberAnimation { target: translationUploadToast; property: "opacity"; to: 0; duration: 300 }
+        }
+    }
+
+    // Donate dialog
+    DecenzaDialog {
+        id: donateDialog
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(parent.width * 0.85, Theme.scaled(360))
+        modal: true
+        dim: true
+        padding: Theme.spacingMedium
+        closePolicy: Dialog.CloseOnEscape | Dialog.CloseOnPressOutside
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 1
+            border.color: Theme.borderColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Theme.scaled(12)
+
+            Text {
+                Layout.fillWidth: true
+                text: TranslationManager.translate("about.supportProject", "Support This Project")
+                font.pixelSize: Theme.scaled(16)
+                font.bold: true
+                color: Theme.textColor
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: TranslationManager.translate("about.donationMessage", "If you find this app useful, donations are welcome but never expected.")
+                font.family: Theme.bodyFont.family
+                font.pixelSize: Theme.scaled(13)
+                color: Theme.textSecondaryColor
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            // QR code
+            Image {
+                Layout.alignment: Qt.AlignHCenter
+                source: "qrc:/qrcode.png"
+                Layout.preferredWidth: Theme.scaled(150)
+                Layout.preferredHeight: Theme.scaled(150)
+                fillMode: Image.PreserveAspectFit
+                sourceSize.width: 150
+                sourceSize.height: 150
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: "paypal@kulitorum.com"
+                font: Theme.captionFont
+                color: Theme.textSecondaryColor
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            // Donate via PayPal button
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(48)
+                radius: Theme.buttonRadius
+                color: Theme.primaryColor
+
+                Accessible.role: Accessible.Button
+                Accessible.name: TranslationManager.translate("about.donateViaPaypal", "Donate via PayPal")
+                Accessible.focusable: true
+                Accessible.onPressAction: donateArea.clicked(null)
+
+                MouseArea {
+                    id: donateArea
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Qt.openUrlExternally("https://www.paypal.com/donate?business=paypal@kulitorum.com")
+                }
+
+                Text {
+                    anchors.centerIn: parent
+                    text: TranslationManager.translate("about.donateViaPaypal", "Donate via PayPal")
+                    font.pixelSize: Theme.scaled(15)
+                    font.bold: true
+                    color: Theme.primaryContrastColor
+                    Accessible.ignored: true
+                }
+            }
+
+            // Close button
+            AccessibleButton {
+                Layout.fillWidth: true
+                text: TranslationManager.translate("common.button.close", "Close")
+                accessibleName: TranslationManager.translate("common.accessibility.dismissDialog", "Dismiss dialog")
+                onClicked: donateDialog.close()
+            }
+        }
+    }
+}

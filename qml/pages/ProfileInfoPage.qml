@@ -1,0 +1,327 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import QtQuick.Layouts
+import Decenza
+
+T.Page {
+    id: profileInfoPage
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: TranslationManager.translate("profileinfo.title", "Profile Info")
+
+    objectName: "profileInfoPage"
+    // suppressShotChart: this page draws its own graph, and the last-shot chart
+    // background would put a second set of curves behind it.
+    background: ThemedPageBackground { suppressShotChart: true }
+
+    // Profile to display
+    property string profileFilename: ""
+    property string profileName: ""
+
+    // Loaded profile data
+    property var profileData: null
+    property string detailRequestId: ""
+    property string detailError: ""
+
+    StackView.onActivated: loadProfile()
+
+    function loadProfile() {
+        profileData = null
+        detailError = ""
+        detailRequestId = profileFilename ? ProfileService.requestProfileDetail(profileFilename) : ""
+    }
+
+    Connections {
+        target: ProfileService
+        function onProfileDetailReady(requestId, filename, detail, reason) {
+            if (requestId !== profileInfoPage.detailRequestId || filename !== profileInfoPage.profileFilename)
+                return
+            profileInfoPage.detailRequestId = ""
+            if (reason || !detail || !detail.steps) {
+                profileInfoPage.detailError = reason || "profileNotFound"
+                profileGraph.frames = []
+                return
+            }
+            profileInfoPage.profileData = detail
+            profileGraph.frames = detail.steps
+        }
+    }
+
+    ScrollView {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: bottomBar.top
+        anchors.topMargin: Theme.pageTopMargin
+        anchors.leftMargin: Theme.standardMargin
+        anchors.rightMargin: Theme.standardMargin
+        contentWidth: availableWidth
+
+        ColumnLayout {
+            width: parent.width
+            spacing: Theme.spacingMedium
+
+            // Header: Title and Author
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Theme.scaled(4)
+
+                Text {
+                    text: profileInfoPage.profileData?.title || profileInfoPage.profileName || TranslationManager.translate("profileinfo.unknownProfile", "Profile")
+                    font: Theme.titleFont
+                    color: Theme.textColor
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                }
+
+                Text {
+                    visible: (profileInfoPage.profileData?.author?.length ?? 0) > 0
+                    text: TranslationManager.translate("profileinfo.by", "by") + " " + (profileInfoPage.profileData?.author ?? "")
+                    font: Theme.labelFont
+                    color: Theme.textSecondaryColor
+                }
+            }
+
+            // Profile Graph Card
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(220)
+                color: Theme.cardBackgroundColor
+                radius: Theme.cardRadius
+
+                ProfileGraph {
+                    id: profileGraph
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(8)
+                    frames: []
+                    selectedFrameIndex: -1
+                    targetWeight: profileInfoPage.profileData ? (profileInfoPage.profileData.target_weight || 0) : 0
+                    targetVolume: profileInfoPage.profileData ? (profileInfoPage.profileData.target_volume || 0) : 0
+                }
+
+                // No data message
+                Text {
+                    anchors.centerIn: parent
+                    visible: !profileInfoPage.profileData || !profileInfoPage.profileData.steps || profileInfoPage.profileData.steps.length === 0
+                    text: profileInfoPage.detailError
+                        ? TranslationManager.translate("profileinfo.loadError", "Profile details could not be loaded")
+                        : TranslationManager.translate("profileinfo.noData", "No profile data")
+                    font: Theme.bodyFont
+                    color: Theme.textSecondaryColor
+                }
+            }
+
+            // Settings Section
+            Rectangle {
+                Layout.fillWidth: true
+                color: Theme.cardBackgroundColor
+                radius: Theme.cardRadius
+                implicitHeight: settingsColumn.height + Theme.scaled(24)
+
+                ColumnLayout {
+                    id: settingsColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Theme.scaled(12)
+                    spacing: Theme.scaled(8)
+
+                    // Section header
+                    Text {
+                        text: TranslationManager.translate("profileinfo.settings", "Settings")
+                        font.family: Theme.titleFont.family
+                        font.pixelSize: Theme.scaled(16)
+                        font.bold: true
+                        color: Theme.textColor
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Theme.borderColor
+                    }
+
+                    // Stop-at type
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.scaled(8)
+
+                        Text {
+                            text: TranslationManager.translate("profileinfo.stopAt", "Stop at:")
+                            font: Theme.bodyFont
+                            color: Theme.textSecondaryColor
+                        }
+                        Text {
+                            text: {
+                                if (!profileInfoPage.profileData) return "-"
+                                var parts = []
+                                if (profileInfoPage.profileData.target_weight > 0)
+                                    parts.push(TranslationManager.translate("profileinfo.weight", "Weight") + " " + profileInfoPage.profileData.target_weight.toFixed(0) + " g")
+                                if (profileInfoPage.profileData.target_volume > 0)
+                                    parts.push(TranslationManager.translate("profileinfo.volume", "Volume") + " " + profileInfoPage.profileData.target_volume.toFixed(0) + " ml")
+                                return parts.length > 0 ? parts.join(", ") : TranslationManager.translate("profileEditor.off", "off")
+                            }
+                            font: Theme.bodyFont
+                            color: Theme.textColor
+                        }
+                    }
+
+                    // Temperature
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.scaled(8)
+
+                        Text {
+                            text: TranslationManager.translate("profileinfo.temperature", "Temperature:")
+                            font: Theme.bodyFont
+                            color: Theme.textSecondaryColor
+                        }
+                        Text {
+                            text: profileInfoPage.profileData ? Theme.cToDisplay(profileInfoPage.profileData.espresso_temperature || 0).toFixed(1) + " " + Theme.tempUnitSuffix() : "-"
+                            font: Theme.bodyFont
+                            color: Theme.textColor
+                        }
+                    }
+
+                    // Frame count
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.scaled(8)
+
+                        Text {
+                            text: TranslationManager.translate("profileinfo.frames", "Frames:")
+                            font: Theme.bodyFont
+                            color: Theme.textSecondaryColor
+                        }
+                        Text {
+                            text: profileInfoPage.profileData && profileInfoPage.profileData.steps ? profileInfoPage.profileData.steps.length.toString() : "0"
+                            font: Theme.bodyFont
+                            color: Theme.textColor
+                        }
+                    }
+
+                    // Flow calibration
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.scaled(8)
+
+                        Text {
+                            text: TranslationManager.translate("profileinfo.flowCalibration", "Flow Calibration:")
+                            font: Theme.bodyFont
+                            color: Theme.textSecondaryColor
+                        }
+                        Text {
+                            property var _flowCalibration: ProfileService.flowCalibration
+                            property int _calVersion: _flowCalibration.perProfileFlowCalVersion || 0
+                            property var profileCalibration: _flowCalibration.profiles
+                                ? _flowCalibration.profiles[profileInfoPage.profileFilename]
+                                : null
+                            property double effectiveCal: {
+                                void(_calVersion);
+                                void(_flowCalibration.autoFlowCalibration);
+                                void(_flowCalibration.flowCalibrationMultiplier);
+                                return profileCalibration && profileCalibration.effectiveFlowCalibration !== undefined
+                                    ? profileCalibration.effectiveFlowCalibration
+                                    : (_flowCalibration.flowCalibrationMultiplier || 1.0);
+                            }
+                            property bool isAuto: {
+                                void(_calVersion);
+                                void(_flowCalibration.autoFlowCalibration);
+                                void(_flowCalibration.flowCalibrationMultiplier);
+                                return !!(profileCalibration && profileCalibration.hasProfileFlowCalibration);
+                            }
+                            // Multipliers above this were historically out-of-range; on newer firmware
+                            // they can be legitimate but are worth flagging so the user can sanity-check
+                            // scale accuracy before trusting them.
+                            readonly property double classicCeiling: 1.8
+                            property bool isUnusuallyHigh: effectiveCal > classicCeiling
+                            property string calLabel: isAuto
+                                ? TranslationManager.translate("profileinfo.flowCalAuto", "(auto)")
+                                : TranslationManager.translate("profileinfo.flowCalGlobal", "(global)")
+                            text: effectiveCal.toFixed(2) + " " + calLabel
+                            font: Theme.bodyFont
+                            // Amber when above the classic 1.8 ceiling — genuine on newer firmware but
+                            // worth a visual nudge so the user double-checks scale accuracy.
+                            color: isUnusuallyHigh ? Theme.warningColor : Theme.textColor
+                            // Make the value discoverable by TalkBack/VoiceOver. The warning is folded
+                            // into Accessible.name (not Accessible.description) because a bare Text
+                            // element without a role is invisible to the accessibility tree — the
+                            // description would be silently dropped. Name covers both the value and
+                            // the warning so the entire piece of information reaches screen-reader
+                            // users in one announcement.
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: isUnusuallyHigh
+                                ? text + " — " + TranslationManager.translate(
+                                    "profileinfo.flowCalHigh",
+                                    "Unusually high, verify scale accuracy")
+                                : text
+                        }
+                    }
+                }
+            }
+
+            // Profile Notes Section
+            Rectangle {
+                Layout.fillWidth: true
+                color: Theme.cardBackgroundColor
+                radius: Theme.cardRadius
+                implicitHeight: notesColumn.height + Theme.scaled(24)
+
+                ColumnLayout {
+                    id: notesColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Theme.scaled(12)
+                    spacing: Theme.scaled(8)
+
+                    // Section header
+                    Text {
+                        text: TranslationManager.translate("profileinfo.notes", "Profile Notes")
+                        font.family: Theme.titleFont.family
+                        font.pixelSize: Theme.scaled(16)
+                        font.bold: true
+                        color: Theme.textColor
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Theme.borderColor
+                    }
+
+                    // Notes content
+                    Text {
+                        Layout.fillWidth: true
+                        text: {
+                            if (profileInfoPage.profileData && profileInfoPage.profileData.profile_notes && profileInfoPage.profileData.profile_notes.length > 0) {
+                                return profileInfoPage.profileData.profile_notes
+                            }
+                            return TranslationManager.translate("profileinfo.noNotes", "No notes available for this profile.")
+                        }
+                        font: Theme.bodyFont
+                        color: profileInfoPage.profileData && profileInfoPage.profileData.profile_notes && profileInfoPage.profileData.profile_notes.length > 0 ?
+                               Theme.textColor : Theme.textSecondaryColor
+                        wrapMode: Text.Wrap
+                        textFormat: Text.PlainText
+                    }
+                }
+            }
+
+            // Spacer at bottom for padding
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.scaled(20)
+            }
+        }
+    }
+
+    // Bottom bar with back button
+    BottomBar {
+        id: bottomBar
+        title: TranslationManager.translate("profileinfo.title", "Profile Info")
+        onBackClicked: AppShell.backRequested()
+    }
+}

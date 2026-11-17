@@ -1,0 +1,102 @@
+import QtQuick
+import QtQuick.Layouts
+import Decenza
+
+// Upload missing shots on a destination card (D14): shown while the destination
+// is missing shots, with how many and how many failed; while the run goes, its
+// progress in place of the button. While a 429 holds its uploads, when they resume.
+ColumnLayout {
+    id: root
+
+    // ShotUploadDestination::name(): "visualizer" or "decent".
+    property string destination
+    // A line under the button about where the shots go, if the destination needs one.
+    property string note
+    property string pendingRequestId: ""
+    property string errorReason: ""
+
+    readonly property var snapshot: ShotUploadService.snapshot || ({})
+    readonly property var missing: snapshot.missing || ({})
+    readonly property var entry: missing[root.destination]
+    readonly property bool running: root.entry !== undefined && root.entry.running === true
+    readonly property int count: root.entry !== undefined ? (root.entry.count ?? 0) : 0
+    readonly property int failed: root.entry !== undefined ? (root.entry.failed ?? 0) : 0
+    readonly property string resumesAt: root.entry !== undefined && root.entry.resumeAtMs
+                                        ? Theme.clockTime(new Date(root.entry.resumeAtMs)) : ""
+
+    visible: root.running || root.count > 0 || root.resumesAt.length > 0 || root.errorReason.length > 0
+    spacing: Theme.spacingSmall
+
+    AccessibleButton {
+        visible: !root.running && root.count > 0
+        text: TranslationManager.translate("settings.upload.missing.button", "Upload missing shots (%1)").arg(root.count)
+        accessibleName: TranslationManager.translate("settings.upload.missing.accessible",
+                                                     "Upload %1 missing shots").arg(root.count)
+        onClicked: { root.errorReason = ""; root.pendingRequestId = ShotUploadService.execute("uploadMissing", { destination: root.destination }) }
+    }
+
+    Text {
+        Layout.fillWidth: true
+        visible: text.length > 0
+        wrapMode: Text.WordWrap
+        font: Theme.captionFont
+        color: root.failed > 0 && !root.running && root.resumesAt.length === 0 ? Theme.errorColor : Theme.textSecondaryColor
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+        // Which line is ShotUploads' decision (missing().status), shared with the web page.
+        readonly property string status: root.entry !== undefined ? (root.entry.status ?? "") : ""
+        text: status === "slowedDown" && root.running
+              ? TranslationManager.translate("settings.upload.missing.rateLimited",
+                                             "%1 of %2 done. The server asked to slow down; continuing at %3")
+                    .arg(root.entry.done ?? 0).arg(root.entry.total ?? 0).arg(root.resumesAt)
+              : status === "slowedDown"
+              ? TranslationManager.translate("settings.upload.waiting",
+                                             "The server asked to slow down; uploads continue at %1").arg(root.resumesAt)
+              : status === "waitingForMachine"
+              ? TranslationManager.translate("settings.upload.missing.waitingForMachine",
+                                             "%1 of %2 done. Waiting for the machine to connect")
+                    .arg(root.entry.done ?? 0).arg(root.entry.total ?? 0)
+              : status === "waitingForSerial"
+              ? TranslationManager.translate("settings.upload.missing.waitingForSerial",
+                                             "%1 of %2 done. Your DE1 does not report its serial number — sign out of your Decent account and sign in again")
+                    .arg(root.entry.done ?? 0).arg(root.entry.total ?? 0)
+              : status === "uploading"
+              ? TranslationManager.translate("settings.upload.missing.progress", "Uploading %1 of %2")
+                    .arg(root.entry.done ?? 0).arg(root.entry.total ?? 0)
+              : status === "failedBefore"
+                ? TranslationManager.translate("settings.upload.missing.failed", "%1 of them could not be uploaded before")
+                      .arg(root.failed)
+                : ""
+    }
+
+    Connections {
+        target: ShotUploadService
+        function onOperationCompleted(requestId, operation, success, result, reason) {
+            if (requestId !== root.pendingRequestId || operation !== "uploadMissing") return
+            root.pendingRequestId = ""
+            root.errorReason = success ? "" : reason
+        }
+    }
+
+    Text {
+        Layout.fillWidth: true
+        visible: root.errorReason.length > 0
+        text: TranslationManager.translate("settings.upload.missing.startFailed",
+                                            "The missing shots could not be started (%1).")
+                  .arg(root.errorReason)
+        wrapMode: Text.WordWrap
+        font: Theme.captionFont
+        color: Theme.errorColor
+    }
+
+    Text {
+        Layout.fillWidth: true
+        visible: root.note.length > 0
+        text: root.note
+        wrapMode: Text.WordWrap
+        font: Theme.captionFont
+        color: Theme.textSecondaryColor
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+    }
+}

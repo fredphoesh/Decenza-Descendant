@@ -1,0 +1,459 @@
+#pragma once
+#include "operationlog.h"
+#include "airequestshape.h"
+
+#include <QObject>
+#include <QString>
+#include <QJsonArray>
+#include <QList>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <functional>
+
+class TranslationManager;
+
+// Abstract base class for AI providers
+class AIProvider : public QObject {
+    Q_OBJECT
+
+public:
+    enum class Status { Ready, Busy, Error };
+    Q_ENUM(Status)
+
+    // One selectable model offered by a provider. `id` is the wire model
+    // string sent to the API; `displayName` is the short label shown in the UI.
+    struct ModelOption {
+        QString id;
+        QString displayName;
+    };
+
+    explicit AIProvider(QNetworkAccessManager* networkManager, QObject* parent = nullptr);
+    virtual ~AIProvider() = default;
+
+    // Inject the TranslationManager so user-visible error/status strings
+    // localize. Set by AIManager for every provider it owns; until injected,
+    // tr_() returns the English fallback.
+    void setTranslationManager(TranslationManager* tm) { m_translationManager = tm; }
+
+    virtual QString name() const = 0;
+    virtual QString id() const = 0;  // "openai", "anthropic", "gemini", "openrouter", "ollama"
+    virtual QString modelName() const = 0;
+    // The catalog display name for modelName(), else modelName() itself.
+    virtual QString shortModelName() const;
+    virtual bool isConfigured() const = 0;
+    virtual bool isLocal() const { return false; }
+
+    // The models this provider offers, first = default; the source of the UI
+    // list and shortModelName(). The pickers show only for more than one entry.
+    // Empty (Ollama) means a free-form model of the provider's own.
+    virtual QList<ModelOption> availableModels() const { return {}; }
+
+    // One-line guidance on the catalog, shown in the app's AI settings and on
+    // the ShotServer page. Empty = no hint.
+    virtual QString modelHint() const { return {}; }
+
+    // Running-cost line for one of this provider's models, empty for a model it
+    // does not offer or has no line for. Takes the model explicitly so the
+    // ShotServer page can price the whole catalog up front.
+    QString costHintFor(const QString& modelId) const;
+
+    // The estimate for whatever model is selected right now.
+    QString costHint() const { return costHintFor(modelName()); }
+
+    Status status() const { return m_status; }
+    void setDiagnosticOperation(const AIOperationLog::Ptr& operation) { m_logOperation = operation; }
+
+    // Main analysis method
+    virtual void analyze(const QString& systemPrompt, const QString& userPrompt) = 0;
+
+    // One-shot extraction (the recipe wizard's stage-1 bag text). Not advisor
+    // analysis, so a provider that thinks for the advisor keeps thinking off here.
+    virtual void extract(const QString& systemPrompt, const QString& userPrompt) { analyze(systemPrompt, userPrompt); }
+
+    // Multi-turn conversation method (messages = array of {role, content} objects)
+    virtual void analyzeConversation(const QString& systemPrompt, const QJsonArray& messages);
+
+    // Server-side URL retrieval (add-recipe-wizard-tea, stage-2 extraction):
+    // analyze() with the provider's web-fetch tool enabled, so the PROVIDER
+    // fetches a URL named in the user prompt — the fallback when the local
+    // page fetch got nothing (JS-rendered shops). Anthropic (web_fetch),
+    // OpenAI (Responses API web_search), and Gemini (url_context) support
+    // it; providers without a server-side fetch tool (Ollama, OpenRouter)
+    // keep the default (unsupported).
+    virtual bool supportsUrlAnalysis() const { return false; }
+
+    // Searching the web is NOT the same capability as fetching a URL the
+    // prompt already names, and only one provider's tool does both. Anthropic's
+    // web_fetch and Gemini's url_context are fetch-only — asked to FIND a page
+    // they answer from memory, which is a hallucinated URL wearing a tool's
+    // credibility. So the search path gets its own tool per provider:
+    // web_search_20250305 (Anthropic), web_search on the Responses API
+    // (OpenAI), google_search grounding (Gemini).
+    virtual bool supportsWebSearch() const { return false; }
+    // Same contract as analyzeUrl (completes via analysisComplete/-Failed);
+    // the difference is the tool attached to the request.
+    virtual void searchWeb(const QString& systemPrompt, const QString& userPrompt) {
+        Q_UNUSED(systemPrompt);
+        Q_UNUSED(userPrompt);
+        emit analysisFailed(QStringLiteral("webSearchUnsupported"));
+    }
+    virtual void analyzeUrl(const QString& systemPrompt, const QString& userPrompt) {
+        Q_UNUSED(systemPrompt); Q_UNUSED(userPrompt);
+        emit analysisFailed(tr_("ai.error.urlNotSupported", "URL analysis not supported by this provider"));
+    }
+
+    // Test connection
+    virtual void testConnection() = 0;
+
+signals:
+    void analysisComplete(const QString& response);
+    void analysisFailed(const QString& error);
+    void statusChanged(Status status);
+    void testResult(bool success, const QString& message);
+
+protected:
+    QString diagnosticOwner() const {
+        const auto op = m_logOperation.lock();
+        return op ? op->owner() : QString::fromLatin1(DECENZA_LOG_MARKER_AI);
+    }
+    QString diagnosticFields() const {
+        const auto op = m_logOperation.lock();
+        return op ? op->fields() : QString();
+    }
+    QString diagnosticModel() const {
+        const auto op = m_logOperation.lock();
+        return op ? op->model : AIOperationLog::field(modelName());
+    }
+    static QString diagnosticCode(const QString& value) {
+        static const QStringList known{
+            "completed", "incomplete", "failed", "cancelled", "max_output_tokens",
+            "stop", "length", "content_filter", "error", "end_turn", "max_tokens",
+            "stop_sequence", "tool_use", "pause_turn", "refusal", "STOP", "MAX_TOKENS",
+            "SAFETY", "RECITATION", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY"};
+        return known.contains(value) ? value : QStringLiteral("other-or-unspecified");
+    }
+    std::weak_ptr<AIOperationLog> m_logOperation;
+    void setStatus(Status status);
+
+    // For providers with a catalog: the first entry is the recommended default,
+    // so the C++ default and the pickers' "unset → first entry" are one fact.
+    QString defaultCatalogModel() const;
+    bool offersModel(const QString& modelId) const;
+    // Empty (unset) selects the default, as the pickers show it; an id the catalog
+    // does not offer is logged and ignored, so a stale stored value can't break a request.
+    void selectCatalogModel(QString& model, const QString& modelId);
+
+    // Map Qt network errors to user-friendly messages (localized via tr_).
+    QString friendlyNetworkError(QNetworkReply* reply) const;
+
+    // Translate a user-visible string via the injected TranslationManager,
+    // falling back to the English source when none is set.
+    QString tr_(const char* key, const char* fallback) const;
+
+    // Build OpenAI-compatible messages array: system message + conversation messages
+    static QJsonArray buildOpenAIMessages(const QString& systemPrompt, const QJsonArray& messages);
+
+    // Retry support: each sendRequest() assigns m_retryFn; each onAnalysisReply() calls tryScheduleRetry()
+    bool tryScheduleRetry(QNetworkReply* reply);  // returns true if retry was scheduled
+
+    // What to do when a reply stops because it hit the output cap.
+    //
+    // A one-shot analysis (analyze/analyzeUrl) is parsed by machine: the caller
+    // reads a trailing fenced `nextShot` JSON block (#1054, parsed by
+    // AIManager::parseStructuredNext), which a cut-off reply has lost. A
+    // half-parsed result is worse than no result, so those paths fail.
+    //
+    // A conversation turn (analyzeConversation) is prose the user reads, so
+    // several thousand useful tokens beat an error — show them with a notice
+    // appended. Each analyze*() sets the policy before sending; the shared
+    // reply handler reads it.
+    enum class TruncationPolicy { Fail, ShowPartial };
+    TruncationPolicy m_truncationPolicy = TruncationPolicy::Fail;
+
+    // User-visible error for a reply that hit MAX_OUTPUT_TOKENS. Shared across
+    // providers: every one of them can truncate, and the user's remedy is the
+    // same regardless of which API produced it.
+    QString truncatedResponseError() const;
+
+    // Notice appended to a partial reply under TruncationPolicy::ShowPartial.
+    QString truncationNotice() const;
+
+    // Shared exit for "the reply is empty, or was cut off, or both". Returns
+    // true when it has emitted (analysisComplete for an allowed partial,
+    // analysisFailed otherwise) and the caller must return; false when the
+    // reply is fine and the caller should carry on to emit it.
+    //
+    // Factored out because all five providers need identical policy on top of
+    // five different vendor spellings of "why I stopped" — the divergence
+    // belongs in each handler's parsing, not in what we do about it.
+    bool dispatchTruncatedOrEmpty(const QString& text, bool truncated,
+                                  const QString& emptyMessage);
+
+    // Error bodies can echo prompts and secrets in any field. Log only shape
+    // and byte count; numeric HTTP/network status is carried by the operation.
+    static QString logSafeErrorBody(const QByteArray& body);
+
+    static constexpr int ANALYSIS_TIMEOUT_MS = 60000;   // 60s for cloud AI analysis
+    static constexpr int TEST_TIMEOUT_MS = 15000;        // 15s for connection tests
+    static constexpr int MAX_RETRIES = 3;                // max retries for 429/502/503/504
+
+    // Output cap for every analysis request, on every provider.
+    //
+    // Was 1024, which was too tight for the job: a dial-in reply plus the
+    // trailing fenced `nextShot` JSON block (#1054) lands right at that edge,
+    // and no provider inspected its stop/finish reason — so a capped reply was
+    // emitted as if complete, silently missing the JSON block.
+    //
+    // #1691 was the acute form, on Anthropic; the mechanism is recorded once at
+    // disableAnthropicThinking() in aiprovider.cpp rather than restated here.
+    //
+    // Raising the cap is close to free: it is a ceiling, not a reservation —
+    // billing is on tokens actually produced.
+    static constexpr int MAX_OUTPUT_TOKENS = AIRequestShape::kMaxOutputTokens;
+
+    QNetworkAccessManager* m_networkManager = nullptr;
+    TranslationManager* m_translationManager = nullptr;
+    Status m_status = Status::Ready;
+    std::function<void()> m_retryFn;  // set by each sendRequest() to re-send the pending request
+    int m_retryCount = 0;             // reset to 0 before each new analyze() / analyzeConversation() call
+    int m_reqGen = 0;                 // incremented on each new request; guards against stale retry timers
+
+private:
+    static bool isRetryableHttpStatus(int httpStatus, int retryCount);
+    static int computeRetryDelayMs(int retryCount, QNetworkReply* reply);
+};
+
+// OpenAI provider
+class OpenAIProvider : public AIProvider {
+    Q_OBJECT
+
+public:
+    explicit OpenAIProvider(QNetworkAccessManager* networkManager,
+                            const QString& apiKey,
+                            QObject* parent = nullptr);
+
+    QString name() const override { return "OpenAI"; }
+    QString id() const override { return "openai"; }
+    QString modelName() const override { return m_model; }
+    bool isConfigured() const override { return !m_apiKey.isEmpty(); }
+    QList<ModelOption> availableModels() const override;
+    QString modelHint() const override;
+
+    void setApiKey(const QString& key) { m_apiKey = key; }
+    // empty → keeps default upstream URL
+    void setBaseUrl(const QString& url) { m_baseUrl = url.endsWith(QLatin1Char('/')) ? url.chopped(1) : url; }
+    void setModel(const QString& modelId) { selectCatalogModel(m_model, modelId); }
+
+    void analyze(const QString& systemPrompt, const QString& userPrompt) override;
+    void analyzeConversation(const QString& systemPrompt, const QJsonArray& messages) override;
+    // OpenAI web search on the Responses API (chat/completions has no general
+    // web tool): the model can open a specific URL from the prompt via the
+    // tool's open_page action. Uses reasoning effort "low", the lowest
+    // gpt-6.1-sol accepts and so the value valid across the catalog.
+    bool supportsUrlAnalysis() const override { return true; }
+    void analyzeUrl(const QString& systemPrompt, const QString& userPrompt) override;
+    bool supportsWebSearch() const override { return true; }
+    void searchWeb(const QString& systemPrompt, const QString& userPrompt) override;
+    void testConnection() override;
+
+private slots:
+    void onAnalysisReply(QNetworkReply* reply);
+    void onResponsesReply(QNetworkReply* reply);
+    void onTestReply(QNetworkReply* reply);
+
+private:
+    void sendRequest(const QJsonObject& requestBody);
+    void sendResponsesRequest(const QJsonObject& requestBody);
+
+    QString m_apiKey;
+    QString m_baseUrl;
+    QString m_model;  // defaultCatalogModel() until the user picks one
+    static constexpr const char* API_URL = "https://api.openai.com/v1/chat/completions";
+    static constexpr const char* RESPONSES_API_URL = "https://api.openai.com/v1/responses";
+};
+
+// Anthropic provider
+class AnthropicProvider : public AIProvider {
+    Q_OBJECT
+
+public:
+    explicit AnthropicProvider(QNetworkAccessManager* networkManager,
+                               const QString& apiKey,
+                               QObject* parent = nullptr);
+
+    QString name() const override { return "Anthropic"; }
+    QString id() const override { return "anthropic"; }
+    QString modelName() const override { return m_model; }
+    bool isConfigured() const override { return !m_apiKey.isEmpty(); }
+    QList<ModelOption> availableModels() const override;
+    QString modelHint() const override;
+
+    void setApiKey(const QString& key) { m_apiKey = key; }
+    // empty → keeps default upstream URL
+    void setBaseUrl(const QString& url) { m_baseUrl = url.endsWith(QLatin1Char('/')) ? url.chopped(1) : url; }
+    void setModel(const QString& modelId) { selectCatalogModel(m_model, modelId); }
+
+    void analyze(const QString& systemPrompt, const QString& userPrompt) override;
+    void extract(const QString& systemPrompt, const QString& userPrompt) override;
+    void analyzeConversation(const QString& systemPrompt, const QJsonArray& messages) override;
+    // Anthropic web_fetch server tool (web_fetch_20250910): the API fetches
+    // the URL named in the user prompt during the request — no client-side
+    // round trip. URL validation requires the URL to appear in the message,
+    // which the extraction prompt guarantees.
+    bool supportsUrlAnalysis() const override { return true; }
+    void analyzeUrl(const QString& systemPrompt, const QString& userPrompt) override;
+    bool supportsWebSearch() const override { return true; }
+    void searchWeb(const QString& systemPrompt, const QString& userPrompt) override;
+    void testConnection() override;
+
+private slots:
+    void onAnalysisReply(QNetworkReply* reply);
+    void onTestReply(QNetworkReply* reply);
+
+private:
+    void sendOneShot(const QString& systemPrompt, const QString& userPrompt, bool advisor);
+    // betaFeature sets `anthropic-beta` for a body carrying a beta tool
+    // (web_fetch); empty for the GA paths.
+    void sendRequest(const QJsonObject& requestBody, const QByteArray& betaFeature = {});
+    static QJsonArray buildCachedSystemPrompt(const QString& systemPrompt);
+
+    // Wrap the first user message's content in a structured block carrying
+    // cache_control when its content is a plain string, so follow-up turns on
+    // the same shot read the per-shot payload from cache (TTL: ephemeralCache()).
+    static QJsonArray messagesWithCachedFirstUser(const QJsonArray& messages);
+
+    QString m_apiKey;
+    QString m_baseUrl;
+    QString m_model;  // defaultCatalogModel() until the user picks one
+    static constexpr const char* API_URL = "https://api.anthropic.com/v1/messages";
+};
+
+// Google Gemini provider
+class GeminiProvider : public AIProvider {
+    Q_OBJECT
+
+public:
+    explicit GeminiProvider(QNetworkAccessManager* networkManager,
+                            const QString& apiKey,
+                            QObject* parent = nullptr);
+
+    QString name() const override { return "Google Gemini"; }
+    QString id() const override { return "gemini"; }
+    QString modelName() const override { return m_model; }
+    bool isConfigured() const override { return !m_apiKey.isEmpty(); }
+    QList<ModelOption> availableModels() const override;
+    QString modelHint() const override;
+
+    void setApiKey(const QString& key) { m_apiKey = key; }
+    // empty → keeps default upstream URL. Matches OpenAI/Anthropic; exists so
+    // the truncation/finish-reason handling is reachable from a test against a
+    // canned-response server (the branch shipped untested and was broken).
+    void setBaseUrl(const QString& url) { m_baseUrl = url.endsWith(QLatin1Char('/')) ? url.chopped(1) : url; }
+    void setModel(const QString& modelId) { selectCatalogModel(m_model, modelId); }
+
+    void analyze(const QString& systemPrompt, const QString& userPrompt) override;
+    void analyzeConversation(const QString& systemPrompt, const QJsonArray& messages) override;
+    // Gemini url_context server tool: the API fetches URLs named in the
+    // prompt during generateContent (supported by every catalog model —
+    // 2.5 and 3.5 families).
+    bool supportsUrlAnalysis() const override { return true; }
+    void analyzeUrl(const QString& systemPrompt, const QString& userPrompt) override;
+    bool supportsWebSearch() const override { return true; }
+    void searchWeb(const QString& systemPrompt, const QString& userPrompt) override;
+    void testConnection() override;
+
+private slots:
+    void onAnalysisReply(QNetworkReply* reply);
+    void onTestReply(QNetworkReply* reply);
+
+private:
+    void sendRequest(const QJsonObject& requestBody);
+
+    QString m_apiKey;
+    QString m_baseUrl;
+    QString m_model;  // defaultCatalogModel() until the user picks one
+    QString apiUrl() const;
+};
+
+// OpenRouter provider (multiple models via OpenAI-compatible API)
+class OpenRouterProvider : public AIProvider {
+    Q_OBJECT
+
+public:
+    explicit OpenRouterProvider(QNetworkAccessManager* networkManager,
+                                 const QString& apiKey,
+                                 QObject* parent = nullptr);
+
+    QString name() const override { return "OpenRouter"; }
+    QString id() const override { return "openrouter"; }
+    QString modelName() const override { return m_model; }
+    bool isConfigured() const override { return !m_apiKey.isEmpty(); }
+    QList<ModelOption> availableModels() const override;
+    QString modelHint() const override;
+
+    void setApiKey(const QString& key) { m_apiKey = key; }
+    void setModel(const QString& modelId) { selectCatalogModel(m_model, modelId); }
+    // empty → keeps default upstream URL. See GeminiProvider::setBaseUrl for
+    // why this exists.
+    void setBaseUrl(const QString& url) { m_baseUrl = url.endsWith(QLatin1Char('/')) ? url.chopped(1) : url; }
+
+    void analyze(const QString& systemPrompt, const QString& userPrompt) override;
+    void analyzeConversation(const QString& systemPrompt, const QJsonArray& messages) override;
+    void testConnection() override;
+
+private slots:
+    void onAnalysisReply(QNetworkReply* reply);
+    void onTestReply(QNetworkReply* reply);
+
+private:
+    void sendRequest(const QJsonObject& requestBody);
+    QUrl chatCompletionsUrl() const;
+
+    QString m_apiKey;
+    QString m_baseUrl;
+    QString m_model;  // defaultCatalogModel() until the user picks one
+    static constexpr const char* API_URL = "https://openrouter.ai/api/v1/chat/completions";
+};
+
+// Ollama local LLM provider
+class OllamaProvider : public AIProvider {
+    Q_OBJECT
+
+public:
+    explicit OllamaProvider(QNetworkAccessManager* networkManager,
+                            const QString& endpoint,
+                            const QString& model,
+                            QObject* parent = nullptr);
+
+    QString name() const override { return "Ollama"; }
+    QString id() const override { return "ollama"; }
+    QString modelName() const override { return m_model; }
+    QString shortModelName() const override { return "Local"; }
+    bool isConfigured() const override { return !m_endpoint.isEmpty() && !m_model.isEmpty(); }
+    bool isLocal() const override { return true; }
+
+    void setEndpoint(const QString& endpoint) { m_endpoint = endpoint; }
+    void setModel(const QString& model) { m_model = model; }
+
+    void analyze(const QString& systemPrompt, const QString& userPrompt) override;
+    void analyzeConversation(const QString& systemPrompt, const QJsonArray& messages) override;
+    void testConnection() override;
+
+    // Get available models from Ollama
+    void refreshModels();
+
+signals:
+    void modelsRefreshed(const QStringList& models);
+
+private slots:
+    void onAnalysisReply(QNetworkReply* reply);
+    void onTestReply(QNetworkReply* reply);
+    void onModelsReply(QNetworkReply* reply);
+
+private:
+    void sendRequest(const QUrl& url, const QJsonObject& requestBody);
+
+    static constexpr int LOCAL_ANALYSIS_TIMEOUT_MS = 120000;  // 120s for local models
+    QString m_endpoint;
+    QString m_model;
+};

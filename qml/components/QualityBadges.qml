@@ -1,0 +1,293 @@
+// `layer.effect` declares an inline component, so ids from this file are not statically
+// resolvable inside it without this pragma. No delegate in this file takes model roles,
+// so no `required property` is needed — see PresetPillRow.qml for the case that does.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Effects
+import QtQuick.Layouts
+import Decenza
+
+// Compact quality status chip(s) for a shot. Sized to its content (shrink-wraps).
+// Note: always shows at least one chip when visible — either a flag or "Clean extraction".
+// Shows the most important quality indicator: channeling (red), grind issue
+// (orange), or clean extraction (green). Multiple flags show multiple chips.
+Item {
+    id: root
+
+    required property bool channelingDetected
+    required property bool grindIssueDetected
+    required property bool skipFirstFrameDetected
+    // Puck-failure flag (peak pressure < PRESSURE_FLOOR_BAR). Dominant: when
+    // true the C++ detector path forces channeling/grind to false so
+    // this chip stands alone. (skipFirstFrameDetected is intentionally NOT
+    // suppressed — it's a machine/profile issue orthogonal to puck integrity
+    // and can co-fire with this chip.) The clean-extraction green chip
+    // below also gates on this — without that, a suppressed puck-failure
+    // shot would render the wrong all-clear.
+    required property bool pourTruncatedDetected
+
+    // Recomputed verdict severity (change: flag-off-expert-band-in-shot-
+    // summary, D12). Read from the already-serialized
+    // shotData.detectorResults.verdictCategory — no new field. Optional
+    // (default "") so other instantiations and legacy/no-analysis shots
+    // are byte-identical. The Shot Summary affordance gets a single calm
+    // tint whenever the verdict is anything other than "clean" — a quiet
+    // "worth opening" cue, deliberately NOT severity-graded into an alarm
+    // (an intentionally-pulled non-clean shot must not look broken; D1).
+    // Empty string == no analysis data → treated as nothing-to-say (no
+    // tint), distinct from a real non-clean verdict.
+    property string verdictCategory: ""
+    readonly property bool worthOpening:
+        verdictCategory !== "" && verdictCategory !== "clean"
+
+    signal summaryRequested()
+
+    Layout.fillWidth: true
+    implicitWidth: badgeRow.implicitWidth
+    implicitHeight: badgeRow.implicitHeight
+
+    Flow {
+        id: badgeRow
+        spacing: Theme.spacingSmall
+
+        // Channeling badge (red)
+        Rectangle {
+            visible: root.channelingDetected
+            width: channelingRow.width + Theme.spacingMedium * 2
+            height: Theme.scaled(28)
+            radius: Theme.scaled(14)
+            color: Qt.rgba(Theme.errorColor.r, Theme.errorColor.g, Theme.errorColor.b, 0.15)
+            border.color: Theme.errorColor
+            border.width: Theme.scaled(1)
+
+            Accessible.role: Accessible.StaticText
+            Accessible.name: channelingText.text
+            Accessible.focusable: true
+
+            Row {
+                id: channelingRow
+                anchors.centerIn: parent
+                spacing: Theme.scaled(4)
+                Rectangle {
+                    width: Theme.scaled(8); height: Theme.scaled(8); radius: Theme.scaled(4)
+                    color: Theme.errorColor; anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+                Tr {
+                    id: channelingText
+                    key: "badges.channeling"
+                    fallback: "Channeling detected"
+                    font: Theme.captionFont
+                    color: Theme.errorColor
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+            }
+        }
+
+        // Grind issue badge (orange)
+        Rectangle {
+            visible: root.grindIssueDetected
+            width: grindRow.width + Theme.spacingMedium * 2
+            height: Theme.scaled(28)
+            radius: Theme.scaled(14)
+            color: Qt.rgba(Theme.warningColor.r, Theme.warningColor.g, Theme.warningColor.b, 0.15)
+            border.color: Theme.warningColor
+            border.width: Theme.scaled(1)
+
+            Accessible.role: Accessible.StaticText
+            Accessible.name: grindText.text
+            Accessible.focusable: true
+
+            Row {
+                id: grindRow
+                anchors.centerIn: parent
+                spacing: Theme.scaled(4)
+                Rectangle {
+                    width: Theme.scaled(8); height: Theme.scaled(8); radius: Theme.scaled(4)
+                    color: Theme.warningColor; anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+                Tr {
+                    id: grindText
+                    key: "badges.grindIssue"
+                    fallback: "Grind issue"
+                    font: Theme.captionFont
+                    color: Theme.warningColor
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+            }
+        }
+
+        // Puck-failed badge (red) — peak pressure stayed below PRESSURE_FLOOR_BAR.
+        // Sits before skipFirstFrame so it reads first when both fire.
+        Rectangle {
+            visible: root.pourTruncatedDetected
+            width: puckFailedRow.width + Theme.spacingMedium * 2
+            height: Theme.scaled(28)
+            radius: Theme.scaled(14)
+            color: Qt.rgba(Theme.errorColor.r, Theme.errorColor.g, Theme.errorColor.b, 0.15)
+            border.color: Theme.errorColor
+            border.width: Theme.scaled(1)
+
+            Accessible.role: Accessible.StaticText
+            Accessible.name: puckFailedText.text
+            Accessible.focusable: true
+
+            Row {
+                id: puckFailedRow
+                anchors.centerIn: parent
+                spacing: Theme.scaled(4)
+                Rectangle {
+                    width: Theme.scaled(8); height: Theme.scaled(8); radius: Theme.scaled(4)
+                    color: Theme.errorColor; anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+                Tr {
+                    id: puckFailedText
+                    key: "badges.puckFailed"
+                    fallback: "Puck failed"
+                    font: Theme.captionFont
+                    color: Theme.errorColor
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+            }
+        }
+
+        // Skip-first-frame badge (red) — DE1 firmware bug or very short first step
+        Rectangle {
+            visible: root.skipFirstFrameDetected
+            width: skipFrameRow.width + Theme.spacingMedium * 2
+            height: Theme.scaled(28)
+            radius: Theme.scaled(14)
+            color: Qt.rgba(Theme.errorColor.r, Theme.errorColor.g, Theme.errorColor.b, 0.15)
+            border.color: Theme.errorColor
+            border.width: Theme.scaled(1)
+
+            Accessible.role: Accessible.StaticText
+            Accessible.name: skipFrameText.text
+            Accessible.focusable: true
+
+            Row {
+                id: skipFrameRow
+                anchors.centerIn: parent
+                spacing: Theme.scaled(4)
+                Rectangle {
+                    width: Theme.scaled(8); height: Theme.scaled(8); radius: Theme.scaled(4)
+                    color: Theme.errorColor; anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+                Tr {
+                    id: skipFrameText
+                    key: "badges.skipFirstFrame"
+                    fallback: "First step skipped"
+                    font: Theme.captionFont
+                    color: Theme.errorColor
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+            }
+        }
+
+        // Clean extraction badge (green) — only shown when no flags are set
+        // AND the shot was actually analysed. analyzeShot short-circuits on
+        // pressure.size() < 10 (shotanalysis.cpp:755) leaving every detector
+        // false and stamping verdictCategory "insufficientData", so the four
+        // booleans alone cannot tell "nothing was wrong" from "nothing was
+        // checked" — an aborted or curve-less shot would claim a clean
+        // extraction the app never established. Empty string still shows the
+        // chip: that is a legacy/no-serialized-analysis shot, which behaved
+        // this way before detectorResults existed and must stay byte-identical.
+        Rectangle {
+            visible: !root.channelingDetected && !root.grindIssueDetected && !root.skipFirstFrameDetected && !root.pourTruncatedDetected
+                     && root.verdictCategory !== "insufficientData"
+            width: cleanRow.width + Theme.spacingMedium * 2
+            height: Theme.scaled(28)
+            radius: Theme.scaled(14)
+            color: Qt.rgba(Theme.successColor.r, Theme.successColor.g, Theme.successColor.b, 0.15)
+            border.color: Theme.successColor
+            border.width: Theme.scaled(1)
+
+            Accessible.role: Accessible.StaticText
+            Accessible.name: cleanText.text
+            Accessible.focusable: true
+
+            Row {
+                id: cleanRow
+                anchors.centerIn: parent
+                spacing: Theme.scaled(4)
+                Rectangle {
+                    width: Theme.scaled(8); height: Theme.scaled(8); radius: Theme.scaled(4)
+                    color: Theme.successColor; anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+                Tr {
+                    id: cleanText
+                    key: "badges.clean"
+                    fallback: "Clean extraction"
+                    font: Theme.captionFont
+                    color: Theme.successColor
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+            }
+        }
+
+        // "Shot Summary" button — the affordance that opens the dialog.
+        // Calm primaryColor tint when worthOpening (D12); never error/
+        // warning/severity-graded. Mirrors the chip tint pattern above.
+        Rectangle {
+            width: summaryRow.width + Theme.spacingMedium * 2
+            height: Theme.scaled(28)
+            radius: Theme.scaled(14)
+            color: root.worthOpening
+                ? Qt.rgba(Theme.primaryColor.r, Theme.primaryColor.g,
+                          Theme.primaryColor.b, 0.15)
+                : Theme.surfaceColor
+            border.color: root.worthOpening ? Theme.primaryColor : Theme.borderColor
+            border.width: Theme.scaled(1)
+
+            Accessible.role: Accessible.Button
+            Accessible.name: summaryLabel.text
+            Accessible.focusable: true
+            Accessible.onPressAction: summaryArea.clicked(null)
+
+            Row {
+                id: summaryRow
+                anchors.centerIn: parent
+                spacing: Theme.scaled(4)
+                Image {
+                    source: "qrc:/icons/Graph.svg"
+                    sourceSize.width: Theme.scaled(12)
+                    sourceSize.height: Theme.scaled(12)
+                    anchors.verticalCenter: parent.verticalCenter
+                    layer.enabled: true
+                    layer.smooth: true
+                    layer.effect: MultiEffect {
+                        colorization: 1.0
+                        colorizationColor: root.worthOpening
+                            ? Theme.primaryColor : Theme.textSecondaryColor
+                    }
+                }
+                Text {
+                    id: summaryLabel
+                    text: TranslationManager.translate("badges.shotSummary", "Shot Summary")
+                    font: Theme.captionFont
+                    color: root.worthOpening
+                        ? Theme.primaryColor : Theme.textSecondaryColor
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+            }
+
+            MouseArea {
+                id: summaryArea
+                anchors.fill: parent
+                onClicked: root.summaryRequested()
+            }
+        }
+    }
+}

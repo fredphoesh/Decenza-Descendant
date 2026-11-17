@@ -1,0 +1,407 @@
+#include <QtTest>
+#include "core/settings.h"
+#include "core/screenreaderprobe.h"
+#include <QSignalSpy>
+#include <QSettings>
+#include <QTemporaryDir>
+#include <QFile>
+
+#include "core/accessibilitymanager.h"
+
+// Verifies the routing rule used by AccessibilityManager:
+//   isScreenReaderActive() == true  -> only platform dispatch
+//   isScreenReaderActive() == false, ttsEnabled == true  -> only TTS dispatch
+//   isScreenReaderActive() == false, ttsEnabled == false -> neither
+//
+// The fake subclass uses the TestSkipAudioInit ctor so no real QTextToSpeech
+// is constructed and overrides the dispatch / isActive virtuals so nothing
+// touches real Qt accessibility state. setEnabled(true) and toggleEnabled()
+// route through the same helper as announce(), so each test resets the
+// recorded calls AFTER setup so we only check what the test itself triggers.
+
+namespace {
+
+struct PlatformCall {
+    QString text;
+    bool assertive = false;
+};
+
+struct TtsCall {
+    QString text;
+    bool interrupt = false;
+};
+
+class FakeAccessibilityManager : public AccessibilityManager {
+public:
+    explicit FakeAccessibilityManager(QObject* parent = nullptr)
+        : AccessibilityManager(TestSkipAudioInit::SkipAudio, parent) {}
+
+    bool fakeScreenReaderActive = false;
+    QVector<PlatformCall> platformCalls;
+    QVector<TtsCall> ttsCalls;
+
+    void resetCalls() {
+        platformCalls.clear();
+        ttsCalls.clear();
+    }
+
+protected:
+    bool isScreenReaderActive() const override { return fakeScreenReaderActive; }
+
+    void dispatchPlatformAnnouncement(const QString& text, bool assertive) override {
+        platformCalls.push_back({text, assertive});
+    }
+
+    void dispatchTtsAnnouncement(const QString& text, bool interrupt) override {
+        ttsCalls.push_back({text, interrupt});
+    }
+};
+
+// Configures the manager and clears any calls produced by setEnabled/setTtsEnabled
+// during setup, so each test asserts only against what it itself triggered.
+void setup(FakeAccessibilityManager& mgr, bool enabled, bool ttsEnabled, bool screenReader) {
+    mgr.fakeScreenReaderActive = screenReader;
+    mgr.setEnabled(enabled);
+    mgr.setTtsEnabled(ttsEnabled);
+    mgr.resetCalls();
+}
+
+}
+
+// AccessibilityManager now uses the PRIMARY store
+// QSettings("DecentEspresso", "DE1Qt") like every other settings domain
+// (it was an isolated QSettings("Decenza","DE1") — see
+// accessibilitymanager.cpp). The two-string ctor hardcodes NativeFormat
+// per Qt docs, so setDefaultFormat()/setPath() can't redirect it.
+// Instead we follow the tst_settings pattern: snapshot the real store's
+// accessibility keys in init() and restore them in cleanup() so the
+// developer's settings round-trip even when assertions fail mid-test.
+
+class tst_AccessibilityAnnouncements : public QObject {
+    Q_OBJECT
+
+private:
+    QSettings m_realSettings{Settings::testQSettingsPath(), QSettings::IniFormat};
+    QVariant m_origEnabled;
+    QVariant m_origTtsEnabled;
+    QVariant m_origTickEnabled;
+    QVariant m_origTickSoundIndex;
+    QVariant m_origTickVolume;
+    QVariant m_origExtractionEnabled;
+    QVariant m_origExtractionInterval;
+    QVariant m_origExtractionMode;
+
+private slots:
+
+    // The probe must have an answer on the platforms that implement one, and
+    // must have NO answer on the platforms that deliberately do not.
+    //
+    // This is not testing what NSWorkspace/SPI_GETSCREENREADER return — that
+    // needs a real reader and is verified by hand. It tests the #ifdef chain,
+    // where a mistake is silent and severe in one direction: a platform that
+    // wrongly returns `true` makes AccessibilityManager believe a screen reader
+    // is present everywhere and mute its own TTS for good, which is the exact
+    // bug this probe was written to fix, aimed at a different platform. The
+    // nullopt half is the one CI actually exercises, since CI is Linux.
+    // An engaged optional{false} and a nullopt are NOT the same answer, and the
+    // one Windows bug this code has had lived precisely in confusing them: a
+    // SPI_GETSCREENREADER call that succeeds while Narrator runs writes FALSE,
+    // and treating that as "no reader" short-circuits the Qt fallback and makes
+    // the app talk over Narrator. Pin all three cases so the distinction is
+    // visible to whoever edits the probe next.
+    void resolvingAScreenReaderAnswerKeepsNoAnswerDistinctFromNo()
+    {
+        // The platform answered: its answer wins, whatever Qt thinks.
+        QCOMPARE(decenzaResolveScreenReaderActive(std::optional<bool>(true), false), true);
+        QCOMPARE(decenzaResolveScreenReaderActive(std::optional<bool>(false), true), false);
+        // The platform declined: Qt decides.
+        QCOMPARE(decenzaResolveScreenReaderActive(std::nullopt, true), true);
+        QCOMPARE(decenzaResolveScreenReaderActive(std::nullopt, false), false);
+    }
+
+    void theScreenReaderProbeAnswersOnlyWherePlatformCodeExists()
+    {
+        const std::optional<bool> answer = decenzaPlatformScreenReaderActive();
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS) || defined(Q_OS_WIN)
+        QVERIFY2(answer.has_value(),
+                 "this platform implements a screen-reader probe, so it must return an "
+                 "answer rather than falling back to QAccessible::isActive()");
+#else
+        QVERIFY2(!answer.has_value(),
+                 "this platform has no screen-reader probe, so it must return nullopt and "
+                 "leave the caller on QAccessible::isActive() — returning a value here would "
+                 "silently decide the routing for every announcement");
+#endif
+    }
+
+    void init() { QTest::failOnWarning();
+        // Snapshot every key AccessibilityManager::saveSettings() touches so
+        // setEnabled / setTtsEnabled writes during a test don't permanently
+        // mutate the developer's real preferences.
+        m_origEnabled            = m_realSettings.value("accessibility/enabled");
+        m_origTtsEnabled         = m_realSettings.value("accessibility/ttsEnabled");
+        m_origTickEnabled        = m_realSettings.value("accessibility/tickEnabled");
+        m_origTickSoundIndex     = m_realSettings.value("accessibility/tickSoundIndex");
+        m_origTickVolume         = m_realSettings.value("accessibility/tickVolume");
+        m_origExtractionEnabled  = m_realSettings.value("accessibility/extractionAnnouncementsEnabled");
+        m_origExtractionInterval = m_realSettings.value("accessibility/extractionAnnouncementInterval");
+        m_origExtractionMode     = m_realSettings.value("accessibility/extractionAnnouncementMode");
+    }
+
+    void cleanup() {
+        auto restore = [&](const char* key, const QVariant& original) {
+            if (original.isValid()) {
+                m_realSettings.setValue(key, original);
+            } else {
+                m_realSettings.remove(key);
+            }
+        };
+        restore("accessibility/enabled",                          m_origEnabled);
+        restore("accessibility/ttsEnabled",                       m_origTtsEnabled);
+        restore("accessibility/tickEnabled",                      m_origTickEnabled);
+        restore("accessibility/tickSoundIndex",                   m_origTickSoundIndex);
+        restore("accessibility/tickVolume",                       m_origTickVolume);
+        restore("accessibility/extractionAnnouncementsEnabled",   m_origExtractionEnabled);
+        restore("accessibility/extractionAnnouncementInterval",   m_origExtractionInterval);
+        restore("accessibility/extractionAnnouncementMode",       m_origExtractionMode);
+        m_realSettings.sync();
+    }
+
+    void platformPathTakenWhenScreenReaderActive() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/true);
+
+        mgr.announce("Shot complete");
+
+        QCOMPARE(mgr.platformCalls.size(), 1);
+        QCOMPARE(mgr.platformCalls[0].text, QStringLiteral("Shot complete"));
+        QCOMPARE(mgr.platformCalls[0].assertive, false);
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    void platformPathSuppressesTtsEvenIfTtsEnabled() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/true);
+
+        mgr.announce("Hello");
+
+        QCOMPARE(mgr.platformCalls.size(), 1);
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    void interruptMapsToAssertiveOnPlatform() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/true);
+
+        mgr.announce("Error", /*interrupt=*/true);
+
+        QCOMPARE(mgr.platformCalls.size(), 1);
+        QCOMPARE(mgr.platformCalls[0].assertive, true);
+    }
+
+    void ttsFallbackWhenNoScreenReaderAndTtsEnabled() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/false);
+
+        mgr.announce("Pouring");
+
+        QCOMPARE(mgr.platformCalls.size(), 0);
+        QCOMPARE(mgr.ttsCalls.size(), 1);
+        QCOMPARE(mgr.ttsCalls[0].text, QStringLiteral("Pouring"));
+        QCOMPARE(mgr.ttsCalls[0].interrupt, false);
+    }
+
+    void interruptMapsToTtsInterruptArg() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/false);
+
+        mgr.announce("Stop", /*interrupt=*/true);
+
+        QCOMPARE(mgr.ttsCalls.size(), 1);
+        QCOMPARE(mgr.ttsCalls[0].interrupt, true);
+    }
+
+    void silentWhenNoScreenReaderAndTtsDisabled() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/false, /*sr=*/false);
+
+        mgr.announce("Should not speak");
+
+        QCOMPARE(mgr.platformCalls.size(), 0);
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    void disabledManagerDispatchesNothing() {
+        FakeAccessibilityManager mgr;
+        // m_enabled defaults to false (TestSkipAudioInit skips loadSettings),
+        // so we don't call setEnabled here. setTtsEnabled doesn't announce.
+        // resetCalls() is called for consistency with the rest of the suite.
+        mgr.fakeScreenReaderActive = true;
+        mgr.setTtsEnabled(true);
+        mgr.resetCalls();
+
+        mgr.announce("Hidden");
+
+        QCOMPARE(mgr.platformCalls.size(), 0);
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    // Steam-coach voice must bypass BOTH accessibility voice gates — the
+    // master switch (m_enabled) AND the Voice Announcements toggle
+    // (m_ttsEnabled): its own opt-in (Settings.app.steamCoachAudioEnabled,
+    // gated at the emitter) is the only gate. Everything that silences
+    // announce() is engaged here — announceCoaching() must still speak. This
+    // pins the exact regression the coaching-voice fix addressed: spoken cues
+    // silently dead behind accessibility prefs the user never connected to
+    // steam coaching (and can't even reach — the Voice Announcements switch
+    // is greyed out while the master switch is off).
+    void coachingAnnouncementBypassesAccessibilityGates() {
+        FakeAccessibilityManager mgr;
+        // m_enabled stays at its default false; ttsEnabled off too — the
+        // deepest silent-for-announce() configuration.
+        mgr.fakeScreenReaderActive = false;
+        mgr.setTtsEnabled(false);
+        mgr.resetCalls();
+
+        mgr.announceCoaching("Steam done", /*interrupt=*/true);
+
+        QCOMPARE(mgr.ttsCalls.size(), 1);
+        QCOMPARE(mgr.ttsCalls[0].text, QStringLiteral("Steam done"));
+        QCOMPARE(mgr.ttsCalls[0].interrupt, true);
+        QCOMPARE(mgr.platformCalls.size(), 0);  // no screen reader -> TTS route
+    }
+
+    // With a screen reader active, coaching follows the same no-TTS-overlap
+    // rule as routeAnnouncement: platform dispatch only.
+    void coachingAnnouncementPrefersScreenReader() {
+        FakeAccessibilityManager mgr;
+        mgr.fakeScreenReaderActive = true;
+        mgr.setTtsEnabled(true);
+        mgr.resetCalls();
+
+        mgr.announceCoaching("Steam done", /*interrupt=*/false);
+
+        QCOMPARE(mgr.platformCalls.size(), 1);
+        QCOMPARE(mgr.platformCalls[0].text, QStringLiteral("Steam done"));
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    void politeAndAssertiveHelpersRouteCorrectly() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/true);
+
+        mgr.announcePolite("Polite text");
+        mgr.announceAssertive("Assertive text");
+
+        QCOMPARE(mgr.platformCalls.size(), 2);
+        QCOMPARE(mgr.platformCalls[0].assertive, false);
+        QCOMPARE(mgr.platformCalls[1].assertive, true);
+    }
+
+    // setEnabled used to call m_tts->say() directly, bypassing the routing —
+    // that meant the "Accessibility enabled" confirmation double-spoke when a
+    // screen reader was on. Now it routes through routeAnnouncement(), so the
+    // platform dispatch fires when isScreenReaderActive() is true.
+    void setEnabledRoutesThroughPlatformWhenScreenReaderActive() {
+        FakeAccessibilityManager mgr;
+        mgr.fakeScreenReaderActive = true;
+        // Defensive: don't depend on the TestSkipAudioInit ctor leaving
+        // m_enabled at false. setEnabled() short-circuits if already-set, so
+        // start from a known disabled state and clear any setup-side calls.
+        mgr.setEnabled(false);
+        mgr.resetCalls();
+
+        mgr.setEnabled(true);
+
+        QCOMPARE(mgr.platformCalls.size(), 1);
+        QCOMPARE(mgr.platformCalls[0].text, QStringLiteral("Accessibility enabled"));
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    // toggleEnabled() must produce exactly one announcement on the platform
+    // path. Earlier the routing produced two (Polite from setEnabled() + Assertive
+    // from toggleEnabled()); on the platform path there's no cancellation
+    // mechanism between QAccessibleAnnouncementEvents, so TalkBack/VoiceOver
+    // would speak the message twice. The fix passes announce=false to the
+    // internal setEnabled call so toggleEnabled() emits a single Assertive event.
+    void toggleEnabledRoutesThroughPlatformWhenScreenReaderActive() {
+        FakeAccessibilityManager mgr;
+        mgr.fakeScreenReaderActive = true;
+        mgr.setEnabled(false);  // start from a known state
+        mgr.resetCalls();
+
+        mgr.toggleEnabled();
+
+        // Exactly one assertive platform announcement; no TTS dispatch.
+        QCOMPARE(mgr.platformCalls.size(), 1);
+        QCOMPARE(mgr.platformCalls[0].text, QStringLiteral("Accessibility enabled"));
+        QCOMPARE(mgr.platformCalls[0].assertive, true);
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    // announceLabel() used to call m_tts->say() directly with a pitch/rate
+    // adjustment, bypassing the screen-reader gate entirely. Now it dispatches
+    // a polite platform announcement when a screen reader is active and skips
+    // the TTS path.
+    void announceLabelRoutesThroughPlatformWhenScreenReaderActive() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/true);
+
+        mgr.announceLabel("Temperature 93 degrees");
+
+        QCOMPARE(mgr.platformCalls.size(), 1);
+        QCOMPARE(mgr.platformCalls[0].text, QStringLiteral("Temperature 93 degrees"));
+        QCOMPARE(mgr.platformCalls[0].assertive, false);
+        QCOMPARE(mgr.ttsCalls.size(), 0);
+    }
+
+    // announceLabel still goes via TTS for the sighted-user-with-no-screen-reader
+    // case so we don't regress the spoken-progress feature.
+    void announceLabelUsesTtsWhenNoScreenReaderAndTtsEnabled() {
+        FakeAccessibilityManager mgr;
+        setup(mgr, /*enabled=*/true, /*tts=*/true, /*sr=*/false);
+
+        mgr.announceLabel("Battery 85 percent");
+
+        QCOMPARE(mgr.platformCalls.size(), 0);
+        QCOMPARE(mgr.ttsCalls.size(), 1);
+        QCOMPARE(mgr.ttsCalls[0].text, QStringLiteral("Battery 85 percent"));
+    }
+
+    // cleanForSpeech() was JavaScript on main.qml's root until it moved here, and
+    // in that form nothing could test it — a QML function reached by creation-context
+    // lookup has no seam. These pin the behaviour the port had to reproduce exactly,
+    // including the ordering: the unit expansions insert spaces that the final
+    // whitespace collapse normalises, so reordering them changes the output.
+    void cleanForSpeech_data() {
+        QTest::addColumn<QString>("input");
+        QTest::addColumn<QString>("expected");
+
+        QTest::newRow("empty")            << QString()               << QString();
+        QTest::newRow("profile extension")<< "gagne_88C.json"        << "gagne 88 degrees Celsius";
+        QTest::newRow("tcl extension")    << "Best Overall.tcl"      << "Best Overall";
+        QTest::newRow("extension midword")<< "a.json.b"              << "a.json.b";
+        QTest::newRow("separators")       << "slow-and_steady"       << "slow and steady";
+        QTest::newRow("degree symbols")   << "brew 93°C then 200°F"  << "brew 93 degrees Celsius then 200 degrees Fahrenheit";
+        QTest::newRow("millilitres")      << "36ml out"              << "36 milliliters out";
+        QTest::newRow("grams")            << "18g in"                << "18 grams in";
+        QTest::newRow("bar")              << "9bar peak"             << "9 bar peak";
+        QTest::newRow("seconds")          << "25s total"             << "25 seconds total";
+        QTest::newRow("percent")          << "60% flow"              << "60 percent flow";
+        // The bare-C rule is word-bounded, so a capital C starting the next word is
+        // left alone. This is what keeps "88 Colombia" from becoming a temperature.
+        QTest::newRow("bare C needs boundary") << "88 Colombia"      << "88 Colombia";
+        QTest::newRow("collapses runs")   << "a   b"                 << "a b";
+        QTest::newRow("trims")            << "  spaced  "           << "spaced";
+    }
+
+    void cleanForSpeech() {
+        QFETCH(QString, input);
+        QFETCH(QString, expected);
+        FakeAccessibilityManager mgr;
+        QCOMPARE(mgr.cleanForSpeech(input), expected);
+    }
+};
+
+QTEST_GUILESS_MAIN(tst_AccessibilityAnnouncements)
+#include "tst_accessibility_announcements.moc"

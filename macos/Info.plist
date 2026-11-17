@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleDisplayName</key>
+    <string>Decenza</string>
+    <key>CFBundleExecutable</key>
+    <string>Decenza</string>
+    <!-- Substituted by CMake from MACOS_BUNDLE_ID (see CMakeLists.txt). Defaults
+         to the shipping id; overridable for local dev builds so they get their
+         own Local Network permission subject. -->
+    <key>CFBundleIdentifier</key>
+    <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+    <key>CFBundleName</key>
+    <string>Decenza</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>${CMAKE_OSX_DEPLOYMENT_TARGET}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+    <key>CFBundleVersion</key>
+    <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>This app uses Bluetooth to connect to your DE1 espresso machine and scales.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>This app uses your location to show where your espresso shots were made on the shot map.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>This app uses your location to show where your espresso shots were made on the shot map.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>This app runs a local web server so you can edit themes and view shot data from a browser on the same network, and discovers the Half Decent Scale on your local network.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_http._tcp</string>
+        <!-- The Half Decent Scale's DNS-SD advertisement (openscale v3.0.9+).
+             macOS only permits browsing service types listed here: omitting it
+             makes DNSServiceBrowse fail with kDNSServiceErr_NoAuth (-65555),
+             which reads like a denied Local Network permission and sends you
+             looking at System Settings instead of at this file.
+             Keep in step with ios/Info.plist. -->
+        <string>_decentscale._tcp</string>
+    </array>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppSleepDisabled</key>
+    <true/>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+</dict>
+</plist>

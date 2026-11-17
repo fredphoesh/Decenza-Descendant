@@ -1,0 +1,141 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/">
+        <!-- Sounds -->
+        <file>sounds/tick.wav</file>
+        <file>sounds/ding.wav</file>
+        <file>sounds/frameclick1.wav</file>
+        <file>sounds/frameclick2.wav</file>
+        <file>sounds/frameclick3.wav</file>
+        <file>sounds/frameclick4.wav</file>
+        <!-- Bundled DE1 firmware images and Decaid manifest. The aliases preserve
+             Decaid's asset paths so the manifest can be consumed without rewriting
+             its assetPath fields. -->
+        <file alias="assets/firmware/manifest.json">firmware/manifest.json</file>
+        <file alias="assets/firmware/de1/de1-1358.bin">firmware/de1/de1-1358.bin</file>
+        <file alias="assets/firmware/de1/de1-1359.bin">firmware/de1/de1-1359.bin</file>
+        <!-- Bundled UI font (Roboto, SIL OFL 1.1, renamed to the application-specific
+             family "Decenza Sans") — gives deterministic glyph metrics across
+             platforms/OEMs/OS versions. The rename is what makes that guarantee hold:
+             a host-installed font sharing the family name would otherwise be free to
+             win family resolution (#1537). See resources/fonts/OFL.txt and
+             tools/rename_bundled_font.py. -->
+        <file>fonts/DecenzaSans-Regular.ttf</file>
+        <file>fonts/DecenzaSans-Medium.ttf</file>
+        <file>fonts/DecenzaSans-Bold.ttf</file>
+        <file>fonts/DecenzaSans-Light.ttf</file>
+        <!-- Symbol fallback (Noto Sans Math, SIL OFL 1.1). Decenza Sans covers Latin/Greek/
+             Cyrillic and 927 glyphs total — no arrows, no geometric shapes. Symbols written
+             in QML therefore came from a per-machine platform fallback. This font supplies
+             every symbol the app actually uses (→ ← ↗ ↕ ▶ ◀ ⧉) from the bundle instead, so
+             they are monochrome, follow Theme colours, and are identical on every platform.
+             Chained after Decenza Sans in Theme's font roles — it is never the primary face.
+             Verify coverage with scripts/check_font_glyph_coverage.py. -->
+        <file>fonts/NotoSansMath-Regular.ttf</file>
+        <!-- Icons -->
+        <file>icons/bell.svg</file>
+        <file>icons/bell-off.svg</file>
+        <file>icons/fullscreen.svg</file>
+        <file>icons/fullscreen-exit.svg</file>
+        <file alias="icons/espresso.svg">icons/espresso 8mm.svg</file>
+        <file>icons/steam.svg</file>
+        <file>icons/water.svg</file>
+        <!-- Drinkware, on the recipe wizard's steam and hot-water tiles.
+             pitcher.svg is drawn for this project; cup/mug/glass-full come
+             from Tabler Icons (MIT) — licence text in
+             icons/MIT-TablerIcons.txt, credited in the README. All four
+             are 24-unit, stroke-width 2, matching the stroked icons above. -->
+        <file>icons/pitcher.svg</file>
+        <file>icons/cup.svg</file>
+        <file>icons/mug.svg</file>
+        <file>icons/glass-full.svg</file>
+        <file alias="icons/flush.svg">icons/flush 8mm.svg</file>
+        <file>icons/settings.svg</file>
+        <file>icons/eye.svg</file>
+        <file>icons/eye-off.svg</file>
+        <file>icons/back.svg</file>
+        <file>icons/edit.svg</file>
+        <file>icons/taste-sour.svg</file>
+        <file>icons/taste-balanced.svg</file>
+        <file>icons/taste-bitter.svg</file>
+        <file>icons/body-thin.svg</file>
+        <file>icons/body-medium.svg</file>
+        <file>icons/body-heavy.svg</file>
+        <file>icons/SortAscending.svg</file>
+        <file>icons/SortDescending.svg</file>
+        <file>icons/AlignLeft.svg</file>
+        <file>icons/AlignCenter.svg</file>
+        <file>icons/AlignRight.svg</file>
+        <file>icons/sleep.svg</file>
+        <file>icons/sparkle.svg</file>
+        <file>icons/pin.svg</file>
+        <file>icons/profile.svg</file>
+        <file>icons/hide-keyboard.svg</file>
+        <file>icons/keyboard.svg</file>
+        <file>icons/battery-0.svg</file>
+        <file>icons/battery-25.svg</file>
+        <file>icons/battery-50.svg</file>
+        <file>icons/battery-75.svg</file>
+        <file>icons/battery-100.svg</file>
+        <file>icons/battery-charging.svg</file>
+        <file>icons/bluetooth.svg</file>
+        <file>icons/coffeebeans.svg</file>
+        <file>icons/cross.svg</file>
+        <file>icons/cross-filled.svg</file>
+        <file>icons/decent-de1.svg</file>
+        <file>icons/filter.svg</file>
+        <file>icons/search.svg</file>
+        <file>icons/grind.svg</file>
+        <file>icons/hand.svg</file>
+        <file>icons/discuss.svg</file>
+        <file>icons/history.svg</file>
+        <file>icons/niche-zero.svg</file>
+        <file>icons/star.svg</file>
+        <file>icons/star-outline.svg</file>
+        <file>icons/tea.svg</file>
+        <file>icons/temperature.svg</file>
+        <file>icons/tick.svg</file>
+        <file>icons/info.svg</file>
+        <file>icons/usb.svg</file>
+        <file>icons/quit.svg</file>
+        <file>icons/scale.svg</file>
+        <file>icons/portal.svg</file>
+        <file>icons/wifi.svg</file>
+        <file>icons/Graph.svg</file>
+        <file>icons/ArrowLeft.svg</file>
+        <file>icons/Upload.svg</file>
+        <file>icons/CloudUpload.svg</file>
+        <file>icons/list.svg</file>
+        <file>icons/picker-wheel.svg</file>
+        <file>icons/plus.svg</file>
+        <file>icons/download.svg</file>
+        <file>icons/minus.svg</file>
+        <file>icons/trash.svg</file>
+        <file>icons/warning.svg</file>
+        <file>icons/more-vertical.svg</file>
+        <file>icons/grid.svg</file>
+        <file>icons/clock.svg</file>
+        <!-- Coffee Cup (3D-rendered layers for CupFillView) -->
+        <file>CoffeeCup/BackGround.png</file>
+        <file>CoffeeCup/Mask.png</file>
+        <file>CoffeeCup/Overlay.png</file>
+        <!-- GHC Simulator -->
+        <file>GHC_Small.png</file>
+        <!-- Shot Map Screensaver -->
+        <file>maps/earth_night.png</file>
+        <file>maps/earth_day.jpg</file>
+        <file>maps/earth_bright.png</file>
+        <!-- About page -->
+        <file alias="qrcode.png">../Logo/qrcode.png</file>
+        <file alias="favicon.png">../ios/Assets.xcassets/AppIcon.appiconset/Icon-40@2x.png</file>
+        <!-- Home-screen icons for the web interface: iOS 180 px, Android 192 px -->
+        <file alias="apple-touch-icon.png">../ios/Assets.xcassets/AppIcon.appiconset/Icon-60@3x.png</file>
+        <file alias="android-icon-192.png">../android/res/mipmap-xxxhdpi/icon.png</file>
+        <file>backgrounds/dots.svg</file>
+        <file>backgrounds/grain.svg</file>
+        <file>backgrounds/linen.svg</file>
+        <file>backgrounds/pinstripe.svg</file>
+        <file>backgrounds/twill.svg</file>
+        <file>backgrounds/weave.svg</file>
+    </qresource>
+</RCC>

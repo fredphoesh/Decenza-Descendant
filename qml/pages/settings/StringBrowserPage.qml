@@ -1,0 +1,1438 @@
+// The string-list delegate reads this file's ids (`stringBrowserPage`,
+// `stringListView`); Bound makes them statically resolvable. It declares both injected
+// roles it uses, `model` and `index`, required in the same edit -- without that, Bound
+// stops role injection and every string row renders blank at RUNTIME, silently.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Templates as T
+import Decenza
+
+T.Page {
+    id: stringBrowserPage
+    // Declarative so it re-evaluates on a language change. This used to be an
+    // imperative assignment in onCompleted/onActivated, which ran once and left
+    // page titles in the previous language until you navigated away and back.
+    readonly property string pageTitle: isEnglish ? TranslationManager.translate("stringBrowser.titleCustomizer", "String Customizer") : TranslationManager.translate("stringBrowser.titleBrowser", "Translation Browser")
+
+    objectName: "stringBrowserPage"
+    background: ThemedPageBackground {}
+    property string initialSearchText: ""
+    property int initialFilterMode: 0
+    readonly property var navigationContext: ({searchText: stringModel.searchFilter, filterMode: stringModel.filterMode})
+
+    property bool isEditing: false
+    readonly property bool browserHasUnsavedChanges: isEditing || draft !== null
+    property int editingIndex: -1
+    readonly property var draft: stringEditor.draft
+    readonly property string pendingEdit: stringEditor.pendingEdit
+    readonly property string draftError: stringEditor.errorReason === "staleContext"
+        ? TranslationManager.translate("stringBrowser.staleDraft", "The host language or translations changed. Your draft is kept below. Copy it before discarding and reloading.")
+        : stringEditor.errorReason ? TranslationManager.translate("stringBrowser.saveFailed", "The translation could not be saved. Your draft is kept below; edit it to retry or discard it.") : ""
+    readonly property string displayedLanguage: draft ? draft.context.language : stringEditor.displayedContext.language || TranslationManager.currentLanguage
+    property bool isEnglish: displayedLanguage === "en"
+    property int diagnosticSequence: 0
+    property int diagnosticNextDelegateId: 0
+    property int diagnosticNextCenterId: 0
+    // Answered by the editing row; a delegate is an untyped Item to itemAtIndex().
+    signal finishEditingRequested()
+
+    // Event snapshots only: per-frame logging would change the focus/scroll timing under investigation (#2145).
+    function trace(eventName: string, details: var): void {
+        if (!stringListView || !stringModel) return
+        const rectangle = Keyboard.rectangle
+        const window = stringBrowserPage.Window.window
+        const focusedItem = window ? window.activeFocusItem : null
+        const record = Object.assign({
+            sequence: ++diagnosticSequence,
+            event: eventName,
+            editing: isEditing,
+            editingIndex: editingIndex,
+            hasDraft: stringEditor.draft !== null,
+            pendingSave: pendingEdit !== "",
+            count: stringModel.count,
+            currentIndex: stringListView.currentIndex,
+            contentY: stringListView.contentY,
+            originY: stringListView.originY,
+            contentHeight: stringListView.contentHeight,
+            viewY: stringListView.y,
+            viewHeight: stringListView.height,
+            keyboardVisible: Keyboard.visible,
+            keyboardX: rectangle.x,
+            keyboardY: rectangle.y,
+            keyboardWidth: rectangle.width,
+            keyboardHeight: rectangle.height,
+            focusedItem: focusedItem ? String(focusedItem).slice(0, 160) : ""
+        }, details || {})
+        WebDebugLogger.debug("App", "StringBrowserPage", JSON.stringify(record))
+    }
+
+    LanguageStringEditor {
+        id: stringEditor
+        executeOperation: function(operation, args) { return LanguageService.execute(operation, args) }
+        onRefreshRequested: stringModel.refresh("editorRefreshRequested")
+    }
+
+    function discardDraft() {
+        trace("discardDraftRequested", {})
+        if (!stringEditor.discard()) return
+        isEditing = false
+        editingIndex = -1
+        Keyboard.hide()
+    }
+
+    Component.onCompleted: {
+        searchField.text = initialSearchText
+        stringModel.filterMode = initialFilterMode
+        LanguageService.refreshStrings()
+        trace("pageOpened", {})
+    }
+    function handleBack() {
+        trace("backRequested", {})
+        if (isEditing) {
+            const row = stringListView.itemAtIndex(editingIndex)
+            if (row) {
+                finishEditingRequested()
+            } else {
+                isEditing = false
+                editingIndex = -1
+                Keyboard.hide()
+            }
+            AppShell.browserBackCancelled()
+        } else if (draft !== null) {
+            if (!stringEditor.errorReason && pendingEdit === "")
+                stringEditor.errorReason = "unsaved"
+            AppShell.browserBackCancelled()
+        } else {
+            AppShell.backRequested()
+        }
+    }
+
+    Connections {
+        target: Keyboard
+        function onVisibleChanged() {
+            stringBrowserPage.trace("keyboardVisibilityChanged", {})
+        }
+        function onRectangleChanged() {
+            stringBrowserPage.trace("keyboardRectangleChanged", {})
+            if (Keyboard.visible && stringBrowserPage.isEditing)
+                stringListView.centerOnItem(stringBrowserPage.editingIndex, "keyboardRectangleChanged")
+        }
+    }
+
+    // Intercept Android system back button / Escape key
+    focus: true
+    Keys.onReleased: function(event) {
+        if (event.key === Qt.Key_Back || event.key === Qt.Key_Escape) {
+            event.accepted = true
+            handleBack()
+        }
+    }
+
+    // Grouped string list model
+    ListModel {
+        id: stringModel
+
+        property int filterMode: 0  // 0=All, 1=Missing/Uncustomized, 2=AI Generated, 3=Customized (English only)
+        property string searchFilter: ""
+
+        function refresh(reason: string): void {
+            if (LanguageService.stringsLoading || !stringEditor.acceptRefresh(LanguageService.stringsContext)) {
+                stringBrowserPage.trace("modelRefreshSkipped", {
+                    reason: reason, stringsLoading: LanguageService.stringsLoading
+                })
+                return
+            }
+            stringBrowserPage.trace("modelRefreshBegin", {
+                reason: reason, filterMode: filterMode, searchLength: searchFilter.length
+            })
+            var groups = LanguageService.strings
+            var search = searchFilter.toLowerCase()
+            var filteredGroups = []
+
+            for (let i = 0; i < groups.length; i++) {
+                let group = groups[i]
+
+                // Filter by mode
+                if (filterMode === 1 && group.isTranslated) continue  // Missing/Uncustomized
+                if (filterMode === 2 && !group.isAiGenerated) continue  // AI Generated
+                if (filterMode === 3 && !group.isTranslated) continue  // Customized (English)
+
+                // Filter by search
+                if (search && !group.fallback.toLowerCase().includes(search) &&
+                    !(group.translation && group.translation.toLowerCase().includes(search)) &&
+                    !(group.aiTranslation && group.aiTranslation.toLowerCase().includes(search))) {
+                    continue
+                }
+
+                filteredGroups.push(group)
+            }
+
+            // An unchanged edit still requests a refresh so deferred host changes
+            // can be accepted. Keep the delegates when row identities are unchanged.
+            var sameRows = count === filteredGroups.length
+            for (let i = 0; sameRows && i < count; i++)
+                sameRows = get(i).key === filteredGroups[i].key
+            if (sameRows) {
+                for (let i = 0; i < count; i++) {
+                    const row = filteredGroups[i]
+                    for (const role of Object.keys(row)) {
+                        if (get(i)[role] !== row[role])
+                            setProperty(i, role, row[role])
+                    }
+                }
+            } else {
+                const preservePosition = reason !== "filterModeChanged" && reason !== "searchFilterChanged"
+                const firstVisibleIndex = stringListView.indexAt(0, stringListView.contentY + 10)
+                const savedKey = preservePosition && firstVisibleIndex >= 0 ? get(firstVisibleIndex).key : ""
+                clear()
+                for (const group of filteredGroups)
+                    append(group)
+                if (savedKey) {
+                    for (let i = 0; i < count; i++) {
+                        if (get(i).key === savedKey) {
+                            stringListView.positionViewAtIndex(i, ListView.Beginning)
+                            break
+                        }
+                    }
+                }
+            }
+            stringBrowserPage.trace("modelRefreshEnd", { reason: reason, reset: !sameRows })
+        }
+
+        onFilterModeChanged: refresh("filterModeChanged")
+        onSearchFilterChanged: refresh("searchFilterChanged")
+    }
+
+    // Refresh when translations change
+    Connections {
+        target: LanguageService
+        function onOperationCompleted(requestId, operation, success, result, reason) {
+            if (requestId === stringBrowserPage.pendingEdit)
+                stringBrowserPage.trace("editOperationCompleted", {
+                    operation: operation, success: success, reason: reason
+                })
+            stringEditor.complete(requestId, operation, success, reason)
+        }
+        function onStringsChanged() {
+            stringModel.refresh("stringsChanged")
+        }
+    }
+
+    // Main content area - properly positioned between status bar and bottom bar
+    Item {
+        id: contentArea
+        anchors.fill: parent
+        anchors.topMargin: Theme.pageTopMargin
+        anchors.bottomMargin: Theme.bottomBarHeight + (draftStatus.visible ? draftStatus.height + Theme.spacingSmall : 0)
+        anchors.leftMargin: Theme.spacingSmall
+        anchors.rightMargin: Theme.spacingSmall
+
+        // Header section - hidden when editing
+        Column {
+            id: headerSection
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            spacing: Theme.spacingSmall
+            visible: !stringBrowserPage.isEditing
+            enabled: stringBrowserPage.draft === null
+
+            // Top row: Language name + progress + AI Translate button
+            Item {
+                width: parent.width
+                height: Theme.scaled(40)
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: LanguageService.getLanguageDisplayName(stringBrowserPage.displayedLanguage)
+                    font: Theme.subtitleFont
+                    color: Theme.textColor
+                }
+
+                // Progress + AI button grouped together on right
+                Row {
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.scaled(12)
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: {
+                            var total = LanguageService.uniqueStringCount
+                            var untranslated = LanguageService.uniqueUntranslatedCount
+                            var translated = total - untranslated
+                            return translated + "/" + total + " (" + Math.floor((translated / Math.max(1, total)) * 100) + "%)"
+                        }
+                        font: Theme.labelFont
+                        color: Theme.textSecondaryColor
+
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: {
+                            var total = LanguageService.uniqueStringCount
+                            var untranslated = LanguageService.uniqueUntranslatedCount
+                            var translated = total - untranslated
+                            var percent = Math.floor((translated / Math.max(1, total)) * 100)
+                            return TranslationManager.translate("stringBrowser.accessible.translationProgress", "Translation progress: %1 percent. %2 of %3 strings translated.").replace("%1", percent).replace("%2", translated).replace("%3", total)
+                        }
+                    }
+
+                    // Clear All AI button (hidden for English)
+                    Rectangle {
+                        visible: !stringBrowserPage.isEnglish
+                        width: Theme.scaled(80)
+                        height: Theme.scaled(36)
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: clearAiArea.pressed ? Qt.darker(Theme.warningColor, 1.2) : Theme.warningColor
+                        radius: Theme.buttonRadius
+
+                        Accessible.role: Accessible.Button
+                        Accessible.name: TranslationManager.translate("stringBrowser.accessible.clearAllAi", "Clear all AI translations")
+                        Accessible.focusable: true
+                        Accessible.onPressAction: clearAiArea.clicked(null)
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: TranslationManager.translate("stringBrowser.clearAiButton", "Clear AI")
+                            font: Theme.bodyFont
+                            color: Theme.primaryContrastColor
+                            Accessible.ignored: true
+                        }
+
+                        MouseArea {
+                            id: clearAiArea
+                            anchors.fill: parent
+                            onClicked: clearAiPopup.open()
+                        }
+                    }
+
+                    // AI Translate button (hidden for English)
+                    Rectangle {
+                        visible: !stringBrowserPage.isEnglish
+                        width: Theme.scaled(120)
+                        height: Theme.scaled(36)
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: aiButtonArea.pressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                        radius: Theme.buttonRadius
+                        opacity: !LanguageService.autoTranslating ? 1.0 : 0.5
+
+                        Accessible.role: Accessible.Button
+                        Accessible.name: LanguageService.autoTranslating ? TranslationManager.translate("stringBrowser.accessible.aiInProgress", "AI translation in progress") : TranslationManager.translate("stringBrowser.accessible.aiTranslateAll", "AI Translate all missing strings")
+                        Accessible.description: TranslationManager.translate("stringBrowser.accessible.aiTranslateDescription", "Use artificial intelligence to automatically translate all untranslated strings")
+                        Accessible.focusable: true
+                        Accessible.onPressAction: aiButtonArea.clicked(null)
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: LanguageService.autoTranslating ? TranslationManager.translate("stringBrowser.translating", "Translating...") : TranslationManager.translate("stringBrowser.aiTranslateButton", "AI Translate")
+                            font: Theme.bodyFont
+                            color: Theme.primaryContrastColor
+                            Accessible.ignored: true
+                        }
+
+                        MouseArea {
+                            id: aiButtonArea
+                            anchors.fill: parent
+                            onClicked: {
+                                if (LanguageService.autoTranslating) return
+                                if (!LanguageService.canAutoTranslate) {
+                                    apiKeyPopup.open()
+                                } else if (LanguageService.uniqueUntranslatedCount === 0) {
+                                    allTranslatedPopup.open()
+                                } else {
+                                    stringEditor.mutate("autoTranslate")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Search and filter row
+            Item {
+                width: parent.width
+                height: Theme.scaled(36)
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: filterRow.left
+                    anchors.rightMargin: Theme.spacingSmall
+                    height: parent.height
+                    color: Theme.cardBackgroundColor
+                    radius: Theme.buttonRadius
+                    border.width: 1
+                    border.color: searchField.activeFocus ? Theme.primaryColor : Theme.borderColor
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: Theme.scaled(8)
+                        spacing: Theme.scaled(8)
+
+                        Image {
+                            anchors.verticalCenter: parent.verticalCenter
+                            source: Theme.emojiToImage("🔍")
+                            sourceSize.width: Theme.scaled(14)
+                            sourceSize.height: Theme.scaled(14)
+                            width: Theme.scaled(14)
+                            height: Theme.scaled(14)
+                        }
+
+                        TextInput {
+                            id: searchField
+                            width: parent.width - Theme.scaled(40)
+                            anchors.verticalCenter: parent.verticalCenter
+                            font: Theme.bodyFont
+                            color: Theme.textColor
+                            clip: true
+                            // Hint the Android IME away from autocorrect; some IMEs ignore
+                            // this, so we also filter via displayText (see below).
+                            inputMethodHints: Qt.ImhNoPredictiveText
+
+                            Accessible.role: Accessible.EditableText
+                            Accessible.name: TranslationManager.translate("stringBrowser.accessible.searchStrings", "Search strings")
+                            Accessible.description: TranslationManager.translate("stringBrowser.accessible.searchDescription", "Type to filter the list of translatable strings")
+                            Accessible.focusable: true
+
+                            Text {
+                                anchors.fill: parent
+                                text: TranslationManager.translate("stringBrowser.searchPlaceholder", "Search strings...")
+                                font: parent.font
+                                color: Theme.textSecondaryColor
+                                visible: !parent.displayText && !parent.activeFocus
+                                verticalAlignment: Text.AlignVCenter
+                            }
+
+                            // Drive filter from displayText (includes IME preedit) so results
+                            // update on every keystroke on Android. See SuggestionField.qml.
+                            onDisplayTextChanged: stringModel.searchFilter = displayText
+                        }
+
+                        Text {
+                            id: clearSearchButton
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "\u{2715}"
+                            font.pixelSize: Theme.scaled(14)
+                            color: Theme.textSecondaryColor
+                            visible: searchField.displayText !== ""
+
+                            Accessible.role: Accessible.Button
+                            Accessible.name: TranslationManager.translate("stringBrowser.accessible.clearSearch", "Clear search")
+                            Accessible.focusable: true
+                            Accessible.onPressAction: searchField.text = ""
+
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: Theme.scaled(-8)
+                                onClicked: searchField.text = ""
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    id: filterRow
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.scaled(4)
+
+                    Repeater {
+                        model: stringBrowserPage.isEnglish ? [
+                            { text: TranslationManager.translate("stringBrowser.filterAll", "All"), mode: 0, description: TranslationManager.translate("stringBrowser.filterAllDescription", "Show all strings") },
+                            { text: TranslationManager.translate("stringBrowser.filterCustom", "Custom"), mode: 3, description: TranslationManager.translate("stringBrowser.filterCustomDescription", "Show only customized strings") }
+                        ] : [
+                            { text: TranslationManager.translate("stringBrowser.filterAll", "All"), mode: 0, description: TranslationManager.translate("stringBrowser.filterAllDescription", "Show all strings") },
+                            { text: TranslationManager.translate("stringBrowser.filterMissing", "Missing"), mode: 1, description: TranslationManager.translate("stringBrowser.filterMissingDescription", "Show only untranslated strings") },
+                            { text: TranslationManager.translate("stringBrowser.filterAi", "AI"), mode: 2, description: TranslationManager.translate("stringBrowser.filterAiDescription", "Show only AI-generated translations") }
+                        ]
+
+                        Rectangle {
+                            id: filterChip
+                            required property var modelData
+
+                            width: Theme.scaled(70)
+                            height: Theme.scaled(36)
+                            color: stringModel.filterMode === filterChip.modelData.mode ? Theme.primaryColor : Theme.cardBackgroundColor
+                            radius: Theme.buttonRadius
+                            border.width: stringModel.filterMode === filterChip.modelData.mode ? 0 : 1
+                            border.color: Theme.borderColor
+
+                            Accessible.role: Accessible.RadioButton
+                            Accessible.name: TranslationManager.translate("stringBrowser.accessible.filter", "%1 filter").replace("%1", filterChip.modelData.text)
+                            Accessible.description: filterChip.modelData.description
+                            Accessible.checked: stringModel.filterMode === filterChip.modelData.mode
+                            Accessible.focusable: true
+                            Accessible.onPressAction: filterMa.clicked(null)
+                            // VoiceOver delivers a RadioButton press as toggle (see AccessibleMouseArea).
+                            Accessible.onToggleAction: filterMa.clicked(null)
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: filterChip.modelData.text
+                                font: Theme.labelFont
+                                color: stringModel.filterMode === filterChip.modelData.mode ? Theme.primaryContrastColor : Theme.textColor
+                                Accessible.ignored: true
+                            }
+
+                            MouseArea {
+                                id: filterMa
+                                anchors.fill: parent
+                                onClicked: stringModel.filterMode = filterChip.modelData.mode
+                            }
+                        }
+                    }
+                }
+            }
+
+            // String count
+            Text {
+                text: TranslationManager.translate("stringBrowser.entries", "%1 translation entries").replace("%1", stringModel.count)
+                font: Theme.labelFont
+                color: Theme.textSecondaryColor
+
+                Accessible.role: Accessible.StaticText
+                Accessible.name: TranslationManager.translate("stringBrowser.accessible.entriesShown", "%1 translation entries shown").replace("%1", stringModel.count)
+            }
+        }
+
+        // Column headers - hidden when editing
+        Rectangle {
+            id: columnHeaders
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: headerSection.bottom
+            anchors.topMargin: Theme.spacingSmall
+            height: Theme.scaled(28)
+            color: Theme.cardBackgroundColor
+            radius: Theme.scaled(4)
+            visible: !stringBrowserPage.isEditing
+
+            // Calculate widths to match delegate columns
+            readonly property real headerRowWidth: width - Theme.scaled(16)  // same as delegate rowWidth
+            readonly property real col1Width: stringBrowserPage.isEnglish ? headerRowWidth * 0.5 : headerRowWidth * 0.35
+            readonly property real col2Width: headerRowWidth * 0.3
+            readonly property real col3Width: stringBrowserPage.isEnglish ? headerRowWidth * 0.5 - Theme.scaled(8) : headerRowWidth * 0.35 - Theme.scaled(8)
+
+            Item {
+                anchors.fill: parent
+                anchors.margins: Theme.scaled(8)
+
+                Text {
+                    id: headerCol1
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: columnHeaders.col1Width
+                    text: TranslationManager.translate("stringBrowser.columnEnglishUs", "English (US)")
+                    font.family: Theme.labelFont.family
+                    font.pixelSize: Theme.labelFont.pixelSize
+                    font.bold: true
+                    color: Theme.textSecondaryColor
+                }
+
+                Text {
+                    id: headerCol2
+                    visible: !stringBrowserPage.isEnglish
+                    anchors.left: headerCol1.right
+                    anchors.leftMargin: Theme.scaled(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: columnHeaders.col2Width
+                    text: TranslationManager.translate("stringBrowser.columnAiTranslation", "AI Translation")
+                    font.family: Theme.labelFont.family
+                    font.pixelSize: Theme.labelFont.pixelSize
+                    font.bold: true
+                    color: Theme.primaryColor
+                }
+
+                Text {
+                    anchors.left: stringBrowserPage.isEnglish ? headerCol1.right : headerCol2.right
+                    anchors.leftMargin: Theme.scaled(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: columnHeaders.col3Width
+                    text: stringBrowserPage.isEnglish ? TranslationManager.translate("stringBrowser.columnCustomText", "Custom Text") : TranslationManager.translate("stringBrowser.columnFinalTranslation", "Final Translation")
+                    font.family: Theme.labelFont.family
+                    font.pixelSize: Theme.labelFont.pixelSize
+                    font.bold: true
+                    color: Theme.successColor
+                }
+            }
+        }
+
+        // String list
+        ListView {
+            id: stringListView
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: stringBrowserPage.isEditing ? parent.top : columnHeaders.bottom
+            anchors.topMargin: stringBrowserPage.isEditing ? 0 : Theme.spacingSmall
+            anchors.bottom: parent.bottom
+            clip: true
+            model: stringModel
+            spacing: Theme.scaled(2)
+
+            onMovementStarted: stringBrowserPage.trace("movementStarted", {})
+            onMovementEnded: stringBrowserPage.trace("movementEnded", {})
+            onHeightChanged: {
+                if (stringBrowserPage.isEditing || stringEditor.draft !== null)
+                    stringBrowserPage.trace("viewHeightChanged", {})
+            }
+            onYChanged: {
+                if (stringBrowserPage.isEditing || stringEditor.draft !== null)
+                    stringBrowserPage.trace("viewYChanged", {})
+            }
+
+            Accessible.role: Accessible.List
+            Accessible.name: stringBrowserPage.isEnglish ? TranslationManager.translate("stringBrowser.accessible.customizationList", "String customization list") : TranslationManager.translate("stringBrowser.accessible.translationList", "Translation list")
+            Accessible.description: TranslationManager.translate("stringBrowser.accessible.stringsSwipeToNavigate", "%1 strings. Swipe to navigate, double tap to edit.").replace("%1", stringModel.count)
+
+
+            // Center editing item in visible area (accounting for keyboard)
+            function centerOnItem(idx: int, reason: string): void {
+                const centerId = ++stringBrowserPage.diagnosticNextCenterId
+                stringBrowserPage.trace("centerBegin", { centerId: centerId, index: idx, reason: reason })
+                if (idx < 0 || idx >= count) {
+                    stringBrowserPage.trace("centerSkipped", { centerId: centerId, reason: "invalidIndex" })
+                    return
+                }
+
+                Qt.callLater(function() {
+                    if (!stringBrowserPage.isEditing || stringBrowserPage.editingIndex !== idx) {
+                        stringBrowserPage.trace("centerSkipped", { centerId: centerId, reason: "editEnded" })
+                        return
+                    }
+                    // Wait for the editing header/layout change before positioning.
+                    positionViewAtIndex(idx, ListView.Center)
+                    stringBrowserPage.trace("centerPositioned", { centerId: centerId, index: idx })
+                    var item = itemAtIndex(idx)
+                    if (!item) {
+                        stringBrowserPage.trace("centerSkipped", { centerId: centerId, reason: "missingItem" })
+                        return
+                    }
+
+                    // Android uses adjustPan (as in SharedKeyboardAwareContainer).
+                    // Other platforms report Keyboard.rectangle in window coordinates.
+                    const kbRect = Keyboard.rectangle
+                    const keyboardOverlaps = Keyboard.visible && kbRect.height > 0 && Qt.platform.os !== "android"
+                    const visibleHeight = keyboardOverlaps
+                        ? Math.max(0, Math.min(height, mapFromItem(null, kbRect.x, kbRect.y).y)) : height
+
+                    // Get item center position in content coordinates
+                    var itemCenter = item.y + item.height / 2
+
+                    // Target: put item center at center of visible area
+                    var visibleCenter = visibleHeight / 2
+                    var targetY = itemCenter - visibleCenter
+
+                    // Clamp to valid range
+                    var minY = originY
+                    var maxY = Math.max(minY, originY + contentHeight - height)
+                    stringBrowserPage.trace("centerAdjustBegin", {
+                        centerId: centerId, index: idx, rowY: item.y, rowHeight: item.height,
+                        keyboardHeightUsed: keyboardOverlaps ? kbRect.height : 0, visibleHeight: visibleHeight,
+                        targetY: targetY, minY: minY, maxY: maxY
+                    })
+                    contentY = Math.max(minY, Math.min(targetY, maxY))
+                    stringBrowserPage.trace("centerAdjustEnd", { centerId: centerId, index: idx })
+                })
+            }
+
+            delegate: FocusScope {
+                id: delegateRoot
+                required property var model
+                required property int index
+                property int diagnosticId: 0
+                property int diagnosticInitialIndex: -1
+                property string diagnosticFallback: ""
+                property bool diagnosticEditorFocused: false
+
+                function traceRow(eventName: string, details: var): void {
+                    stringBrowserPage.trace(eventName, Object.assign({
+                        rowInstance: diagnosticId, index: index,
+                        initialIndex: diagnosticInitialIndex, fallback: diagnosticFallback,
+                        rowY: y, rowHeight: height, editorFocused: diagnosticEditorFocused
+                    }, details || {}))
+                }
+
+                Component.onCompleted: {
+                    diagnosticId = ++stringBrowserPage.diagnosticNextDelegateId
+                    diagnosticInitialIndex = index
+                    diagnosticFallback = String(model.fallback || "").slice(0, 160)
+                    traceRow("rowCreated", {})
+                }
+                Component.onDestruction: traceRow("rowDestroyed", {})
+
+                width: stringListView.width
+                // Calculate height based on tallest column content
+                height: Math.max(Theme.scaled(48), rowHeight + Theme.scaled(16))
+                Rectangle {
+                    anchors.fill: parent
+                    color: delegateRoot.index % 2 === 0 ? Theme.cardBackgroundColor : Qt.darker(Theme.cardBackgroundColor, 1.05)
+                    radius: Theme.scaled(4)
+                }
+
+                // Functions at delegate level where singletons are accessible
+                function setEditing(editing, idx) {
+                    // updateCurrent() retains its delegate separately from visible
+                    // rows (Qt 6.12 qquickitemview.cpp:1834-1853).
+                    // The FocusScope keeps the editor focused when this selects it.
+                    if (editing)
+                        stringListView.currentIndex = idx
+                    stringBrowserPage.isEditing = editing
+                    stringBrowserPage.editingIndex = idx
+                }
+
+                Connections {
+                    target: stringBrowserPage
+                    function onFinishEditingRequested() {
+                        if (delegateRoot.index === stringBrowserPage.editingIndex)
+                            delegateRoot.finishEditing()
+                    }
+                }
+
+                function finishEditing() {
+                    if (finalInput.activeFocus)
+                        finalInput.exitEditing()
+                    else
+                        setEditing(false, -1)
+                }
+
+                // Accessibility: announce the English text and translation status
+                Accessible.role: Accessible.Grouping
+                Accessible.name: {
+                    var name = TranslationManager.translate("stringBrowser.accessible.english", "English: ") + delegateRoot.model.fallback + ". "
+                    if (stringBrowserPage.isEnglish) {
+                        if (delegateRoot.model.translation) {
+                            name += TranslationManager.translate("stringBrowser.accessible.customText", "Custom text: ") + delegateRoot.model.translation
+                        } else {
+                            name += TranslationManager.translate("stringBrowser.accessible.noCustomization", "No customization. Double tap to customize.")
+                        }
+                    } else {
+                        if (delegateRoot.model.translation) {
+                            name += TranslationManager.translate("stringBrowser.accessible.translation", "Translation: ") + delegateRoot.model.translation
+                            if (delegateRoot.model.isAiGenerated) {
+                                name += ". " + TranslationManager.translate("stringBrowser.accessible.aiGenerated", "AI generated.")
+                            }
+                        } else if (delegateRoot.model.aiTranslation) {
+                            name += TranslationManager.translate("stringBrowser.accessible.aiSuggestion", "AI suggestion: %1. Double tap to edit or accept.").replace("%1", delegateRoot.model.aiTranslation)
+                        } else {
+                            name += TranslationManager.translate("stringBrowser.accessible.notTranslated", "Not translated. Double tap to translate.")
+                        }
+                    }
+                    return name
+                }
+                Accessible.focusable: true
+                Accessible.onPressAction: finalInput.activateEditor()
+
+                // Calculate the row width for column sizing
+                readonly property real rowWidth: width - Theme.scaled(16)  // margins
+                readonly property real col1Width: stringBrowserPage.isEnglish ? rowWidth * 0.5 : rowWidth * 0.35
+                readonly property real col2Width: rowWidth * 0.3
+                readonly property real col3Width: stringBrowserPage.isEnglish ? rowWidth * 0.5 - Theme.scaled(8) : rowWidth * 0.35 - Theme.scaled(8)
+
+                // Hidden text elements to measure required height
+                Text {
+                    id: measureCol1
+                    width: delegateRoot.col1Width
+                    text: delegateRoot.model.fallback
+                    font: Theme.bodyFont
+                    wrapMode: Text.Wrap
+                    visible: false
+                }
+                Text {
+                    id: measureCol2
+                    width: delegateRoot.col2Width - Theme.scaled(8)
+                    text: delegateRoot.model.aiTranslation || "-"
+                    font: Theme.bodyFont
+                    wrapMode: Text.Wrap
+                    visible: false
+                }
+                Text {
+                    id: measureCol3
+                    width: delegateRoot.col3Width - Theme.scaled(8)
+                    // Use live text from TextEdit when editing this row, otherwise model value
+                    text: (finalInput.activeFocus ? finalInput.text : delegateRoot.model.translation) || "Tap..."
+                    font: Theme.bodyFont
+                    wrapMode: Text.Wrap
+                    visible: false
+                }
+
+                // Calculate max height needed
+                readonly property real rowHeight: stringBrowserPage.isEnglish
+                    ? Math.max(measureCol1.implicitHeight, measureCol3.implicitHeight)
+                    : Math.max(measureCol1.implicitHeight, measureCol2.implicitHeight, measureCol3.implicitHeight)
+
+                // Content row
+                Item {
+                    id: contentRow
+                    anchors.fill: parent
+                    anchors.margins: Theme.scaled(8)
+
+                    // English/Default column
+                    Text {
+                        id: englishText
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        width: delegateRoot.col1Width
+                        text: delegateRoot.model.fallback
+                        font: Theme.bodyFont
+                        color: Theme.textColor
+                        wrapMode: Text.Wrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+
+                    // AI Translation column (hidden for English)
+                    Rectangle {
+                        id: aiColumn
+                        visible: !stringBrowserPage.isEnglish
+                        anchors.left: englishText.right
+                        anchors.leftMargin: Theme.scaled(8)
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        width: delegateRoot.col2Width
+                        color: aiCopyArea.pressed ? Qt.rgba(Theme.primaryColor.r, Theme.primaryColor.g, Theme.primaryColor.b, 0.2) : "transparent"
+                        radius: Theme.scaled(4)
+
+                        Accessible.role: Accessible.Button
+                        Accessible.name: delegateRoot.model.aiTranslation ? TranslationManager.translate("stringBrowser.accessible.aiSuggestionTap", "AI suggestion: %1. Tap to use this translation.").replace("%1", delegateRoot.model.aiTranslation) : TranslationManager.translate("stringBrowser.accessible.noAiTranslation", "No AI translation available")
+                        Accessible.focusable: delegateRoot.model.aiTranslation ? true : false
+                        Accessible.onPressAction: aiCopyArea.clicked(null)
+
+                        Text {
+                            anchors.left: parent.left
+                            anchors.right: aiClearButton.left
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+                            anchors.margins: Theme.scaled(4)
+                            text: delegateRoot.model.aiTranslation || "-"
+                            font: Theme.bodyFont
+                            color: delegateRoot.model.aiTranslation ? Theme.primaryColor : Theme.textSecondaryColor
+                            wrapMode: Text.Wrap
+                            verticalAlignment: Text.AlignVCenter
+                            opacity: delegateRoot.model.aiTranslation ? 1.0 : 0.5
+                        }
+
+                        // Clear AI translation button
+                        Item {
+                            id: aiClearButton
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.rightMargin: Theme.scaled(4)
+                            width: delegateRoot.model.aiTranslation ? Theme.scaled(20) : 0
+                            height: Theme.scaled(20)
+                            visible: delegateRoot.model.aiTranslation && delegateRoot.model.aiTranslation !== ""
+
+                            ColoredIcon {
+                                anchors.centerIn: parent
+                                source: "qrc:/icons/cross.svg"
+                                iconWidth: Theme.scaled(12)
+                                iconHeight: Theme.scaled(12)
+                                iconColor: aiClearArea.pressed ? Theme.warningColor : Theme.textSecondaryColor
+                            }
+
+                            Accessible.role: Accessible.Button
+                            Accessible.name: TranslationManager.translate("stringBrowser.accessible.clearAiTranslation", "Clear AI translation")
+                            Accessible.focusable: true
+                            Accessible.onPressAction: aiClearArea.clicked(null)
+
+                            MouseArea {
+                                id: aiClearArea
+                                anchors.fill: parent
+                                anchors.margins: Theme.scaled(-8)
+                                onClicked: {
+                                    stringEditor.mutate("clearAiTranslation", { fallback: delegateRoot.model.fallback })
+                                }
+                            }
+                        }
+
+                        MouseArea {
+                            id: aiCopyArea
+                            anchors.left: parent.left
+                            anchors.right: aiClearButton.left
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+                            onClicked: {
+                                if (delegateRoot.model.aiTranslation && delegateRoot.model.aiTranslation !== "") {
+                                    stringEditor.mutate("copyAiToFinal", { fallback: delegateRoot.model.fallback })
+                                }
+                            }
+                        }
+                    }
+
+                    // Final/Custom column (editable)
+                    Rectangle {
+                        id: finalColumn
+                        anchors.left: stringBrowserPage.isEnglish ? englishText.right : aiColumn.right
+                        anchors.leftMargin: Theme.scaled(8)
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        color: finalInput.activeFocus ? Qt.rgba(Theme.successColor.r, Theme.successColor.g, Theme.successColor.b, 0.1) : "transparent"
+                        radius: Theme.scaled(4)
+                        border.width: finalInput.activeFocus ? 2 : 0
+                        border.color: Theme.successColor
+
+                        // AI indicator badge (not for English)
+                        Rectangle {
+                            visible: !stringBrowserPage.isEnglish && delegateRoot.model.isAiGenerated
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: Theme.scaled(2)
+                            width: Theme.scaled(16)
+                            height: Theme.scaled(16)
+                            radius: Theme.scaled(8)
+                            color: Theme.primaryColor
+                            z: 1
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: "AI"
+                                font.pixelSize: Theme.scaled(8)
+                                font.bold: true
+                                color: Theme.primaryContrastColor
+                            }
+                        }
+
+                        // Use TextEdit for multi-line support
+                        TextEdit {
+                            id: finalInput
+                            anchors.fill: parent
+                            anchors.margins: Theme.scaled(4)
+                            anchors.rightMargin: (!stringBrowserPage.isEnglish && delegateRoot.model.isAiGenerated) ? Theme.scaled(20) : Theme.scaled(4)
+                            text: stringBrowserPage.draft && stringBrowserPage.draft.fallback === delegateRoot.model.fallback
+                                  ? stringBrowserPage.draft.text : delegateRoot.model.translation || ""
+                            font: Theme.bodyFont
+                            color: delegateRoot.model.translation ? Theme.successColor : Theme.textSecondaryColor
+                            wrapMode: TextEdit.Wrap
+                            verticalAlignment: Text.AlignVCenter
+                            readOnly: !activeFocus || stringBrowserPage.pendingEdit !== ""
+
+                            Accessible.role: Accessible.EditableText
+                            Accessible.focusable: true
+                            Accessible.name: stringBrowserPage.isEnglish
+                                ? TranslationManager.translate("stringBrowser.accessible.customTextFor", "Custom text for: %1").replace("%1", delegateRoot.model.fallback)
+                                : TranslationManager.translate("stringBrowser.accessible.translationFor", "Translation for: %1").replace("%1", delegateRoot.model.fallback)
+                            Accessible.description: {
+                                if (stringBrowserPage.isEnglish) {
+                                    return delegateRoot.model.translation
+                                        ? TranslationManager.translate("stringBrowser.accessible.currentCustomText", "Current custom text: %1. Edit to change.").replace("%1", delegateRoot.model.translation)
+                                        : TranslationManager.translate("stringBrowser.accessible.noCustomTextSet", "No custom text set. Type to customize this string.")
+                                } else {
+                                    return delegateRoot.model.translation
+                                        ? TranslationManager.translate("stringBrowser.accessible.currentTranslation", "Current translation: %1. Edit to change.").replace("%1", delegateRoot.model.translation)
+                                        : TranslationManager.translate("stringBrowser.accessible.notTranslatedType", "Not translated. Type your translation here.")
+                                }
+                            }
+
+                            Text {
+                                anchors.fill: parent
+                                visible: !parent.text && !parent.activeFocus
+                                text: stringBrowserPage.isEnglish ? TranslationManager.translate("stringBrowser.tapToCustomize", "Tap to customize...") : TranslationManager.translate("stringBrowser.tapToTranslate", "Tap to translate...")
+                                font: parent.font
+                                color: Theme.textSecondaryColor
+                                verticalAlignment: Text.AlignVCenter
+                                wrapMode: Text.Wrap
+                                opacity: 0.5
+                            }
+
+                            onActiveFocusChanged: {
+                                delegateRoot.diagnosticEditorFocused = activeFocus
+                                delegateRoot.traceRow(activeFocus ? "focusGained" : "focusLost", {
+                                    textLength: text.length, preeditLength: preeditText.length
+                                })
+                                if (activeFocus) {
+                                    if (!stringEditor.beginEdit(delegateRoot.model.fallback, delegateRoot.model.translation || "")) {
+                                        delegateRoot.traceRow("beginEditRejected", {})
+                                        focus = false
+                                        return
+                                    }
+                                    delegateRoot.setEditing(true, delegateRoot.index)
+                                    const currentIndex = delegateRoot.index
+                                    Qt.callLater(function() {
+                                        stringBrowserPage.trace("focusCenterCallback", { index: currentIndex })
+                                        if (stringBrowserPage.isEditing &&
+                                            stringBrowserPage.editingIndex === currentIndex)
+                                            stringListView.centerOnItem(currentIndex, "focusGained")
+                                    })
+                                } else {
+                                    if (!stringBrowserPage.draft || stringBrowserPage.draft.fallback !== delegateRoot.model.fallback
+                                        || stringBrowserPage.pendingEdit !== "") {
+                                        delegateRoot.traceRow("finishEditSkipped", {})
+                                        return
+                                    }
+                                    delegateRoot.traceRow("finishEditRequested", {
+                                        changed: text.trim() !== stringBrowserPage.draft.original
+                                    })
+                                    delegateRoot.setEditing(false, -1)
+                                    stringEditor.finishEdit(delegateRoot.model.fallback, text)
+                                }
+                            }
+
+                            onTextChanged: {
+                                if (activeFocus && stringBrowserPage.draft && stringBrowserPage.draft.fallback === delegateRoot.model.fallback)
+                                    stringEditor.setText(delegateRoot.model.fallback, text)
+                            }
+
+                            Keys.onReturnPressed: function(event) {
+                                // Shift+Enter for newline, Enter alone to confirm
+                                if (event.modifiers & Qt.ShiftModifier) {
+                                    event.accepted = false  // Let it insert newline
+                                } else {
+                                    exitEditing()
+                                }
+                            }
+                            Keys.onEnterPressed: function(event) {
+                                if (event.modifiers & Qt.ShiftModifier) {
+                                    event.accepted = false
+                                } else {
+                                    exitEditing()
+                                }
+                            }
+
+                            function activateEditor() {
+                                delegateRoot.traceRow("activateRequested", {})
+                                const accepted = stringEditor.beginEdit(delegateRoot.model.fallback, delegateRoot.model.translation || "")
+                                delegateRoot.traceRow("activateResult", { accepted: accepted })
+                                if (accepted)
+                                    forceActiveFocus()
+                            }
+
+                            // Focus loss submits the single save request after IME commit.
+                            function exitEditing() {
+                                delegateRoot.traceRow("exitEditRequested", {})
+                                // Commit any IME pre-edit text before changing focus; the
+                                // focus-loss handler below is the single save path.
+                                Keyboard.commit()
+                                Keyboard.hide()
+                                focus = false
+                            }
+                        }
+
+                        // Tap area for easier activation
+                        MouseArea {
+                            anchors.fill: parent
+                            visible: !finalInput.activeFocus
+                            enabled: stringBrowserPage.pendingEdit === "" && (!stringBrowserPage.draft || stringBrowserPage.draft.fallback === delegateRoot.model.fallback)
+                            onClicked: finalInput.activateEditor()
+                        }
+                    }
+                }
+            }
+
+        }
+    }
+
+    Row {
+        id: draftStatus
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: bottomBar.top
+        anchors.margins: Theme.spacingSmall
+        spacing: Theme.spacingSmall
+        visible: stringBrowserPage.draftError.length > 0 || stringBrowserPage.pendingEdit !== ""
+        height: Math.max(draftMessage.implicitHeight, discardDraftButton.height)
+        Text {
+            id: draftMessage
+            width: parent.width - discardDraftButton.width - parent.spacing
+            text: stringBrowserPage.pendingEdit !== ""
+                  ? TranslationManager.translate("stringBrowser.saving", "Saving translation…") : stringBrowserPage.draftError
+            color: Theme.errorColor
+            font: Theme.labelFont
+            wrapMode: Text.Wrap
+            Accessible.role: Accessible.AlertMessage
+        }
+        AccessibleButton {
+            id: discardDraftButton
+            accessibleName: text
+            focusPolicy: Qt.NoFocus
+            text: TranslationManager.translate("common.button.discard", "Discard")
+            enabled: stringBrowserPage.pendingEdit === ""
+            onClicked: stringBrowserPage.discardDraft()
+        }
+    }
+
+    // AI Progress overlay
+    Rectangle {
+        anchors.fill: parent
+        visible: LanguageService.autoTranslating
+        color: Qt.rgba(0, 0, 0, 0.7)
+        z: 10
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: {}
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: Theme.scaled(340)
+            height: progressContent.height + Theme.scaled(48)
+            color: Theme.cardBackgroundColor
+            radius: Theme.cardRadius
+            border.width: 2
+            border.color: Theme.primaryContrastColor
+
+            Column {
+                id: progressContent
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: Theme.scaled(24)
+                spacing: Theme.scaled(16)
+
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: TranslationManager.translate("stringBrowser.columnAiTranslation", "AI Translation")
+                    font: Theme.titleFont
+                    color: Theme.textColor
+                }
+
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: TranslationManager.translate("stringBrowser.translatingStrings", "Translating strings...")
+                    font: Theme.bodyFont
+                    color: Theme.textSecondaryColor
+                }
+
+                Text {
+                    width: parent.width
+                    text: LanguageService.lastTranslatedText || TranslationManager.translate("stringBrowser.starting", "Starting...")
+                    font: Theme.labelFont
+                    color: Theme.primaryColor
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideMiddle
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: Theme.scaled(8)
+                    color: Theme.backgroundColor
+                    radius: Theme.scaled(4)
+
+                    Rectangle {
+                        width: parent.width * (LanguageService.autoTranslateProgress / Math.max(1, LanguageService.autoTranslateTotal))
+                        height: parent.height
+                        color: Theme.primaryColor
+                        radius: Theme.scaled(4)
+                        Behavior on width { NumberAnimation { duration: 200 } }
+                    }
+                }
+
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: LanguageService.autoTranslateProgress + " / " + LanguageService.autoTranslateTotal
+                    font: Theme.bodyFont
+                    color: Theme.textColor
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: Theme.scaled(40)
+                    color: cancelArea.pressed ? Qt.darker(Theme.warningColor, 1.2) : Theme.warningColor
+                    radius: Theme.buttonRadius
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("stringBrowser.accessible.cancelAiTranslation", "Cancel AI translation")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: cancelArea.clicked(null)
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: TranslationManager.translate("common.button.cancel", "Cancel")
+                        font: Theme.bodyFont
+                        color: Theme.primaryContrastColor
+                        Accessible.ignored: true
+                    }
+
+                    MouseArea {
+                        id: cancelArea
+                        anchors.fill: parent
+                        onClicked: LanguageService.execute("cancelAutoTranslate")
+                    }
+                }
+            }
+        }
+    }
+
+    // API Key missing popup
+    DecenzaDialog {
+        id: apiKeyPopup
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        dim: true
+        padding: Theme.scaled(20)
+        closePolicy: Dialog.CloseOnEscape | Dialog.CloseOnPressOutside
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 2
+            border.color: Theme.warningColor
+        }
+
+        contentItem: Column {
+            spacing: Theme.scaled(16)
+            width: Theme.scaled(320)
+
+            Text {
+                width: parent.width
+                text: TranslationManager.translate("stringBrowser.aiProviderNotConfigured", "AI Provider Not Configured")
+                font: Theme.subtitleFont
+                color: Theme.warningColor
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            Text {
+                width: parent.width
+                text: TranslationManager.translate("stringBrowser.aiProviderDescription", "To use AI translation, configure an AI provider with a valid API key.\n\nGo to Settings → AI to set up:\n• OpenAI (GPT-4o-mini)\n• Anthropic (Claude)\n• Google (Gemini)\n• Ollama (local)")
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+            }
+
+            Row {
+                width: parent.width
+                spacing: Theme.scaled(8)
+
+                Rectangle {
+                    width: (parent.width - Theme.scaled(8)) / 2
+                    height: Theme.scaled(40)
+                    color: cancelApiArea.pressed ? Qt.darker(Theme.surfaceColor, 1.2) : Theme.surfaceColor
+                    radius: Theme.buttonRadius
+                    border.width: 1
+                    border.color: Theme.borderColor
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("common.button.cancel", "Cancel")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: cancelApiArea.clicked(null)
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: TranslationManager.translate("common.button.cancel", "Cancel")
+                        font: Theme.bodyFont
+                        color: Theme.textColor
+                        Accessible.ignored: true
+                    }
+
+                    MouseArea {
+                        id: cancelApiArea
+                        anchors.fill: parent
+                        onClicked: apiKeyPopup.close()
+                    }
+                }
+
+                Rectangle {
+                    width: (parent.width - Theme.scaled(8)) / 2
+                    height: Theme.scaled(40)
+                    color: goAiArea.pressed ? Qt.darker(Theme.primaryColor, 1.2) : Theme.primaryColor
+                    radius: Theme.buttonRadius
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("stringBrowser.goToAiSettings", "Go to AI Settings")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: goAiArea.clicked(null)
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: TranslationManager.translate("stringBrowser.goToAiSettings", "Go to AI Settings")
+                        font: Theme.bodyFont
+                        color: Theme.primaryContrastColor
+                        Accessible.ignored: true
+                    }
+
+                    MouseArea {
+                        id: goAiArea
+                        anchors.fill: parent
+                        onClicked: {
+                            apiKeyPopup.close()
+                            AppShell.backRequested()
+                            AppShell.backRequested()
+                            AppShell.aiSettingsRequested()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // All translated popup
+    DecenzaDialog {
+        id: allTranslatedPopup
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        dim: true
+        padding: Theme.scaled(20)
+        closePolicy: Dialog.CloseOnEscape | Dialog.CloseOnPressOutside
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 2
+            border.color: Theme.successColor
+        }
+
+        contentItem: Column {
+            spacing: Theme.scaled(16)
+            width: Theme.scaled(280)
+
+            Text {
+                width: parent.width
+                text: TranslationManager.translate("stringBrowser.allDone", "All Done!")
+                font: Theme.subtitleFont
+                color: Theme.successColor
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            Text {
+                width: parent.width
+                text: TranslationManager.translate("stringBrowser.allStringsTranslated", "All strings have already been translated.")
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            Rectangle {
+                width: parent.width
+                height: Theme.scaled(40)
+                color: okArea.pressed ? Qt.darker(Theme.successColor, 1.2) : Theme.successColor
+                radius: Theme.buttonRadius
+
+                Accessible.role: Accessible.Button
+                Accessible.name: TranslationManager.translate("common.button.ok", "OK")
+                Accessible.focusable: true
+                Accessible.onPressAction: okArea.clicked(null)
+
+                Text {
+                    anchors.centerIn: parent
+                    text: TranslationManager.translate("common.button.ok", "OK")
+                    font: Theme.bodyFont
+                    color: Theme.primaryContrastColor
+                    Accessible.ignored: true
+                }
+
+                MouseArea {
+                    id: okArea
+                    anchors.fill: parent
+                    onClicked: allTranslatedPopup.close()
+                }
+            }
+        }
+    }
+
+    // Clear AI translations confirmation popup
+    DecenzaDialog {
+        id: clearAiPopup
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        dim: true
+        padding: Theme.scaled(20)
+        closePolicy: Dialog.CloseOnEscape | Dialog.CloseOnPressOutside
+
+        background: Rectangle {
+            color: Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.width: 2
+            border.color: Theme.warningColor
+        }
+
+        contentItem: Column {
+            spacing: Theme.scaled(16)
+            width: Theme.scaled(320)
+
+            Text {
+                width: parent.width
+                text: TranslationManager.translate("stringBrowser.clearAllAiTitle", "Clear All AI Translations?")
+                font: Theme.subtitleFont
+                color: Theme.warningColor
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            Text {
+                width: parent.width
+                text: TranslationManager.translate("stringBrowser.clearAllAiDescription", "This will delete all AI-generated translations for %1.\n\nHuman-edited translations will be preserved.\n\nYou can then re-translate with AI Translate.").replace("%1", LanguageService.getLanguageDisplayName(stringBrowserPage.displayedLanguage))
+                font: Theme.bodyFont
+                color: Theme.textColor
+                wrapMode: Text.Wrap
+            }
+
+            Row {
+                width: parent.width
+                spacing: Theme.scaled(8)
+
+                Rectangle {
+                    width: (parent.width - Theme.scaled(8)) / 2
+                    height: Theme.scaled(40)
+                    color: cancelClearArea.pressed ? Qt.darker(Theme.surfaceColor, 1.2) : Theme.surfaceColor
+                    radius: Theme.buttonRadius
+                    border.width: 1
+                    border.color: Theme.borderColor
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("common.button.cancel", "Cancel")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: cancelClearArea.clicked(null)
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: TranslationManager.translate("common.button.cancel", "Cancel")
+                        font: Theme.bodyFont
+                        color: Theme.textColor
+                        Accessible.ignored: true
+                    }
+
+                    MouseArea {
+                        id: cancelClearArea
+                        anchors.fill: parent
+                        onClicked: clearAiPopup.close()
+                    }
+                }
+
+                Rectangle {
+                    width: (parent.width - Theme.scaled(8)) / 2
+                    height: Theme.scaled(40)
+                    color: confirmClearArea.pressed ? Qt.darker(Theme.warningColor, 1.2) : Theme.warningColor
+                    radius: Theme.buttonRadius
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: TranslationManager.translate("stringBrowser.accessible.clearAllAi", "Clear all AI translations")
+                    Accessible.focusable: true
+                    Accessible.onPressAction: confirmClearArea.clicked(null)
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: TranslationManager.translate("stringBrowser.clearAllButton", "Clear All")
+                        font: Theme.bodyFont
+                        color: Theme.primaryContrastColor
+                        Accessible.ignored: true
+                    }
+
+                    MouseArea {
+                        id: confirmClearArea
+                        anchors.fill: parent
+                        onClicked: {
+                            stringEditor.mutate("clearAllAiTranslations")
+                            clearAiPopup.close()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Bottom bar - anchored to page bottom
+    BottomBar {
+        id: bottomBar
+        title: stringBrowserPage.isEnglish ? TranslationManager.translate("stringBrowser.titleCustomizer", "String Customizer") : TranslationManager.translate("stringBrowser.titleBrowser", "Translation Browser")
+        onBackClicked: stringBrowserPage.handleBack()
+    }
+
+    // Refusals from TranslationManager reach the user here instead of only the log. Without this
+    // a guarded save looks exactly like a broken button — which is how it was found: an edit was
+    // correctly refused, nothing said so, and the tester had to ask whether the feature worked.
+    TranslationErrorToast {}
+}

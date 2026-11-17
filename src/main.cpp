@@ -1,0 +1,5306 @@
+#include "remote/bagservice.h"
+#include "remote/bagservicesource.h"
+#include "remote/profileservice.h"
+#include "remote/calibrationservice.h"
+#include "remote/calibrationservicesource.h"
+#include "remote/flowcalibrationservice.h"
+#include "remote/flowcalibrationservicesource.h"
+#include "remote/sensorcalibrationservice.h"
+#include "remote/sensorcalibrationservicesource.h"
+#include "remote/historyservice.h"
+#include "remote/screensaverservice.h"
+#include "remote/screensaverservicesource.h"
+#include "remote/libraryservice.h"
+#include "remote/libraryservicesource.h"
+#include "remote/thememanagementservice.h"
+#include "remote/thememanagementservicesource.h"
+#include "remote/layoutservice.h"
+#include "remote/layoutservicesource.h"
+#include "remote/settingspreferencesservice.h"
+#include "remote/settingspreferencesservicesource.h"
+#include "remote/comparisonservice.h"
+#include "remote/comparisonservicesource.h"
+#include "remote/conversationsession.h"
+#include "remote/conversationsessionsource.h"
+#include <QUuid>
+#include <QQmlComponent>
+#include "remote/historyservicesource.h"
+#include "remote/shotreviewactions.h"
+#include "remote/shotreviewactionssource.h"
+#include "remote/profileservicesource.h"
+#include "remote/recipecontextservice.h"
+#include "remote/recipecontextservicesource.h"
+#include "remote/beanuiservice.h"
+#include "remote/beanuiservicesource.h"
+#include "remote/beansearchservice.h"
+#include "remote/beansearchservicesource.h"
+#include "remote/hoststatusservice.h"
+#include "remote/hoststatusservicesource.h"
+#include "remote/preparationservice.h"
+#include "remote/preparationservicesource.h"
+#include "remote/hostsessionservice.h"
+#include "remote/hostsessionservicesource.h"
+#include "remote/machinecontrolservice.h"
+#include "remote/machinecontrolservicesource.h"
+#include "remote/liveshotgraphservice.h"
+#include "remote/liveshotgraphservicesource.h"
+#include "remote/steamservice.h"
+#include "remote/steamservicesource.h"
+#include "remote/equipmentservice.h"
+#include "remote/recipeservice.h"
+#include "remote/recipeservicesource.h"
+#include "remote/equipmentservicesource.h"
+#include "remote/maintenanceservice.h"
+#include "remote/maintenanceservicesource.h"
+#include "remote/mqttservice.h"
+#include "remote/mqttservicesource.h"
+#include "remote/backupservice.h"
+#include "remote/backupservicesource.h"
+#include "core/fullbackuprestore.h"
+#include "remote/datamigrationservice.h"
+#include "remote/datamigrationservicesource.h"
+#include "remote/importservice.h"
+#include "remote/importservicesource.h"
+#include "remote/debugconversionservice.h"
+#include "remote/debugconversionservicesource.h"
+#include "remote/globalsupportservice.h"
+#include "remote/globalsupportservicesource.h"
+#include "remote/shotserversettingsservice.h"
+#include "remote/shotserversettingsservicesource.h"
+#include "remote/profileimportservice.h"
+#include "remote/profileimportservicesource.h"
+#include "remote/visualizerprofileimportservice.h"
+#include "remote/visualizerprofileimportservicesource.h"
+#include "remote/aisettingsservice.h"
+#include "remote/aisettingsservicesource.h"
+#include "remote/updateservice.h"
+#include "remote/updateservicesource.h"
+#include "remote/shotuploadservice.h"
+#include "remote/shotuploadservicesource.h"
+#include "remote/languageservice.h"
+#include "remote/languageservicesource.h"
+#include "remote/systemlogservice.h"
+#include "remote/systemlogservicesource.h"
+#include "remote/settingsconnectionsservice.h"
+#include "remote/settingsconnectionsservicesource.h"
+#include "remote/ghcsimulatorservice.h"
+#ifdef DECENZA_SIMULATOR
+#include "remote/ghcsimulatorservicesource.h"
+#endif
+#include "core/packageidentity.h"
+#include "core/bundledfontregistration.h"
+#include <QRemoteObjectHost>
+// ---------------------------------------------------------------------------
+// Sanitizer report capture
+//
+// ASan is FATAL: on a use-after-free it prints its report and SIGABRTs, so the
+// app is gone before it can log anything itself. The report therefore has to be
+// written by the sanitizer runtime directly, to a file that survives the crash
+// — otherwise it lands on a stderr nobody was watching and the only evidence a
+// user can give you is "it closed".
+//
+// __asan_default_options / __ubsan_default_options are weak hooks the runtimes
+// call during their own init — see the constraints on them below; they are far
+// tighter than they look. Each runtime appends ".<pid>" to log_path, so
+// concurrent runs never collide.
+//
+// Whether this build is instrumented at all is decided by core/sanitizers.h,
+// which explains why three separate detection routes are needed. It is included
+// before everything else deliberately: these hooks must be compiled or not
+// compiled, and that decision cannot depend on Qt headers.
+#include "core/diagnosticlogging.h"
+#include "core/sanitizers.h"
+
+#ifdef DECENZA_SANITIZERS_PRESENT
+
+// These two hooks are called by the sanitizer runtimes during their OWN
+// initialisation, which happens from __malloc_init — before libSystem is
+// initialised, before the C++ runtime, before main(). Almost nothing is legal
+// here, and each function may do exactly one thing: return a pointer to a
+// string literal.
+//
+// This took two crashes to get right, both SIGSEGV before main():
+//
+//   attempt 1: static const std::string built by a lambda
+//              -> __cxa_guard_acquire + malloc, re-entering the allocator that
+//                 was still initialising.   crash in sanitizerReportDir()
+//   attempt 2: static char buffer + getenv + snprintf
+//              -> "allocation-free", but snprintf is still libc, and libc is
+//                 not up yet.               crash in buildSanitizerLogPath()
+//
+// So the paths are compile-time literals. That rules out $HOME, which is why
+// the reports land in /tmp rather than beside the app's other data — /tmp needs
+// no lookup and no mkdir (a log_path whose directory does not exist silently
+// falls back to stderr, which would defeat the point). announceSanitizerReports()
+// reads them from there later, where normal code rules apply.
+//
+// An ASAN_OPTIONS / UBSAN_OPTIONS environment variable still overrides these.
+// They are defaults, not overrides, which is what makes baking them in safe.
+
+// Prefixes; each runtime appends ".<pid>", so concurrent runs never collide.
+#define DECENZA_ASAN_LOG  "/tmp/decenza-asan"
+#define DECENZA_UBSAN_LOG "/tmp/decenza-ubsan"
+
+extern "C" const char* __asan_default_options()
+{
+    // halt_on_error stays at ASan's default (fatal). Continuing past a
+    // use-after-free means reading memory the allocator has already handed out
+    // again, so everything after the first report is fiction.
+    return "log_path=" DECENZA_ASAN_LOG ":print_stacktrace=1:detect_leaks=0";
+}
+
+extern "C" const char* __ubsan_default_options()
+{
+    // Recovering, matching the Debug build's -fsanitize-recover: a developer
+    // running the app should be TOLD about undefined behaviour, not have the app
+    // killed mid-session. The report reaches the file either way.
+    return "log_path=" DECENZA_UBSAN_LOG ":print_stacktrace=1:halt_on_error=0";
+}
+
+// The Qt-side reporting function is defined further down, after the Qt headers.
+// Unlike these hooks it runs normally from main() and may allocate freely.
+
+#endif  // DECENZA_SANITIZERS_PRESENT
+
+#include <QApplication>
+#ifdef DECENZA_HAS_WEBVIEW
+#include <QtWebView/qtwebviewfunctions.h>
+#endif
+#include <QQmlApplicationEngine>
+#ifdef DECENZA_QML_PROFILING_PORT
+#include <QQmlDebuggingEnabler>
+#endif
+#include <QQmlContext>
+#include <QQuickStyle>
+#include <QQuickWindow>
+#include <QSGRendererInterface>
+#include <QScreen>
+#include <QIcon>
+#include <QTimer>
+#include <QEventLoop>
+#include <QGuiApplication>
+#include <QFont>
+#include <QFontDatabase>
+#include <QFontInfo>
+#include <QFontMetrics>
+#include <QAccessible>
+#include <QClipboard>
+#include <QCoreApplication>
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QStandardPaths>
+#include <QPixmapCache>
+#ifdef Q_OS_MACOS
+#include <QSslSocket>
+#endif
+#include <QSysInfo>
+#include <memory>
+#include <vector>
+#include "core/storagelogging.h"
+#include <QElapsedTimer>
+#include <QNetworkAccessManager>
+#include <QMetaEnum>
+#include <QNetworkInformation>
+#ifdef Q_OS_MACOS
+#include <QProcess>
+#endif
+#include "version.h"
+
+#ifdef Q_OS_ANDROID
+#include <QJniObject>
+#include <QJniEnvironment>
+#endif
+
+
+
+#include "core/asynclogger.h"
+#include "core/deviceinfo.h"
+#include "core/btlogfilter.h"
+#include "core/gcdeferredabort.h"
+#include "core/appsettings.h"
+#include "core/settings.h"
+#include "core/themeeditoroptions.h"
+#include "core/settings_qml.h"   // SettingsForeign — QML singleton registration
+#include "core/contextsingletons_qml.h"  // *Foreign — singletons replacing setContextProperty()
+#include "core/settings_mqtt.h"
+#include "core/settings_autowake.h"
+#include "core/settings_hardware.h"
+#include "core/settings_ai.h"
+#include "core/settings_theme.h"
+#include "core/settings_visualizer.h"
+#include "core/settings_mcp.h"
+#include "core/settings_brew.h"
+#include "core/settings_dye.h"
+#include "core/settings_network.h"
+#include "core/settings_app.h"
+#include "core/settings_calibration.h"
+#include "core/translationmanager.h"
+#include "core/batterymanager.h"
+#include "core/memorymonitor.h"
+#include "core/accessibilitymanager.h"
+#include "core/autowakemanager.h"
+#include "core/databasebackupmanager.h"
+#include "core/crashhandler.h"
+#include "network/crashreporter.h"
+#include "core/profilestorage.h"
+#include "ble/blemanager.h"
+#include "ble/belkaportaldiscovery.h"
+#include "ble/blegattqueue.h"
+#include "controllers/portalcontroller.h"
+// For the [DE1][Simulator] attach line below — main.cpp owns the simulator's
+// lifetime, so it is the only place that can report it.
+#include "ble/de1logging.h"
+#include "ble/de1device.h"
+#include "ble/de1transport.h"
+#ifndef Q_OS_IOS
+#include "usb/usbmanager.h"
+#include "usb/usbscalemanager.h"
+#include "usb/usbhotplug.h"
+#include "ble/scales/scalelogging.h"
+#include "usb/usbdecentscale.h"
+#include "usb/serialtransport.h"
+#endif
+#include "ble/scaledevice.h"
+#include "ble/scales/scalefactory.h"
+#include "ble/scales/scaletypeids.h"
+#include "ble/scales/flowscale.h"
+#include "ble/scales/decentscalewifi.h"
+#include "ble/refractometers/difluidr1.h"
+#include "ble/refractometers/difluidr2.h"
+#include "ble/refractometers/refractometerdevice.h"
+#if defined(Q_OS_IOS) || defined(Q_OS_MACOS)
+#include "ble/transport/corebluetooth/corebluetoothscalebletransport.h" // IWYU pragma: keep
+#else
+#include "ble/transport/qtscalebletransport.h" // IWYU pragma: keep
+#endif
+#include "core/fontlogging.h"
+#include "core/networklogging.h"
+#include "machine/machinestate.h"
+#include "machine/sawlogging.h"
+#include "machine/weightprocessor.h"
+#include "models/shotdatamodel.h"
+#include "widget/machinestatussnapshot.h"
+#include "models/steamdatamodel.h"
+#include "machine/steamhealthtracker.h"
+#include "controllers/maincontroller.h"
+#include "controllers/firmwareupdater.h"
+#include "ble/refractometerrecovery.h"
+#include "controllers/profilemanager.h"
+#include "controllers/shottimingcontroller.h"
+#include "ai/aimanager.h"
+#include "ai/aiconversation.h"
+#include "screensaver/screensavervideomanager.h"
+#if defined(Q_OS_IOS) || defined(Q_OS_MACOS)
+#include "screensaver/iosbrightness.h"
+#endif
+#include "network/webdebuglogger.h"
+#include "core/widgetlibrary.h"
+#include "history/shothistoryexporter.h"
+#include "history/shothistorystorage.h"
+#include "history/shotprojection.h"
+#include "mcp/mcpserver.h"
+#include "network/remoteaccess.h"
+#include "network/relayclient.h"
+#include "weather/weathermanager.h"
+#include "models/flowcalibrationmodel.h"
+
+// Simulator engine (absent from tablet release builds — see DECENZA_SIMULATOR
+// in CMakeLists.txt) and GHC window (desktop debug only)
+#ifdef DECENZA_SIMULATOR
+#include "simulator/de1simulator.h"
+#include "simulator/simulatedscale.h"
+#endif
+// DECENZA_SIMULATOR is part of the condition, not decoration: GHCSimulator guards its own
+// contents on it (it drives DE1Simulator and cannot compile without it), so every site that
+// names the class has to agree. Desktop defines it unconditionally, which is why the two used to
+// look interchangeable — until `-DDECENZA_SIMULATOR_OVERRIDE=0`, the flag that exists precisely
+// so the tablet-production shape can be built on a desktop, made them differ.
+#if (defined(Q_OS_WIN) || defined(Q_OS_MACOS)) && defined(QT_DEBUG) && defined(DECENZA_SIMULATOR)
+#include "simulator/ghcsimulator.h"
+#endif
+
+using namespace Qt::StringLiterals;
+
+// Generated by qmltyperegistrar into decenza_qmltyperegistrations.cpp; registers the module's
+// QML_ELEMENT types. Declared by hand because Qt emits no header for it. See the call site in
+// main() for why it has to be invoked explicitly rather than left to Qt's lazy import path.
+extern void qml_register_types_Decenza();
+
+namespace {
+
+const char* graphicsApiName(QSGRendererInterface::GraphicsApi api)
+{
+    switch (api) {
+    case QSGRendererInterface::Software:   return "Software";
+    case QSGRendererInterface::OpenGL:     return "OpenGL";
+    case QSGRendererInterface::Direct3D11: return "D3D11";
+    case QSGRendererInterface::Direct3D12: return "D3D12";
+    case QSGRendererInterface::Vulkan:     return "Vulkan";
+    case QSGRendererInterface::Metal:      return "Metal";
+    case QSGRendererInterface::Null:       return "Null";
+    default:                               return "Unknown";
+    }
+}
+
+// True when the saved scale address is one the BLE/WiFi reconnect ladder can
+// actually dial. Two prefixes are excluded, for the same reason in both cases —
+// arming the ladder for them spins a timer that can only ever no-op:
+//   "usb:" — owned by UsbScaleManager, which reconnects via usbScaleAvailable.
+//   "sim:" — the debug simulator's synthetic primary. It is promoted to primary
+//            whenever simulation mode is on and no real scale was ever paired,
+//            it appears in the Known Devices picker like any other entry, and
+//            BLEManager::tryDirectConnectToScale refuses it.
+// Kept as one predicate so a future third prefix is added once rather than at
+// each of the ladder's arming sites.
+bool scaleAddressIsLadderDialable(const QString& address)
+{
+    return !address.isEmpty()
+        && !address.startsWith(QStringLiteral("usb:"), Qt::CaseInsensitive)
+        && !address.startsWith(QStringLiteral("sim:"), Qt::CaseInsensitive);
+}
+
+bool scaleAddressIsWifi(const QString& address)
+{
+    return address.startsWith(QStringLiteral("wifi:"), Qt::CaseInsensitive);
+}
+
+// Wires a WiFi scale driver to its collaborators. Called from BOTH places that
+// create or re-adopt one, because the set of things a driver needs injected is a
+// property of the driver, not of the call site — and it was already drifting:
+// the two sites each hand-rolled the same resolver/cache pair, so a third
+// dependency meant remembering to add it twice.
+void wireWifiScaleDriver(DecentScaleWifi* wifi, Settings& settings, BLEManager& bleManager)
+{
+    wifi->setIpResolver([&settings](const QString& host) {
+        return settings.network()->wifiScaleIp(host);
+    });
+    wifi->setIpCacheUpdate([&settings](const QString& host, const QString& ip) {
+        settings.network()->setWifiScaleIp(host, ip);
+    });
+    // Repeating connect failures share BLEManager's per-message warn budget, so
+    // the driver's half of a dead reconnect cycle goes quiet at the same point
+    // the manager's half does. Previously only the manager's was budgeted, which
+    // left this driver warning once per 60 s forever with no attempt number and
+    // no outcome beside it.
+    wifi->setRepeatFailureSink([&bleManager](const QString& message, bool warn) {
+        bleManager.scaleRepeatFailure(
+            message,
+            warn ? BLEManager::RepeatTier::Warn : BLEManager::RepeatTier::Info,
+            QStringLiteral("BLE DecentScaleWifi"));
+    });
+}
+
+// A desktop install last run before 1.5.6 keeps its data under the old app
+// name. Read as a fresh install, it would get a new database here, and that
+// database stops 2.1.0's app-name move from ever recovering the old one.
+bool hasPreRenameShotDatabase()
+{
+    const QString currentName = QCoreApplication::applicationName();
+    QCoreApplication::setApplicationName(QStringLiteral("Decenza DE1"));
+    const QString oldDatabase = ShotHistoryStorage::defaultDatabasePath();
+    QCoreApplication::setApplicationName(currentName);
+    return QFileInfo::exists(oldDatabase);
+}
+
+}  // namespace
+
+#ifdef DECENZA_SANITIZERS_PRESENT
+// Fold sanitizer report files into the app's own log.
+//
+// ASan aborts the process, so the run that produced a report cannot report it —
+// the evidence exists only as a file, and until something reads that file the
+// user's account of the incident is "it closed". Putting it in the debug log is
+// what makes it reachable over MCP rather than only to whoever had a terminal
+// open at the time.
+//
+// Called at startup for reports left by a previous run, and again at shutdown
+// for anything UBSan produced during this one (UBSan recovers, so its findings
+// would otherwise wait for the next launch). Files are renamed .reported once
+// announced, so a finding is reported once and not on every launch forever.
+void announceSanitizerReports(const QString& whenLabel)
+{
+    // Matches the literal paths in the __*_default_options hooks above; each
+    // runtime appends ".<pid>" to the prefix.
+    QDir dir(QStringLiteral("/tmp"));
+    const QStringList found =
+        dir.entryList({QStringLiteral("decenza-asan.*"),
+                       QStringLiteral("decenza-ubsan.*")},
+                      QDir::Files, QDir::Time);
+    int announced = 0;
+    int unreadable = 0;
+    for (const QString& name : found) {
+        if (name.endsWith(QStringLiteral(".reported")))
+            continue;
+        QFile f(dir.filePath(name));
+        if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            // Counted, not skipped silently. A bare `continue` here would leave
+            // `announced` at zero and print "none pending" below while an
+            // unreadable report sat in the directory — the exact conflation the
+            // else-branch was added to prevent, reintroduced one level up.
+            ++unreadable;
+            continue;
+        }
+        // Cap the excerpt — a report can run to hundreds of lines, and the point
+        // is to make the finding visible, not to move the file into the log. The
+        // full path is logged so the rest is findable.
+        const QByteArray head = f.read(4000);
+        f.close();
+        if (head.trimmed().isEmpty()) {
+            // An ASan report truncated to zero bytes by the abort. Still
+            // evidence that something happened; do not count it as "none".
+            ++unreadable;
+            continue;
+        }
+        DIAG_WARN(APP, "main").noquote() << "SANITIZER REPORT (" << whenLabel << ") —"
+                             << dir.filePath(name) << "\n"
+                             << QString::fromUtf8(head).trimmed();
+        // The rename is what stops a finding being re-announced forever, so
+        // its failure has to be visible. It fails when the destination already
+        // exists — and it will, because the runtimes append ".<pid>" and PIDs
+        // are reused. Without this branch a fixed crash gets re-diagnosed on
+        // every launch, in a log that assistants read over MCP and act on.
+        if (!QFile::rename(dir.filePath(name),
+                           dir.filePath(name + QStringLiteral(".reported")))) {
+            DIAG_WARN(APP, "Sanitizer").noquote()
+                << "could not mark" << dir.filePath(name)
+                << "as reported — it will be announced again next launch."
+                << "Delete it by hand once the finding is dealt with.";
+        }
+        ++announced;
+    }
+    if (announced > 0) {
+        DIAG_WARN(APP, "Sanitizer").noquote()
+            << "announced" << announced << "report(s) from" << whenLabel
+            << "- a sanitizer does not write one unless it detected something, so"
+            << "treat each as real until the source location says otherwise.";
+    }
+    if (unreadable > 0) {
+        DIAG_WARN(APP, "Sanitizer").noquote()
+            << unreadable << "report file(s) in" << dir.path()
+            << "could not be read or were empty. Something was written; its"
+            << "contents are lost. Inspect them by hand.";
+    }
+    if (announced == 0 && unreadable == 0) {
+        // Say so even when there is nothing. Otherwise silence means either
+        // "scanned, found nothing" or "never ran" — and those are the two
+        // readings a reporting mechanism must never conflate. The first version
+        // of this function logged only on a finding, so its own correctness was
+        // unobservable: exactly the ambiguity the sanitizer canary exists to
+        // remove, reproduced in the code that reports sanitizer results.
+        //
+        // Gated on `unreadable` too: claiming "none pending" while an
+        // unreadable file sits there would be the same lie in a new place.
+        DIAG_DEBUG(APP, "main").noquote() << "Sanitizer report scan (" << whenLabel
+                           << "): none pending in" << dir.path();
+    }
+}
+#endif  // DECENZA_SANITIZERS_PRESENT
+
+int main(int argc, char *argv[])
+{
+    // Install async logger FIRST — sits at bottom of handler chain.
+    // All handlers above (CrashHandler, WebDebugLogger, ShotDebugLogger) do
+    // fast in-memory work, then call through to AsyncLogger which does
+    // non-blocking I/O on a background thread. This eliminates synchronous
+    // logcat writes (~500μs each on Android) from the main thread.
+    AsyncLogger::install();
+
+    // Install crash handler - catches SIGSEGV, SIGABRT, etc.
+    CrashHandler::install();
+
+    // Read the previous run's crash before WebDebugLogger::install() starts this
+    // run's session in debug.log; read after, the submitted narrative was padded
+    // with this launch's startup lines (#1937). Not cleared here — QML clears it
+    // after the user dismisses the report.
+    const CrashHandler::PreviousCrash previousCrash = CrashHandler::previousCrash();
+    const bool previousRunCrashed = previousCrash == CrashHandler::PreviousCrash::Pending;
+    const QString previousCrashLog = previousRunCrashed ? CrashHandler::readCrashLog() : QString();
+    const QString previousDebugLogTail = previousRunCrashed ? CrashHandler::getDebugLogTail() : QString();
+
+    // Include wall clock in all log messages on all platforms
+    qSetMessagePattern("[LOG] [%{time HH:mm:ss.zzz}] %{message}");
+
+#ifdef Q_OS_IOS
+    // Use basic (single-threaded) render loop on iOS to avoid threading issues
+    // with Qt Multimedia VideoOutput calling UIKit APIs from render thread
+    qputenv("QSG_RENDER_LOOP", "basic");
+#endif
+
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+    // Use native AVFoundation backend instead of FFmpeg on Apple platforms.
+    // The FFmpeg/VideoToolbox backend leaks ~10 MB of Metal/IOSurface memory
+    // per video transition (SIGBUS crash after ~15 screensaver videos).
+    // The native darwin backend manages memory through AVPlayerLayer instead.
+    qputenv("QT_MEDIA_BACKEND", "darwin");
+#endif
+
+#ifdef Q_OS_MACOS
+    // TLS is Secure Transport, as on iOS (selected after QApplication below). Before
+    // macOS 15 its PKCS12 import otherwise goes through the login keychain and prompts
+    // for key access (qtls_st.cpp:822-847).
+    qputenv("QT_SSL_USE_TEMPORARY_KEYCHAIN", "1");
+#endif
+
+    // Install web debug logger early to capture all output
+    WebDebugLogger::install();
+
+    // Logged only now: the crash check above ran before this run's log existed.
+    if (previousCrash == CrashHandler::PreviousCrash::DiscardedOnExit) {
+        DIAG_DEBUG(APP, "main") << "Discarded the previous run's crash report: it crashed after main() returned";
+    } else if (previousCrash == CrashHandler::PreviousCrash::DiscardFailed) {
+        DIAG_WARN(APP, "main") << "The previous run crashed after main() returned, but its crash.log "
+                                  "could not be deleted; it will be checked again at every launch";
+    }
+
+    // Suppress Qt's spurious "Missing CAP_NET_ADMIN" bluetooth warning
+    // when our own probe says caps are effective. Must run before Qt
+    // Bluetooth classes are constructed.
+    BtLogFilter::install();
+
+    // Diagnostic for the QML GC sweep crash (#2076, #2054, #2030): every incremental
+    // mark is re-checked by a full one, which costs a full mark per GC cycle on the
+    // GUI thread. Remove with the fix for that crash.
+    BtLogFilter::enableGcCrossValidation();
+    DIAG_INFO(MEMORY, "main") << "QML incremental-GC cross-validation enabled (#2076)";
+
+#ifdef Q_OS_WIN
+    // Windows expresses monitor scaling as a percentage (100/125/150/175/200%),
+    // which Qt converts to a fractional device pixel ratio (e.g. 150% -> 1.5).
+    // Non-integer ratios are Qt's own documented cause of layout/text overflow
+    // and sizing artifacts (see doc.qt.io/qt-6/highdpi.html) — and 125%/150%
+    // are common Windows laptop defaults, unlike macOS/Android's integer-ratio
+    // scaling. Round to the nearest whole multiple so every pixel-based
+    // Theme.scaled() computation lands on integer device pixels. Must be set
+    // before QApplication is constructed. (#1469)
+    QGuiApplication::setHighDpiScaleFactorRoundingPolicy(Qt::HighDpiScaleFactorRoundingPolicy::RoundPreferFloor);
+#endif
+
+#ifdef DECENZA_HAS_WEBVIEW
+    // "Needs to be called immediately before the QGuiApplication instance is created";
+    // it only does work in static (iOS) builds (qtwebview/src/webview/qtwebviewfunctions.cpp:48-57).
+    QtWebView::initialize();
+#endif
+
+    QApplication app(argc, argv);
+    CrashHandler::refreshDeviceLine();
+
+#ifdef Q_OS_MACOS
+    // The app bundles no OpenSSL, so choose Secure Transport rather than let Qt's OpenSSL
+    // plugin load whatever libssl it finds (Homebrew's, on a dev Mac).
+    if (!QSslSocket::setActiveBackend(QStringLiteral("securetransport"))) {
+        DIAG_WARN(NETWORK, "main") << "Secure Transport TLS backend unavailable; HTTPS will not work. Backends:"
+                                   << QSslSocket::availableBackends();
+    }
+#endif
+
+#ifdef Q_OS_IOS
+    // Stops the iOS "Allow Paste" prompt on every return to the app. When the
+    // pasteboard changed while backgrounded, Qt emits dataChanged on becoming
+    // active (qiosclipboard.mm:40-43, 64-72), and every live editable
+    // TextInput/TextEdit — visible or not, e.g. the always-built BrewDialog —
+    // reads the clipboard text to refresh canPaste (qquicktextinput.cpp:2894,
+    // 3008-3009; qquicktextedit.cpp:2824). That read is what prompts. Nothing
+    // here reads canPaste or listens to the signal, and user-initiated paste
+    // goes through UIKit's paste: action, not this signal.
+    QGuiApplication::clipboard()->blockSignals(true);
+#endif
+
+    // --- Bundled UI font (issues #1469, #1537) -----------------------------
+    // Decenza ships its own UI font so text glyph metrics are deterministic
+    // across platforms, OEMs, and OS versions instead of inheriting each
+    // device's system font — differing system-font metrics were causing text
+    // to overflow/clip on some devices but not others. Registered before the
+    // QML engine loads so all QML UI inherits it. QML elements that set an
+    // explicit font.family (e.g. Theme.monoFontFamily) still override it.
+    //
+    // The font is Roboto, RENAMED to the application-specific family
+    // "Decenza Sans" (see tools/rename_bundled_font.py).
+    //
+    // HYPOTHESIS, NOT CONFIRMED. The reasoning: registering under a widely
+    // distributed name may make family lookup ambiguous on hosts that already
+    // have that font installed (Windows machines commonly get a Roboto from
+    // Chrome or Adobe), and if shaping and rasterization then resolve to
+    // different files you get a ligature drawn as an unrelated glyph — the
+    // "Profile" -> "Proule" signature of #1537.
+    //
+    // DISCONFIRMING EVIDENCE, recorded deliberately: a dev Mac WITH a system
+    // Roboto installed rendered correctly under the old name. A name collision
+    // is therefore NOT sufficient on its own, and this rename may not be the
+    // fix. It is cheap insurance that removes one variable; the per-weight
+    // resolution logging below is what will actually confirm or refute it.
+    //
+    // See also the CurveTextRendering block further down, which attributes
+    // #1537 to distance-field re-caching during resize. These two explanations
+    // are NOT reconciled — do not treat either as settled.
+    //
+    // Registration succeeding is NOT evidence the bundled font is in use — that
+    // is exactly how #1537 shipped unnoticed — so we log what actually resolved.
+    {
+        const QStringList& fontFiles = BundledFontRegistration::uiFontResources();
+
+        // Collision detector: any pre-existing host family that could be picked
+        // in place of ours. Logged BEFORE registration so the host's own font
+        // database is visible, not our additions to it. "Roboto" stays on the
+        // watch list because it is the family the bundled font used to claim, so
+        // a host copy is the specific collision we care about.
+        //
+        // Presence here is a CORRELATE, NOT PROOF: a dev Mac with a system Roboto
+        // renders correctly. Read it together with the per-weight resolution lines
+        // below, which are the actual evidence.
+        {
+            QStringList competing;
+            for (const QString& family : QFontDatabase::families()) {
+                if (family.contains(QLatin1String("Decenza"), Qt::CaseInsensitive)
+                    || family.contains(QLatin1String("Roboto"), Qt::CaseInsensitive)) {
+                    competing << family;
+                }
+            }
+            if (!competing.isEmpty())
+                FONT_LOG_STDERR("Bundled", QStringLiteral("Host families that could collide with the bundled "
+                                           "family: %1").arg(competing.join(QStringLiteral(", "))));
+        }
+
+        // Log EVERY file's outcome. Taking families.first() from the first success and
+        // discarding the rest is how this block previously reported a clean bill of health
+        // while a weight had quietly registered under a foreign family — the same class of
+        // mistake #1537 was: treating one observation as proof about four files.
+        const QVector<BundledFontRegistration::Font> registrations =
+            BundledFontRegistration::registerUiFonts();
+        const QString bundledFamily = BundledFontRegistration::primaryFamily(registrations);
+        int registeredCount = 0;
+        QStringList registeredFiles;
+        QStringList registeredFamilies;
+        for (const BundledFontRegistration::Font& registration : registrations) {
+            const QString& path = registration.resource;
+            if (registration.id < 0) {
+                FONT_WARN_STDERR("Bundled", QStringLiteral("Failed to register bundled font: %1").arg(path));
+                continue;
+            }
+            const QStringList& families = registration.families;
+            if (families.isEmpty()) {
+                // A valid id with no families: registration "succeeded" and contributed
+                // nothing. This weight is unreachable at runtime.
+                FONT_WARN_STDERR("Bundled",
+                    QStringLiteral("Registered but exposed NO family: %1 — this weight will "
+                                   "not be reachable").arg(path));
+                continue;
+            }
+            registeredFiles << path;
+            registeredFamilies << families.join(QStringLiteral(", "));
+            ++registeredCount;
+        }
+        // Still EVERY file's outcome — one line when they agree, one line each when
+        // they do not. The rule this block was written for is that a weight can
+        // quietly register under a foreign family, and that case is exactly the one
+        // that still gets a line of its own; four identical answers did not need four.
+        const bool oneFamily = !registeredFamilies.isEmpty()
+                               && registeredFamilies.count(registeredFamilies.first())
+                                      == registeredFamilies.size();
+        if (oneFamily) {
+            FONT_LOG_STDERR("Bundled", QStringLiteral("Registered %1 file(s) -> %2: %3")
+                     .arg(QString::number(registeredFiles.size()),
+                          registeredFamilies.first(),
+                          registeredFiles.join(QStringLiteral(", "))));
+        } else {
+            for (qsizetype i = 0; i < registeredFiles.size(); ++i) {
+                FONT_LOG_STDERR("Bundled", QStringLiteral("Registered %1 -> %2")
+                         .arg(registeredFiles.at(i), registeredFamilies.at(i)));
+            }
+        }
+        if (registeredCount != fontFiles.size()) {
+            FONT_WARN_STDERR("Bundled",
+                QStringLiteral("PARTIAL registration — %1 of %2 files usable; some weights "
+                               "unavailable").arg(registeredCount).arg(fontFiles.size()));
+        }
+
+        if (!bundledFamily.isEmpty()) {
+            app.setFont(QFont(bundledFamily));
+            // Publish to Theme.qml so every font role can state the family explicitly
+            // rather than relying on application-font inheritance.
+            SettingsTheme::setBundledFontFamily(bundledFamily);
+            FONT_INFO_STDERR("Bundled", QStringLiteral("Bundled application font set: %1").arg(bundledFamily));
+
+            // Probe the weights Theme.qml actually requests THROUGH THIS FAMILY: the
+            // default, and bold (five of the eight roles set bold: true). A single
+            // default-weight probe would miss a bold-only substitution entirely.
+            //
+            // Deliberately NOT Light/Medium. They ship as SEPARATE ID1 families
+            // ("Decenza Sans Light"/"Medium") linked by typographic family ID16 — see
+            // tools/rename_bundled_font.py. Probing them under "Decenza Sans" can never
+            // match on platforms that register by ID1, which would flip
+            // allWeightsResolved false on healthy machines and stamp the probe advance
+            // "[FALLBACK FONT]" — destroying the one number this block exists to make
+            // comparable between machines. They are reported below as their own families.
+            struct WeightProbe { const char* label; QFont::Weight weight; };
+            static const WeightProbe kProbes[] = {
+                {"Regular", QFont::Normal},
+                {"Bold",    QFont::Bold},
+            };
+            bool allWeightsResolved = true;
+            QStringList resolved;
+            for (const auto& p : kProbes) {
+                QFont f(bundledFamily);
+                f.setWeight(p.weight);
+                const QFontInfo fi(f);
+                // The family comparison is the real substitution signal. exactMatch() is
+                // reported for information only and deliberately NOT escalated: it returns
+                // false whenever ANY requested attribute was not matched exactly (size,
+                // style, weight), so warning on it would emit confident wrong diagnoses.
+                // These logs are read by users' AI assistants, which act on them.
+                const bool familyOk = (fi.family() == bundledFamily);
+                if (familyOk) {
+                    resolved << QStringLiteral("%1 exactMatch=%2")
+                                    .arg(QString::fromLatin1(p.label),
+                                         fi.exactMatch() ? QStringLiteral("true")
+                                                         : QStringLiteral("false"));
+                } else {
+                    allWeightsResolved = false;
+                    FONT_WARN_STDERR("Resolve",
+                        QStringLiteral("%1 did NOT resolve to %2 — got %3; text metrics are "
+                                       "not deterministic for this weight")
+                            .arg(p.label, bundledFamily, fi.family()));
+                }
+            }
+            if (!resolved.isEmpty()) {
+                FONT_LOG_STDERR("Resolve",
+                    QStringLiteral("Resolved to family=%1: %2")
+                        .arg(bundledFamily, resolved.join(QStringLiteral(", "))));
+            }
+            FONT_LOG_STDERR("Bundled",
+                QStringLiteral("Styles available for %1 = %2")
+                    .arg(bundledFamily,
+                         QFontDatabase::styles(bundledFamily).join(QStringLiteral(", "))));
+            // Light/Medium are their own families by design; report presence without
+            // letting their absence contaminate allWeightsResolved. Nothing in Theme.qml
+            // requests them today, so absence is informational, not a fault.
+            QStringList subFamilies;
+            for (const char* suffix : {" Light", " Medium"}) {
+                const QString sub = bundledFamily + QString::fromLatin1(suffix);
+                subFamilies << QStringLiteral("%1 %2").arg(sub,
+                    QFontDatabase::families().contains(sub) ? QStringLiteral("present")
+                                                            : QStringLiteral("ABSENT"));
+            }
+            FONT_LOG_STDERR("Bundled",
+                QStringLiteral("Sub-families: %1").arg(subFamilies.join(QStringLiteral(", "))));
+
+            // Probe metric, deliberately at a FIXED 14px and a fixed string rather
+            // than the user's effective label size: the value is only useful if it
+            // is comparable between two machines' logs. This exact string mirrors
+            // shothistory.helpey's English fallback (one of the grid cells that
+            // overflowed in #1469), kept in sync BY HAND — it is a stable yardstick,
+            // not a live measurement of what the user sees. Under a non-English
+            // locale the UI draws a different string entirely.
+            //
+            // Tagged when resolution failed, because an untagged number invites the
+            // reader to diff it against a healthy machine and read the delta as a
+            // rendering difference rather than as the font substitution it actually is.
+            QFont metricFont(bundledFamily);
+            metricFont.setPixelSize(14);
+            const qreal probe = QFontMetricsF(metricFont)
+                                    .horizontalAdvance(QStringLiteral("Extraction yield (%)"));
+            FONT_LOG_STDERR("Probe",
+                QStringLiteral("Probe advance \"Extraction yield (%)\" @14px = %1%2")
+                    .arg(probe, 0, 'f', 2)
+                    .arg(allWeightsResolved
+                             ? QString()
+                             : QStringLiteral(" [FALLBACK FONT — not comparable]")));
+        } else {
+            FONT_WARN_STDERR("Bundled",
+                QStringLiteral("No bundled font registered (bundled font resource missing "
+                               "from build) — falling back to platform default"));
+        }
+    }
+
+    // Symbol fallback face, registered separately from the four weights above: it is
+    // never a candidate for the primary family, and folding it into fontFiles would
+    // corrupt both the "all weights registered" count and the probe metric.
+    //
+    // Decenza Sans carries 927 glyphs — Latin, Greek, Cyrillic, and no symbols. Every
+    // arrow and geometric shape written in QML was therefore resolved by whatever the
+    // host happened to offer, which is why the same screen could measure differently on
+    // two machines. Noto Sans Math supplies all seven the app uses (→ ← ↗ ↕ ▶ ◀ ⧉).
+    //
+    // Chained AFTER the bundled family in Theme's font roles, so it only ever fills a
+    // gap. Being a real text font it stays monochrome and takes the element's colour —
+    // which is what emoji cannot do, and the reason symbols are not emoji here.
+    {
+        const BundledFontRegistration::Font registration = BundledFontRegistration::registerSymbolFont();
+        const QString symbol = BundledFontRegistration::symbolFamily(registration);
+        if (symbol.isEmpty()) {
+            // Not fatal: symbols revert to the platform fallback they used before this
+            // font existed. Warn, because the failure is otherwise invisible — the glyphs
+            // still draw, just not from the bundle, and not identically across machines.
+            FONT_WARN_STDERR("Symbol",
+                QStringLiteral("Symbol fallback did not register — symbols will come from the "
+                               "platform fallback and vary between machines"));
+        } else {
+            SettingsTheme::setSymbolFontFamily(symbol);
+            FONT_LOG_STDERR("Symbol", QStringLiteral("Symbol fallback registered: %1").arg(symbol));
+
+            // Also chain it on the APPLICATION font. Theme's roles cover everything that
+            // asks for one, but an element setting only font.pixelSize inherits this font
+            // instead — ValueInput's gear hint is one such site — and would otherwise still
+            // resolve its symbols against the host. Re-set rather than mutate: the app font
+            // was assigned above, before this face existed.
+            const QString primary = SettingsTheme::bundledFontFamily();
+            if (!primary.isEmpty()) {
+                app.setFont(BundledFontRegistration::applicationFont(primary, symbol));
+            }
+        }
+    }
+
+// Q_OS_LINUX is also defined on Android (qsystemdetection.h:46), so Android is excluded
+// explicitly — from v2.0.0 to 2.0.8 it ran curve text, the mobile cost described below.
+#if (defined(Q_OS_MACOS) || defined(Q_OS_WIN) || defined(Q_OS_LINUX)) && !defined(Q_OS_ANDROID)
+    // Use CurveTextRendering (Qt 6.7+) on all resizable desktop platforms. It
+    // renders every glyph as bezier curves on the GPU, so it needs neither the
+    // distance-field glyph cache nor the native bitmap path. Two problems it avoids:
+    //
+    //   * Windows/Linux "fi" ligature glitch (#1537): Qt's default QtTextRendering
+    //     (distance fields) re-caches glyphs while the window is resized, and at
+    //     certain widths the "fi" ligature drops — "Profile" briefly reads
+    //     "Proule", "Profiles" reads "Proules" — then snaps back on the next size.
+    //     CurveTextRendering has no distance-field cache, so the ligature is stable.
+    //
+    //   * macOS Apple Color Emoji crash: QtTextRendering STILL falls back to native
+    //     bitmap rendering (QSGTextMaskMaterial) when a glyph run contains color-font
+    //     glyphs. If CoreText shapes ANY character to Apple Color Emoji, that bitmap
+    //     path hits PNGReadPlugin::InitializePluginData → CopyEmojiImage and crashes
+    //     on QSGRenderThread.
+    //
+    //     CurveTextRendering REDUCES but does NOT eliminate this. An earlier version of
+    //     this comment claimed the crash path was gone; a crash on 2026-07-18 disproved
+    //     it — the stack ran through QSGTextMaskMaterial with Curve rendering active and
+    //     confirmed. Curves cannot represent colour bitmaps, so Qt still falls back to
+    //     the texture-mask path for colour glyphs specifically — precisely the case this
+    //     was meant to cover. The real defence is never letting a colour glyph reach
+    //     CoreText: route every externally-sourced string through
+    //     Theme.replaceEmojiWithImg() so emoji render as bundled SVGs. Text that skips
+    //     that path (that crash was GitHub release notes in a plain TextArea) is the
+    //     remaining exposure.
+    //
+    // Mobile (Android/iOS) keeps Qt's default: those windows are fullscreen and
+    // don't resize, so the ligature glitch can't occur, and the default avoids the
+    // extra GPU cost of curve rendering on constrained devices. iOS shares macOS's
+    // CoreText/Apple Color Emoji stack, but the CopyEmojiImage crash has only ever
+    // been observed on macOS, so iOS is intentionally left on the default too.
+    QQuickWindow::setTextRenderType(QQuickWindow::CurveTextRendering);
+#endif
+    {
+        // Every platform, so a field log says which text renderer is active.
+        auto actual = QQuickWindow::textRenderType();
+        FONT_LOG_STDERR("TextRender",
+            QStringLiteral("Text render type: %1 (%2)")
+                .arg(actual == QQuickWindow::CurveTextRendering ? QStringLiteral("Curve")
+                     : actual == QQuickWindow::QtTextRendering  ? QStringLiteral("QtText")
+                                                                : QStringLiteral("Native"))
+                .arg(static_cast<int>(actual)));
+    }
+
+#ifdef Q_OS_MACOS
+    // Probe which characters CoreText routes to Apple Color Emoji — diagnostic
+    // for the CopyEmojiImage crash. If any non-emoji chars use the emoji font,
+    // it explains why Qt fell back to native rendering despite QtTextRendering.
+    macos_probeEmojiFont();
+#endif
+
+    // Set application metadata
+    app.setOrganizationName("DecentEspresso");
+    app.setOrganizationDomain("decentespresso.com");
+    app.setApplicationName("Decenza");
+    app.setApplicationVersion(VERSION_STRING);
+
+    // Before any settings or database migration runs: data older than the
+    // upgrade floor is refused and left exactly as it is.
+    auto floorProbe = ShotHistoryStorage::probeUpgradeFloor(ShotHistoryStorage::defaultDatabasePath());
+    if (floorProbe == ShotHistoryStorage::UpgradeFloorProbe::NoDatabase && hasPreRenameShotDatabase()) {
+        DIAG_WARN(STORAGE, "UpgradeFloor") << "shot database found only under the pre-1.5.6 app name";
+        floorProbe = ShotHistoryStorage::UpgradeFloorProbe::BelowFloor;
+    }
+    switch (floorProbe) {
+    case ShotHistoryStorage::UpgradeFloorProbe::BelowFloor: {
+        DIAG_WARN(STORAGE, "UpgradeFloor") << "shot database is below schema"
+            << UpgradeFloor::kSchemaVersion << "- showing the install-"
+            << UpgradeFloor::kSteppingStoneRelease << "notice and exiting without changes";
+        QQmlApplicationEngine notice;
+        notice.setInitialProperties({{QStringLiteral("steppingStoneRelease"),
+                                      QString::fromLatin1(UpgradeFloor::kSteppingStoneRelease)}});
+        notice.load(QUrl(u"qrc:/qt/qml/Decenza/qml/UpgradeFloorNotice.qml"_s));
+        if (notice.rootObjects().isEmpty())
+            return 1;
+        return app.exec();
+    }
+    case ShotHistoryStorage::UpgradeFloorProbe::Unknown:
+        DIAG_WARN(STORAGE, "UpgradeFloor") << "could not read the shot database's schema version -"
+            << "continuing; the database layer refuses it before writing if it is below the floor";
+        break;
+    case ShotHistoryStorage::UpgradeFloorProbe::NoDatabase:
+    case ShotHistoryStorage::UpgradeFloorProbe::Supported:
+        break;
+    }
+
+    // Limit Qt's pixmap cache to 32 MB (default is 10 MB on desktop but unbounded
+    // growth via QML Image elements can reach 100+ MB on devices with many emoji/icon SVGs).
+    // iPad 7,4 has 3 GB RAM — keep cache reasonable to avoid OOM kills.
+    QPixmapCache::setCacheLimit(32 * 1024);  // 32 MB in KB
+
+    // Set Qt Quick Controls style (must be before QML engine creation)
+    QQuickStyle::setStyle("Material");
+
+    DIAG_DEBUG(APP, "main") << "App started - version" << VERSION_STRING << "build" << versionCode()
+#ifdef QT_NO_DEBUG
+             << "(release)"
+#else
+             << "(debug)"
+#endif
+             << "built" << __DATE__ << __TIME__
+             << "at" << QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // Say which sanitizers are compiled in. A sanitizer that is silently not
+    // applied produces exactly the same clean run as code with no defects, so
+    // "is it actually on?" must be answerable without running otool over the
+    // binary. It is also the first thing worth knowing when triaging a report
+    // in a log — these logs are read by users' assistants over MCP, not only
+    // by whoever built the binary.
+    {
+        QStringList activeSanitizers;
+        // CMake-defined first — see the note on DECENZA_SANITIZERS_PRESENT above
+        // for why compiler macros alone cannot answer this on GCC + UBSan.
+#if defined(DECENZA_ASAN_ACTIVE)
+        activeSanitizers << QStringLiteral("ASan");
+#endif
+#if defined(DECENZA_UBSAN_ACTIVE)
+        activeSanitizers << QStringLiteral("UBSan");
+#endif
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+        if (!activeSanitizers.contains(QStringLiteral("ASan")))
+            activeSanitizers << QStringLiteral("ASan");
+#  endif
+#  if __has_feature(undefined_behavior_sanitizer)
+        if (!activeSanitizers.contains(QStringLiteral("UBSan")))
+            activeSanitizers << QStringLiteral("UBSan");
+#  endif
+#  if __has_feature(thread_sanitizer)
+        activeSanitizers << QStringLiteral("TSan");
+#  endif
+#endif
+        // GCC spells these as predefined macros rather than __has_feature.
+#if defined(__SANITIZE_ADDRESS__)
+        if (!activeSanitizers.contains(QStringLiteral("ASan")))
+            activeSanitizers << QStringLiteral("ASan");
+#endif
+#if defined(__SANITIZE_THREAD__)
+        if (!activeSanitizers.contains(QStringLiteral("TSan")))
+            activeSanitizers << QStringLiteral("TSan");
+#endif
+        if (activeSanitizers.isEmpty())
+            DIAG_DEBUG(APP, "Sanitizers") << "none (uninstrumented build)";
+        else
+            DIAG_DEBUG(APP, "main").noquote() << "Sanitizers active:" << activeSanitizers.join(QStringLiteral(", "))
+                               << "- a clean run means something in this build";
+    }
+
+    // Surface any report the sanitizer runtimes wrote during a PREVIOUS run.
+    //
+    // ASan aborts the process, so the run that produced a report cannot report
+    // it — the evidence only exists as a file, and until something reads that
+    // file the user's account of the incident is "it closed". Folding it into
+    // the app's own log puts it where the debug log already goes, which is what
+    // makes it reachable over MCP rather than only to whoever had a terminal
+    // open at the time.
+    //
+    // Reports are renamed to .reported once logged, so a finding is announced
+    // on the next launch and not on every launch forever.
+#ifdef DECENZA_SANITIZERS_PRESENT
+    announceSanitizerReports(QStringLiteral("previous run"));
+
+    // UBSan does NOT abort (it recovers, by design, so a developer running the
+    // app is told about undefined behaviour rather than having it killed
+    // mid-session). That means a finding produced during THIS run would
+    // otherwise sit in its file until the next launch. Scanning again on the
+    // way out puts it in the same session's log, where it belongs.
+    //
+    // ASan needs no equivalent: it aborts, so aboutToQuit never runs and the
+    // next launch is the only chance to announce it.
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, []() {
+        announceSanitizerReports(QStringLiteral("this run"));
+    });
+#endif
+    DIAG_DEBUG(APP, "Platform") << QSysInfo::prettyProductName().simplified()
+             << "arch:" << QSysInfo::currentCpuArchitecture()
+             << "kernel:" << QSysInfo::kernelType() << QSysInfo::kernelVersion();
+    if (QScreen *screen = QGuiApplication::primaryScreen()) {
+        // Windows expresses monitor scaling as a percentage (100/125/150%...),
+        // which Qt turns into a devicePixelRatio that can be fractional unless
+        // setHighDpiScaleFactorRoundingPolicy() rounds it — logged here so a
+        // reporter's debug log actually shows what scale/DPI their box ran at
+        // instead of us guessing (font/layout overflow reports, e.g. #1469).
+        DIAG_DEBUG(APP, "Display") << screen->name()
+                 << "devicePixelRatio:" << screen->devicePixelRatio()
+                 << "logicalDPI:" << screen->logicalDotsPerInch()
+                 << "physicalDPI:" << screen->physicalDotsPerInch()
+                 << "geometry:" << screen->geometry()
+                 << "availableGeometry:" << screen->availableGeometry();
+    }
+#ifdef Q_OS_ANDROID
+    {
+        const DeviceInfo::AndroidBuild build = DeviceInfo::androidBuild();
+        DIAG_DEBUG(APP, "SDK") << "Android" << build.release
+                 << "SDK:" << build.sdkInt
+                 << "device:" << build.manufacturer << build.model;
+
+        // Screen-reader fingerprint. TalkBack is a Play-Store app that updates
+        // independently of the OS, and its handling of synthesized text-change
+        // events has regressed our typing echo (issue #1300) with no OS/settings
+        // change. The debug log previously carried none of this, so capture the
+        // OS-level accessibility settings + TalkBack's package version here to
+        // make every a11y log self-diagnosing. NOTE: TalkBack's *internal* feature
+        // toggles (keyboard echo, verbosity) live in its private prefs and are not
+        // readable by other apps — only these system-level settings are.
+        QJniObject activity = QNativeInterface::QAndroidApplication::context();
+        if (activity.isValid()) {
+            QJniObject resolver = activity.callObjectMethod(
+                "getContentResolver", "()Landroid/content/ContentResolver;");
+            QJniEnvironment().checkAndClearExceptions();
+            auto secureSetting = [&](const char *key) -> QString {
+                if (!resolver.isValid())
+                    return QStringLiteral("?");
+                QJniObject jkey = QJniObject::fromString(QString::fromLatin1(key));
+                QJniObject val = QJniObject::callStaticObjectMethod(
+                    "android/provider/Settings$Secure", "getString",
+                    "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;",
+                    resolver.object(), jkey.object());
+                QJniEnvironment().checkAndClearExceptions();
+                return val.isValid() ? val.toString() : QString();
+            };
+            const QString services = secureSetting("enabled_accessibility_services");
+            DIAG_DEBUG(ACCESSIBILITY, "main") << "Accessibility settings:"
+                     << "enabled=" << secureSetting("accessibility_enabled")
+                     << "touchExploration=" << secureSetting("touch_exploration_enabled")
+                     << "QAccessible.isActive=" << QAccessible::isActive();
+            DIAG_DEBUG(ACCESSIBILITY, "main") << "Accessibility services:"
+                     << (services.isEmpty() ? QStringLiteral("none") : services);
+
+            // TalkBack version: the package id is the part before '/' of the first
+            // enabled service component (getPackageInfo throws NameNotFound for an
+            // absent package, so clear the JNI exception afterward).
+            const QString pkg = services.section(u'/', 0, 0).section(u':', 0, 0).trimmed();
+            if (!pkg.isEmpty()) {
+                QJniObject pm = activity.callObjectMethod(
+                    "getPackageManager", "()Landroid/content/pm/PackageManager;");
+                QJniEnvironment().checkAndClearExceptions();
+                if (pm.isValid()) {
+                    QJniObject info = pm.callObjectMethod(
+                        "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+                        QJniObject::fromString(pkg).object(), 0);
+                    QJniEnvironment().checkAndClearExceptions();
+                    if (info.isValid()) {
+                        QJniObject ver = info.getObjectField<jstring>("versionName");
+                        QJniEnvironment().checkAndClearExceptions();
+                        DIAG_DEBUG(APP, "main") << "Screen reader package:" << pkg
+                                 << "version:" << (ver.isValid() ? ver.toString() : QString());
+                    }
+                }
+            }
+
+            // Per-service configuration (the closest readable thing to "TalkBack
+            // settings"): AccessibilityServiceInfo.toString() dumps the event types
+            // it subscribes to, capabilities, feedbackType, and flags. The
+            // user-facing keyboard-echo/verbosity toggles are NOT here (private to
+            // TalkBack), but eventTypes/flags reveal what events it accepts.
+            QJniObject am = activity.callObjectMethod(
+                "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;",
+                QJniObject::fromString(QStringLiteral("accessibility")).object());
+            QJniEnvironment().checkAndClearExceptions();
+            if (am.isValid()) {
+                QJniObject list = am.callObjectMethod(
+                    "getEnabledAccessibilityServiceList", "(I)Ljava/util/List;",
+                    (jint)0xFFFFFFFF);  // FEEDBACK_ALL_MASK
+                QJniEnvironment().checkAndClearExceptions();
+                if (list.isValid()) {
+                    const jint n = list.callMethod<jint>("size", "()I");
+                    for (jint i = 0; i < n; ++i) {
+                        QJniObject svc = list.callObjectMethod(
+                            "get", "(I)Ljava/lang/Object;", i);
+                        QJniEnvironment().checkAndClearExceptions();
+                        if (svc.isValid())
+                            DIAG_DEBUG(APP, "main") << "A11y service config:" << svc.toString();
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+#ifdef Q_OS_MACOS
+    // Re-register the app bundle with Launch Services when the version changes
+    // so macOS picks up the new icon instead of serving a stale cached one.
+    {
+        AppSettings s;
+        QString lastRegistered = s.value("internal/lastIconRegisteredVersion").toString();
+        if (lastRegistered != VERSION_STRING) {
+            QString bundlePath = QCoreApplication::applicationDirPath() + "/../..";
+            QProcess::startDetached(
+                "/System/Library/Frameworks/CoreServices.framework"
+                "/Versions/A/Frameworks/LaunchServices.framework"
+                "/Versions/A/Support/lsregister",
+                {"-f", QFileInfo(bundlePath).canonicalFilePath()});
+            s.setValue("internal/lastIconRegisteredVersion", VERSION_STRING);
+            DIAG_DEBUG(APP, "main") << "Re-registered app bundle with Launch Services for icon refresh";
+        }
+    }
+#endif
+
+    // Startup timing - always on, lightweight. Helps diagnose ANRs on slow devices.
+    // Wall clock comes from WebDebugLogger's [LOG HH:mm:ss.zzz] prefix automatically.
+    QElapsedTimer startupTimer;
+    startupTimer.start();
+    auto checkpoint = [&startupTimer](const char* label) {
+        // Not bracketed: a leading "[token]" is subsystem-marker grammar, and this is
+        // one timing label, not a subsystem anyone retrieves as a group.
+        DIAG_DEBUG(APP, "main").noquote() << QStringLiteral("Startup timing: %1 - %2 ms")
+                                  .arg(label).arg(startupTimer.elapsed());
+    };
+
+    if (previousRunCrashed) {
+        // The trailing end marker is NOT redundant with the one inside
+        // previousCrashLog, and must not be tidied away. writeCrashLog() can die
+        // before it writes its own closer (it demangles from a signal handler on
+        // a possibly-corrupt heap), and this line is what closes the block for the
+        // NEXT report's CrashHandler::getDebugLogTail(), which strips these blocks
+        // out of the narrative it submits. Both markers come from CrashHandler so a respelling
+        // cannot desynchronise the writer from the stripper.
+        DIAG_WARN(APP, "main") << "=== PREVIOUS CRASH DETECTED ===";
+        DIAG_WARN(APP, "main").noquote() << previousCrashLog;
+        DIAG_WARN(APP, "main") << CrashHandler::kReportEnd;
+    }
+    checkpoint("Crash check done");
+
+    // Create core objects
+    Settings settings;
+    settings.theme()->initSystemThemeDetection();
+
+    // Font size overrides, logged here rather than in the [Font] block above because that
+    // runs before Settings exists. Only roles the user actually changed are reported —
+    // when everything is stock (the overwhelmingly common case) this logs nothing at all,
+    // so the line's presence is itself the signal. Without it, a layout report cannot be
+    // read against the text sizes the reporter is actually running (#1469).
+    {
+        const QVariantMap overrides = settings.theme()->fontSizeOverrides();
+        if (!overrides.isEmpty()) {
+            QStringList parts;
+            for (auto it = overrides.constBegin(); it != overrides.constEnd(); ++it) {
+                parts << QStringLiteral("%1=%2 (default %3)")
+                             .arg(it.key())
+                             .arg(it.value().toInt())
+                             .arg(SettingsTheme::fontSizeDefaults().value(it.key()));
+            }
+            FONT_LOG_STDERR("Overrides", QStringLiteral("Font size overrides: %1").arg(parts.join(QStringLiteral(", "))));
+        }
+    }
+
+    checkpoint("Settings");
+
+    // Shared QNetworkAccessManager — avoids per-class NAM overhead (connection
+    // pooling, reduced thread count). Passed by pointer to most HTTP consumers.
+    QNetworkAccessManager sharedNetworkManager;
+
+    // Monitor network reachability so the debug log captures connectivity
+    // changes that race with long-running downloads (issue #1089). Best-effort:
+    // load fails on platforms without a backend, in which case we just don't log.
+    // The enum's NAME, not its ordinal. Reachability is a Q_ENUM, so streaming it
+    // with qDebug used to print "Reachability(Online)"; routing it through a
+    // helper made it a QString and a static_cast<int> turned that into
+    // "Initial reachability: 4", which means nothing to the person or the AI
+    // reading the log. CLAUDE.md states the rule for MCP payloads ("use
+    // human-readable strings for enums") and the reason is identical here.
+    const auto reachabilityName = [](QNetworkInformation::Reachability r) {
+        const char* key = QMetaEnum::fromType<QNetworkInformation::Reachability>()
+                              .valueToKey(static_cast<int>(r));
+        return key ? QString::fromLatin1(key)
+                   : QStringLiteral("Unknown(%1)").arg(static_cast<int>(r));
+    };
+    if (QNetworkInformation::loadDefaultBackend()) {
+        if (auto* info = QNetworkInformation::instance()) {
+            NETWORK_INFO_STDERR("Reachability", QStringLiteral("Initial reachability: %1")
+                    .arg(reachabilityName(info->reachability())));
+            QObject::connect(info, &QNetworkInformation::reachabilityChanged,
+                             [reachabilityName](QNetworkInformation::Reachability r) {
+                NETWORK_INFO_STDERR("Reachability", QStringLiteral("Reachability changed -> %1")
+                            .arg(reachabilityName(r)));
+            });
+        }
+    } else {
+        // DEBUG, not WARN. The comment above calls this best-effort, and on any
+        // platform with no backend it is a permanent, unfixable, once-per-startup
+        // condition — a WARN that can never be acted on trains readers to skim the
+        // tier that is supposed to mean "look here". That is this change's own
+        // argument, and promoting this line contradicted it.
+        NETWORK_LOG_STDERR("Reachability",
+            QStringLiteral("QNetworkInformation backend unavailable on this platform — "
+                           "connectivity changes will not be logged"));
+    }
+
+    TranslationManager translationManager(&sharedNetworkManager, &settings);
+    checkpoint("TranslationManager");
+    // Before BLEManager: a saved WiFi scale is probed during startup, and its permission
+    // request is dropped if this does not exist yet.
+    LocalNetworkAccess localNetworkAccess;
+    BLEManager bleManager;
+
+    // Two switches, deliberately kept apart:
+    //   simulationMode        — "no DE1 attached". Disables DE1 BLE only.
+    //   simulatedScaleEnabled — "Simulated Scale". Blocks real scale connects,
+    //                           because the simulator owns the weight stream.
+    // Wiring both to setDisabled() used to mean that running the DE1 simulator
+    // silently disabled real scales even with Simulated Scale switched off.
+    //
+    // The AND is load-bearing, not defensive. The two settings have different
+    // defaults — simulatedScaleEnabled defaults to TRUE unconditionally, while
+    // simulationMode defaults to true only on debug Windows/macOS — and the
+    // SimulatedScale object is constructed ONLY inside `if (simulationMode())`
+    // further down. Reading simulatedScaleEnabled alone therefore blocks every
+    // real scale on a debug iOS/Android/Linux build, and on any desktop build
+    // where the DE1 simulator is off, with no simulated scale to take over and
+    // no way back: the Settings row is `visible: Settings.app.simulationMode`,
+    // so the switch is hidden in exactly that state. "A simulated scale owns
+    // the weight stream" is only true when a simulated scale actually exists.
+    const auto applyScaleSimulated = [&bleManager, &settings]() {
+        bleManager.setScaleSimulated(settings.app()->simulationMode()
+                                     && settings.app()->simulatedScaleEnabled());
+    };
+    bleManager.setDisabled(settings.app()->simulationMode());
+    applyScaleSimulated();
+    QObject::connect(settings.app(), &SettingsApp::simulatedScaleEnabledChanged,
+                     &bleManager, applyScaleSimulated);
+    // simulationMode is an input to the gate above, so it must re-evaluate it
+    // too — otherwise turning the DE1 simulator off leaves the scale blocked.
+    QObject::connect(settings.app(), &SettingsApp::simulationModeChanged,
+                     &bleManager, applyScaleSimulated);
+
+    DE1Device de1Device;
+    de1Device.setSettings(settings.hardware());  // Heater calibration sent to firmware
+    // D9: wire the persisted (build-scoped) dual-HIGH-incapable classification
+    // store BEFORE any BLE connect, so a known-weak device starts both links
+    // at BALANCED on the first connect (no detection window) — and a record
+    // from a different build is auto-discarded (re-detect every new build).
+    bleManager.setSettings(settings.hardware());
+    bleManager.setSavedScaleAddresses([&settings] { return settings.knownScaleAddresses(); });
+    // Wire TranslationManager so user-visible BLE error strings get i18n
+    // (scale debug-log lines stay in English regardless — they're diagnostic).
+    bleManager.setTranslationManager(&translationManager);
+    DIAG_DEBUG(APP, "main") << "Simulation mode:" << (settings.app()->simulationMode() ? "ON" : "off");
+    de1Device.setSimulationMode(settings.app()->simulationMode());  // Restore simulation mode from settings
+    std::unique_ptr<ScaleDevice> physicalScale;  // Physical BLE scale (when connected)
+    FlowScale flowScale;  // Virtual scale using DE1 flow data (fallback when no BLE scale)
+    ShotDataModel shotDataModel;
+    SteamDataModel steamDataModel;
+    SteamHealthTracker steamHealthTracker;
+    MachineState machineState(&de1Device);
+    machineState.setSettings(&settings);
+    machineState.setScale(&flowScale);  // Start with FlowScale, switch to physical scale if found
+#ifdef Q_OS_ANDROID
+    // Do not treat the default or a stale state as proof that the machine is idle.
+    // STATE_INFO must have arrived on the current connection, and the raw state
+    // (rather than a page or a deferred MachineState phase) must be non-operational.
+    GcDeferredAbort::Coordinator gcAbort(
+        [&] { return !de1Device.firmwareFlashInProgress()
+                 && GcDeferredAbort::confirmedIdle(de1Device.isConnected(),
+                 de1Device.hasCurrentStateInfo(), de1Device.state()); },
+        [&] {
+            // During a known operation, wait for its state notification instead
+            // of adding a Bluetooth read to the operation's control traffic.
+            if (!de1Device.firmwareFlashInProgress()
+                    && GcDeferredAbort::shouldRequestState(de1Device.isConnected(),
+                    de1Device.hasCurrentStateInfo(), de1Device.state()))
+                de1Device.requestCurrentStateInfo();
+        },
+        [](const QString& mismatch) {
+            const QByteArray evidence = mismatch.toLocal8Bit();
+            qFatal("%s", evidence.constData()); // log-marker-exempt: evidence already carries [Memory][QmlGc]
+        });
+    const auto gcStateConnection = QObject::connect(&de1Device, &DE1Device::stateInfoReceived,
+                                                     &gcAbort, [&] { gcAbort.stateInfoReceived(); });
+    const auto gcConnectionChange = QObject::connect(&de1Device, &DE1Device::connectedChanged,
+                                                      &gcAbort, [&] { gcAbort.connectionChanged(); });
+    BtLogFilter::setGcMismatchHandler([&](const QString& evidence) {
+        DIAG_WARN(MEMORY, "QmlGc") << "Mismatch captured; abort pending until the machine reports idle";
+        de1Device.setGcAbortPending(true);
+        gcAbort.mismatch(evidence);
+    });
+#endif
+    flowScale.setSettings(&settings);
+    ProfileStorage profileStorage;
+#ifndef Q_OS_IOS
+    USBManager usbManager;
+    UsbScaleManager usbScaleManager;
+#endif
+    checkpoint("Core objects");
+    MainController mainController(&sharedNetworkManager, &settings, &de1Device, &machineState, &shotDataModel, &profileStorage);
+    mainController.setSteamDataModel(&steamDataModel);
+    mainController.setSteamHealthTracker(&steamHealthTracker);
+    mainController.setTranslationManager(&translationManager);  // for LiveSteamCoach cue i18n
+    checkpoint("MainController");
+
+    // Publishes machine phase/temp/last-shot to platform-shared storage for
+    // the iOS/Android Home Screen widget. Reads existing accessors only.
+    MachineStatusSnapshot machineStatusSnapshot(&de1Device, &machineState);
+    // shotPersisted fires once a LIVE shot is stored: post SAW-settling
+    // (finalized), espresso only (steam never saves a shot), and unconditionally
+    // — unlike shotEndedShowMetadata it does not depend on the post-shot-review
+    // setting. It only fires for a successful save, so there is no shotId<=0
+    // case here. MainController's dev-only generateFakeShotData() persists a row
+    // without emitting it, so a simulated shot deliberately leaves the tile
+    // alone; the old shotSaved wiring updated it for those too.
+    //
+    // It carries the same yield and duration that went into the row, which is
+    // the whole point: this used to read shotDataModel.finalWeight() and
+    // .stopTime() instead, and stopTime is written ONLY by the stop-at-weight
+    // path (WeightProcessor::stopNow → markStopAt). Any other ending — manual
+    // stop, profile end, volume stop, or SAW blocked by an oscillating scale —
+    // left it at its -1 sentinel, WidgetLastShot::make() rejected it, and the
+    // tile kept whatever it had last accepted (each rejection logged, throttled,
+    // which is how the report surfaced). In one reporter's log that was every
+    // shot in the file (#1658).
+    QObject::connect(&mainController, &MainController::shotPersisted,
+                     &machineStatusSnapshot,
+                     [&machineStatusSnapshot](qint64, double durationSec, double yieldG) {
+                         // setLastShot takes (yield, duration); the signal carries
+                         // (duration, yield) to match its siblings in onShotEnded().
+                         // The swap is here, named, and deliberate.
+                         machineStatusSnapshot.setLastShot(yieldG, durationSec);
+                     });
+
+    // Create and wire ShotTimingController (centralized timing and weight handling)
+    ShotTimingController timingController(&de1Device);
+    timingController.setScale(&flowScale);  // Start with FlowScale, switch to physical if found
+    timingController.setSettings(&settings);
+    timingController.setMachineState(&machineState);
+    machineState.setTimingController(&timingController);
+    mainController.setTimingController(&timingController);
+    mainController.setBLEManager(&bleManager);
+    mainController.setFlowScale(&flowScale);
+
+    // Connect timing controller outputs to shot data model
+    QObject::connect(&timingController, &ShotTimingController::weightSampleReady,
+                     &shotDataModel, qOverload<double, double, double>(&ShotDataModel::addWeightSample));
+    QObject::connect(&timingController, &ShotTimingController::weightSourceUsed,
+                     &shotDataModel, &ShotDataModel::recordWeightSource);
+    QObject::connect(&timingController, &ShotTimingController::weightBaselineReady,
+                     &shotDataModel, qOverload<double, double>(&ShotDataModel::addWeightSample));
+
+    // Batch shotTimeChanged onto the 33ms flush timer (signal-to-signal connection)
+    // This avoids expensive QML binding evaluation in the BLE signal handler
+    QObject::connect(&shotDataModel, &ShotDataModel::flushed,
+                     &timingController, &ShotTimingController::shotTimeChanged);
+
+    // SAW stop, per-frame weight exit, and graph markings are now handled by
+    // WeightProcessor signals (stopNow, skipFrame) wired below.
+    // ShotTimingController::stopAtWeightReached and perFrameWeightReached are no longer emitted.
+
+    // SAW learning is keyed per (profile, scale) — and "scale" has to mean the scale that
+    // actually served the shot, not the one nominated as primary in Settings. The two
+    // diverge whenever the WiFi-primary Half Decent Scale is unreachable and the app falls
+    // back to its BLE transport: that path deliberately skips setPrimaryScale() (see
+    // isFallbackConnect in the resultFound handler), so settings.scaleType() keeps answering
+    // "decent-wifi" while every weight sample arrives over BLE. Writing BLE-served shots
+    // into the WiFi pool corrupts a learned model the user cannot see or reset separately.
+    // Observed on-device: four consecutive BLE-served shots logged scale="decent-wifi".
+    //
+    // Note the SEED defaults in SettingsCalibration::sensorLag() are identical for "decent"
+    // and "decent-wifi" today (both 0.38), so the first-shot prediction would not differ —
+    // it is the accumulated per-key pools that this protects, and that argument survives a
+    // future edit to the seed table.
+    //
+    // Resolved by MachineState::activeScaleType(), which keys on the scale actually wired
+    // into the shot path. Deliberately NOT main()'s physicalScale: a USB scale never
+    // occupies it (the USB discovery handler calls physicalScale.reset() and installs
+    // usbScale directly), so keying on physicalScale would leave USB shots on the saved
+    // type — correct today only because the USB path always calls setPrimaryScale(), i.e.
+    // by the same luck the WiFi→BLE fallback removes.
+    //
+    // The Calibration tab and reset_saw_learning action=profile read the same
+    // property, so the pool being trained is the pool the user sees and can clear. Keeping
+    // those in sync matters as much as the key itself: a write path that diverges from the
+    // read path is worse than a consistently wrong key, because nothing on screen reveals it.
+
+    // The SAW key is resolved at shot START (to pick the prediction model and sensor
+    // lag) and again ~40 s later at learning time (to pick the pool to write). Those
+    // are two reads of live state with a whole shot in between, and main() swaps the
+    // serving scale on device events at a dozen call sites — a USB cable knocked loose
+    // mid-pour is enough. Latch it once, alongside ProfileManager::latchForShot(),
+    // and learn under the key that actually made the prediction.
+    QString sawScaleKeyForShot;
+
+    // The basket segment of the SAW key, latched at the same moment and for the same
+    // reason: swapping the active equipment package between the stop and settling
+    // completion would otherwise file the entry under a basket that did not pull the shot.
+    QString sawBasketKeyForShot;
+
+    // Connect SAW learning signal to settings persistence.
+    // Logs the predicted-vs-actual drip ("accuracy" line) before persisting, so any single
+    // shot's debug log records whether SAW hit its target. addSawLearningPoint then routes
+    // the entry through the per-(profile, scale) batch accumulator and emits the
+    // "accumulated"/"committed"/"batch rejected" qDebug line that ShotDebugLogger captures.
+    QObject::connect(&timingController, &ShotTimingController::sawLearningComplete,
+                     [&settings, &mainController, &machineState, &sawScaleKeyForShot,
+                      &sawBasketKeyForShot](
+                             double drip, double flowAtStop, double overshoot) {
+                         // Prefer the latched key. Empty only if learning somehow fires
+                         // without a cycle start, in which case live state is all there is.
+                         const QString liveScaleType = machineState.activeScaleType();
+                         const QString scaleType = sawScaleKeyForShot.isEmpty()
+                                                       ? liveScaleType : sawScaleKeyForShot;
+                         if (!sawScaleKeyForShot.isEmpty() && liveScaleType != sawScaleKeyForShot) {
+                             // Not fatal — the latched key is the correct one to learn
+                             // under — but it means the serving scale changed mid-shot,
+                             // which is worth seeing in the shot log rather than inferring
+                             // later from a pool that drifted.
+                             SAW_WARN_STDERR("Learning",
+                                 QStringLiteral("Scale changed mid-shot: predicted with %1 but now "
+                                                "serving %2 — learning under the former")
+                                     .arg(sawScaleKeyForShot, liveScaleType));
+                         }
+                         const QString profileFilename = mainController.profileManager()->baseProfileName();
+                         // Same latch-or-live rule as the scale key above.
+                         const QString basketKey = sawBasketKeyForShot.isEmpty()
+                                                       ? settings.calibration()->currentBasketKey()
+                                                       : sawBasketKeyForShot;
+                         const double predictedDrip = settings.calibration()->getExpectedDripFor(
+                             profileFilename, scaleType, flowAtStop, basketKey);
+                         SAW_LOG_STDERR("Learning",
+                             QStringLiteral("Accuracy: predictedDrip=%1 g actualDrip=%2 g "
+                                            "delta=%3 g overshoot=%4 g flow=%5 g/s "
+                                            "scale=%6 profile=%7 basket=%8")
+                                 .arg(predictedDrip, 0, 'f', 2).arg(drip, 0, 'f', 2)
+                                 .arg(drip - predictedDrip, 0, 'f', 2).arg(overshoot, 0, 'f', 2)
+                                 .arg(flowAtStop, 0, 'f', 2).arg(scaleType, profileFilename, basketKey));
+                         settings.calibration()->addSawLearningPoint(drip, flowAtStop, scaleType, overshoot,
+                                                                    profileFilename, basketKey);
+                     });
+
+    // Forward sawSettling state to MainController for QML binding
+    QObject::connect(&timingController, &ShotTimingController::sawSettlingChanged,
+                     &mainController, &MainController::sawSettlingChanged);
+
+    // Connect shot ended to timing controller
+    QObject::connect(&machineState, &MachineState::shotEnded,
+                     &timingController, &ShotTimingController::endShot);
+
+    // Connect shot processing to MainController (waits for SAW settling if needed)
+    QObject::connect(&timingController, &ShotTimingController::shotProcessingReady,
+                     &mainController, &MainController::onShotEnded);
+
+    checkpoint("ShotTimingController wiring");
+
+    // Weight processor on dedicated worker thread — isolates LSLR + SOW decisions
+    // from main thread stalls (GC pauses, remaining synchronous I/O).
+    WeightProcessor weightProcessor;
+    QThread weightThread;
+    weightThread.setObjectName(QStringLiteral("WeightProcessor"));
+    weightProcessor.moveToThread(&weightThread);
+    weightThread.start();
+
+    // Scale → WeightProcessor (main → worker, auto QueuedConnection)
+    // Initially connected to FlowScale; reconnected when physical scale is found
+    QObject::connect(&flowScale, &ScaleDevice::weightSampleReceived,
+                     &weightProcessor, &WeightProcessor::processWeight);
+
+    // WeightProcessor → DE1Device: stop-at-weight.
+    // Use DirectConnection so the lambda runs immediately on the WeightProcessor's HighPriority
+    // thread, then post a Qt::HighEventPriority event to DE1Device. This makes the SAW stop
+    // jump ahead of any normal-priority events already queued on the main thread (e.g. D-Flow
+    // setpoint writes), preventing the 4+ second delivery delay seen on slow devices.
+    QObject::connect(&weightProcessor, &WeightProcessor::stopNow,
+                     &weightProcessor, [&de1Device](qint64 sawTriggerMs) {
+                         QCoreApplication::postEvent(&de1Device,
+                             new SawStopEvent(sawTriggerMs),
+                             Qt::HighEventPriority);
+                     }, Qt::DirectConnection);
+
+    // WeightProcessor → MachineState: forward SAW trigger for QML "Target reached" display
+    QObject::connect(&weightProcessor, &WeightProcessor::stopNow,
+                     &machineState, [&machineState](qint64) {
+                         emit machineState.targetWeightReached();
+                     });
+
+    // WeightProcessor → MachineState: notify QML when SAW is bypassed (untared cup).
+    // Using &machineState as context ensures lambda runs on the main thread.
+    QObject::connect(&weightProcessor, &WeightProcessor::untaredCupDetected,
+                     &machineState, [&machineState]() {
+                         emit machineState.sawBypassed();
+                     });
+
+    // WeightProcessor → ShotDataModel: re-anchor the graph on the zero that actually
+    // arrived. MachineState::tareCompleted already clears the pre-tare samples, but it
+    // fires when the tare COMMAND goes out; the scale's zeroed sample lands tens of ms
+    // later, and any pre-tare reading in between is appended after that clear. It then
+    // becomes the spike filter's anchor there — a logged shot rejected the real 0.1 g
+    // against a stale 141.1 g at 534 g/s, three times. Same event as WeightProcessor's
+    // own tare wait, so the two cannot disagree about when the zero landed.
+    // &shotDataModel as context puts it on the main thread.
+    QObject::connect(&weightProcessor, &WeightProcessor::tareLanded,
+                     &shotDataModel, [&shotDataModel]() { shotDataModel.clearWeightData(); });
+
+    // WeightProcessor → ShotDataModel: mark stop time on graph.
+    // Using &shotDataModel as context ensures lambda runs on the main thread.
+    QObject::connect(&weightProcessor, &WeightProcessor::stopNow,
+                     &shotDataModel, [&timingController, &shotDataModel](qint64) {
+                         shotDataModel.markStopAt(timingController.shotTime());
+                     });
+
+    // WeightProcessor → DE1Device: per-frame weight exit.
+    // Using &de1Device as context ensures BLE write happens on the main thread.
+    QObject::connect(&weightProcessor, &WeightProcessor::skipFrame,
+                     &de1Device, [&de1Device](int) { de1Device.skipToNextFrame(); });
+
+    // WeightProcessor → ShotTimingController: SAW learning context
+    QObject::connect(&weightProcessor, &WeightProcessor::sawTriggered,
+                     &timingController, &ShotTimingController::onSawTriggered);
+
+    // WeightProcessor → ShotTimingController: record weight exits for transition tracking
+    QObject::connect(&weightProcessor, &WeightProcessor::skipFrame,
+                     &timingController, &ShotTimingController::recordWeightExit);
+
+    // WeightProcessor → ShotTimingController: flow rates for graph and settling
+    QObject::connect(&weightProcessor, &WeightProcessor::flowRatesReady,
+                     &timingController, &ShotTimingController::onWeightSample);
+
+    // WeightProcessor → MachineState: cached flow rate for QML property.
+    // Using &machineState as context ensures lambda runs on the main thread.
+    QObject::connect(&weightProcessor, &WeightProcessor::flowRatesReady,
+                     &machineState, [&machineState](double, double flowRate, double flowRateShort) {
+                         machineState.updateCachedFlowRates(flowRate, flowRateShort);
+                     });
+
+    // WeightProcessor → MachineState: the shot's post-tare zero offset, so the live
+    // readout, MQTT and MCP report the same weight SAW stops on and the shot record
+    // saves. &machineState as context puts it on the main thread.
+    QObject::connect(&weightProcessor, &WeightProcessor::preShotZeroOffsetChanged,
+                     &machineState, &MachineState::updatePreShotZeroOffset);
+    QObject::connect(&weightProcessor, &WeightProcessor::preShotZeroOffsetChanged,
+                     &timingController, &ShotTimingController::setAppliedZeroOffset);
+
+    // Forward frame number updates from shot samples to worker thread.
+    // With &weightProcessor as context, Qt auto-uses QueuedConnection (cross-thread).
+    QObject::connect(&timingController, &ShotTimingController::sampleReady,
+                     &weightProcessor, [&weightProcessor](double, double pressure, double flow, double,
+                         double, double, double, int frameNumber, bool) {
+                         // pressure/flow feed the step-exit arbiter (mixed-frame race guard).
+                         weightProcessor.setCurrentFrame(frameNumber, pressure, flow);
+                     });
+
+    // Shot lifecycle → WeightProcessor: configure at shot start, stop at shot end.
+    // IMPORTANT: MainController::onEspressoCycleStarted runs BEFORE this lambda
+    // (connected earlier in MainController's constructor) and calls tare() synchronously.
+    // So by the time this lambda runs, isTareComplete() is already true.
+    // We include setTareComplete(true) in the SAME queued invocation as startExtraction()
+    // to guarantee correct ordering on the worker thread. A separate tareCompleteChanged
+    // connection would race: its queued setTareComplete(true) arrives on the worker BEFORE
+    // startExtraction() (which resets m_tareComplete=false), causing tare to be lost.
+    QObject::connect(&machineState, &MachineState::espressoCycleStarted,
+                     [&weightProcessor, &machineState, &settings, &mainController, &timingController,
+                      &sawScaleKeyForShot, &sawBasketKeyForShot]() {
+                         // Freeze the resolved target + dose for the duration
+                         // of the shot (add-yield-ratio-anchor Decision 9),
+                         // alongside the SAW model snapshot below so the two
+                         // stay consistent. While latched,
+                         // ProfileManager::targetWeight() answers with the
+                         // frozen value, so NO late write — a dose capture,
+                         // a bean switch's override clear, a recipe
+                         // activation, an MCP/web anchor write, a profile
+                         // load — can re-resolve and reach the worker through
+                         // the ungated forwarder below and move the live SAW
+                         // target. Event-driven, released at shot end.
+                         mainController.profileManager()->latchForShot();
+
+                         // Build snapshot of learning data and configuration.
+                         // Per-(profile, scale, basket) lookup falls back to the global
+                         // bootstrap / pool / scale default automatically when the triple has
+                         // not yet graduated (fewer than kSawMinMediansForGraduation committed
+                         // batches — 1 today, so one 3-shot batch). The "Model:" log line
+                         // records which source is driving this shot's predictions.
+                         //
+                         // The entries fetched below are the committed (drip, flow) pairs, and
+                         // they go straight into the WeightProcessor snapshot that decides when
+                         // to fire the stop — so a pair that describes no real shot mis-stops
+                         // one. See addSawPerPairEntry's commit step.
+                         double targetWeight = machineState.targetWeight();
+                         QString scaleType = machineState.activeScaleType();
+                         sawScaleKeyForShot = scaleType;  // latched for the learning path
+                         const QString basketKey = settings.calibration()->currentBasketKey();
+                         sawBasketKeyForShot = basketKey;  // latched for the same reason
+                         QString profileFilename = mainController.profileManager()->baseProfileName();
+                         bool converged = settings.calibration()->isSawConverged(scaleType);
+                         int maxEntries = converged ? 12 : 8;
+                         const auto entries = settings.calibration()->sawLearningEntriesFor(profileFilename, scaleType, maxEntries, basketKey);
+                         const QString modelSource = settings.calibration()->sawModelSource(profileFilename, scaleType, basketKey);
+                         const double currentLag = settings.calibration()->sawLearnedLagFor(profileFilename, scaleType, basketKey);
+                         SAW_LOG_STDERR("Learning",
+                             QStringLiteral("Model: source=%1 lag=%2 s profile=%3 scale=%4 basket=%5 historyN=%6")
+                                 .arg(modelSource).arg(currentLag, 0, 'f', 3)
+                                 .arg(profileFilename, scaleType, basketKey).arg(entries.size()));
+                         QVector<double> drips, flows;
+                         drips.reserve(entries.size());
+                         flows.reserve(entries.size());
+                         for (const auto& e : entries) {
+                             drips.append(e.first);
+                             flows.append(e.second);
+                         }
+
+                         // Build frame exit weights and preinfuse count from current profile
+                         QVector<double> frameExitWeights;
+                         // Per-frame firmware exit conditions (parallel to frameExitWeights):
+                         // lets the step-exit arbiter avoid double frame-advances on frames
+                         // that carry both a weight exit and a firmware pressure/flow exit.
+                         QVector<FrameExitCondition> frameExitConditions;
+                         const Profile& profile = mainController.profileManager()->currentProfile();
+                         int preinfuseFrameCount = profile.preinfuseFrameCount();
+                         {
+                             const auto& steps = profile.steps();
+                             frameExitWeights.reserve(steps.size());
+                             frameExitConditions.reserve(steps.size());
+                             for (const auto& step : steps) {
+                                 frameExitWeights.append(step.exitWeight);
+                                 frameExitConditions.append(FrameExitCondition::fromExitFields(
+                                     step.exitIf, step.exitType,
+                                     step.exitPressureOver, step.exitPressureUnder,
+                                     step.exitFlowOver, step.exitFlowUnder));
+                             }
+                         }
+
+                         // Tare already happened synchronously in onEspressoCycleStarted
+                         bool tareComplete = timingController.isTareComplete();
+                         double sensorLagSeconds = SettingsCalibration::sensorLag(scaleType);
+
+                         QMetaObject::invokeMethod(&weightProcessor,
+                             [&weightProcessor, targetWeight, preinfuseFrameCount, frameExitWeights, frameExitConditions, drips, flows, converged, tareComplete, sensorLagSeconds]() {
+                                 weightProcessor.configure(targetWeight, preinfuseFrameCount, frameExitWeights, frameExitConditions, drips, flows, converged,
+                                                           sensorLagSeconds);
+                                 weightProcessor.startExtraction();
+                                 if (tareComplete) {
+                                     weightProcessor.setTareComplete(true);
+                                 }
+                             }, Qt::QueuedConnection);
+                     });
+
+    // Auto-tare during "flow before" phase → WeightProcessor: clear stale cup-weight data.
+    // NOTE: resetForRetare() must NOT call setTareComplete() — see ordering comment above
+    // (lines 548-554). A separate queued setTareComplete would race with startExtraction().
+    QObject::connect(&machineState, &MachineState::flowBeforeAutoTare,
+                     [&weightProcessor]() {
+                         QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor]() {
+                             weightProcessor.resetForRetare();
+                         }, Qt::QueuedConnection);
+                     });
+
+    // Mark extraction start when flow actually begins, not at preheat.
+    // This ensures the untared-cup sanity check in WeightProcessor doesn't fire during
+    // preheat while the BLE tare command is still in transit to the scale.
+    QObject::connect(&machineState, &MachineState::shotStarted,
+                     [&weightProcessor]() {
+                         QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor]() {
+                             weightProcessor.markExtractionStart();
+                         }, Qt::QueuedConnection);
+                     });
+
+    QObject::connect(&machineState, &MachineState::shotEnded,
+                     [&weightProcessor]() {
+                         QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor]() {
+                             weightProcessor.stopExtraction();
+                         }, Qt::QueuedConnection);
+                     });
+
+    // Retire the shot's zero correction once the shot has been saved. shotProcessingReady
+    // is the right edge: shotEnded fires while drip is still settling, and the settle
+    // samples run through the same correction, so clearing there would step the graph and
+    // the saved finalWeightG by the offset. Queued into the worker, and posted after the
+    // direct-connected onShotEnded above has already read the shot, so the record is safe.
+    // Without this the offset outlived its shot and every surface reading MachineState::
+    // scaleWeight (idle readout, steam, dose weighing, MQTT, MCP, widget) stayed skewed by
+    // it — and a manual tare could not fix it, because the scale zeroed while the app went
+    // on subtracting. Only an app restart cleared it.
+    QObject::connect(&timingController, &ShotTimingController::shotProcessingReady,
+                     [&weightProcessor]() {
+                         QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor]() {
+                             weightProcessor.clearPreShotZeroOffset();
+                         }, Qt::QueuedConnection);
+                     });
+
+    // Release the shot latch on espressoCycleEnded, NOT shotEnded: the latch is
+    // armed at espressoCycleStarted, and only espressoCycleEnded is that
+    // signal's pair. shotEnded is gated on flow having started, so a cycle
+    // aborted during preheat (stop tapped, machine aborts, BLE drops) would
+    // arm the latch and never release it — freezing targetWeight() at that
+    // shot's value for the rest of the session while every surface kept
+    // showing the live one. The latch outliving the cycle is precisely the
+    // failure this latch exists to prevent, so it is released on the broadest
+    // exit rather than the narrowest. Idempotent.
+    //
+    // Ordering — twice written wrong here, so it is sourced. Release runs BEFORE
+    // the save path, on every shot, and what guarantees it is the delivery mode,
+    // not settling: espressoCycleEnded is emitted SYNCHRONOUSLY on the phase
+    // transition (machinestate.cpp:806), while shotEnded — which reaches
+    // onShotEnded via ShotTimingController::endShot() -> shotProcessingReady —
+    // is emitted inside a Qt::QueuedConnection invokeMethod
+    // (machinestate.cpp:854-866). So the release is always at least one event
+    // loop turn ahead.
+    //
+    // Stop-at-weight settling widens that gap to ~1.4 s when it runs, but does
+    // NOT establish it: on a shot with no SAW trigger, endShot() takes the else
+    // branch at shottimingcontroller.cpp:150-155 and emits shotProcessingReady
+    // immediately, with no settling window at all. An earlier version of this
+    // comment claimed settling was the mechanism, which is false for every
+    // manual, volume-stopped, GHC-button and profile-end shot.
+    //
+    // Harmless for the yield snapshot, which deliberately survives release. It
+    // is why ProfileManager's flow-calibration latch, which does NOT survive, is
+    // taken in onShotEnded() rather than cleared here.
+    QObject::connect(&machineState, &MachineState::espressoCycleEnded,
+                     [&weightProcessor, &mainController, &machineState]() {
+                         mainController.profileManager()->releaseShotLatch();
+                         // Disarm the SAW worker for the same reason and by the
+                         // same asymmetry: startExtraction arms it at cycle
+                         // start (above), stopExtraction hangs off shotEnded and
+                         // so never runs for a cycle that never flowed, leaving
+                         // SAW live against the dead shot's target until the
+                         // next shot re-armed it. No-op on a normal shot.
+                         QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor]() {
+                             weightProcessor.endShotCycle();
+                         }, Qt::QueuedConnection);
+                         // Same asymmetry, third time: the pre-shot zero is retired on
+                         // shotProcessingReady (above), which is reached only through
+                         // shotEnded. A mid-pour disconnect sets Phase::Disconnected,
+                         // emits THIS signal and returns before the queued shotEnded ever
+                         // fires (MachineState::updateFromDevice), so the offset a flowing
+                         // shot had already adopted would stay applied to the idle scale
+                         // for the rest of the session — the bug this fix exists to remove,
+                         // reached by a different road.
+                         //
+                         // Guarded on Disconnected rather than clearing unconditionally,
+                         // because this signal is emitted SYNCHRONOUSLY on the normal
+                         // Ending -> Idle exit while shotEnded is queued: an unguarded
+                         // clear here would land before the settle window and step the
+                         // drip samples, and so the saved finalWeightG, by the offset.
+                         // A disconnect has no such window — the shot is dead and nothing
+                         // further will be captured from it.
+                         if (machineState.phase() == MachineState::Phase::Disconnected) {
+                             QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor]() {
+                                 weightProcessor.clearPreShotZeroOffset();
+                             }, Qt::QueuedConnection);
+                         }
+                     });
+
+    // Machine phase → WeightProcessor: extend scale-feed-liveness detection to
+    // the pre-shot EspressoPreheating phase (BLE connection-priority backstop,
+    // #1093/#1176). The feed dies during preheat prep on weak radios, ~6 s
+    // before extraction — detecting it there lets the backoff + reconnect begin
+    // during warm-up. True only while preheating; any other phase
+    // (Idle/Sleep/Preinfusion/.../extraction-end) clears it, so a legitimately
+    // idle scale never trips (m_active covers true extraction separately).
+    // Cross-thread to the worker → explicit Qt::QueuedConnection, consistent
+    // with the WeightProcessor wiring above.
+    QObject::connect(&machineState, &MachineState::phaseChanged,
+                     [&weightProcessor, &machineState]() {
+                         const bool preheating =
+                             machineState.phase() == MachineState::Phase::EspressoPreheating;
+                         QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor, preheating]() {
+                             weightProcessor.setShotCycleActive(preheating);
+                         }, Qt::QueuedConnection);
+                     });
+
+    // Forward live SAW target changes (the mid-shot SAW adjustment buttons) to the worker.
+    // Pre-shot callers (profile activation, recipe save) also fire this signal, but
+    // configure() overwrites m_targetWeight at shot start, so any pre-shot forwarding
+    // is harmless. Only mid-shot bumps observably move the worker's target.
+    // Ladder writes can no longer reach this path mid-shot
+    // (add-yield-ratio-anchor): targetWeight() answers with the RESOLVED target
+    // latched at espressoCycleStarted (see above), so neither a dose write nor
+    // an anchor write/clear moves it — and therefore this forwarder — during a
+    // shot. Latching only the dose would not have covered the anchor writes.
+    // The deliberately mid-shot caller (the phase-gated adjustment grid, via
+    // MainController::bumpTargetWeight) writes MachineState directly rather than
+    // through the ladder, so it still flows.
+    QObject::connect(&machineState, &MachineState::targetWeightChanged,
+                     [&weightProcessor, &machineState]() {
+                         const double w = machineState.targetWeight();
+                         QMetaObject::invokeMethod(&weightProcessor, [&weightProcessor, w]() {
+                             weightProcessor.setTargetWeight(w);
+                         }, Qt::QueuedConnection);
+                     });
+
+#ifdef Q_OS_ANDROID
+    // GC management: defer Android GC during flowing operations (espresso, hot water, etc.)
+    // to reduce stop-the-world pause impact on BLE delivery and SAW latency.
+    //
+    // Strategy:
+    //   - App startup:
+    //       • Call idleGc() immediately and start the 15-minute periodic timer.
+    //   - Any operation starting (MachineState::isOperating):
+    //       • Stop the periodic timer (no GC right before or during a shot).
+    //       • Raise heap utilization threshold to 0.95 (GC only if heap is 95% full).
+    //         No explicit System.gc() here — GC near preinfusion is worse than no GC.
+    //   - Returning to Idle/Ready:
+    //       • onFlowingEnded() resets the heap threshold and runs an immediate GC.
+    //       • Restart the 15-minute periodic timer for ongoing idle maintenance.
+    //
+    // During extended idle (screensaver, overnight) the timer fires every 15 minutes
+    // to prevent unbounded Java heap growth from BLE GATT callbacks.
+    //
+    // s_inOperation prevents double-calls as the machine moves through sub-phases
+    // (EspressoPreheating → Preinfusion → Pouring → Ending).
+
+    auto* idleGcTimer = new QTimer();
+    idleGcTimer->setSingleShot(false);
+    idleGcTimer->setInterval(15 * 60 * 1000);  // 15-minute periodic idle GC
+    QObject::connect(idleGcTimer, &QTimer::timeout, []() {
+        QJniObject::callStaticMethod<void>(
+            "io/github/kulitorum/decenza_de1/BleHelper",
+            "idleGc", "()V");
+    });
+
+    QObject::connect(&machineState, &MachineState::phaseChanged,
+                     [&machineState, idleGcTimer]() {
+        using Phase = MachineState::Phase;
+        static bool s_inOperation = false;
+        const Phase phase = machineState.phase();
+
+        const bool enteringOp = !s_inOperation && machineState.isOperating();
+
+        const bool exitingOp = s_inOperation && (
+            phase == Phase::Idle ||
+            phase == Phase::Ready ||
+            phase == Phase::Sleep ||
+            phase == Phase::Disconnected);
+
+        if (enteringOp) {
+            s_inOperation = true;
+            idleGcTimer->stop();  // Pause periodic GC during operations
+            QJniObject::callStaticMethod<void>(
+                "io/github/kulitorum/decenza_de1/BleHelper",
+                "onFlowingStarted", "()V");
+        } else if (exitingOp) {
+            s_inOperation = false;
+            QJniObject::callStaticMethod<void>(
+                "io/github/kulitorum/decenza_de1/BleHelper",
+                "onFlowingEnded", "()V");  // runs immediate post-shot GC
+            idleGcTimer->start();  // Resume periodic idle GC
+        }
+    });
+
+    // Run GC at startup and start the periodic idle timer. The app starts idle
+    // and onFlowingEnded() won't fire until the first shot ends, so without this
+    // the heap accumulates BLE stack garbage unchecked until the first shot.
+    QJniObject::callStaticMethod<void>(
+        "io/github/kulitorum/decenza_de1/BleHelper",
+        "idleGc", "()V");
+    idleGcTimer->start();
+
+    // BLE dead-binder recovery: when the Bluetooth GATT binder/process dies
+    // (toggled off, OEM power policy, GATT proxy unbound) Qt's BLE handler
+    // thread raises a DeadObjectException (or its DeadSystemException
+    // subclass if system_server itself died). The Java crash handler catches
+    // both, keeps the app alive, and writes a flag file; we poll for it
+    // every 10 s and trigger BLE reconnection if found. Issues #189, #1227.
+    auto* bleRecoveryTimer = new QTimer();
+    bleRecoveryTimer->setInterval(10000);
+    QObject::connect(bleRecoveryTimer, &QTimer::timeout,
+                     [&bleManager, &de1Device]() {
+        // Use same path as CrashHandler (proven to match Java getFilesDir())
+        QString flagPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                         + "/ble_dead_system";
+        QFile flagFile(flagPath);
+        if (!flagFile.exists())
+            return;
+
+        DIAG_WARN(APP, "main") << "BLE recovery: dead BLE binder detected, triggering reconnect";
+        flagFile.remove();
+
+        // The BLE handler thread is dead — Qt's QLowEnergyController won't emit
+        // disconnected() on its own. Force-disconnect and re-scan.
+        if (de1Device.isConnected()) {
+            DIAG_WARN(DE1, "main") << "BLE recovery: forcing DE1 disconnect";
+            de1Device.disconnect();
+        }
+        bleManager.resetScaleConnectionState();
+
+        // Attempt reconnection after a short delay to let Android restart Bluetooth.
+        // Scale uses scan-only (allowDirectConnect=false): right after a BLE-stack
+        // death a parked direct-connect to a possibly-absent scale is exactly the
+        // contention we avoid (#1303); the scan reconnects it when it advertises.
+        QTimer::singleShot(3000, [&bleManager]() {
+            DIAG_DEBUG(APP, "main") << "BLE recovery: attempting reconnect";
+            bleManager.tryDirectConnectToDE1();
+            bleManager.tryDirectConnectToScale(/*allowDirectConnect=*/false);
+        });
+    });
+    bleRecoveryTimer->start();
+#endif
+
+    checkpoint("WeightProcessor wiring");
+
+    // Create and wire AI Manager
+    AIManager aiManager(&sharedNetworkManager, &settings);
+    mainController.setAiManager(&aiManager);
+    // Localize AI error strings. Wired here (not via MainController's fan-out)
+    // because MainController::setTranslationManager already ran above, before
+    // the AIManager was attached. Forwards to every provider + the conversation.
+    aiManager.setTranslationManager(&translationManager);
+
+    for (const auto& controls : {ThemeEditorOptions::fontControls(), ThemeEditorOptions::shaderControls()})
+        for (const QVariant& control : controls) {
+            const QVariantMap row = control.toMap();
+            translationManager.registerString(row.value(QStringLiteral("labelKey")).toString(),
+                                              row.value(QStringLiteral("label")).toString());
+        }
+
+    // Register the per-provider model-hint strings and the per-MODEL cost
+    // strings with the translation registry.
+    //
+    // Model hints: SettingsAITab.qml builds these keys dynamically
+    // (AIManager::modelHintKey), which the QML string scanner
+    // cannot see; registering here keeps the batch-translation registry
+    // complete while the English copy stays in AIProvider::modelHint().
+    //
+    // Cost lines: the keys are static (ai.cost.<provider>.<model>) and live in
+    // C++, but translateString() only registers a key when it is CALLED, and
+    // the app only ever calls costHintFor() for the model currently selected.
+    // Without this loop a user translates the app, switches models, and gets
+    // an English cost line for a model whose string was never offered to the
+    // translator. Priced models are enumerated rather than assumed, so a model
+    // with no costHintFor() case simply contributes no key.
+    for (const QString& providerId : aiManager.availableProviders()) {
+        const QString hint = aiManager.modelHint(providerId);
+        if (!hint.isEmpty())
+            translationManager.translateString(aiManager.modelHintKey(providerId), hint);
+        for (const QVariant& model : aiManager.availableModels(providerId)) {
+            const QString modelId = model.toMap().value("id").toString();
+            if (!modelId.isEmpty())
+                (void)aiManager.costHint(providerId, modelId);
+        }
+    }
+
+    // Connect FlowScale to graph initially (will be disconnected if physical scale found)
+    QObject::connect(&flowScale, &ScaleDevice::weightChanged,
+                     &mainController, &MainController::onScaleWeightChanged);
+
+    ScreensaverVideoManager screensaverManager(&sharedNetworkManager, &settings, &profileStorage);
+#ifdef Q_OS_IOS
+    // Restore screen brightness if the app crashed while dimmed
+    ios_checkAndRestoreBrightness();
+#endif
+    checkpoint("ScreensaverVideoManager");
+
+    // Connect screensaver manager and AI manager to shot server
+    mainController.shotServer()->setScreensaverVideoManager(&screensaverManager);
+    mainController.shotServer()->setAIManager(&aiManager);
+    // Connect screensaver manager to data migration client for media import
+    mainController.dataMigration()->setScreensaverVideoManager(&screensaverManager);
+
+    // Shot-history-to-file exporter: mirrors the shots DB into individual
+    // visualizer-format JSON files under ProfileStorage::userHistoryPath()
+    // whenever Settings::exportShotsToFile is on.
+    ShotHistoryExporter shotHistoryExporter(&settings, &profileStorage, mainController.shotHistory());
+
+    BatteryManager batteryManager;
+    batteryManager.setDE1Device(&de1Device);
+    batteryManager.setSettings(&settings);
+
+    mainController.shotServer()->setBatteryManager(&batteryManager);
+
+    MemoryMonitor memoryMonitor;
+    mainController.shotServer()->setMemoryMonitor(&memoryMonitor);
+
+    WidgetLibrary widgetLibrary(&settings);
+    mainController.shotServer()->setWidgetLibrary(&widgetLibrary);
+
+    // MCP Server for AI remote control
+    McpServer mcpServer;
+    mcpServer.setDE1Device(&de1Device);
+    mcpServer.setMachineState(&machineState);
+    mcpServer.setMainController(&mainController);
+    mcpServer.setProfileManager(mainController.profileManager());
+    mcpServer.setShotHistoryStorage(mainController.shotHistory());
+    mcpServer.setBLEManager(&bleManager);
+    mcpServer.setSettings(&settings);
+    mcpServer.setMemoryMonitor(&memoryMonitor);
+    mcpServer.setScreensaverVideoManager(&screensaverManager);
+    mcpServer.setTranslationManager(&translationManager);
+    mcpServer.setBatteryManager(&batteryManager);
+    mainController.shotServer()->setMcpServer(&mcpServer);
+
+    // Remote access: a dedicated tokenized listener (separate from ShotServer)
+    // and the embedded Tailscale node, serving the MCP connector for
+    // Claude/ChatGPT mobile apps and Remote Web Access. Both default off.
+    RemoteAccess remoteAccess;
+    remoteAccess.setMcpServer(&mcpServer);
+    remoteAccess.setSettings(settings.mcp());
+    remoteAccess.setNetworkSettings(settings.network());
+    remoteAccess.setWebHost(mainController.shotServer());
+    // webUrl() is empty while the server is down (its port taken, say).
+    QObject::connect(mainController.shotServer(), &ShotServer::runningChanged,
+                     &remoteAccess, &RemoteAccess::webUrlChanged);
+    // Expose live remote-access status + connector/login URLs to the web
+    // settings page (Settings.mcp holds the persisted config).
+    mainController.shotServer()->setRemoteMcpAccess(&remoteAccess);
+    // Note: registerAllTools() is deferred until after AccessibilityManager is created (below)
+
+    // Relay client for Pocket app remote control via AWS WebSocket
+    RelayClient relayClient(&de1Device, &machineState, &settings);
+    mainController.shotServer()->setRelayClient(&relayClient);
+    if (!settings.app()->pocketPairingToken().isEmpty() && settings.app()->screenCaptureEnabled()) {
+        relayClient.setEnabled(true);
+    }
+
+    // React to setting changes at runtime
+    QObject::connect(settings.app(), &SettingsApp::screenCaptureEnabledChanged, [&relayClient, &settings]() {
+        if (settings.app()->screenCaptureEnabled() && !settings.app()->pocketPairingToken().isEmpty()) {
+            relayClient.setEnabled(true);
+        } else {
+            relayClient.setEnabled(false);
+        }
+    });
+
+#ifdef Q_OS_ANDROID
+    // Quiet anything that owns a long-lived QSocketNotifier before Android's
+    // PackageInstaller takes over. The system reaps our fds during the install
+    // handover and Qt's UNIX event dispatcher SIGSEGVs in
+    // QSocketNotifier::setEnabled if it tries to service one afterward (#865).
+    // Both UpdateChecker (UI-triggered) and ShotServer (web-triggered) emit
+    // aboutToDispatchInstall on the main thread immediately before the JNI
+    // dispatch; the connection below uses Qt::AutoConnection which resolves
+    // to Qt::DirectConnection because both signal and receiver are on the
+    // main thread — the slot runs synchronously, finishes the teardown, and
+    // returns before the JNI call dispatches. If either emitter ever moves
+    // to a worker thread the connection silently flips to QueuedConnection
+    // and the fix breaks; keep both emit sites on the main thread.
+    // We don't try to restore on cancel — the install either succeeds
+    // (process replaced) or fails (rare; user can restart).
+    // CrashReporter is wired separately below because it's declared later.
+    auto quietNetworkForApkInstall = [&mainController, &sharedNetworkManager, &relayClient]() {
+        DIAG_DEBUG(APP, "main") << "Quieting network services for APK install handover";
+        if (auto* server = mainController.shotServer()) {
+            server->stop();
+        }
+        sharedNetworkManager.clearConnectionCache();
+        relayClient.shutdown();
+    };
+    QObject::connect(mainController.updateChecker(), &UpdateChecker::aboutToDispatchInstall,
+                     &mainController, quietNetworkForApkInstall);
+#endif
+
+    // Weather forecast manager (hourly updates, region-aware API selection)
+    WeatherManager weatherManager(&sharedNetworkManager);
+    weatherManager.setLocationProvider(mainController.locationProvider());
+
+    // DE1 auto-reconnect state — declared early because autoWakeManager and
+    // applicationStateChanged lambdas capture these by reference.
+    int de1ReconnectAttempt = 0;
+    QTimer de1ReconnectTimer;
+    de1ReconnectTimer.setSingleShot(true);
+    // Tracks "was connected or connecting" for edge-detection in the
+    // connectedChanged handler. Updated by connectingChanged so startup
+    // failures (connecting→failed, never reached connected) also arm the
+    // retry timer — not just mid-session disconnects (connected→disconnected).
+    bool de1WasActive = false;
+
+    // Auto-wake manager for scheduled wake-ups
+    AutoWakeManager autoWakeManager(settings.autoWake());
+    QObject::connect(&autoWakeManager, &AutoWakeManager::wakeRequested,
+                     &de1Device, &DE1Device::wakeUp);
+    QObject::connect(&autoWakeManager, &AutoWakeManager::wakeRequested,
+                     &mainController, &MainController::autoWakeTriggered);
+    // Also wake the scale and reconnect DE1 if needed
+    QObject::connect(&autoWakeManager, &AutoWakeManager::wakeRequested,
+                     [&physicalScale, &bleManager, &settings, &de1Device, &de1ReconnectTimer, &de1ReconnectAttempt]() {
+        QStringList did{QStringLiteral("DE1 wake sent")};  // DE1Device::wakeUp, connected above
+        if (!de1Device.isConnected() && !de1Device.isConnecting()) {
+            // Reset reconnect counter and start fresh retry sequence
+            de1ReconnectAttempt = 0;
+            if (!de1ReconnectTimer.isActive()) {
+                de1ReconnectTimer.start(500);
+                did << QStringLiteral("DE1 reconnect started");
+            } else {
+                did << QStringLiteral("DE1 reconnect already running");
+            }
+        }
+        if (physicalScale && physicalScale->isConnected()) {
+            physicalScale->wake();
+            did << QStringLiteral("scale wake sent");
+        } else if (!settings.scaleAddress().isEmpty()) {
+            did << QStringLiteral("scale reconnect scheduled");
+            // Scale disconnected - try to reconnect. DE1 wake is a foreground
+            // trigger, so allow the bounded direct-connect fast-path (default).
+            QTimer::singleShot(500, &bleManager, [&bleManager]() {
+                bleManager.tryDirectConnectToScale();
+            });
+        }
+        DIAG_DEBUG(AUTOSLEEP, "AutoWakeManager").noquote()
+            << "Auto-wake: " + did.join(QStringLiteral(", "));
+    });
+    autoWakeManager.start();
+
+    // Sensor calibration capture. Declared before `engine` like every other
+    // published singleton, so it outlives the bindings that read it (see the
+    // LIFETIME note in contextsingletons_qml.h).
+    SensorCalibrationController sensorCalibration(&de1Device, &translationManager);
+    {
+        // The two facts the wizard needs about the loaded profile: its FILENAME
+        // (baseProfileName — currentProfileName is a display string that
+        // decorates itself once edited) and its final frame's declared holds.
+        // That last frame is the one the test profiles end on and the one the
+        // user is watching when they read their gauge.
+        ProfileManager* pm = mainController.profileManager();
+        sensorCalibration.setProfileContextProvider(
+            [pm]() -> SensorCalibrationController::ProfileContext {
+                SensorCalibrationController::ProfileContext ctx;
+                if (!pm) return ctx;
+                ctx.filename = pm->baseProfileName();
+                const QList<ProfileFrame>& steps = pm->currentProfile().steps();
+                if (!steps.isEmpty()) {
+                    ctx.holdPressure = steps.last().pressure;
+                    ctx.holdTemperature = steps.last().temperature;
+                }
+                return ctx;
+            });
+        QObject::connect(pm, &ProfileManager::currentProfileChanged,
+                         &sensorCalibration, &SensorCalibrationController::noteProfileChanged);
+    }
+
+    // Database backup manager for scheduled daily backups
+    DatabaseBackupManager backupManager(&settings, mainController.shotHistory(),
+                                       &profileStorage, &screensaverManager);
+    mainController.setBackupManager(&backupManager);
+    backupManager.setTranslationManager(&translationManager);
+    QObject::connect(&backupManager, &DatabaseBackupManager::profilesRestored,
+                     mainController.profileManager(), &ProfileManager::refreshProfiles);
+    QObject::connect(&backupManager, &DatabaseBackupManager::mediaRestored,
+                     &screensaverManager, &ScreensaverVideoManager::reloadPersonalMedia);
+    backupManager.start();
+
+    checkpoint("Managers wired");
+
+#ifndef Q_OS_IOS
+    // Scanning is opt-in for both the DE1 and the scale — see
+    // Settings::usbSerialEnabled for what it does and does not gate.
+    const auto applyUsbScanning = [&]() {
+        if (settings.usbSerialEnabled()) {
+            usbManager.startPolling();
+            usbScaleManager.startPolling();
+        } else {
+            usbManager.stopPolling();
+            usbScaleManager.stopPolling();
+            // Without this a submitted log carries no USB lines at all, and "off"
+            // reads exactly like "broken".
+            SCALE_INFO_STDERR_TAGGED("USB Scale",
+                QStringLiteral("Scanning disabled (Settings > Connections > Scan for USB "
+                               "devices). Hotplug and Scan for Devices still work."));
+        }
+    };
+    // Safe on a never-started manager: finishScanProbe() early-returns with no scan
+    // pending, so stopPolling() emits nothing.
+    applyUsbScanning();
+    QObject::connect(&settings, &Settings::usbSerialEnabledChanged, applyUsbScanning);
+
+    // Outside the setting: an idle receiver costs nothing.
+    UsbHotplug::start(&usbScaleManager, &usbManager);
+
+    // Hotplug only reports devices attached WHILE the app runs, so one plugged in
+    // before launch is otherwise invisible until a replug or a Scan. Ungated: the
+    // setting bounds a per-tick cost, and this is one hasDevice() per launch.
+    usbScaleManager.onHotplugEvent();
+    usbManager.onHotplugEvent();
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, []() { UsbHotplug::stop(); });
+#endif
+
+    AccessibilityManager accessibilityManager;
+    QObject::connect(mainController.preparation(), &PreparationController::captureDingRequested,
+                     &accessibilityManager, &AccessibilityManager::playCaptureDing);
+    accessibilityManager.setTranslationManager(&translationManager);
+
+    // Steam-coach voice: the coach emits speakRequested only when its own audio
+    // setting is on; route it via announceCoaching, which bypasses BOTH
+    // accessibility voice gates — the master switch AND the Voice Announcements
+    // (ttsEnabled) toggle; that second bypass is load-bearing (see
+    // AccessibilityManager::announceCoaching). Do not reroute this through
+    // announce()/routeAnnouncement — either re-gates the voice.
+    QObject::connect(mainController.liveSteamCoach(), &LiveSteamCoach::speakRequested,
+                     &accessibilityManager, &AccessibilityManager::announceCoaching);
+
+    // Now that all managers exist, finish MCP server setup
+    mcpServer.setAccessibilityManager(&accessibilityManager);
+    mcpServer.registerAllTools();
+    mcpServer.registerAllResources();
+    mcpServer.connectSseNotifications();
+
+    // Start the remote listener now if either route was left enabled.
+    remoteAccess.refresh();
+
+    // Crash reporter for sending crash reports to api.decenza.coffee
+    CrashReporter crashReporter;
+
+#ifdef Q_OS_ANDROID
+    // Drop CrashReporter's private QNAM keepalive sockets before APK install.
+    // Same rationale as the quietNetworkForApkInstall lambda above; this is
+    // a separate connect because crashReporter is constructed after that
+    // lambda's call site.
+    QObject::connect(mainController.updateChecker(), &UpdateChecker::aboutToDispatchInstall,
+                     &crashReporter, &CrashReporter::clearConnectionCache);
+#endif
+
+    checkpoint("Pre-QML setup done");
+
+    // Same rule, and this one was learned the hard way. The refractometer is
+    // wired up ~950 lines below, next to the rest of its BLE handling, but the
+    // unique_ptr lives HERE so the device outlives the engine. Declared down
+    // there it was destroyed first, and ~QObject's destroyed() reached a live
+    // QML binding on BLEManager.refractometerConnected, which dispatched a pure
+    // virtual on the half-destroyed object — a SIGBUS on quit. Keep the
+    // declaration above `engine`; the QPointer in BLEManager is the second
+    // line of defence, not a licence to move this back down.
+    std::unique_ptr<RefractometerDevice> refractometer;
+
+    // Hand the previous run's crash log to the singleton QML already uses for crash reporting,
+    // replacing the bare "PreviousCrashLog"/"PreviousDebugLogTail" context properties. crashReporter
+    // is declared further up and already outlives `engine`, so this needs no hoist of its own.
+    // The tombstone lookup has none of the crash check's ordering constraint, so
+    // it waits until the app object and its Android context exist.
+    crashReporter.setPreviousRun(CrashHandler::withAndroidTombstone(previousCrashLog),
+                                 previousDebugLogTail);
+
+    // Hoisted here from ~1500 lines below for that same rule, when it became a QML singleton.
+    // A context property is dropped by QML when its object emits destroyed(), so it survived
+    // being declared after `engine`; a singleton reached through a static raw pointer has no
+    // such mechanism and nothing nulls it, so the declaration has to outlive the engine.
+    // Only the DECLARATION moved: the three setters that give it its dependencies stay where
+    // they were, because mainController.shotHistory() is not ready this early.
+    FlowCalibrationModel flowCalibrationModel;
+
+    // The stable QML identity for whichever scale is live. Declared here for the same lifetime
+    // rule as everything else registered as a singleton; the eleven places below that used to
+    // re-point the `ScaleDevice` context property now call setTarget() on this.
+    ScaleDeviceProxy scaleProxy;
+    RefractometerProxy refractometerProxy;
+#if defined(Q_OS_IOS) || defined(Q_OS_MACOS)
+    BelkaPortalDevice belkaPortal([] { return new CoreBluetoothScaleBleTransport(); });
+#else
+    BelkaPortalDevice belkaPortal([] { return new QtScaleBleTransport(); });
+#endif
+    BelkaPortalForeign::s_singletonInstance = &belkaPortal;
+    QObject::connect(mainController.firmwareUpdater(), &FirmwareUpdater::stateChanged,
+                     &belkaPortal, [&bleManager, &belkaPortal, updater = mainController.firmwareUpdater()] {
+        const auto state = updater->state();
+        const bool transferring = state == FirmwareUpdater::State::Erasing
+            || state == FirmwareUpdater::State::Uploading || state == FirmwareUpdater::State::Verifying;
+        bleManager.setFirmwareUpdateActive(transferring);
+        belkaPortal.setFirmwareUpdateActive(transferring);
+    });
+    connectPortalDiscovery(&bleManager, &belkaPortal);
+    PortalController portalController(&belkaPortal, settings.hardware(), &machineState,
+                                     &timingController, &shotDataModel);
+    mainController.setScaleDeviceProxy(&scaleProxy);
+
+    // Native and browser QML consume the generated Steam and equipment replicas
+    // over the same authenticated session socket.
+    // Qt resolves a replica acquired from this host to its in-process source
+    // (Qt 6.12 qremoteobjectnode.cpp:1525-1542).
+    NativeLiveShotGraphSource liveShotGraphSource(&shotDataModel, mainController.profileManager(), &machineState);
+    // Native graph presentation works even before the optional web listener starts.
+    liveShotGraphSource.setIdentity(QString::fromLatin1(decenzaPackageId()),
+        QUuid::createUuid().toString(QUuid::WithoutBraces));
+    NativeSteamServiceSource steamServiceSource(&mainController, &settings,
+        &machineState, &de1Device, &scaleProxy);
+    NativeHostStatusServiceSource hostStatusSource(&weatherManager, &batteryManager);
+    NativePreparationServiceSource preparationSource(mainController.preparation());
+    if (auto* server = mainController.shotServer()) {
+        QObject::connect(server, &ShotServer::remoteObjectClientOpened,
+                         &preparationSource, &NativePreparationServiceSource::openClient);
+        QObject::connect(server, &ShotServer::remoteObjectClientClosed,
+                         &preparationSource, &NativePreparationServiceSource::closeClient);
+    }
+    NativeHostSessionServiceSource hostSessionSource(&settings, &de1Device,
+        &machineState, &mainController, &scaleProxy, &bleManager,
+#ifndef Q_OS_IOS
+        &usbScaleManager,
+#else
+        nullptr,
+#endif
+        &belkaPortal, &accessibilityManager);
+    NativeMachineControlServiceSource machineControlServiceSource(
+        &mainController, &settings, &machineState, &de1Device,
+        &bleManager, &batteryManager, &scaleProxy);
+    machineControlServiceSource.setScreensaverManager(&screensaverManager);
+    NativeEquipmentServiceSource equipmentServiceSource(
+        mainController.equipmentStorage(), settings.dye(), mainController.shotHistory());
+    QObject::connect(&aiManager, &AIManager::grindCalibrationChanged,
+                     &equipmentServiceSource, &NativeEquipmentServiceSource::grindCalibrationChanged);
+    NativeRecipeServiceSource recipeServiceSource(
+        mainController.recipeStorage(), settings.dye(),
+        [&mainController](qint64 id) { mainController.activateRecipe(id); },
+        [&mainController] { mainController.deactivateRecipe(); });
+    QObject::connect(&mainController, &MainController::recipeActivated,
+                     &recipeServiceSource, [&recipeServiceSource](qint64 id, bool success) {
+        recipeServiceSource.completeActivation(id, success);
+    });
+    QObject::connect(&mainController, &MainController::recipeActivationFailed,
+                     &recipeServiceSource, [&recipeServiceSource](qint64 id, const QString&, const QString& title) {
+        recipeServiceSource.completeActivation(id, false, title);
+    });
+    NativeBagServiceSource bagServiceSource(mainController.bagStorage(), settings.dye());
+    NativeProfileServiceSource profileServiceSource(mainController.profileManager(), settings.app(),
+                                                   settings.calibration());
+    NativeCalibrationSource calibrationServiceSource(&settings, mainController.profileManager(),
+        &machineState, &de1Device, &steamHealthTracker);
+    NativeFlowCalibrationSource flowCalibrationServiceSource(&flowCalibrationModel, settings.calibration());
+    NativeSensorCalibrationSource sensorCalibrationServiceSource(&sensorCalibration, &de1Device);
+    NativeHistoryServiceSource historyServiceSource(
+        mainController.shotHistory(), settings.network(),
+        [&mainController](const QString& requestId, qint64 shotId) {
+            mainController.loadShotWithMetadataForRequest(requestId, shotId);
+        });
+    QObject::connect(&mainController, &MainController::shotMetadataLoadRequestCompleted,
+                     &historyServiceSource,
+                     [&historyServiceSource](const QString& requestId, qint64 shotId, bool success) {
+        historyServiceSource.completeShotLoad(requestId, shotId, success);
+    });
+    NativeComparisonServiceSource comparisonServiceSource(mainController.shotHistory());
+    ConversationSessionSource conversationSessionSource(&aiManager, mainController.shotHistory());
+    const QString nativeConversationId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    conversationSessionSource.bindNativeSession(nativeConversationId);
+    ConversationSession::setNativeSessionId(nativeConversationId);
+    NativeShotReviewActionSource shotReviewActionSource(&mainController, &settings, &bleManager, &refractometerProxy);
+    shotReviewActionSource.setRemoteAccess(&remoteAccess);
+    shotReviewActionSource.openClient(nativeConversationId, true);
+    preparationSource.openClient(nativeConversationId);
+    if (auto* server = mainController.shotServer()) {
+        QObject::connect(server, &ShotServer::remoteObjectClientOpened,
+                         &conversationSessionSource, &ConversationSessionSource::openClient);
+        QObject::connect(server, &ShotServer::remoteObjectClientClosed,
+                         &conversationSessionSource, &ConversationSessionSource::closeClient);
+        QObject::connect(server, &ShotServer::remoteObjectClientOpened, &shotReviewActionSource,
+                         [&shotReviewActionSource](const QString& id) { shotReviewActionSource.openClient(id); });
+        QObject::connect(server, &ShotServer::remoteObjectClientClosed,
+                         &shotReviewActionSource, &NativeShotReviewActionSource::closeClient);
+    }
+    NativeScreensaverServiceSource screensaverServiceSource(&screensaverManager);
+    screensaverServiceSource.openClient(nativeConversationId);
+    if (auto* server = mainController.shotServer()) {
+        QObject::connect(server, &ShotServer::remoteObjectClientOpened,
+                         &screensaverServiceSource, &NativeScreensaverServiceSource::openClient);
+        QObject::connect(server, &ShotServer::remoteObjectClientClosed,
+                         &screensaverServiceSource, &NativeScreensaverServiceSource::closeClient);
+    }
+    NativeLayoutServiceSource layoutServiceSource(settings.network());
+    NativeLibraryServiceSource libraryServiceSource(&widgetLibrary, &settings);
+    NativeThemeManagementSource themeManagementSource(&settings, &screensaverManager);
+    themeManagementSource.openClient(nativeConversationId);
+    if (auto* server = mainController.shotServer()) {
+        QObject::connect(server, &ShotServer::remoteObjectClientOpened,
+                         &themeManagementSource, &NativeThemeManagementSource::openClient);
+        QObject::connect(server, &ShotServer::remoteObjectClientClosed,
+                         &themeManagementSource, &NativeThemeManagementSource::closeClient);
+    }
+    NativeSettingsPreferencesSource settingsPreferencesSource(&settings);
+    settingsPreferencesSource.setAccessibilityManager(&accessibilityManager);
+    NativeSettingsConnectionsServiceSource settingsConnectionsSource(
+        &settings, &bleManager, &de1Device, &scaleProxy, &machineState,
+#ifndef Q_OS_IOS
+        &usbManager, &usbScaleManager,
+#else
+        nullptr, nullptr,
+#endif
+        &belkaPortal, mainController.hdsFirmwareUpdate());
+    settingsConnectionsSource.setShotHistory(mainController.shotHistory());
+    settingsPreferencesSource.setScreensaverManager(&screensaverManager);
+    settingsPreferencesSource.setBatteryManager(&batteryManager);
+    settingsPreferencesSource.setShotReporter(mainController.shotReporter());
+    QObject::connect(&settingsPreferencesSource, &NativeSettingsPreferencesSource::steamSettingsApplyRequested,
+                     &mainController, &MainController::applySteamSettings);
+    NativeRecipeContextSource recipeContextSource(&settings, mainController.shotHistory());
+    QObject::connect(&recipeContextSource, &NativeRecipeContextSource::presetApplyRequested,
+                     &mainController, [&mainController](const QString& domain) {
+        if (domain == QLatin1String("waterVessel")) mainController.applySelectedWaterVessel();
+        else if (domain == QLatin1String("flush")) mainController.applyFlushSettings();
+    });
+    NativeBeanSearchServiceSource beanSearchServiceSource(mainController.bagStorage(), &settings,
+        mainController.shotHistory()->databasePath());
+    NativeBeanUiServiceSource beanUiServiceSource(mainController.beanbase(), &aiManager, &settings,
+        mainController.visualizerSync(), mainController.bagStorage());
+    beanUiServiceSource.setCommunitySettings(mainController.communitySettings());
+    beanUiServiceSource.setCommunityApply([&mainController](const QVariantMap& suggestion) {
+        mainController.applyCommunitySuggestion(suggestion);
+    });
+    QObject::connect(&mainController, &MainController::communitySuggestionApplied,
+                     &beanUiServiceSource, &NativeBeanUiServiceSource::completeCommunitySuggestion);
+    NativeMaintenanceServiceSource maintenanceServiceSource(&mainController, &de1Device,
+        &machineState, mainController.profileManager());
+    NativeShotUploadServiceSource shotUploadServiceSource(&settings, mainController.visualizer(),
+        mainController.decentAccount(), mainController.visualizerImporter(), mainController.shotUploads());
+    NativeMqttServiceSource mqttServiceSource(&settings, mainController.mqttClient(), mainController.shotServer());
+    NativeUpdateServiceSource updateServiceSource(mainController.updateChecker(), mainController.firmwareUpdater(),
+        settings.app(), &de1Device, [&mainController] { mainController.checkForSoftwareUpdates(true); });
+    NativeGlobalSupportServiceSource globalSupportSource(&crashReporter, &mainController, mainController.profileManager(), &mcpServer);
+    NativeShotServerSettingsSource shotServerSettingsSource(&settings, mainController.shotServer(), &mainController, &remoteAccess);
+    NativeVisualizerProfileImportServiceSource visualizerProfileImportSource(mainController.visualizerImporter());
+    NativeBackupServiceSource backupServiceSource(&backupManager, settings.app());
+    FullBackupRestore fullBackupRestore(&settings, mainController.shotHistory(), &profileStorage,
+                                       &screensaverManager, &aiManager, &translationManager);
+    mainController.dataMigration()->setFullBackupRestore(&fullBackupRestore);
+    fullBackupRestore.setRestoreAllowed([&backupManager, &machineState] {
+        return !backupManager.isBackupInProgress() && !backupManager.isRestoreInProgress()
+            && !machineState.isOperating();
+    });
+    backupServiceSource.setFullBackupRestore(&fullBackupRestore);
+    QObject::connect(&fullBackupRestore, &FullBackupRestore::profilesRestored,
+                     mainController.profileManager(), &ProfileManager::refreshProfiles);
+    QObject::connect(&fullBackupRestore, &FullBackupRestore::mediaRestored,
+                     &screensaverManager, &ScreensaverVideoManager::reloadPersonalMedia);
+    backupServiceSource.setRestoreAllowed([&machineState] { return !machineState.isOperating(); });
+    backupServiceSource.openClient(nativeConversationId);
+    if (auto* server = mainController.shotServer()) {
+        QObject::connect(server, &ShotServer::remoteObjectClientOpened,
+                         &backupServiceSource, &NativeBackupServiceSource::openClient);
+        QObject::connect(server, &ShotServer::remoteObjectClientClosed,
+                         &backupServiceSource, &NativeBackupServiceSource::closeClient);
+    }
+    NativeDataMigrationServiceSource dataMigrationServiceSource(mainController.dataMigration());
+    NativeImportServiceSource importServiceSource(mainController.shotImporter(), mainController.profileImporter(), mainController.shotHistory());
+    screensaverServiceSource.setImportService(&importServiceSource);
+    backupServiceSource.setImportService(&importServiceSource);
+    updateServiceSource.setImportService(&importServiceSource);
+    updateServiceSource.setInstallAllowed([&machineState] { return !machineState.isOperating(); });
+    NativeProfileImportServiceSource profileImportSource(mainController.profileImporter(), &importServiceSource);
+    NativeDebugConversionServiceSource debugConversionServiceSource(mainController.profileConverter(), &importServiceSource);
+    NativeAISettingsSource aiSettingsSource(&settings, &aiManager, &remoteAccess, &mcpServer, mainController.shotServer());
+    settingsPreferencesSource.setAIManager(&aiManager);
+    NativeLanguageServiceSource languageServiceSource(&translationManager);
+    languageServiceSource.setImportService(&importServiceSource);
+    languageServiceSource.setFileOperationAllowed([&machineState] { return !machineState.isOperating(); });
+    NativeSystemLogServiceSource systemLogServiceSource(WebDebugLogger::instance());
+    systemLogServiceSource.setMemorySummaryProvider([&memoryMonitor] { return memoryMonitor.toSummaryString(); });
+    systemLogServiceSource.setMemorySnapshotProvider([&memoryMonitor] {
+        QVariantMap snapshot = memoryMonitor.toJson().toVariantMap();
+        snapshot.insert(QStringLiteral("summary"), memoryMonitor.toSummaryString());
+        snapshot.insert(QStringLiteral("instrumentedBuild"), memoryMonitor.instrumentedBuild());
+        return snapshot;
+    });
+    systemLogServiceSource.openClient(nativeConversationId);
+    if (auto* server = mainController.shotServer()) {
+        QObject::connect(server, &ShotServer::remoteObjectClientOpened,
+                         &systemLogServiceSource, &NativeSystemLogServiceSource::openClient);
+        QObject::connect(server, &ShotServer::remoteObjectClientClosed,
+                         &systemLogServiceSource, &NativeSystemLogServiceSource::closeClient);
+    }
+#ifdef DECENZA_SIMULATOR
+    NativeGHCSimulatorServiceSource ghcServiceSource(&de1Device, nullptr);
+#endif
+    QRemoteObjectHost sharedServiceHost;
+    sharedServiceHost.setProperty("decenzaClientId", nativeConversationId);
+    if (!sharedServiceHost.setHostUrl(QUrl(QStringLiteral("decenza-service:///session")),
+                                    QRemoteObjectHost::AllowExternalRegistration)
+        || !sharedServiceHost.enableRemoting<HostStatusStateSourceAPI>(&hostStatusSource)
+        || !sharedServiceHost.enableRemoting<PreparationServiceStateSourceAPI>(&preparationSource)
+        || !sharedServiceHost.enableRemoting<HostSessionStateSourceAPI>(&hostSessionSource)
+        || !sharedServiceHost.enableRemoting<MachineControlStateSourceAPI>(&machineControlServiceSource)
+        || !sharedServiceHost.enableRemoting<LiveShotGraphStateSourceAPI>(&liveShotGraphSource)
+        || !sharedServiceHost.enableRemoting<SteamStateSourceAPI>(&steamServiceSource)
+        || !sharedServiceHost.enableRemoting<EquipmentStateSourceAPI>(&equipmentServiceSource)
+        || !sharedServiceHost.enableRemoting<RecipeStateSourceAPI>(&recipeServiceSource)
+        || !sharedServiceHost.enableRemoting<BagStateSourceAPI>(&bagServiceSource)
+        || !sharedServiceHost.enableRemoting<ProfileStateSourceAPI>(&profileServiceSource)
+        || !sharedServiceHost.enableRemoting<CalibrationStateSourceAPI>(&calibrationServiceSource)
+        || !sharedServiceHost.enableRemoting<FlowCalibrationStateSourceAPI>(&flowCalibrationServiceSource)
+        || !sharedServiceHost.enableRemoting<SensorCalibrationStateSourceAPI>(&sensorCalibrationServiceSource)
+        || !sharedServiceHost.enableRemoting<HistoryStateSourceAPI>(&historyServiceSource)
+        || !sharedServiceHost.enableRemoting<ScreensaverStateSourceAPI>(&screensaverServiceSource)
+        || !sharedServiceHost.enableRemoting<LayoutStateSourceAPI>(&layoutServiceSource)
+        || !sharedServiceHost.enableRemoting<LibraryStateSourceAPI>(&libraryServiceSource)
+        || !sharedServiceHost.enableRemoting<ThemeManagementStateSourceAPI>(&themeManagementSource)
+        || !sharedServiceHost.enableRemoting<SettingsPreferencesStateSourceAPI>(&settingsPreferencesSource)
+        || !sharedServiceHost.enableRemoting<ConnectionsStateSourceAPI>(&settingsConnectionsSource)
+        || !sharedServiceHost.enableRemoting<MaintenanceStateSourceAPI>(&maintenanceServiceSource)
+        || !sharedServiceHost.enableRemoting<ShotUploadStateSourceAPI>(&shotUploadServiceSource)
+        || !sharedServiceHost.enableRemoting<MqttStateSourceAPI>(&mqttServiceSource)
+        || !sharedServiceHost.enableRemoting<BackupStateSourceAPI>(&backupServiceSource)
+        || !sharedServiceHost.enableRemoting<DataMigrationStateSourceAPI>(&dataMigrationServiceSource)
+        || !sharedServiceHost.enableRemoting<ImportStateSourceAPI>(&importServiceSource)
+        || !sharedServiceHost.enableRemoting<DebugConversionStateSourceAPI>(&debugConversionServiceSource)
+        || !sharedServiceHost.enableRemoting<GlobalSupportStateSourceAPI>(&globalSupportSource)
+#ifdef DECENZA_SIMULATOR
+        || !sharedServiceHost.enableRemoting<GHCSimulatorStateSourceAPI>(&ghcServiceSource)
+#endif
+        || !sharedServiceHost.enableRemoting<ShotServerSettingsStateSourceAPI>(&shotServerSettingsSource)
+        || !sharedServiceHost.enableRemoting<ProfileImportStateSourceAPI>(&profileImportSource)
+        || !sharedServiceHost.enableRemoting<VisualizerProfileImportStateSourceAPI>(&visualizerProfileImportSource)
+        || !sharedServiceHost.enableRemoting<AISettingsStateSourceAPI>(&aiSettingsSource)
+        || !sharedServiceHost.enableRemoting<UpdateStateSourceAPI>(&updateServiceSource)
+        || !sharedServiceHost.enableRemoting<LanguageStateSourceAPI>(&languageServiceSource)
+        || !sharedServiceHost.enableRemoting<SystemLogStateSourceAPI>(&systemLogServiceSource)
+        || !sharedServiceHost.enableRemoting<ComparisonStateSourceAPI>(&comparisonServiceSource)
+        || !sharedServiceHost.enableRemoting<ConversationSessionStateSourceAPI>(&conversationSessionSource)
+        || !sharedServiceHost.enableRemoting<ShotReviewActionStateSourceAPI>(&shotReviewActionSource)
+        || !sharedServiceHost.enableRemoting<RecipeContextStateSourceAPI>(&recipeContextSource)
+        || !sharedServiceHost.enableRemoting<BeanSearchStateSourceAPI>(&beanSearchServiceSource)
+        || !sharedServiceHost.enableRemoting<BeanUiStateSourceAPI>(&beanUiServiceSource))
+        return 1;
+    HostStatusService::setPublishedNode(&sharedServiceHost);
+    PreparationService::setPublishedNode(&sharedServiceHost);
+    HostSessionService::setPublishedNode(&sharedServiceHost);
+    HostSessionService::setAppearancePublisher(
+        [source = QPointer<NativeHostSessionServiceSource>(&hostSessionSource)](const QVariantMap& appearance) {
+            if (source) source->setAppearance(appearance);
+        });
+    MachineControlService::setPublishedNode(&sharedServiceHost);
+    SteamService::setPublishedNode(&sharedServiceHost);
+    LiveShotGraphService::setPublishedNode(&sharedServiceHost);
+    EquipmentService::setPublishedNode(&sharedServiceHost);
+    RecipeService::setPublishedNode(&sharedServiceHost);
+    BagService::setPublishedNode(&sharedServiceHost);
+    ProfileService::setPublishedNode(&sharedServiceHost);
+    CalibrationService::setPublishedNode(&sharedServiceHost);
+    FlowCalibrationService::setPublishedNode(&sharedServiceHost);
+    SensorCalibrationService::setPublishedNode(&sharedServiceHost);
+    HistoryService::setPublishedNode(&sharedServiceHost);
+    ScreensaverService::setLocalManager(&screensaverManager);
+    ScreensaverService::setLocalMemoryMonitor(&memoryMonitor);
+    const auto wakeScreensaverScale = [&physicalScale, &bleManager]() {
+        if (physicalScale && physicalScale->isConnected())
+            physicalScale->wake();
+        else
+            bleManager.tryDirectConnectToScale();
+    };
+    ScreensaverService::setLocalWakeScaleCallback(wakeScreensaverScale);
+    ScreensaverService::setPublishedNode(&sharedServiceHost);
+    LayoutService::setPublishedNode(&sharedServiceHost);
+    LibraryService::setPublishedLocalLibrary(&widgetLibrary);
+    LibraryService::setPublishedNode(&sharedServiceHost);
+    ThemeManagementService::setPublishedNode(&sharedServiceHost);
+    SettingsPreferencesService::setPublishedNode(&sharedServiceHost);
+    MaintenanceService::setPublishedNode(&sharedServiceHost);
+    ShotUploadService::setPublishedNode(&sharedServiceHost);
+    MqttService::setPublishedNode(&sharedServiceHost);
+    BackupService::setPublishedNode(&sharedServiceHost);
+    DataMigrationService::setPublishedNode(&sharedServiceHost);
+    ImportService::setPublishedNode(&sharedServiceHost);
+    DebugConversionService::setPublishedNode(&sharedServiceHost);
+    GlobalSupportService::setPublishedNode(&sharedServiceHost);
+#ifdef DECENZA_SIMULATOR
+    GHCSimulatorService::setPublishedNode(&sharedServiceHost);
+#endif
+    ShotServerSettingsService::setPublishedNode(&sharedServiceHost);
+    ProfileImportService::setPublishedNode(&sharedServiceHost);
+    VisualizerProfileImportService::setPublishedNode(&sharedServiceHost);
+    AISettingsService::setPublishedNode(&sharedServiceHost);
+    UpdateService::setPublishedNode(&sharedServiceHost);
+    LanguageService::setPublishedNode(&sharedServiceHost);
+    SystemLogService::setPublishedNode(&sharedServiceHost);
+    SettingsConnectionsService::setPublishedNode(&sharedServiceHost);
+    SettingsConnectionsService::setNativeLogShareHandler([&bleManager] {
+        bleManager.shareSystemLog();
+    });
+    ComparisonService::setPublishedNode(&sharedServiceHost);
+    ConversationSession::setPublishedNode(&sharedServiceHost);
+    ShotReviewActions::setPublishedNode(&sharedServiceHost);
+    RecipeContextService::setPublishedNode(&sharedServiceHost);
+    BeanSearchService::setPublishedNode(&sharedServiceHost);
+    BeanUiService::setPublishedNode(&sharedServiceHost);
+    if (auto* server = mainController.shotServer()) {
+        server->setHostSessionSource(&hostSessionSource);
+        server->setRemoteObjectHost(&sharedServiceHost);
+        const auto updateServiceIdentity = [&steamServiceSource, &liveShotGraphSource, server] {
+            if (!server->sessionHostId().isEmpty())
+                liveShotGraphSource.setIdentity(QString::fromLatin1(decenzaPackageId()), server->sessionHostId());
+            steamServiceSource.setIdentity(QString::fromLatin1(decenzaPackageId()), server->sessionHostId());
+        };
+        QObject::connect(server, &ShotServer::runningChanged,
+                         &steamServiceSource, updateServiceIdentity);
+        updateServiceIdentity();
+    }
+
+
+    // Hoisted for the same rule, and note it was ALREADY exposed to QML from below the engine —
+    // as a context property, which QML drops on destroyed(), so the ordering hazard was papered
+    // over rather than absent. Its constructor takes no dependencies (it just blanks the LEDs),
+    // so only the DECLARATION moves; setDE1Device()/setDE1Simulator() stay where the simulator
+    // exists, ~1750 lines below.
+#if (defined(Q_OS_WIN) || defined(Q_OS_MACOS)) && defined(QT_DEBUG) && defined(DECENZA_SIMULATOR)
+    GHCSimulator ghcSimulator;
+#endif
+
+#ifdef DECENZA_QML_PROFILING_PORT
+    // QML-profiling build only (android-release.yml qml_profiling). Must precede the engine:
+    // the server serves engines created after it starts (qqmldebug.cpp:167-174). Localhost
+    // only — reach it with `adb forward tcp:3768 tcp:3768`.
+    QQmlDebuggingEnabler::setServices(QQmlDebuggingEnabler::profilerServices());
+    if (QQmlDebuggingEnabler::startTcpDebugServer(DECENZA_QML_PROFILING_PORT,
+            QQmlDebuggingEnabler::DoNotWaitForClient, QStringLiteral("127.0.0.1")))
+        DIAG_WARN(APP, "main") << "QML profiling build: debug server listening on 127.0.0.1:"
+                               << DECENZA_QML_PROFILING_PORT;
+    else
+        DIAG_WARN(APP, "main") << "QML profiling build: debug server failed to start on port"
+                               << DECENZA_QML_PROFILING_PORT;
+#endif
+
+    // Set up QML engine
+    QQmlApplicationEngine engine;
+    checkpoint("QML engine created");
+
+    // Auto-connect when DE1 is discovered via BLE
+    // Tell BLEManager whether a DE1 connect is in flight and how the last one
+    // ended (see noteDe1Connecting for what reads it). Both signals, because
+    // DE1Device emits connectingChanged alone when an attempt STARTS and both
+    // when one ends — reading one of them would miss an edge. isConnecting()
+    // clears in onTransportConnected(), which runs only after every DE1
+    // notification subscription is confirmed, so the attempt brackets connect,
+    // discovery and subscribe.
+    const auto noteDe1Connecting = [&de1Device, &bleManager]() {
+        bleManager.noteDe1Connecting(de1Device.isConnecting(), de1Device.isConnected());
+    };
+    QObject::connect(&de1Device, &DE1Device::connectingChanged, &bleManager, noteDe1Connecting);
+    QObject::connect(&de1Device, &DE1Device::connectedChanged, &bleManager, noteDe1Connecting);
+
+    QObject::connect(&bleManager, &BLEManager::de1Discovered,
+                     &de1Device, [&de1Device, &bleManager, &physicalScale, &settings
+#ifndef Q_OS_IOS
+                     , &usbManager
+#endif
+                     ](const QBluetoothDeviceInfo& device) {
+#ifndef Q_OS_IOS
+        // Don't connect via BLE if already connected via USB
+        if (usbManager.isDe1Connected()) {
+            bleManager.de1Debug(QStringLiteral("de1Discovered: skipping BLE connect - USB already "
+                                               "connected"), QStringLiteral("main"));
+            return;
+        }
+#endif
+        if (!de1Device.isConnected() && !de1Device.isConnecting()) {
+            de1Device.connectToDevice(device);
+
+            // Save DE1 address for direct wake on next startup
+            QString identifier = getDeviceIdentifier(device);
+            settings.setMachineAddress(identifier);
+            bleManager.setSavedDE1Address(identifier, device.name());
+
+            // Only stop scan if we're not still looking for a scale
+            bool lookingForScale = bleManager.hasSavedScale() || bleManager.isScanningForScales();
+            if (!lookingForScale || (physicalScale && physicalScale->isConnected())) {
+                bleManager.stopScan();
+            }
+        }
+    });
+
+    // No DE1Device::logMessage forwarder. It existed to feed the connections-page
+    // DE1 view through BLEManager::de1LogMessage, a signal that reached that window
+    // and nothing else — so everything sent through it was missing from every log a
+    // user submitted. DE1Device's macros already write each line to the system log
+    // carrying [DE1][<source>], which is what the view now reads.
+
+#ifndef Q_OS_IOS
+    // When USB DE1 discovered: disconnect BLE, switch to USB transport
+    QObject::connect(&usbManager, &USBManager::de1Discovered,
+        [&de1Device, &bleManager](SerialTransport* transport) {
+            // Disconnect BLE if connected
+            if (de1Device.isConnected()) {
+                de1Device.disconnect();
+            }
+            // Stop BLE scanning while USB is connected
+            bleManager.stopScan();
+            // Switch to USB transport
+            de1Device.setTransport(transport);
+        });
+
+    // When USB DE1 lost: clear transport, BLE scanning can resume
+    QObject::connect(&usbManager, &USBManager::de1Lost,
+        [&de1Device, &bleManager]() {
+            de1Device.disconnect();
+            // Resume BLE scanning to find DE1 via Bluetooth
+            bleManager.startScan();
+        });
+
+    // No USBManager::logMessage forwarder either — same reason. USB_LOG/INFO/WARN
+    // already carry [DE1][USB].
+#endif
+
+    // Scale auto-reconnect after disconnect: backoff ramp 5s → 30s → 60s, then
+    // the 60s tail repeats for as long as the scale stays disconnected. We never
+    // give up permanently (matches de1app): a scale powered back on hours later is
+    // reconnected automatically because each retry runs a ~15s scan that
+    // connects as soon as it sees the saved scale advertising, so it is picked
+    // up within a retry cycle (#1207).
+    int scaleReconnectAttempt = 0;
+    bool scaleHunting = false;   // last cadence logged; cleared by a ramp restart
+    QTimer scaleReconnectTimer;
+    scaleReconnectTimer.setSingleShot(true);
+    const std::vector<int> reconnectDelays = {5000, 30000, 60000};
+
+    // Whether the ladder keeps running under the screensaver: with keepScaleOn,
+    // for the ramp's first scans only. The tablet's stack drops a still-on Skale
+    // mid-sleep, and left unconnected it powers off before anyone wakes the
+    // screen; past the ramp it pauses, which bounds the scanning #1976 traced
+    // DE1 write failures to. Not for a WiFi scale: a socket it opened would stay
+    // open all night, bypassing the close-and-check-in the DE1-sleep handler
+    // gives WiFi.
+    const auto scaleRampRunsUnderScreensaver =
+        [&settings, &scaleReconnectAttempt, &reconnectDelays]() {
+            return settings.keepScaleOn()
+                && !scaleAddressIsWifi(settings.scaleAddress())
+                && scaleReconnectAttempt < static_cast<int>(reconnectDelays.size());
+        };
+
+    // Do not add a slow tier: a scale woken after the crossing stayed unconnected
+    // through a pour that read 0 g (#2058). While the machine is not in an
+    // operation a failed attempt starts the next one immediately (the hunt, in the
+    // scaleRetryNeeded handler), so the 30 s/60 s gaps apply only mid-operation.
+    // Only the screensaver pauses the ladder (after the ramp, with keepScaleOn):
+    // with Auto-Sleep off, a scale left switched off is scanned for all session.
+    // That is the accepted cost.
+    //
+    // Do not gate a ramp restart on the timer being idle: it is single-shot and
+    // re-armed every tick, so it is always active while the ladder runs.
+
+    // Set by a deliberate DE1-sleep disconnect (keepScaleOn=false, or a WiFi
+    // scale with keepScaleOn) to hold every reconnect path until the DE1 wakes.
+    // Also cleared by app resume, a user scale change (disconnectScaleRequested)
+    // and any successful connect.
+    bool scaleAutoReconnectSuppressed = false;
+
+    // Tracks whether disableLcd() was called on a BT scale during DE1 sleep
+    // and a wake() to restore the LCD hasn't run yet. Set in the DE1 sleep
+    // handler (BT keepScaleOn=true path only — WiFi's onConnected sends
+    // "display on" on its own reconnect handshake, so no separate restore is
+    // needed). Cleared whenever wake() is called: from the phaseChanged wake
+    // handler on the happy path (scale stayed connected through sleep), or
+    // from connectedChanged when a BT scale reconnects post-wake after having
+    // dropped mid-sleep (or after the wake handler's fallthrough couldn't
+    // act). Independent from scaleAutoReconnectSuppressed because the two
+    // concerns (reconnect arming vs. LCD restore) decouple under app-resume
+    // and user-initiated-scan paths that clear the suppression flag.
+    bool scaleLcdRestorePending = false;
+
+    // DE1-phase tracking flags (declared here so the disconnectScaleRequested
+    // handler below can clear them; the phaseChanged lambda that owns them
+    // lives much further down — see "Manage scale power state…" block).
+    //   de1EverAwake: suppress Sleep reaction on initial connect (DE1's
+    //     default BLE state is Sleep, so MachineState transitions
+    //     Disconnected→Sleep before the real state arrives).
+    //   wasInSleep: tracks whether the previous phase was Sleep, so the wake
+    //     actions fire on the very first non-Sleep transition (the DE1 typically
+    //     wakes into Phase::Heating or Phase::Ready, not Phase::Idle).
+    bool de1EverAwake = false;
+    bool wasInSleep = false;
+
+    // R2 refractometer auto-reconnect: shares the scale's reconnectDelays
+    // (5s → 30s → 60s, then 60s forever). The R2 is only used to capture TDS/EY
+    // on the post-shot review page, so — unlike the scale — this tick is scoped
+    // to that page's "hunt": it is armed only while the hunt is active and keeps
+    // trying whenever the R2 is disconnected and an address is saved. The
+    // isRefractometerHunt() guard in its handler is a backstop. Shares
+    // reconnectDelays with the scale (whose reconnect is independent and
+    // always-on).
+    int refractometerReconnectAttempt = 0;
+    QTimer refractometerReconnectTimer;
+    refractometerReconnectTimer.setSingleShot(true);
+
+    // Lifetime guard for the signal handlers below that capture main()'s locals
+    // by reference.
+    //
+    // Stack objects destruct in reverse declaration order, so everything declared
+    // after `engine` (the reconnect state just above) is destroyed BEFORE
+    // `engine` is. The senders those handlers hang off
+    // — app, bleManager, machineState, screensaverManager, the scale — are all
+    // declared above `engine` and so outlive the very locals their handlers write
+    // to. A signal emitted during teardown then runs a lambda over dead stack.
+    //
+    // Not theoretical: ~QQmlApplicationEngine drives QML context destruction,
+    // which re-enters C++ setters (BLEManager::setRefractometerHunt is one), and
+    // the resulting emission ran a handler that assigned to an already-destroyed
+    // stack int — an ASan use-after-scope abort on quit.
+    //
+    // Passing this as each connection's context object makes Qt sever them all
+    // when it dies. The explicit reset() after app.exec() is what does the work
+    // and must not be dropped: it runs ahead of every local's destructor, whereas
+    // this unique_ptr's own destructor fires at THIS declaration point and so
+    // would already be too late for anything declared below it.
+    //
+    // Handlers whose sender IS one of these locals (the reconnect timers) need no
+    // guard — the connection already dies with the sender.
+    auto handlerScope = std::make_unique<QObject>();
+
+    QObject::connect(&scaleReconnectTimer, &QTimer::timeout,
+                     [&bleManager, &settings, &scaleReconnectAttempt, &scaleReconnectTimer,
+                      &reconnectDelays, &screensaverManager, scaleRampRunsUnderScreensaver]() {
+        // Stopping the timer on screensaver entry was not enough: a scan already
+        // in flight re-armed it on failure and scanned all night (#1976). Every
+        // arming of this timer lands in this tick, so it is the backstop; the
+        // screensaver-exit handler restarts the ramp.
+        if (screensaverManager.screensaverActive() && !scaleRampRunsUnderScreensaver()) {
+            bleManager.scaleInfo(QStringLiteral(
+                "Scale reconnect paused until the screensaver closes"), QStringLiteral("main"));
+            return;
+        }
+        if (settings.scaleAddress().isEmpty()) {
+            // scaleReconnectTimer is single-shot (see its setSingleShot(true) at
+            // construction), so this return does not re-arm — the ladder is
+            // permanently dead from this point on. Worth a line above DEBUG: it was
+            // a bare qDebug, invisible to a [Scale] search, so "why did it stop
+            // trying to reconnect my scale" had no answer in a submitted log.
+            bleManager.scaleInfo(QStringLiteral(
+                "Scale reconnect: no saved scale address, stopping retries"),
+                QStringLiteral("main"));
+            return;
+        }
+        // USB scales are owned by UsbScaleManager and reconnect via its
+        // usbScaleAvailable handler — NOT this BLE/WiFi direct-wake timer.
+        // tryDirectConnectToScale() early-returns for "usb:" addresses, so
+        // re-arming here would spin forever (and resetScaleConnectionState()
+        // below would needlessly stop the BLE connection timer each tick).
+        // Stop the timer when the saved scale is USB.
+        if (!scaleAddressIsLadderDialable(settings.scaleAddress())) {
+            // Also a ladder-ending return on a single-shot timer — same reasoning
+            // as above.
+            bleManager.scaleInfo(QStringLiteral(
+                "Scale reconnect: saved scale is not dialable by this ladder "
+                "(USB is handled by UsbScaleManager; sim: is the simulator's "
+                "synthetic entry) — stopping retries"), QStringLiteral("main"));
+            return;
+        }
+        // The bounded ramp changes retry spacing. On the endless tail, shared
+        // connection-failure suppression retains changes and the episode count.
+        if (scaleReconnectAttempt < static_cast<int>(reconnectDelays.size())) {
+            bleManager.scaleInfo(QStringLiteral("Auto-reconnect attempt %1")
+                .arg(scaleReconnectAttempt + 1), QStringLiteral("main"));
+        }
+        bleManager.resetScaleConnectionState();
+        // Background reconnect: scan only, never a parked direct-connect. A
+        // direct connectToDevice() to an absent scale holds the Android BLE
+        // stack in Connecting for ~30s every cycle and starves the DE1 link
+        // (issue #1303). The saved scale auto-connects when seen in a scan.
+        bleManager.tryDirectConnectToScale(/*allowDirectConnect=*/false);
+        scaleReconnectAttempt++;
+        // Persistent reconnect: walk the ramp, then hold on the last (60s) delay.
+        // Stops naturally when the scale connects (connectedChanged), the user
+        // forgets it (scaleAddress empty, above), or the user scans for a
+        // different scale.
+        scaleReconnectTimer.start(reconnectDelays[
+            std::min(scaleReconnectAttempt, static_cast<int>(reconnectDelays.size()) - 1)]);
+    });
+
+    // Arm the scale retry timer when a startup direct-connect attempt times out.
+    // Without this, a startup connection timeout (scale asleep / not advertising, 20 s)
+    // leaves the scale disconnected until the user manually reopens the app —
+    // same root cause as the DE1 reconnect bug fixed in a0bade6f. flowScaleFallback
+    // is guarded by m_flowScaleFallbackEmitted so it fires at most once per session
+    // (until the scale connects or the user clears it — resetScaleConnectionState()
+    // deliberately does not reset this guard); the retry loop above handles
+    // subsequent timeout failures itself.
+    QObject::connect(&bleManager, &BLEManager::flowScaleFallback, handlerScope.get(),
+                     [&settings, &bleManager, &scaleReconnectTimer, &scaleReconnectAttempt,
+                      &reconnectDelays, &scaleAutoReconnectSuppressed]() {
+        if (settings.scaleAddress().isEmpty()) {
+            DIAG_DEBUG(SCALE, "main") << "Scale reconnect (startup): no saved address, skipping";
+            return;
+        }
+        // USB scales reconnect via UsbScaleManager (usbScaleAvailable), not this
+        // BLE/WiFi timer. Arming it would fire once and self-terminate at the
+        // timeout guard — skip arming entirely.
+        if (!scaleAddressIsLadderDialable(settings.scaleAddress())) {
+            return;
+        }
+        if (scaleAutoReconnectSuppressed) {
+            DIAG_DEBUG(SCALE, "main") << "Scale reconnect (startup): suppressed (deliberate DE1-sleep disconnect), skipping";
+            return;
+        }
+        if (scaleReconnectTimer.isActive()) {
+            DIAG_DEBUG(SCALE, "main") << "Scale reconnect (startup): timer already active, skipping";
+            return;
+        }
+        scaleReconnectAttempt = 0;
+        scaleReconnectTimer.start(reconnectDelays[0]);
+        bleManager.scaleInfo(QStringLiteral("Scheduling reconnect in %1 s (startup failure)")
+                                 .arg(reconnectDelays[0] / 1000),
+                             QStringLiteral("main"));
+    });
+
+    // Re-arm the scale reconnect when the simulated scale is switched OFF.
+    // setScaleSimulated(true) stops the connection timer and drops the physical
+    // scale; nothing restarts either, so without this the real scale stays
+    // stranded until an app restart or a manual rescan — with no user-visible
+    // reason. Mirrors the R2 disabledChanged re-arm further down.
+    QObject::connect(&bleManager, &BLEManager::scaleSimulatedChanged,
+                     handlerScope.get(), [&bleManager, &settings, &scaleReconnectTimer,
+                                   &scaleReconnectAttempt, &reconnectDelays,
+                                   &scaleAutoReconnectSuppressed]() {
+        if (bleManager.isScaleSimulated())
+            return;  // rising edge — the teardown in setScaleSimulated is correct
+        // "sim:" is excluded because the simulator promotes its own synthetic
+        // address to primary when no real scale was ever paired — arming the
+        // ladder against it dials nonsense and ends in a "No Scale Found"
+        // dialog every 60 s. tryDirectConnectToScale guards this too; the check
+        // is repeated here so the ladder isn't started only to no-op.
+        if (!scaleAddressIsLadderDialable(settings.scaleAddress())
+            || scaleAutoReconnectSuppressed
+            || scaleReconnectTimer.isActive())
+            return;
+        scaleReconnectAttempt = 0;
+        scaleReconnectTimer.start(reconnectDelays[0]);
+        bleManager.scaleInfo(
+            QStringLiteral("Simulated scale switched off — resuming reconnect in %1 s")
+                .arg(reconnectDelays[0] / 1000),
+            QStringLiteral("main"));
+    });
+
+    // Re-arm the reconnect ladder on EVERY scale-connection failure, not just
+    // the first one. flowScaleFallback above is gated to fire once per saved-
+    // scale cycle (so the "No Scale Found" dialog doesn't re-pop on every
+    // retry), but the retry timer itself must survive the WiFi→BLE-fallback
+    // failure case: the scale-type change in that path stops scaleReconnectTimer
+    // (see "Scale reconnect: timer stopped due to scale type change" below),
+    // and without this signal there was no path to start it back up. The
+    // timer's own slot self-perpetuates once running. Mid-operation a running
+    // timer is left alone; otherwise the next attempt starts now (the hunt,
+    // below). The exception is the screensaver: no re-arm while it is up (past
+    // the keepScaleOn ramp), and its exit restarts the ramp.
+    QObject::connect(&bleManager, &BLEManager::scaleRetryNeeded, handlerScope.get(),
+                     [&settings, &bleManager, &scaleReconnectTimer,
+                      &reconnectDelays, &scaleAutoReconnectSuppressed, &screensaverManager,
+                      &machineState, &scaleHunting, scaleRampRunsUnderScreensaver]() {
+        if (!scaleAddressIsLadderDialable(settings.scaleAddress())) return;
+        if (scaleAutoReconnectSuppressed) return;
+        // Hunt: outside an operation the next attempt starts as this one fails, so
+        // a scale switched on at any moment is seen within one attempt (the R2
+        // hunt's shape). Mid-operation the spaced ramp stands, so a new scan is
+        // not started against the DE1 link. A wifi: scale is included: each
+        // chained attempt re-dials it, and a saved BLE scale can stand in via the
+        // fallback scan. Suspended, not merely inactive: a desktop app is inactive
+        // whenever another window has focus. Both emit sites of this signal sit
+        // behind the 20 s attempt timeout (BLEManager::onScaleConnectionTimeout),
+        // which is what keeps the chain from spinning.
+        const bool hunt = !machineState.isOperating() && !screensaverManager.screensaverActive()
+            && bleManager.isBluetoothAvailable()
+            && QGuiApplication::applicationState() != Qt::ApplicationSuspended;
+        // INFO on the edge: a submitted log has to show which cadence was running.
+        if (hunt != scaleHunting) {
+            scaleHunting = hunt;
+            bleManager.scaleInfo(hunt
+                ? QStringLiteral("Scale not found — scanning back-to-back while the machine is idle")
+                : QStringLiteral("Scale not found — retries spaced (operation running, app in "
+                                 "background or Bluetooth off)"),
+                QStringLiteral("main"));
+        }
+        if (scaleReconnectTimer.isActive()) {
+            if (hunt)
+                scaleReconnectTimer.start(0);
+            return;
+        }
+        // A scan that was in flight when the screensaver started ends here.
+        if (screensaverManager.screensaverActive() && !scaleRampRunsUnderScreensaver()) {
+            bleManager.scaleInfo(QStringLiteral("Scale not found; reconnect paused until the "
+                                                "screensaver closes"),
+                                 QStringLiteral("main"));
+            return;
+        }
+        if (hunt) {
+            scaleReconnectTimer.start(0);
+            return;
+        }
+        scaleReconnectTimer.start(reconnectDelays.back());
+        bleManager.scaleInfo(QStringLiteral("Scheduling reconnect in %1 s (retry after failure)")
+                                 .arg(reconnectDelays.back() / 1000),
+                             QStringLiteral("main"));
+    });
+
+    // Every "a scale might be here now" event restarts the ladder through here.
+    // The gates were previously spelled out at each site and had drifted: four
+    // tested the `usb:` prefix instead of scaleAddressIsLadderDialable(), which
+    // also excludes the simulator's `sim:` entry, so they armed a ladder the
+    // first tick permanently terminates. Callers that mean "the user is back"
+    // clear scaleAutoReconnectSuppressed before calling; that is a judgement
+    // about intent, not a gate, so it stays with them.
+    QObject::connect(&bleManager, &BLEManager::scaleReconnectRampRestartRequested,
+                     handlerScope.get(),
+                     [&settings, &physicalScale, &bleManager, &scaleReconnectTimer,
+                      &scaleReconnectAttempt, &reconnectDelays, &scaleHunting,
+                      &scaleAutoReconnectSuppressed](const QString& reason,
+                                                     int firstDelayMs) {
+        if (physicalScale && physicalScale->isConnected()) return;
+        if (!scaleAddressIsLadderDialable(settings.scaleAddress())) return;
+        if (scaleAutoReconnectSuppressed) {
+            // DEBUG: the screensaver usually closes BECAUSE the DE1 woke, a few
+            // ms before the wake handler clears the hold and logs the restart.
+            DIAG_DEBUG(SCALE, "main") << reason << "- scale reconnect held until the DE1 wakes";
+            return;
+        }
+        const int delayMs = firstDelayMs >= 0 ? firstDelayMs : reconnectDelays[0];
+        scaleReconnectAttempt = 0;
+        scaleHunting = false;
+        scaleReconnectTimer.start(delayMs);
+        bleManager.scaleInfo(QStringLiteral("%1 — restarting scale reconnect ramp, first retry in %2 ms")
+                                 .arg(reason).arg(delayMs),
+                             QStringLiteral("main"));
+    });
+
+    // === Proactive switch-back to the WiFi primary scale ===
+    // When the saved primary is a WiFi scale but we're currently on the BLE
+    // backup (the WiFi->BLE fallback connected after WiFi was unreachable),
+    // periodically check — only while the machine is idle (idle page, never
+    // mid-shot) — whether the WiFi scale is reachable again, and hop back if so.
+    // The check (BLEManager::probeWifiPrimaryReachable → a WebSocket HDS-identity
+    // probe against ws://<cached-ip>/snapshot, requiring a valid HDS frame
+    // within ~3.5 s) is non-disruptive: it never touches the live BLE link, so
+    // a failed check leaves the working backup untouched. A bare TCP-open on
+    // port 80 was the old check; it false-positived against any LAN device on
+    // 80 and triggered the WiFi↔BLE thrash in #1281. This is genuine periodic
+    // polling (for an external availability change), not a timer-as-guard.
+    QTimer wifiPreferTimer;
+    constexpr int kWifiPreferIntervalMs = 30000;  // re-check every 30 s while armed
+
+    // Armed only on the WiFi-primary / BLE-backup combination AND while the
+    // machine is in a non-brewing phase. "Non-brewing" = Disconnected (no DE1,
+    // i.e. scale-only debugging), Sleep, Idle, Ready; ANY other phase (Heating,
+    // EspressoPreheating, Preinfusion, Pouring, Ending, Steaming, HotWater,
+    // Flushing, Refill, Descaling, Cleaning) blocks the switch so the scale is
+    // never disrupted mid-operation.
+    auto onWifiBackupAndIdle = [&settings, &physicalScale, &machineState]() -> bool {
+        if (!scaleAddressIsWifi(settings.scaleAddress()))
+            return false;                                  // primary isn't WiFi
+        if (!physicalScale || !physicalScale->isConnected())
+            return false;                                  // nothing connected → reconnect machinery owns it
+        if (physicalScale->type() == ScaleTypeIds::scaleTypeId(ScaleType::DecentScaleWifi))
+            return false;                                  // already on the WiFi primary
+        switch (machineState.phase()) {
+        case MachineState::Phase::Disconnected:
+        case MachineState::Phase::Sleep:
+        case MachineState::Phase::Idle:
+        case MachineState::Phase::Ready:
+            return true;
+        default:
+            return false;                                  // brewing / active — don't switch
+        }
+    };
+
+    QObject::connect(&wifiPreferTimer, &QTimer::timeout,
+                     [&settings, &bleManager, onWifiBackupAndIdle]() {
+        if (!onWifiBackupAndIdle()) return;
+        const QString hostname = settings.scaleAddress().mid(QStringLiteral("wifi:").size());
+        const QString cachedIp = settings.network()->wifiScaleIp(hostname);
+        if (cachedIp.isEmpty()) return;  // no cheap probe target (mDNS is unreliable here) — skip this cycle
+        bleManager.probeWifiPrimaryReachable(cachedIp);
+    });
+    wifiPreferTimer.start(kWifiPreferIntervalMs);
+
+    QObject::connect(&bleManager, &BLEManager::wifiPrimaryReachable,
+                     [&bleManager, onWifiBackupAndIdle](bool reachable) {
+        if (!reachable) return;
+        // Re-validate: up to ~3 s elapsed during the probe, so state may have
+        // changed (a shot started, the user picked a scale, WiFi already back…).
+        if (!onWifiBackupAndIdle()) return;
+        bleManager.switchToWifiPrimary();
+    });
+
+    // DE1 auto-reconnect after disconnect. Matches de1app behaviour: on Android it
+    // retries essentially forever (99999999 attempts) because the DE1 may be in deep
+    // sleep and take a while to become reachable. We use backoff: 5s, 30s, then 60s
+    // repeated for the first 12 attempts (5s + 30s + 10×60s ≈ 10.5 min), then drop to
+    // a slow background retry that continues indefinitely.
+    //
+    // We deliberately do NOT give up permanently (#1309): the original code stopped
+    // after 12 attempts, which left a DE1 unreachable for ~22h in a real log — a
+    // screensaver/screen-tap wake fired one connect but couldn't restart the dead
+    // ladder. A slow forever-retry costs one connect attempt per 5 min (negligible)
+    // and (a) reconnects a DE1 that was simply powered off for >10 min and (b) keeps
+    // the BLE-stack-wedge detector fed so its adapter power-cycle stays viable.
+    constexpr int kDE1MaxReconnectAttempts = 12;     // 5s + 30s + 10*60s = ~10.5 min of fast retries
+    constexpr int kDE1SlowReconnectMs = 5 * 60 * 1000;  // then every 5 min, forever
+
+    QObject::connect(&de1ReconnectTimer, &QTimer::timeout,
+                     [&bleManager, &de1Device, &settings, &de1ReconnectAttempt, &de1ReconnectTimer]() {
+        if (settings.machineAddress().isEmpty()) {
+            // de1ReconnectTimer is single-shot, so this return does not re-arm —
+            // the ladder is permanently dead from here. Was a bare qDebug,
+            // invisible to a [DE1] search; the scale ladder's equivalent lines
+            // were converted, this one was missed.
+            bleManager.de1Info(QStringLiteral(
+                "DE1 reconnect: no saved DE1 address, stopping retries"),
+                QStringLiteral("main"));
+            return;
+        }
+        if (de1Device.isConnected() || de1Device.isConnecting()) {
+            bleManager.de1Info(QStringLiteral(
+                "DE1 reconnect: already connected/connecting, stopping retries"),
+                QStringLiteral("main"));
+            return;
+        }
+        // Clamp the counter at the cap so it doesn't grow without bound across
+        // days of slow retries; once capped we stay on the slow tier. Track
+        // whether THIS tick is the one that reached the cap: the counter stops
+        // moving once capped, so an uncorrected `==` check below would be true on
+        // every slow tick forever rather than once.
+        const bool justHitCap = de1ReconnectAttempt < kDE1MaxReconnectAttempts
+                                 && ++de1ReconnectAttempt == kDE1MaxReconnectAttempts;
+        bleManager.de1Debug(QStringLiteral("DE1 reconnect: attempt %1 of %2")
+                                 .arg(de1ReconnectAttempt).arg(kDE1MaxReconnectAttempts),
+                             QStringLiteral("main"));
+        bleManager.tryDirectConnectToDE1();
+
+        if (de1ReconnectAttempt < kDE1MaxReconnectAttempts) {
+            // 30s after first attempt, 60s for all subsequent
+            // (the initial 5s delay before attempt 1 is set by connectedChanged)
+            int delay = de1ReconnectAttempt == 1 ? 30000 : 60000;
+            de1ReconnectTimer.start(delay);
+        } else {
+            if (justHitCap) {
+                // Announce the one crossing, not every slow cycle — mirrors the
+                // scale ladder's identical crossing (main.cpp,
+                // scaleReconnectTimer handler). WARN is what makes the crossing
+                // findable in a submitted log — without it, a machine gone for
+                // 10+ minutes reads as a ladder that silently died.
+                bleManager.de1Warn(QStringLiteral(
+                    "DE1 still absent after %1 attempts — slowing retries to every %2 min")
+                        .arg(de1ReconnectAttempt).arg(kDE1SlowReconnectMs / 60000),
+                    QStringLiteral("main"));
+            }
+            de1ReconnectTimer.start(kDE1SlowReconnectMs);
+        }
+    });
+
+    // When the DE1 starts connecting, mark it as active so that if the
+    // attempt fails before reaching connected, connectedChanged will still
+    // recognise the inactive transition and arm the retry timer.
+    QObject::connect(&de1Device, &DE1Device::connectingChanged,
+                     [&de1Device, &de1WasActive]() {
+        if (de1Device.isConnecting()) de1WasActive = true;
+    });
+
+    // Feed DE1 controller faults to the BLE-stack-wedge detector (#1309). This
+    // is separate from the dual-HIGH scale-transport wiring below (which only
+    // exists when a BLE scale is present) — the wedge detector must hear faults
+    // regardless of whether a scale transport was ever created.
+    QObject::connect(&de1Device, &DE1Device::de1LinkFault,
+                     &bleManager, &BLEManager::onDe1LinkFault);
+
+    // Surface DE1 BLE errors to the UI. DE1Device::errorOccurred had no consumer,
+    // so DE1 connection problems (incl. the "try toggling Bluetooth off/on" hint)
+    // never reached the user — only scale/scan errors did. onDe1Error debounces
+    // so the reconnect ladder doesn't re-pop the same dialog. (#1309)
+    QObject::connect(&de1Device, &DE1Device::errorOccurred,
+                     &bleManager, &BLEManager::onDe1Error);
+
+    // After an automatic adapter power-cycle clears a wedged stack, reset the
+    // DE1 reconnect budget and kick a fresh attempt immediately — mirrors the
+    // AutoWake re-arm path. Without this the slow-tier timer would wait up to
+    // 5 min before retrying a stack that's now healthy. (#1309)
+    QObject::connect(&bleManager, &BLEManager::bleStackRecovered,
+                     [&de1Device, &de1ReconnectTimer, &de1ReconnectAttempt]() {
+        if (de1Device.isConnected() || de1Device.isConnecting()) return;
+        de1ReconnectAttempt = 0;
+        de1ReconnectTimer.start(500);
+        DIAG_DEBUG(DE1, "main") << "DE1 reconnect: BLE stack recovered — restarting reconnect ladder";
+    });
+
+    // When DE1 connects or disconnects, manage reconnect timer.
+    //
+    // connectedChanged() can fire multiple times while the device is already
+    // in the disconnected state — DE1Device::disconnect() emits it
+    // unconditionally, and our reconnect path calls disconnect() on the old
+    // transport before spinning up a new one. Without edge-tracking, every
+    // spurious emission would reset de1ReconnectAttempt=0 and re-arm the 5 s
+    // timer, scrambling the backoff schedule. de1WasActive is set true by
+    // connectingChanged when a connection attempt starts and reset to false
+    // here on each active→inactive transition, so startup failures
+    // (connecting→failed without ever reaching connected) also arm the retry
+    // timer while spurious inactive→inactive emissions are still suppressed.
+    QObject::connect(&de1Device, &DE1Device::connectedChanged,
+                     [&de1Device, &de1ReconnectTimer, &de1ReconnectAttempt, &settings, &de1WasActive, &bleManager
+#ifndef Q_OS_IOS
+                     , &usbManager
+#endif
+                     ]() {
+        const bool isConnected = de1Device.isConnected();
+        const bool isActive = isConnected || de1Device.isConnecting();
+        // Feed the BLE-stack-wedge detector the DE1 link state (#1309).
+        bleManager.noteDe1Connected(isConnected);
+        if (!de1WasActive && !isActive) {
+            return;  // Spurious inactive→inactive emission — ignore
+        }
+        const bool wasActive = de1WasActive;
+        de1WasActive = isActive;
+
+        if (isConnected) {
+            // Just transitioned to connected: stop any pending reconnect attempts.
+            de1ReconnectTimer.stop();
+            de1ReconnectAttempt = 0;
+        } else if (wasActive) {
+            // Was active (connecting or connected), now neither: start
+            // auto-reconnect if we have a saved address.
+#ifndef Q_OS_IOS
+            if (usbManager.isDe1Connected()) {
+                // Don't try BLE reconnect if USB is handling the DE1
+                return;
+            }
+#endif
+            if (settings.machineAddress().isEmpty()) {
+                DIAG_DEBUG(DE1, "main") << "DE1 reconnect: no saved address — skipping auto-reconnect";
+            } else if (!de1ReconnectTimer.isActive()) {
+                // Distinguish a fresh disconnect (attempt counter is 0) from a
+                // mid-schedule retry attempt that failed (counter > 0). Resetting
+                // unconditionally meant every failed retry restarted the 5 s
+                // schedule, so the backoff never escalated past attempt 1 — and
+                // the "retries exhausted" branch was dead code because the
+                // counter never reached the cap (see issue #1309).
+                //
+                // After the fix this branch is the primary scheduler for every
+                // retry after the first: on each failed attempt the timer-
+                // callback's "already connecting" early-return (line 1430-1432)
+                // bails without rescheduling, then a later connecting→disconnected
+                // emission lands here while the timer is idle and advances the
+                // schedule to the next backoff step.
+                if (de1ReconnectAttempt == 0) {
+                    de1ReconnectTimer.start(5000);  // Fresh disconnect — first retry after 5s
+                    DIAG_DEBUG(DE1, "main") << "DE1 reconnect: scheduled first retry in 5000 ms";
+                } else if (de1ReconnectAttempt < kDE1MaxReconnectAttempts) {
+                    const int delay = de1ReconnectAttempt == 1 ? 30000 : 60000;
+                    de1ReconnectTimer.start(delay);
+                    DIAG_DEBUG(DE1, "main") << "DE1 reconnect: attempt" << de1ReconnectAttempt
+                             << "failed, next retry in" << delay << "ms";
+                } else {
+                    // Don't give up permanently (#1309) — fall to the slow tier.
+                    de1ReconnectTimer.start(kDE1SlowReconnectMs);
+                    DIAG_DEBUG(DE1, "main") << "DE1 reconnect: fast retries exhausted — slow background retry in"
+                             << kDE1SlowReconnectMs << "ms";
+                }
+            }
+        }
+    });
+
+    // Connect to any supported scale when discovered
+    QObject::connect(&bleManager, &BLEManager::scaleDiscovered, handlerScope.get(),
+                     [&physicalScale, &flowScale, &machineState, &mainController, &bleManager, &settings, &timingController, &de1Device, &weightProcessor, &scaleProxy, &scaleReconnectTimer, &scaleReconnectAttempt, &scaleAutoReconnectSuppressed, &scaleLcdRestorePending, &screensaverManager
+                     // By value: this lambda outlives nothing, but the scale
+                     // connection it makes below needs the same lifetime guard.
+                     , handlerScopePtr = handlerScope.get()
+#ifndef Q_OS_IOS
+                     , &usbScaleManager
+#endif
+                     ](const QBluetoothDeviceInfo& device, const QString& type) {
+        // A fresh mDNS resolution BLEManager just handed us (see BLEManager::
+        // pendingWifiResolvedIp()) is passed straight to connectToHost() as its
+        // preferredIp — dialed first, but never written to the persisted IP
+        // cache. Keeping unverified resolutions out of the cache is what stops a
+        // stale scan-time IP from clobbering a fresher one an actual connection
+        // already persisted; the cache is now written only by verified connects
+        // (DecentScaleWifi::onRecognizedAsHds) and eviction.
+#ifndef Q_OS_IOS
+        // Tear down an active USB scale FIRST (before touching physicalScale).
+        // The single-scale invariant covers BLE/WiFi via physicalScale, but the
+        // USB scale lives in UsbScaleManager — without this, switching from a
+        // connected USB scale to BLE/WiFi would leave BOTH feeding weight into
+        // WeightProcessor/MainController. disconnectScale() keeps the USB scale
+        // AVAILABLE (it's still plugged in) — we're switching away, not losing it.
+        if (usbScaleManager.scale()) {
+            QObject::disconnect(usbScaleManager.scale(), &ScaleDevice::weightChanged,
+                                &mainController, &MainController::onScaleWeightChanged);
+            QObject::disconnect(usbScaleManager.scale(), &ScaleDevice::weightSampleReceived,
+                                &weightProcessor, &WeightProcessor::processWeight);
+            usbScaleManager.disconnectScale();
+        }
+#endif
+        // Single-scale invariant: at most one physical scale is connected at a
+        // time (a different scale type replaces the old one below, never runs
+        // alongside it). This caps concurrent forced-HIGH BLE links at two —
+        // DE1 + scale — the proven-good PR Kulitorum/Decenza#1097 baseline. Connecting a second
+        // scale simultaneously would make it a third HIGH link and reintroduce
+        // the GATT-scheduler contention that tears the weakest link down (the
+        // refractometer fix relies on this same 2-link ceiling). If
+        // simultaneous multi-scale is ever added, the non-primary link must
+        // stay BALANCED / unmanaged like the refractometer transport.
+        if (physicalScale && physicalScale->isConnected()) {
+            return;
+        }
+
+        // Only stop scan if DE1 is already connected/connecting
+        if (de1Device.isConnected() || de1Device.isConnecting()) {
+            bleManager.stopScan();
+        }
+
+        // If we already have a scale object, check if it's the same type
+        if (physicalScale) {
+            // Compare types via enum to handle format differences (e.g., "decent" vs "Decent Scale")
+            if (ScaleFactory::resolveScaleType(physicalScale->type()) != ScaleFactory::resolveScaleType(type)) {
+                DIAG_DEBUG(SCALE, "main") << "Scale type changed from" << physicalScale->type() << "to" << type << "- creating new scale";
+                // IMPORTANT: Clear all references before deleting the scale to prevent dangling pointers
+                machineState.setScale(&flowScale);  // Switch to FlowScale first
+                timingController.setScale(&flowScale);
+                // Reconnect FlowScale to WeightProcessor temporarily
+                QObject::connect(&flowScale, &ScaleDevice::weightSampleReceived,
+                                 &weightProcessor, &WeightProcessor::processWeight);
+                bleManager.setScaleDevice(nullptr);  // Clear BLEManager's reference
+                physicalScale.reset();  // Now safe to delete old scale
+                if (scaleReconnectTimer.isActive()) {
+                    bleManager.scaleInfo(QStringLiteral("Reconnect stopped (scale type changed)"),
+                                         QStringLiteral("main"));
+                }
+                scaleReconnectTimer.stop();
+                // NOTE: scaleReconnectAttempt is deliberately NOT cleared here.
+                // A type change is not evidence the scale is coming back, and
+                // this handler runs SYNCHRONOUSLY inside a reconnect tick —
+                // BLEManager::tryDirectConnectToScale() emits scaleDiscovered({},
+                // "decent-wifi") directly (blemanager.cpp), before the tick
+                // increments the counter. With a wifi: primary and a BLE Decent
+                // scale in range that never completes a connect, the type
+                // alternates "decent-wifi" ↔ "decent" every cycle, so clearing
+                // here would re-log "Auto-reconnect attempt 1" on every cycle.
+                // The user-driven cases that DO warrant a clear go through
+                // disconnectScaleRequested, which clears it there.
+            } else {
+                // Re-wire to use physical scale
+                machineState.setScale(physicalScale.get());
+                timingController.setScale(physicalScale.get());
+                scaleProxy.setTarget(physicalScale.get());
+                if (type == ScaleTypeIds::scaleTypeId(ScaleType::DecentScaleWifi)) {
+                    if (auto* wifi = qobject_cast<DecentScaleWifi*>(physicalScale.get())) {
+                        // (Re-wire each time — cheap, and ensures the callbacks
+                        // reference the live Settings instance.)
+                        wireWifiScaleDriver(wifi, settings, bleManager);
+                        // If BLEManager just resolved this hostname (a scan
+                        // selection), hand the IP to connectToHost() as its
+                        // preferredIp so it dials the known IP directly instead
+                        // of asking Qt's resolver to re-resolve ".local".
+                        // Use the endpoint the scale advertised over DNS-SD
+                        // rather than assuming :80/snapshot (defaults to that
+                        // when discovery had no TXT data).
+                        wifi->setEndpoint(bleManager.pendingWifiPort(),
+                                          bleManager.pendingWifiPath());
+                        wifi->connectToHost(bleManager.pendingWifiHostname(),
+                                            bleManager.pendingWifiResolvedIp());
+                    }
+                } else {
+                    physicalScale->connectToDevice(device);
+                }
+                return;
+            }
+        }
+
+        // Create new scale object
+        physicalScale = ScaleFactory::createScale(device, type);
+        if (!physicalScale) {
+            DIAG_WARN(SCALE, "main") << "Failed to create scale for type:" << type;
+            return;
+        }
+
+        // Save scale to known scales and set as primary. For WiFi entries the
+        // identifier is the prefixed hostname; for BLE it's the MAC/UUID.
+        const bool isWifi = (type == ScaleTypeIds::scaleTypeId(ScaleType::DecentScaleWifi));
+        const QString hostname = isWifi ? bleManager.pendingWifiHostname() : QString();
+        const QString deviceId = isWifi ? (QStringLiteral("wifi:") + hostname)
+                                         : getDeviceIdentifier(device);
+        // Hostname-derived label rather than a generic one — with two WiFi
+        // scales paired, one identical name for both makes Known Devices
+        // useless. See pendingWifiDisplayName() for why the DNS-SD instance
+        // name is deliberately NOT what this is built from.
+        const QString displayName = isWifi ? bleManager.pendingWifiDisplayName()
+                                            : device.name();
+        // Manual "Add WiFi Scale" entries DEFER persistence until the WS
+        // endpoint actually validates as an HDS scale. Without this, a typo or
+        // a random LAN host (e.g. the user typing their router's IP) would be
+        // silently saved as the primary, then dialed on every reconnect /
+        // proactive switch-back cycle. The commit happens when
+        // DecentScaleWifi::recognizedAsHds fires (first valid HDS frame); if
+        // BLEManager's connection timer trips first, manualWifiValidationFailed
+        // is emitted to the QML layer instead and nothing is persisted. (#1281)
+        const bool deferPersistence = isWifi && bleManager.isManualWifiConnect();
+        // BUT preserve the user's chosen primary when this connect is a
+        // temporary WiFi→BLE fallback: BLEManager's m_wifiFallbackToBleActive
+        // is true only between the WiFi-timeout fallback trigger and the next
+        // successful connect. In that window we connect to the discovered BLE
+        // Decent scale but DON'T rewrite the saved primary address — the user
+        // explicitly chose WiFi and the fallback is meant to be temporary, so
+        // the next app launch should retry WiFi first.
+        const bool isFallbackConnect = !isWifi && bleManager.isWifiFallbackToBleActive();
+        if (deferPersistence) {
+            bleManager.scaleInfo(
+                QStringLiteral("Validating manual WiFi scale at %1 — deferring persistence "
+                               "until it answers as an HDS (%2)").arg(hostname, deviceId),
+                QStringLiteral("main"));
+        } else {
+            // Always track this scale in the known-scales list (useful for the
+            // multi-scale picker and per-scale state).
+            settings.addKnownScale(deviceId, type, displayName);
+            if (!isFallbackConnect) {
+                settings.setPrimaryScale(deviceId);
+                bleManager.setSavedScaleAddress(deviceId, type, displayName);
+            } else {
+                bleManager.scaleInfo(
+                    QStringLiteral("WiFi fallback connected to %1 — saved WiFi primary %2 preserved")
+                        .arg(displayName, settings.scaleAddress()),
+                    QStringLiteral("main"));
+            }
+        }
+
+        // Switch MachineState and TimingController to use physical scale instead of FlowScale
+        machineState.setScale(physicalScale.get());
+        timingController.setScale(physicalScale.get());
+
+        // Connect scale to BLEManager for auto-scan control
+        bleManager.setScaleDevice(physicalScale.get());
+
+        // Forward scale-level error messages to BLEManager::errorOccurred, which
+        // main.qml wires to the error dialog. Transient connect-failures are log-only
+        // inside the drivers — BLE transport/service-discovery errors (PR Kulitorum/Decenza#1285, PR Kulitorum/Decenza#1292)
+        // and WiFi mDNS-miss / host-not-found / 503 retries (PR Kulitorum/Decenza#1253). What reaches
+        // here is an ACTIONABLE error worth showing unconditionally — e.g. WiFi 503
+        // "Another client is connected to the scale" that the retry loop can't
+        // resolve, or a measurement-side condition from a refractometer ("No liquid
+        // detected", "Beyond range").
+        QObject::connect(physicalScale.get(), &ScaleDevice::errorOccurred,
+                         &bleManager, &BLEManager::errorOccurred);
+
+        // Disconnect FlowScale from graph and weight processor
+        QObject::disconnect(&flowScale, &ScaleDevice::weightChanged,
+                            &mainController, &MainController::onScaleWeightChanged);
+        QObject::disconnect(&flowScale, &ScaleDevice::weightSampleReceived,
+                            &weightProcessor, &WeightProcessor::processWeight);
+
+        // Connect physical scale weight updates to MainController (permanent for scale lifetime).
+        // WeightProcessor connection is managed by the connectedChanged lambda below
+        // to avoid double-connecting (once here + once on connect event).
+        QObject::connect(physicalScale.get(), &ScaleDevice::weightChanged,
+                         &mainController, &MainController::onScaleWeightChanged);
+
+        // Connection-priority backoff (#1093/#1176): feed the scale-agnostic
+        // transport its two detection inputs. de1Device re-emits de1LinkFault
+        // (stable across DE1 transport swaps; same thread as the transport).
+        // WeightProcessor lives on the weight worker thread, so its
+        // scaleFeedStalled → transport slot is cross-thread: pin it
+        // Qt::QueuedConnection explicitly (it must run on the transport's main
+        // thread, where it touches the QLowEnergyController) rather than rely
+        // on AutoConnection resolving correctly — a future moveToThread reorder
+        // must not silently turn this into a direct cross-thread call. Both
+        // connections use the transport as context, so they auto-disconnect
+        // when it is destroyed on a scale-type change. No-op for transports
+        // that keep the base virtual no-ops (e.g. CoreBluetooth / iOS-macOS).
+        //
+        // de1LinkFault is intentionally left AutoConnection (NOT pinned): it
+        // is same-thread today (DirectConnection), and if the DE1 layer is
+        // ever moved to a worker thread, AutoConnection self-corrects to
+        // Queued — pinning DirectConnection here would instead make that a
+        // silent unsafe cross-thread call. The asymmetry with the pinned
+        // scaleFeedStalled below is deliberate (that one is genuinely
+        // cross-thread and must be Queued).
+        if (ScaleBleTransport* scaleTransport = physicalScale->bleTransport()) {
+            QObject::connect(&de1Device, &DE1Device::de1LinkFault,
+                             scaleTransport, &ScaleBleTransport::onDe1LinkFault);
+            QObject::connect(&weightProcessor, &WeightProcessor::scaleFeedStalled,
+                             scaleTransport, &ScaleBleTransport::onScaleFeedStalled,
+                             Qt::QueuedConnection);
+            // Recovery counterpart (observe-mode change). Same cross-thread
+            // pinning rationale as scaleFeedStalled above (WeightProcessor is
+            // on the weight worker thread; the slot touches the transport's
+            // main-thread state) — must be Queued, not AutoConnection.
+            QObject::connect(&weightProcessor, &WeightProcessor::scaleFeedResumed,
+                             scaleTransport, &ScaleBleTransport::onScaleFeedResumed,
+                             Qt::QueuedConnection);
+            // Confirmed-stall trigger (epoch-scope-and-stall-confirm). This —
+            // not scaleFeedStalled — is what drives the enforce backoff now.
+            // Same cross-thread Queued pinning rationale as above.
+            QObject::connect(&weightProcessor, &WeightProcessor::scaleFeedStallConfirmed,
+                             scaleTransport, &ScaleBleTransport::onScaleFeedStallConfirmed,
+                             Qt::QueuedConnection);
+            // #1176: tell the transport when an espresso cycle is in progress
+            // (EspressoPreheating → shot end) so a triggered backoff DEFERS
+            // the skip-HIGH teardown instead of bouncing the scale mid-shot;
+            // an idle backoff still reconnects immediately. MachineState and
+            // the transport are both main-thread → AutoConnection (same
+            // rationale as the de1LinkFault wiring above). scaleTransport is
+            // the context object so these auto-disconnect on a scale-type
+            // change. No-op for transports keeping the base virtual no-op.
+            QObject::connect(&machineState, &MachineState::espressoCycleStarted,
+                             scaleTransport, [scaleTransport]() {
+                                 scaleTransport->setShotActive(true);
+                             });
+            QObject::connect(&machineState, &MachineState::shotEnded,
+                             scaleTransport, [scaleTransport]() {
+                                 scaleTransport->setShotActive(false);
+                             });
+        }
+
+        // When physical scale connects/disconnects, switch between physical and FlowScale
+        QObject::connect(physicalScale.get(), &ScaleDevice::connectedChanged, handlerScopePtr,
+                         [&physicalScale, &flowScale, &machineState, &bleManager, &mainController, &timingController, &weightProcessor, &scaleProxy, &scaleReconnectTimer, &scaleReconnectAttempt, &settings, &scaleAutoReconnectSuppressed, &scaleLcdRestorePending, &screensaverManager]() {
+            if (physicalScale && physicalScale->isConnected()) {
+                // Scale connected - stop any pending reconnect attempts
+                scaleReconnectTimer.stop();
+                scaleReconnectAttempt = 0;
+                // A fresh successful connect clears any deliberate-disconnect
+                // suppression (e.g. scale reconnected during DE1 sleep via a
+                // manual scan).
+                scaleAutoReconnectSuppressed = false;
+                // A scale that connects while the screensaver is up keeps its
+                // display off: the driver's handshake skips its display-on steps,
+                // and screensaver exit or DE1 wake calls wake(). The screensaver,
+                // not the DE1 phase, because it is what says nobody is looking: a
+                // scale switched on after a tap stays lit even if the DE1 is
+                // still asleep or unreachable.
+                const bool holdDisplay = screensaverManager.screensaverActive();
+                physicalScale->setDisplayHeldOff(holdDisplay);
+                if (holdDisplay) {
+                    DIAG_DEBUG(SCALE, "main") << "Scale connected under the screensaver - keeping its display off";
+                    physicalScale->disableLcd();
+                } else if (scaleLcdRestorePending) {
+                    // BT keepScaleOn=true: the LCD was turned off at DE1 sleep and
+                    // the link dropped before the wake handler could restore it.
+                    DIAG_DEBUG(SCALE, "main") << "Scale reconnected with LCD-restore pending - waking";
+                    physicalScale->wake();
+                    scaleLcdRestorePending = false;
+                }
+                // Scale connected - use physical scale
+                machineState.setScale(physicalScale.get());
+                timingController.setScale(physicalScale.get());
+                scaleProxy.setTarget(physicalScale.get());
+                // Disconnect FlowScale from graph and weight processor
+                QObject::disconnect(&flowScale, &ScaleDevice::weightChanged,
+                                    &mainController, &MainController::onScaleWeightChanged);
+                QObject::disconnect(&flowScale, &ScaleDevice::weightSampleReceived,
+                                    &weightProcessor, &WeightProcessor::processWeight);
+                // Connect physical scale to weight processor
+                QObject::connect(physicalScale.get(), &ScaleDevice::weightSampleReceived,
+                                 &weightProcessor, &WeightProcessor::processWeight);
+                // Notify MQTT
+                if (mainController.mqttClient()) {
+                    mainController.mqttClient()->onScaleConnectedChanged(true);
+                }
+                settings.setUseFlowScale(false);
+                DIAG_DEBUG(SCALE, "main") << "Scale connected - switched to physical scale, disabled FlowScale";
+            } else if (physicalScale) {
+                // Scale disconnected - fall back to FlowScale
+                machineState.setScale(&flowScale);
+                timingController.setScale(&flowScale);
+                scaleProxy.setTarget(&flowScale);
+                // Disconnect physical scale from weight processor
+                QObject::disconnect(physicalScale.get(), &ScaleDevice::weightSampleReceived,
+                                    &weightProcessor, &WeightProcessor::processWeight);
+                // Reconnect FlowScale to graph and weight processor
+                QObject::connect(&flowScale, &ScaleDevice::weightChanged,
+                                 &mainController, &MainController::onScaleWeightChanged);
+                QObject::connect(&flowScale, &ScaleDevice::weightSampleReceived,
+                                 &weightProcessor, &WeightProcessor::processWeight);
+                // Notify MQTT
+                if (mainController.mqttClient()) {
+                    mainController.mqttClient()->onScaleConnectedChanged(false);
+                }
+                emit bleManager.scaleDisconnected();
+                DIAG_DEBUG(SCALE, "main") << "Scale disconnected - switched to FlowScale";
+                // Not while the DE1-sleep handler holds the reconnect (see
+                // scaleAutoReconnectSuppressed); its wake branch re-arms it.
+                if (scaleAutoReconnectSuppressed) {
+                    DIAG_DEBUG(SCALE, "main") << "Scale disconnect was deliberate (DE1-sleep) - auto-reconnect suppressed until DE1 wakes";
+                } else {
+                    bleManager.requestScaleReconnectRampRestart(
+                        QStringLiteral("Scale disconnected, weight now estimated from flow"));
+                }
+            }
+        });
+
+        // Point the QML-facing proxy at the scale that was just created
+        scaleProxy.setTarget(physicalScale.get());
+
+        // Connect to the scale. WiFi takes a hostname; BLE takes the device info.
+        if (isWifi) {
+            if (auto* wifi = qobject_cast<DecentScaleWifi*>(physicalScale.get())) {
+                // Wire the mDNS-resilience cache to Settings so a successful
+                // hostname connect persists the peer IP for next time.
+                wireWifiScaleDriver(wifi, settings, bleManager);
+                // For manual entries: commit the deferred persistence ONLY
+                // after the WS endpoint validates as HDS, and surface a
+                // user-visible failure if validation fails. Both connections
+                // are SingleShotConnection because the driver guarantees
+                // recognizedAsHds and recognitionFailed are mutually exclusive
+                // for a given attempt (recognitionTimer is stopped by
+                // onRecognizedAsHds, and the cached-IP fallback branch of
+                // onRecognitionTimeout doesn't emit recognitionFailed — only
+                // the terminal give-up branch does).
+                //
+                // Why this exists at all: the outer 20 s scale-connection timer
+                // in BLEManager is stopped at WS-connect time (it watches for
+                // "ever connected", not "recognized"), so when a manual entry's
+                // WS handshake succeeds but the endpoint sends no HDS frame in
+                // 5 s (a non-HDS WS server, a captive portal, a future bug),
+                // the manualWifiValidationFailed path through
+                // onScaleConnectionTimeout would never fire. Without the
+                // explicit recognitionFailed wiring below, the user would see
+                // the scale appear connected for ~5 s, then disappear, with no
+                // error and no opportunity to retry. (#1281 follow-up.)
+                if (deferPersistence) {
+                    QObject::connect(wifi, &DecentScaleWifi::recognizedAsHds,
+                                     &bleManager,
+                                     [&settings, &bleManager, deviceId, type, displayName, hostname]() {
+                        bleManager.scaleInfo(
+                            QStringLiteral("Manual WiFi scale at %1 validated as HDS — "
+                                           "committing persistence (%2)").arg(hostname, deviceId),
+                            QStringLiteral("main"));
+                        settings.addKnownScale(deviceId, type, displayName);
+                        settings.setPrimaryScale(deviceId);
+                        bleManager.setSavedScaleAddress(deviceId, type, displayName);
+                        emit bleManager.manualWifiValidationSucceeded(hostname);
+                    },
+                    Qt::SingleShotConnection);
+                    QObject::connect(wifi, &DecentScaleWifi::recognitionFailed,
+                                     &bleManager,
+                                     [&bleManager, hostname]() {
+                        bleManager.scaleWarn(
+                            QStringLiteral("Manual WiFi scale at %1 connected but did not "
+                                           "respond as HDS").arg(hostname),
+                            QStringLiteral("main"));
+                        emit bleManager.manualWifiValidationFailed(hostname);
+                        // The driver's onRecognitionTimeout aborts the WS
+                        // socket, but the DecentScaleWifi object itself stays
+                        // alive as `physicalScale` until something resets the
+                        // unique_ptr. Without this emit, that zombie disconnected
+                        // driver would survive the failed validation — and the
+                        // next reconnect-timer / scaleDiscovered tick would
+                        // re-route into the type-unchanged branch and re-dial
+                        // the unvalidated hostname against the same dead object.
+                        // disconnectScaleRequested's handler clears
+                        // BLEManager's reference and resets physicalScale, so
+                        // the next manual attempt starts from a clean slate.
+                        emit bleManager.disconnectScaleRequested();
+                    },
+                    Qt::SingleShotConnection);
+                }
+                // pendingWifiResolvedIp() carries a fresh mDNS resolution for a
+                // scan selection, the "Add WiFi Scale" dialog's "Use" button, or
+                // a saved-primary auto-match; it's dialed first as preferredIp
+                // (never cached until verified). Empty for manual-typed entries
+                // and cache-driven reconnects — those fall through to the cached
+                // IP / hostname-resolve path (see BLEManager call sites).
+                wifi->setEndpoint(bleManager.pendingWifiPort(), bleManager.pendingWifiPath());
+                wifi->connectToHost(hostname, bleManager.pendingWifiResolvedIp());
+            }
+        } else {
+            physicalScale->connectToDevice(device);
+        }
+    });
+
+    // Handle disconnect request when starting a new scan
+    QObject::connect(&bleManager, &BLEManager::disconnectScaleRequested, handlerScope.get(),
+                     [&physicalScale, &flowScale, &machineState, &scaleProxy, &mainController, &bleManager, &timingController, &weightProcessor, &scaleReconnectTimer, &scaleReconnectAttempt, &scaleAutoReconnectSuppressed, &wasInSleep, &scaleLcdRestorePending]() {
+        // Stop any pending auto-reconnect (user is deliberately scanning for a different scale)
+        scaleReconnectTimer.stop();
+        // User is selecting a new scale — clear any sleep-related state for
+        // the outgoing scale so the new scale's normal reconnect/LCD behaviour
+        // applies. Without this, a scan-during-sleep cycle would leave the
+        // wake handler armed for the replaced scale's address and the LCD-
+        // restore flag pointed at a (now-deleted) physicalScale instance.
+        scaleAutoReconnectSuppressed = false;
+        wasInSleep = false;
+        scaleLcdRestorePending = false;
+        scaleReconnectAttempt = 0;
+        if (physicalScale) {
+            DIAG_DEBUG(SCALE, "main") << "Disconnecting scale before scan";
+            // Switch to FlowScale first
+            machineState.setScale(&flowScale);
+            timingController.setScale(&flowScale);
+            scaleProxy.setTarget(&flowScale);
+            // Reconnect FlowScale to graph and weight processor (physical scale is being destroyed).
+            // Disconnect first to avoid duplicate connections if connectedChanged fires during reset().
+            QObject::disconnect(&flowScale, &ScaleDevice::weightChanged,
+                                &mainController, &MainController::onScaleWeightChanged);
+            QObject::disconnect(&flowScale, &ScaleDevice::weightSampleReceived,
+                                &weightProcessor, &WeightProcessor::processWeight);
+            QObject::connect(&flowScale, &ScaleDevice::weightChanged,
+                             &mainController, &MainController::onScaleWeightChanged);
+            QObject::connect(&flowScale, &ScaleDevice::weightSampleReceived,
+                             &weightProcessor, &WeightProcessor::processWeight);
+            // Notify MQTT that scale is disconnected
+            if (mainController.mqttClient()) {
+                mainController.mqttClient()->onScaleConnectedChanged(false);
+            }
+            // Clear BLEManager's reference before deleting
+            bleManager.setScaleDevice(nullptr);
+            // Now reset the physical scale
+            physicalScale.reset();
+        }
+    });
+
+    // === Refractometer (DiFluid R1 / R2) ===
+    // The `refractometer` unique_ptr itself is declared up with the engine —
+    // see the note there for why the order matters. The QML-facing proxy starts with no
+    // target, which is the normal state: a refractometer is only connected while the
+    // post-shot review page has it open.
+    RefractometerForeign::s_singletonInstance = &refractometerProxy;
+
+    // Restore saved refractometer address for auto-reconnect
+    if (!settings.savedRefractometerAddress().isEmpty()) {
+        bleManager.setSavedRefractometerAddress(settings.savedRefractometerAddress(),
+                                                 settings.savedRefractometerName());
+    }
+
+    QObject::connect(&bleManager, &BLEManager::refractometerDiscovered, handlerScope.get(),
+                     [&refractometer, &refractometerProxy, &bleManager, &settings](const QBluetoothDeviceInfo& device) {
+        bleManager.refractometerDebug(
+            QStringLiteral("Discovered %1 (existing instance=%2, connected=%3)")
+                .arg(getDeviceIdentifier(device),
+                     refractometer ? QString::number(reinterpret_cast<quintptr>(refractometer.get()), 16)
+                                    : QStringLiteral("none"),
+                     (refractometer && refractometer->isConnected()) ? QStringLiteral("true")
+                                                                     : QStringLiteral("false")),
+            QStringLiteral("main"));
+        if (refractometer && refractometer->isConnected()) {
+            if (getDeviceIdentifier(device) == settings.savedRefractometerAddress()) {
+                bleManager.refractometerDebug(
+                    QStringLiteral("Same device already connected — ignoring discovery (no churn)"),
+                    QStringLiteral("main"));
+                return;  // Same device already connected — nothing to do
+            }
+            // Different device selected — continue to cleanup + create
+        }
+
+        // Clean up old refractometer before replacing — disconnect first (emits
+        // signals while pointers are still valid), then clear raw pointer holders
+        if (refractometer) {
+            bleManager.refractometerDebug(
+                QStringLiteral("Tearing down previous instance=%1 (connected=%2) to recreate")
+                    .arg(QString::number(reinterpret_cast<quintptr>(refractometer.get()), 16),
+                         refractometer->isConnected() ? QStringLiteral("true") : QStringLiteral("false")),
+                QStringLiteral("main"));
+            refractometer->disconnectFromDevice();
+            bleManager.setRefractometerDevice(nullptr);
+            refractometerProxy.setTarget(nullptr);
+        }
+
+        // Create transport using the same platform selection as scales
+#if defined(Q_OS_IOS) || defined(Q_OS_MACOS)
+        auto* transport = new CoreBluetoothScaleBleTransport();
+#else
+        auto* transport = new QtScaleBleTransport();
+#endif
+        // Pick the driver by advertised name. R1 prefix is checked first because
+        // it's the strict prefix match; R2 is the broader heuristic.
+        if (DiFluidR1::isR1Device(device.name())) {
+            refractometer = std::make_unique<DiFluidR1>(transport);
+        } else {
+            refractometer = std::make_unique<DiFluidR2>(transport);
+        }
+        // INFO: the connect attempt starting is the user's story — it is what
+        // precedes either "Connected and ready for measurements" or silence. The
+        // instance address rides along because this is the line that pairs with a
+        // teardown above when churn happens.
+        bleManager.refractometerInfo(
+            QStringLiteral("Connecting to %1 (instance=%2)")
+                .arg(device.name(),
+                     QString::number(reinterpret_cast<quintptr>(refractometer.get()), 16)),
+            QStringLiteral("main"));
+        transport->setLinkRole(ScaleBleTransport::LinkRole::Refractometer);
+        refractometer->connectToDevice(device);
+
+        // Tell BLEManager about the live device (for isRefractometerConnected property)
+        bleManager.setRefractometerDevice(refractometer.get());
+
+        // Expose to QML
+        refractometerProxy.setTarget(refractometer.get());
+
+        // Save address for auto-reconnect
+        settings.setSavedRefractometerAddress(getDeviceIdentifier(device));
+        settings.setSavedRefractometerName(device.name());
+        bleManager.setSavedRefractometerAddress(getDeviceIdentifier(device), device.name());
+
+        // No logMessage forwarder. The R1_LOG/R2_INFO/R2_WARN macros already write
+        // each line to the system log carrying [Refractometer][BLE DiFluidRx], which
+        // is both what the connections view reads and what a user submits. This
+        // connection existed only to copy them into the private buffer.
+
+        // Surface actionable measurement errors ("No liquid detected", "Beyond
+        // range", …) to the error dialog, mirroring the physical scale's
+        // errorOccurred → BLEManager::errorOccurred wiring. requestMeasurement()
+        // is user-initiated (Post-Shot Review / Settings buttons), so an error
+        // here is a direct response to a tap, not background-scan noise.
+        QObject::connect(refractometer.get(), &RefractometerDevice::errorOccurred,
+                         &bleManager, &BLEManager::errorOccurred);
+
+        // Auto Test lives in Settings, not on the device, because the R2 is only
+        // connected while the post-shot review page is open — a device-only control
+        // would be unusable almost everywhere the user might want to change it. So
+        // Settings holds the intent and we push it to the device on every connect.
+        // The device stores it too; writing on each connect just keeps the two in
+        // step when the setting was changed with the R2 away.
+        if (refractometer->supportsAutoTest()) {
+            RefractometerDevice* refPtr = refractometer.get();
+            // Auto Test only. Making it also raise the device's test count so unattended
+            // readings were averaged was tried and dropped: three runs on hardware put
+            // the single-reading scatter at about 0.011% TDS, so averaging three buys
+            // roughly 0.005% — less than the 0.01% step the device reports in, and so
+            // not representable in the answer at all. The driver keeps setDeviceTestCount
+            // as protocol coverage; nothing sets it, and the device default of 1 stands.
+            const auto applyAutoTest = [refPtr, &settings]() {
+                if (!refPtr->isConnected()) return;
+                refPtr->setAutoTest(settings.app()->refractometerAutoTest());
+            };
+            QObject::connect(refPtr, &RefractometerDevice::connectedChanged, refPtr, applyAutoTest);
+            // Changing the setting while the device happens to be connected applies
+            // straight away rather than waiting for the next connect.
+            QObject::connect(settings.app(), &SettingsApp::refractometerAutoTestChanged,
+                             refPtr, applyAutoTest);
+        }
+
+        bleManager.refractometerDebug(QStringLiteral("Created and connecting to %1").arg(device.name()),
+                                      QStringLiteral("main"));
+    });
+
+    // Handle Forget Refractometer — disconnect and clean up
+    QObject::connect(&bleManager, &BLEManager::disconnectRefractometerRequested, handlerScope.get(),
+                     [&refractometer, &refractometerProxy, &bleManager,
+                      &refractometerReconnectTimer, &refractometerReconnectAttempt]() {
+        if (refractometer) {
+            bleManager.refractometerDebug(QStringLiteral("Forget requested, disconnecting"),
+                                          QStringLiteral("main"));
+            refractometer->disconnectFromDevice();
+            bleManager.setRefractometerDevice(nullptr);
+            refractometerProxy.setTarget(nullptr);
+            refractometer.reset();
+        }
+        // Stop any pending/persistent reconnect — the user forgot this device.
+        // Unconditional (mirrors the scale's disconnectScaleRequested).
+        //
+        // LAST: disconnectFromDevice() and setRefractometerDevice(nullptr) both
+        // emit refractometerConnectedChanged, which re-arms this tick if the hunt
+        // is on (a Forget over MCP or the web while the review page is open).
+        // clearSavedRefractometer() emits this request last, so nothing re-arms
+        // after us.
+        refractometerReconnectTimer.stop();
+        refractometerReconnectAttempt = 0;
+    });
+
+    QObject::connect(&refractometerReconnectTimer, &QTimer::timeout,
+                     [&bleManager, &settings, &refractometerReconnectAttempt,
+                      &refractometerReconnectTimer, &reconnectDelays]() {
+        // Every reason this tick stops, decided in one place, reported in one
+        // line. There were four `qDebug() << "Refractometer reconnect: …"` lines
+        // here, none of them marked, so the reason a paired refractometer had
+        // quietly stopped retrying appeared in NO search for [Refractometer] —
+        // the exact question these lines exist to answer.
+        //
+        // Each of these stops the tick rather than rescheduling it. Nothing is
+        // lost: the corresponding change (hunt reopened, BLE re-enabled, a new
+        // address saved) has its own handler that re-arms the timer. Ticking on
+        // regardless is what used to write a user-visible "R2 auto-reconnect
+        // attempt N" every minute forever while doing nothing at all.
+        QString stopReason;
+        if (settings.savedRefractometerAddress().isEmpty()) {
+            stopReason = QStringLiteral("no refractometer is paired");
+        } else if (!bleManager.isRefractometerHunt()) {
+            // The R2 is only used on the post-shot review page (the "hunt").
+            // setRefractometerHunt(true) resumes it directly — an immediate scan
+            // plus onScanFinished chaining — so this timer is not needed to drive
+            // on-page reconnects. The scale's reconnect is a separate always-on
+            // timer and is unaffected by any of this.
+            stopReason = QStringLiteral("the review page is closed — will resume when it reopens");
+        } else if (bleManager.isRefractometerConnected()) {
+            stopReason = QStringLiteral("already connected");
+        } else if (bleManager.isDisabled()) {
+            stopReason = QStringLiteral("BLE is off (simulator mode) — will resume when it is re-enabled");
+        } else if (bleManager.firmwareUpdateActive()) {
+            stopReason = QStringLiteral("DE1 firmware update is active — will resume when it ends");
+        }
+        if (!stopReason.isEmpty()) {
+            bleManager.refractometerDebug(
+                QStringLiteral("Auto-reconnect tick stopping: %1").arg(stopReason),
+                QStringLiteral("main"));
+            return;
+        }
+
+        // The chain is alive — reschedule without spending a rung of the ramp.
+        //
+        // This tick is a RECOVERY path, not a second scanner: while the hunt's
+        // back-to-back chain is running there is always a scan in flight, so
+        // tryDirectConnectToRefractometer() would decline with "a scan is already
+        // in flight" and the attempt below would be pure fiction.
+        //
+        // isScanningForScales() is NOT hunt-scoped, and that matters enough to say
+        // out loud — blemanager.cpp warns about this exact flag ("looks like the
+        // right flag and is not: the refractometer hunt sets it too"), here in the
+        // mirror image. A user-initiated scan or the scale's own always-on
+        // reconnect ladder sets it too, so this branch can be taken while the hunt
+        // chain is NOT what is scanning. It is still correct, for a reason worth
+        // writing down rather than inferring: every scan finishes through the one
+        // shared onScanFinished(), whose hunt re-chain fires regardless of who
+        // started it. So any scan in flight really does mean the chain will be
+        // re-kicked, and the recovery this tick provides is genuinely not needed
+        // yet. It was reported
+        // as fact anyway — a device log showed six consecutive "Auto-reconnect
+        // attempt N" lines at INFO, every one of them immediately followed by the
+        // skip, and not one of them a real attempt.
+        //
+        // The counter is what makes this more than cosmetic. Incrementing it on a
+        // no-op walked the ramp out to its 60 s tail while nothing was wrong, so a
+        // chain that died AFTER that (onScanError clears the scan flag and
+        // deliberately does not re-chain — BLEManager::onScanError) waited a
+        // minute for the recovery this timer exists to provide, instead of 5 s.
+        // The safety net degraded itself precisely while it was idle.
+        //
+        // Re-arms at the FIRST rung, not the current one, and that is the whole
+        // point of the branch: this is now a watchdog polling for a dead chain,
+        // and the hunt windows it polls are short — four in one device session,
+        // the longest 120 s. A 60 s tail would let the chain die and stay dead for
+        // most of a window. The ramp itself is left where it was, so the first
+        // REAL attempt after a death still starts at 5 s.
+        //
+        // Silent on purpose. A watchdog that finds nothing wrong is not news, and
+        // at a 5 s cadence a line here would be the dominant [Refractometer] entry
+        // in every hunt window — the same cry-wolf shape the INFO lines it
+        // replaces already had. The story stays readable without it: "Hunt active
+        // — chaining another scan" with no "Auto-reconnect attempt" between says
+        // the chain was healthy and the watchdog had nothing to do.
+        if (bleManager.isScanningForScales()) {
+            refractometerReconnectTimer.start(reconnectDelays[0]);
+            return;
+        }
+
+        // One line for the attempt, where there were three: an unmarked
+        // "[R2-diag] reconnect tick attempt=N — scanning", an unmarked
+        // "Refractometer reconnect: attempt N", and an appendScaleLog that reached
+        // the view but not the marker. Past every guard, so this really does scan
+        // — an earlier version said "— will scan" before the BLE-disabled check
+        // existed, and then did not.
+        //
+        // Only changes in the bounded retry ramp need an attempt receipt.
+        const int attempt = refractometerReconnectAttempt + 1;
+        const QString attemptMsg = QStringLiteral("Auto-reconnect attempt %1").arg(attempt);
+        if (refractometerReconnectAttempt < static_cast<int>(reconnectDelays.size())) {
+            bleManager.refractometerInfo(attemptMsg, QStringLiteral("main"));
+        }
+        bleManager.tryDirectConnectToRefractometer();
+        refractometerReconnectAttempt++;
+        // Persistent reconnect: walk the ramp, then hold on the 60s tail.
+        // Stops on any of the guards above.
+        if (refractometerReconnectAttempt < static_cast<int>(reconnectDelays.size())) {
+            refractometerReconnectTimer.start(reconnectDelays[refractometerReconnectAttempt]);
+        } else {
+            refractometerReconnectTimer.start(reconnectDelays.back());
+        }
+    });
+
+    // Reconcile the same retry ladder on connection, hunt, BLE availability
+    // and firmware-suspension edges. In particular, firmware teardown stops
+    // the timer even when a browser keeps its review-page hunt open; resuming
+    // must re-arm it so a later scan error can recover without reopening it.
+    connectRefractometerRecovery(&bleManager, handlerScope.get(),
+        &refractometerReconnectTimer, refractometerReconnectAttempt, reconnectDelays[0],
+        [&settings] { return !settings.savedRefractometerAddress().isEmpty(); },
+        [&bleManager, &reconnectDelays] {
+            bleManager.refractometerDebug(
+                QStringLiteral("Reconnect: arming recovery tick in %1 ms").arg(reconnectDelays[0]),
+                QStringLiteral("main"));
+        });
+
+    // No refractometer auto-connect at startup: the R2 is only used on the
+    // post-shot review page, so it is pursued when that page opens (which fires
+    // refractometerHuntChanged → arms the reconnect tick above) and disconnected
+    // when it closes. A startup arm here would be dead code — tryDirectConnect
+    // no-ops with the hunt off, and the tick self-stops on its first fire. The
+    // scale's own startup/reconnect path is separate and unaffected.
+
+#ifndef Q_OS_IOS
+    // When USB scale discovered: wire it as the active scale (same pattern as BLE scale)
+    QObject::connect(&usbScaleManager, &UsbScaleManager::scaleDiscovered,
+                     [&physicalScale, &flowScale, &machineState, &mainController, &scaleProxy,
+                      &bleManager, &timingController, &weightProcessor, &settings](UsbDecentScale* usbScale) {
+        // Don't connect if we already have a connected BLE scale
+        if (physicalScale && physicalScale->isConnected()) {
+            bleManager.scaleDebug(QStringLiteral("USB scale available but a BLE scale is already "
+                                                 "connected — ignoring"), QStringLiteral("main"));
+            return;
+        }
+
+        // If we have a disconnected BLE scale, clean it up
+        if (physicalScale) {
+            machineState.setScale(&flowScale);
+            timingController.setScale(&flowScale);
+            bleManager.setScaleDevice(nullptr);
+            physicalScale.reset();
+        }
+
+        // Switch to USB scale
+        machineState.setScale(usbScale);
+        timingController.setScale(usbScale);
+        scaleProxy.setTarget(usbScale);
+
+        // Disconnect FlowScale from graph and weight processor
+        QObject::disconnect(&flowScale, &ScaleDevice::weightChanged,
+                            &mainController, &MainController::onScaleWeightChanged);
+        QObject::disconnect(&flowScale, &ScaleDevice::weightSampleReceived,
+                            &weightProcessor, &WeightProcessor::processWeight);
+
+        // Connect USB scale weight updates
+        QObject::connect(usbScale, &ScaleDevice::weightChanged,
+                         &mainController, &MainController::onScaleWeightChanged);
+        QObject::connect(usbScale, &ScaleDevice::weightSampleReceived,
+                         &weightProcessor, &WeightProcessor::processWeight);
+
+        // NOTE: deliberately NOT wiring usbScale's errorOccurred to the error
+        // dialog. It used to be, mirroring the physical (BLE/WiFi) scale's
+        // wiring — but UsbDecentScale emits nothing there any more (#1658). Its
+        // failures are open-refused, port-lost and unplug, and
+        // UsbScaleManager::connectToScale() already handles each: it checks
+        // isConnected() after open(), tears the half-open scale down, and
+        // re-arms discovery. The dialog only ever interrupted that recovery,
+        // with a raw "[USB Scale] …" log string as its text. A future USB error
+        // that IS user-actionable should re-add this connect deliberately,
+        // alongside a translated message — not inherit a pipe from a driver
+        // that no longer speaks into it.
+
+        // Register in the known-scales registry + set as primary, using the
+        // stable USB identifier "usb:decent". addKnownScale + setPrimaryScale
+        // write the correct scale type ("decent-usb") and display name into
+        // Settings, so the Settings panel shows it and it auto-reconnects on a
+        // future startup when it's still the saved primary (see the
+        // usbScaleAvailable handler below). Note this ALWAYS sets the USB scale
+        // as primary — unlike the BLE/WiFi scaleDiscovered handler, which gates
+        // the primary write on the WiFi→BLE fallback flag. There is no USB
+        // fallback path, so selecting USB is always an explicit primary choice.
+        const QString kUsbScaleAddress = QStringLiteral("usb:decent");
+        const QString kUsbScaleType = QStringLiteral("decent-usb");
+        const QString kUsbScaleName = QStringLiteral("Half Decent Scale (USB)");
+        settings.addKnownScale(kUsbScaleAddress, kUsbScaleType, kUsbScaleName);
+        settings.setPrimaryScale(kUsbScaleAddress);
+        bleManager.setSavedScaleAddress(kUsbScaleAddress, kUsbScaleType, kUsbScaleName);
+
+        // Notify MQTT
+        if (mainController.mqttClient()) {
+            mainController.mqttClient()->onScaleConnectedChanged(true);
+        }
+
+        bleManager.scaleInfo(QStringLiteral("Switched to USB scale: %1").arg(usbScale->name()),
+                             QStringLiteral("main"));
+    });
+
+    // When USB scale lost: fall back to FlowScale (or BLE scale if available)
+    QObject::connect(&usbScaleManager, &UsbScaleManager::scaleLost,
+                     [&physicalScale, &flowScale, &machineState, &mainController, &scaleProxy,
+                      &timingController, &weightProcessor, &usbScaleManager, &bleManager]() {
+        // Disconnect the USB scale's weight signals
+        if (usbScaleManager.scale()) {
+            QObject::disconnect(usbScaleManager.scale(), &ScaleDevice::weightChanged,
+                                &mainController, &MainController::onScaleWeightChanged);
+            QObject::disconnect(usbScaleManager.scale(), &ScaleDevice::weightSampleReceived,
+                                &weightProcessor, &WeightProcessor::processWeight);
+        }
+
+        // Fall back to BLE scale if connected, otherwise FlowScale
+        if (physicalScale && physicalScale->isConnected()) {
+            machineState.setScale(physicalScale.get());
+            timingController.setScale(physicalScale.get());
+            scaleProxy.setTarget(physicalScale.get());
+            bleManager.scaleInfo(QStringLiteral("USB scale lost — falling back to BLE scale"),
+                                 QStringLiteral("main"));
+        } else {
+            machineState.setScale(&flowScale);
+            timingController.setScale(&flowScale);
+            scaleProxy.setTarget(&flowScale);
+            // Reconnect FlowScale
+            QObject::connect(&flowScale, &ScaleDevice::weightChanged,
+                             &mainController, &MainController::onScaleWeightChanged);
+            QObject::connect(&flowScale, &ScaleDevice::weightSampleReceived,
+                             &weightProcessor, &WeightProcessor::processWeight);
+            bleManager.scaleInfo(QStringLiteral("USB scale lost — falling back to FlowScale"),
+                                 QStringLiteral("main"));
+            // Surface a "scale disconnected" UI notice — same as the BLE/WiFi
+            // disconnect path (see the connectedChanged handler that emits this
+            // when a physical scale drops to FlowScale). Only on the FlowScale
+            // fallback: falling back to a still-connected BLE scale is a switch,
+            // not a disconnect, so it shouldn't flash a "disconnected" notice.
+            emit bleManager.scaleDisconnected();
+        }
+
+        // Notify MQTT
+        if (mainController.mqttClient()) {
+            mainController.mqttClient()->onScaleConnectedChanged(false);
+        }
+    });
+
+    // USB scale presence (probe-confirmed, NOT connected): list it as a
+    // selectable entry, exactly like a discovered BLE/WiFi scale. Auto-connect
+    // ONLY when the USB scale is the saved primary — otherwise just list it so
+    // the same scale can be tested over Bluetooth/WiFi.
+    QObject::connect(&usbScaleManager, &UsbScaleManager::usbScaleAvailable,
+                     [&bleManager, &usbScaleManager, &settings]() {
+        bleManager.setUsbScaleAvailable(true, QStringLiteral("Half Decent Scale (USB)"));
+        if (settings.scaleAddress() == QStringLiteral("usb:decent")) {
+            bleManager.scaleInfo(QStringLiteral("USB scale available and is saved primary — "
+                                                "auto-connecting"), QStringLiteral("main"));
+            usbScaleManager.connectToScale();
+        } else {
+            bleManager.scaleDebug(QStringLiteral("USB scale available — listed as selectable "
+                                                 "(not auto-connecting)"), QStringLiteral("main"));
+        }
+    });
+    QObject::connect(&usbScaleManager, &UsbScaleManager::usbScaleUnavailable,
+                     [&bleManager]() {
+        bleManager.setUsbScaleAvailable(false, QStringLiteral("Half Decent Scale (USB)"));
+    });
+
+    // User selected the USB entry in the discovered list: connect it.
+    QObject::connect(&bleManager, &BLEManager::usbConnectRequested,
+                     [&usbScaleManager]() {
+        usbScaleManager.connectToScale();
+    });
+
+    // "Scan for Devices" covers USB too, not just BLE and WiFi. BLEManager asks
+    // (it doesn't own UsbScaleManager) and the completion feeds back so the
+    // composite "Scanning..." indicator waits for all three transports.
+    QObject::connect(&bleManager, &BLEManager::usbProbeRequested,
+                     [&usbScaleManager]() {
+        usbScaleManager.probeNow();
+    });
+    QObject::connect(&usbScaleManager, &UsbScaleManager::probeFinished,
+                     [&bleManager]() {
+        bleManager.onUsbProbeFinished();
+    });
+
+    // No UsbScaleManager::logMessage forwarders. There were TWO of them — one into
+    // the scale log, one into the DE1 log — because the USB scale is diagnosed from
+    // both panels and neither view could read the other's channel. That was the
+    // whole problem: a line had to be copied per view, and 73 hand-rolled prefixes
+    // with 21 drifted qDebug/emit pairs grew out of the same gap. Every line now
+    // carries [Scale][USB Scale] once, in the system log, which both views read.
+#endif // !Q_OS_IOS
+
+    // Load saved scale address for direct wake connection. Read from the
+    // multi-scale-era key (primaryScaleAddress) first, then fall back to the
+    // legacy single-scale key (scale/address). The Settings orphan-heal in
+    // the Settings constructor already syncs them before we reach this code,
+    // but reading the canonical key directly avoids depending on that sync —
+    // and the legacy key was the historical source of the
+    // "tryDirectConnectToScale - no saved scale address/type" bug (QML
+    // checked the new key, this load used the old one, and a drift between
+    // them stranded the user with no auto-connect). If primary is set, look
+    // up its full entry from knownScales so we feed BLEManager the correct
+    // type/name without depending on the legacy scale/type and scale/name
+    // keys being in sync.
+    QString savedScaleAddr = settings.primaryScaleAddress();
+    QString savedScaleType;
+    QString savedScaleName;
+    if (!savedScaleAddr.isEmpty()) {
+        for (const QVariant& v : settings.knownScales()) {
+            const QVariantMap s = v.toMap();
+            if (s.value("address").toString().compare(savedScaleAddr, Qt::CaseInsensitive) == 0) {
+                savedScaleType = s.value("type").toString();
+                savedScaleName = s.value("name").toString();
+                break;
+            }
+        }
+    }
+    // Fall back to the legacy keys if primary wasn't set (older builds, or
+    // a fresh install before any scale connect has written the multi-scale
+    // store). The orphan-heal will reconcile this on the next launch.
+    if (savedScaleAddr.isEmpty()) {
+        savedScaleAddr = settings.scaleAddress();
+        savedScaleType = settings.scaleType();
+        savedScaleName = settings.scaleName();
+    }
+    if (!savedScaleAddr.isEmpty() && !savedScaleType.isEmpty()) {
+        bleManager.setSavedScaleAddress(savedScaleAddr, savedScaleType, savedScaleName);
+    }
+
+    // Load saved DE1 address for direct wake connection
+    QString savedDE1Addr = settings.machineAddress();
+    if (!savedDE1Addr.isEmpty()) {
+        bleManager.setSavedDE1Address(savedDE1Addr, QString());
+    }
+
+    // BLE scanning is now started from QML after first-run dialog is dismissed
+    // This allows the user to turn on their scale before we start scanning
+
+    // FlowScale weight connection is handled by the fallback timer and scale disconnect logic
+    // Don't connect here - only one scale should feed the graph at a time
+
+
+    // Expose C++ objects to QML. No `QQmlContext* context` here any more: with ScaleDevice
+    // migrated there is nothing left on this path that publishes by name into the root context.
+    // Also a compile-time singleton, registered via QML_FOREIGN in settings_qml.h rather than
+    // macros on the class — settings.h is included by CLI tools that do not link Qt::Qml, and by
+    // most of the app, so it deliberately stays free of QtQml. Same publish-the-instance shape:
+    // main owns `settings` and hands it out long before QML exists.
+    SettingsForeign::s_singletonInstance = &settings;
+    // A compile-time-registered QML singleton (TranslationManagerForeign in
+    // contextsingletons_qml.h), NOT a context property. The engine does not construct it — it is
+    // the stack object above, already wired into BLE, MCP, AI, backup and accessibility — so
+    // main publishes the instance and the wrapper's create() hands it back.
+    //
+    // Registering at compile time is what lets qmllint resolve the 3,668 QML references to this
+    // name; a runtime qmlRegisterSingletonInstance() would not, because qmltyperegistrar never
+    // sees it. That is the whole point of the migration, not a side effect of it.
+    TranslationManagerForeign::s_singletonInstance = &translationManager;
+    // MUST be called explicitly, and this is not optional bookkeeping — without it the
+    // declarative registration above never runs and every translated string in the app is
+    // `undefined`. Qt registers a module's compile-time types lazily, on first import, behind
+    // this guard (qqmltypeloader.cpp:805-807, and identically qqmlimport.cpp:943-944):
+    //
+    //     auto module = QQmlMetaType::typeModule(qmldir.typeNamespace(), import->version);
+    //     if (!module)
+    //         QQmlMetaType::qmlRegisterModuleTypes(qmldir.typeNamespace());
+    //     // else: If the module already exists, the types must have been already registered
+    //
+    // That last assumption is false for a module like this one, which mixes declarative
+    // (QML_ELEMENT) and runtime registrations. The qmlRegisterUncreatableType<...>("Decenza",
+    // ...) calls below create a type module for the URI before QML ever imports it, so at
+    // import time typeModule() returns non-null, the guard short-circuits, and the generated
+    // registration function is never invoked. Calling it here is the idiom Qt uses for the same
+    // situation in its own qtdeclarative/tools/qml/main.cpp.
+    //
+    // Calling it twice would be harmless anyway: the lazy path is itself guarded on the module
+    // not existing yet.
+    qml_register_types_Decenza();
+    // Required before QML loads: TranslationManager.translate is a QJSValue property holding a
+    // callable, and it needs an engine to build that callable from. qmlEngine(this) is null for
+    // an object the engine did not create, so the engine cannot be discovered from inside.
+    // Without this every translated string in the app evaluates to undefined. create() repeats
+    // this for engines that reach the singleton by another route. See translationmanager.h.
+    translationManager.setJsEngine(&engine);
+    // EmojiAssets, MarkdownRenderer and TemperatureDisplay used to be context properties over
+    // objects declared here. They are QML_SINGLETONs now, engine-constructed and engine-owned,
+    // so there is nothing left for main() to declare or publish. What they are for is on the
+    // classes: emojiassets.h, markdownrenderer.h, temperaturedisplay.h.
+    BLEManagerForeign::s_singletonInstance = &bleManager;
+    // DE1Device is a QML_FOREIGN + QML_SINGLETON (contextsingletons_qml.h), not a context
+    // property. Published here rather than at the declaration because the ordering that matters
+    // is "before engine.load()", and this is where that is obvious.
+    DE1DeviceForeign::s_singletonInstance = &de1Device;
+    ScaleDeviceForeign::s_singletonInstance = &scaleProxy;
+    scaleProxy.setTarget(&flowScale);  // FlowScale initially, re-pointed as hardware comes and goes
+    // No "FlowScale" property. It was published "always available for diagnostics" and no QML
+    // ever read it — the only occurrences of the name in qml/ are three comments in main.qml
+    // about the FlowScale *fallback*, which is a different thing. Publishing an unread name is
+    // not free: a context property is invisible to qmllint, so it cannot be told apart from a
+    // typo at the call sites that never came.
+    MachineStateForeign::s_singletonInstance = &machineState;
+    ShotDataModelForeign::s_singletonInstance = &shotDataModel;
+    SteamDataModelForeign::s_singletonInstance = &steamDataModel;
+    SteamHealthTrackerForeign::s_singletonInstance = &steamHealthTracker;
+    // Compile-time QML singleton (MainControllerForeign in contextsingletons_qml.h), not a
+    // context property — same reason as every other publish in this block. The largest win remaining
+    // after TranslationManager and Settings; measured reduction 916 unqualified warnings.
+    //
+    // BOTH halves are load-bearing and only one of them is visible to static tooling: the macros
+    // put the TYPE in the registry, this call publishes the INSTANCE. Delete this line and the
+    // build, qmllint and the whole suite stay green while every MainController.* binding in the
+    // app resolves to null. tst_qmlregistration asserts this call exists, for that reason.
+    MainControllerForeign::s_singletonInstance = &mainController;
+    ProfileManagerForeign::s_singletonInstance = mainController.profileManager();
+    // ScreensaverManager: QML's name for ScreensaverVideoManager. See contextsingletons_qml.h.
+    ScreensaverManagerForeign::s_singletonInstance = &screensaverManager;
+    AutoWakeManagerForeign::s_singletonInstance = &autoWakeManager;
+    SensorCalibrationControllerForeign::s_singletonInstance = &sensorCalibration;
+    BatteryManagerForeign::s_singletonInstance = &batteryManager;
+    MemoryMonitorForeign::s_singletonInstance = &memoryMonitor;
+    LocalNetworkAccessForeign::s_singletonInstance = &localNetworkAccess;
+    memoryMonitor.setEngine(&engine);
+    AccessibilityManagerForeign::s_singletonInstance = &accessibilityManager;
+    ProfileStorageForeign::s_singletonInstance = &profileStorage;
+    WeatherManagerForeign::s_singletonInstance = &weatherManager;
+    CrashReporterForeign::s_singletonInstance = &crashReporter;
+    WidgetLibraryForeign::s_singletonInstance = &widgetLibrary;
+    McpServerForeign::s_singletonInstance = &mcpServer;
+    ShotHistoryExporterForeign::s_singletonInstance = &shotHistoryExporter;
+#ifndef Q_OS_IOS
+    // The objects, the Foreign structs and the types themselves are all absent on iOS — that
+    // platform builds no part of src/usb/ and links no SerialPort module. So the QML names do not
+    // resolve there and evaluating one is a ReferenceError; every call site is short-circuited on
+    // Qt.platform.os before the read, or unreachable behind one. See the note above
+    // USBManagerForeign in contextsingletons_qml.h.
+    USBManagerForeign::s_singletonInstance = &usbManager;
+    UsbScaleManagerForeign::s_singletonInstance = &usbScaleManager;
+#endif
+
+    // Declared above `engine` (see there); only the wiring is here, where its dependencies exist.
+    flowCalibrationModel.setStorage(mainController.shotHistory());
+    flowCalibrationModel.setSettings(settings.calibration());
+    flowCalibrationModel.setDevice(&de1Device);
+    FlowCalibrationModelForeign::s_singletonInstance = &flowCalibrationModel;
+
+    // No "AppVersion", "AppVersionCode", "PreviousCrashLog" or "PreviousDebugLogTail" properties.
+    // All four were bare values with no object to hang off, and the first draft of this migration
+    // invented an AppInfo singleton to hold them. Review found that three of the four already had
+    // an owner:
+    //   - AppVersion / AppVersionCode duplicated UpdateChecker::currentVersion /
+    //     currentVersionCode, which read the same VERSION_STRING and versionCode(), are already
+    //     CONSTANT and QML-registered, and are already reached as MainController.updateChecker in
+    //     the very file that displayed them. Two sources of truth for one number is the drift this
+    //     change exists to remove, so the holder was deleted rather than kept.
+    //   - PreviousCrashLog / PreviousDebugLogTail moved onto CrashReporter (set above), which is
+    //     where QML already goes to submit them.
+    // No "IsDebugBuild" property. It was published from a #ifdef QT_DEBUG / #else pair and read
+    // by no QML file. If a debug-only affordance is wanted later, add it back as a property on a
+    // registered singleton so qmllint can see it — not as a context property, which is exactly
+    // the shape that let this one sit unused without anything noticing.
+
+#if (defined(Q_OS_WIN) || defined(Q_OS_MACOS)) && defined(QT_DEBUG) && defined(DECENZA_SIMULATOR)
+    // Make GHCSimulator available to main window for window sync
+    // Declared above `engine` (see there). Optional rather than mandatory: the declaration is
+    // inside a debug-desktop `#if`, so on every other build there is no instance and QML reads
+    // the name as undefined — which main.qml's truthy guard has always expected.
+    GHCSimulatorForeign::s_singletonInstance = &ghcSimulator;
+#endif
+
+    // The "…Type" registrations that used to live here are all gone, and the reason they existed
+    // is worth keeping, because it is two different reasons wearing one naming convention.
+    //
+    // MachineStateType, DE1DeviceType and SteamHealthTrackerType were genuine workarounds: a
+    // context property resolves AHEAD of a type of the same name, so a class whose instance was
+    // published as a context property could not also be registered under its plain name. Each
+    // disappeared when its instance became a singleton, which needs no second name because QML
+    // reads the enums straight off it (MachineState.Phase.X,
+    // SteamHealthTracker.EstablishingAfterReset).
+    //
+    // CoffeeBagStorageType, EquipmentStorageType and UnifiedBeanSearchModelType were NOT. No
+    // context property of those names ever existed — `git log -S 'setContextProperty("CoffeeBagStorage"'`
+    // finds nothing. They simply copied the ...Type suffix from the neighbours above, and moved
+    // for the unrelated reason in the next paragraph.
+    //
+    // DE1DeviceType was the last runtime qmlRegisterUncreatableType in that shape and is removed
+    // here; nothing in qml/ or tests/ referenced it. AIConversation, CoffeeBagStorage,
+    // EquipmentStorage and UnifiedBeanSearchModel went earlier, to QML_ELEMENT + QML_UNCREATABLE
+    // in their own headers — a runtime registration is invisible to qmltyperegistrar, so it never
+    // reaches Decenza.qmltypes and qmllint cannot resolve the type behind the properties that
+    // return it. QML reaches those four through MainController properties, never by type name.
+
+    // The CREATABLE types that used to be registered here — StrangeAttractorRenderer,
+    // FastLineRenderer, DocumentFormatter and the four Pipe*Geometry types —
+    // now carry QML_ELEMENT in their own headers. Same QML names, same creatable
+    // contract, and for the same reason the uncreatable ones moved: a runtime qmlRegisterType<>
+    // is invisible to qmltyperegistrar, so the type never reached Decenza.qmltypes and qmllint
+    // reported every USE of it as "was not found. Did you add all imports and dependencies?" —
+    // 19 warnings across six QML files, none of them a real missing import.
+    //
+    // Safe in their headers, and the reason is per-TARGET, not per-base-class (DocumentFormatter
+    // derives from plain QObject): documentformatter.cpp is compiled ONLY by the Decenza target, and the one of these that is compiled elsewhere,
+    // fastlinerenderer.cpp, goes into decenza_shotlib, which links Qt6::Quick. Apply that test to
+    // the next header, not the inheritance one.
+
+    // Settings sub-object types are registered at COMPILE time via QML_FOREIGN in
+    // settings_qml.h, not here. A runtime qmlRegisterUncreatableType<> is invisible to
+    // qmltyperegistrar, so qmllint could not resolve them and reported every
+    // Settings.<domain>.<prop> as a missing property — 1,079 of them. Same QML type names,
+    // same uncreatable contract, now checkable by the linter.
+
+    // ShotProjection is a Q_GADGET value type used as the parameter of
+    // ShotHistoryStorage::shotReady. qmlRegisterUncreatableMetaObject registers
+    // its meta-object so QML signal handlers can read its Q_PROPERTYs by name
+    // (`shotData.finalWeightG`). qRegisterMetaType makes the type usable on
+    // Qt::QueuedConnection signal/slot connections (the connection threads
+    // serialize the QVariant<ShotProjection> across thread boundaries).
+    qRegisterMetaType<ShotProjection>("ShotProjection");
+    ShotProjection::registerMetaTypeConverters();
+    qmlRegisterUncreatableMetaObject(ShotProjection::staticMetaObject,
+        "Decenza", 1, 0, "ShotProjection",
+        "ShotProjection is a value type returned by ShotHistoryStorage signals");
+
+    checkpoint("Context properties & type registration");
+
+    // Load main QML file (QTP0001 NEW policy uses /qt/qml/ prefix)
+    const QUrl url(u"qrc:/qt/qml/Decenza/qml/main.qml"_s);
+
+    QObject::connect(&engine, &QQmlApplicationEngine::objectCreated,
+        &app, [url, &checkpoint](QObject *obj, const QUrl &objUrl) {
+            if (!obj && url == objUrl)
+                QCoreApplication::exit(-1);
+            else if (obj)
+                checkpoint("QML objectCreated");
+        }, Qt::QueuedConnection);
+
+    engine.load(url);
+    checkpoint("engine.load(main.qml) returned");
+    weatherManager.setQmlReady();  // Unblock weather fetch; guards against #718 (crash during QML incubation)
+
+    // Give RelayClient a handle to the main window for screen capture
+    if (!engine.rootObjects().isEmpty()) {
+        QQuickWindow* window = qobject_cast<QQuickWindow*>(engine.rootObjects().constFirst());
+        if (window) {
+            relayClient.setWindow(window);
+            // Which backend the device picked (Vulkan/GL/Metal/D3D) — for field reports of
+            // rendering faults. Queued: the signal comes from the render thread. Logged now if
+            // the first expose already initialised it.
+            const auto logRhi = [window]() {
+                const QSGRendererInterface* rif = window->rendererInterface();
+                DIAG_INFO(APP, "main") << "Scene graph ready, RHI ="
+                    << (rif ? graphicsApiName(rif->graphicsApi()) : "unknown");
+            };
+            QObject::connect(window, &QQuickWindow::sceneGraphInitialized, window, logRhi,
+                             Qt::QueuedConnection);
+            if (window->isSceneGraphInitialized())
+                logRhi();
+        }
+    }
+
+    // Simulator engine (desktop in every configuration, tablets in debug only —
+    // see DECENZA_SIMULATOR in CMakeLists.txt) and GHC window (desktop debug only).
+#ifdef DECENZA_SIMULATOR
+    // NOTE: These must be declared outside the if-block so they survive through
+    // app.exec(). Otherwise the if-block scope destroys them before the event
+    // loop starts, and signal connections become dangling references (use-after-free).
+    std::unique_ptr<DE1Simulator> de1SimulatorPtr;
+    std::unique_ptr<SimulatedScale> simulatedScalePtr;
+#if (defined(Q_OS_WIN) || defined(Q_OS_MACOS)) && defined(QT_DEBUG) && defined(DECENZA_SIMULATOR)
+    std::unique_ptr<QQmlApplicationEngine> ghcEnginePtr;
+#endif
+
+    if (settings.app()->simulationMode()) {
+        // Create the DE1 machine simulator
+        de1SimulatorPtr = std::make_unique<DE1Simulator>();
+        auto& de1Simulator = *de1SimulatorPtr;
+
+        // Set simulator on DE1Device so commands are relayed to it
+        de1Device.setSimulator(&de1Simulator);
+        ghcServiceSource.setSimulator(&de1Simulator);
+
+        // Marked and at INFO, replacing a bare `qDebug() << "Creating DE1
+        // Simulator..."`. This is the machine's counterpart to
+        // "DE1 CONNECTED (BLE)" and it is the one line that says WHICH machine the
+        // app is talking to. Without it the DE1 view opened empty until the user
+        // happened to change a profile or start a shot, and nothing on the page
+        // distinguished "simulated machine attached" from "no machine at all" —
+        // the simulator is also why no real DE1 will ever appear, which is the
+        // question a reader of that log is most likely to be asking.
+        DE1_INFO_STDERR_TAGGED("Simulator",
+            QStringLiteral("Simulated DE1 attached — no real machine will be "
+                           "scanned for or connected this session"));
+
+        // Give it the current profile from ProfileManager
+        auto* pm = mainController.profileManager();
+        // Guarded like the handlers further up: `de1Simulator` lives in a
+        // unique_ptr declared AFTER `engine`, while `pm`/`settings` are declared
+        // before it, so without a context object these outlive their own capture
+        // and fire into freed stack during QML teardown.
+        QObject::connect(pm, &ProfileManager::currentProfileChanged, handlerScope.get(),
+                         [&de1Simulator, pm]() {
+            de1Simulator.setProfile(pm->currentProfileObject());
+        });
+        // Set initial profile
+        de1Simulator.setProfile(pm->currentProfileObject());
+
+        // Connect dose from settings (affects puck resistance simulation)
+        QObject::connect(settings.dye(), &SettingsDye::dyeBeanWeightChanged, handlerScope.get(),
+                         [&de1Simulator, &settings]() {
+            de1Simulator.setDose(settings.dye()->dyeBeanWeight());
+        });
+        // Set initial dose
+        de1Simulator.setDose(settings.dye()->dyeBeanWeight());
+
+        // Connect grind setting (finer grind = more resistance, can choke machine)
+        QObject::connect(settings.dye(), &SettingsDye::dyeGrinderSettingChanged, handlerScope.get(),
+                         [&de1Simulator, &settings]() {
+            de1Simulator.setGrindSetting(settings.dye()->dyeGrinderSetting());
+        });
+        // Set initial grind
+        de1Simulator.setGrindSetting(settings.dye()->dyeGrinderSetting());
+
+        // Connect simulator state changes to DE1Device (which will emit to MachineState)
+        QObject::connect(&de1Simulator, &DE1Simulator::stateChanged, [&de1Simulator, &de1Device]() {
+            de1Device.setSimulatedState(de1Simulator.state(), de1Simulator.subState());
+        });
+        QObject::connect(&de1Simulator, &DE1Simulator::subStateChanged, [&de1Simulator, &de1Device]() {
+            de1Device.setSimulatedState(de1Simulator.state(), de1Simulator.subState());
+        });
+
+        // Connect simulator shot samples to DE1Device (which will emit to MainController/graphs)
+        QObject::connect(&de1Simulator, &DE1Simulator::shotSampleReceived,
+                         &de1Device, &DE1Device::emitSimulatedShotSample);
+
+        // Idle-state steam temperature updates (fired when the app commands a
+        // new steam target via setShotSettings — including Off presets).
+        QObject::connect(&de1Simulator, &DE1Simulator::idleSteamTempChanged,
+                         &de1Device, &DE1Device::setSimulatedIdleSteamTemp);
+
+        // Create SimulatedScale and connect it like a real scale
+        simulatedScalePtr = std::make_unique<SimulatedScale>();
+        auto& simulatedScale = *simulatedScalePtr;
+
+        // Replace FlowScale with SimulatedScale for graph data
+        QObject::disconnect(&flowScale, &ScaleDevice::weightChanged,
+                            &mainController, &MainController::onScaleWeightChanged);
+        QObject::connect(&simulatedScale, &ScaleDevice::weightChanged,
+                         &mainController, &MainController::onScaleWeightChanged);
+
+        // Set SimulatedScale as the active scale (matching physical scale pattern)
+        machineState.setScale(&simulatedScale);
+        timingController.setScale(&simulatedScale);
+        scaleProxy.setTarget(&simulatedScale);
+
+        // Register as a known scale so UI gated on Settings.knownScales (keepScaleOn
+        // toggle, alerts toggle, known-devices picker) is reachable in simulation.
+        // Idempotent: addKnownScale dedupes by address. Removed on non-sim startup below.
+        const QString kSimulatedScaleAddress = QStringLiteral("sim:00:00:00:00:00:00");
+        settings.addKnownScale(kSimulatedScaleAddress,
+                               QStringLiteral("simulated"),
+                               QStringLiteral("Simulated Scale"));
+        // Promote to primary only if no real scale is paired, so the Known Devices
+        // picker shows "Simulated Scale" instead of "No scale selected" without
+        // clobbering a user's real scale pairing.
+        if (settings.primaryScaleAddress().isEmpty()) {
+            settings.setPrimaryScale(kSimulatedScaleAddress);
+        }
+
+        // Reconnect WeightProcessor from FlowScale to SimulatedScale for espresso SAW
+        QObject::disconnect(&flowScale, &ScaleDevice::weightSampleReceived,
+                            &weightProcessor, &WeightProcessor::processWeight);
+
+        // Helper: apply current simulatedScaleEnabled state.
+        // Enabled  → scale connected, simulator drives weight, WeightProcessor gets weight.
+        // Disabled → scale disconnected (isConnected()=false suppresses SAV skip naturally),
+        //            weight signals cut so SAW doesn't fire either.
+        auto applySimulatedScaleEnabled = [&de1Simulator, &simulatedScale, &weightProcessor, &settings]() {
+            if (settings.app()->simulatedScaleEnabled()) {
+                simulatedScale.simulateConnection();
+                QObject::connect(&de1Simulator, &DE1Simulator::scaleWeightChanged,
+                                 &simulatedScale, &SimulatedScale::setSimulatedWeight,
+                                 Qt::UniqueConnection);
+                QObject::connect(&simulatedScale, &ScaleDevice::weightSampleReceived,
+                                 &weightProcessor, &WeightProcessor::processWeight,
+                                 Qt::UniqueConnection);
+            } else {
+                simulatedScale.simulateDisconnection();
+                QObject::disconnect(&de1Simulator, &DE1Simulator::scaleWeightChanged,
+                                    &simulatedScale, &SimulatedScale::setSimulatedWeight);
+                QObject::disconnect(&simulatedScale, &ScaleDevice::weightSampleReceived,
+                                    &weightProcessor, &WeightProcessor::processWeight);
+            }
+        };
+        QObject::connect(settings.app(), &SettingsApp::simulatedScaleEnabledChanged,
+                         &simulatedScale, [applySimulatedScaleEnabled]() {
+            applySimulatedScaleEnabled();
+        });
+        applySimulatedScaleEnabled();
+
+        // GHC Simulator window (desktop debug only — other platforms use the layout widget)
+#if (defined(Q_OS_WIN) || defined(Q_OS_MACOS)) && defined(QT_DEBUG) && defined(DECENZA_SIMULATOR)
+        // Configure GHC visual controller (created earlier for main window access)
+        ghcSimulator.setDE1Device(&de1Device);
+        ghcSimulator.setDE1Simulator(&de1Simulator);
+
+        ghcEnginePtr = std::make_unique<QQmlApplicationEngine>();
+        auto& ghcEngine = *ghcEnginePtr;
+        const QUrl ghcUrl(u"qrc:/qt/qml/Decenza/qml/simulator/GHCSimulatorWindow.qml"_s);
+        QQmlComponent ghcComponent(&ghcEngine, ghcUrl);
+        const QVariantMap ghcProperties{
+            {QStringLiteral("controller"), QVariant::fromValue(static_cast<QObject*>(&ghcSimulator))},
+            {QStringLiteral("translator"), QVariant::fromValue(static_cast<QObject*>(&translationManager))},
+            {QStringLiteral("controllerAvailable"), true},
+            {QStringLiteral("useSharedHidePreference"), true},
+            {QStringLiteral("settingsApp"), QVariant::fromValue(static_cast<QObject*>(settings.app()))},
+            {QStringLiteral("positionStore"), QVariant::fromValue(static_cast<QObject*>(&settings))},
+            {QStringLiteral("initialX"), settings.value(QStringLiteral("ghcWindow/x"), -1).toReal()},
+            {QStringLiteral("initialY"), settings.value(QStringLiteral("ghcWindow/y"), -1).toReal()}
+        };
+        if (QObject* ghcWindow = ghcComponent.createWithInitialProperties(ghcProperties,
+                                                                          ghcEngine.rootContext())) {
+            ghcWindow->setParent(&ghcEngine);
+            DIAG_DEBUG(APP, "main") << "GHC Simulator: Window created successfully";
+        } else {
+            DIAG_WARN(APP, "main") << "GHC Simulator: Failed to create window"
+                                    << ghcComponent.errors();
+        }
+#endif // desktop GHC window
+    }
+#endif // DECENZA_SIMULATOR
+
+    // Purge the simulated-scale entry when not running in simulation mode, so a
+    // prior simulation session's placeholder doesn't leak into the real connection UI.
+    if (!settings.app()->simulationMode()) {
+        settings.removeKnownScale(QStringLiteral("sim:00:00:00:00:00:00"));
+    }
+
+#ifdef Q_OS_ANDROID
+    // Set landscape orientation on Android (after QML is loaded)
+    // SCREEN_ORIENTATION_SENSOR_LANDSCAPE = 6 (uses sensor to pick correct landscape)
+    // Note: Using 0 (SCREEN_ORIENTATION_LANDSCAPE) causes upside-down display on some tablets
+    // because "natural landscape" varies by device manufacturer
+    QJniObject activity = QNativeInterface::QAndroidApplication::context();
+    if (activity.isValid()) {
+        activity.callMethod<void>("setRequestedOrientation", "(I)V", 6);
+
+        // Read SDK version on the Qt main thread before entering the Android UI lambda
+        const jint sdkVersion = QNativeInterface::QAndroidApplication::sdkVersion();
+
+        // Enable immersive mode - must run on UI thread
+        QNativeInterface::QAndroidApplication::runOnAndroidMainThread([activity, sdkVersion]() {
+            QJniObject window = activity.callObjectMethod("getWindow", "()Landroid/view/Window;");
+            if (window.isValid()) {
+                // FLAG_LAYOUT_NO_LIMITS = 0x200 - extend window into navigation bar area
+                window.callMethod<void>("addFlags", "(I)V", 0x200);
+
+                QJniObject decorView = window.callObjectMethod("getDecorView", "()Landroid/view/View;");
+
+                if (sdkVersion >= 30) {
+                    // API 30+ (Android 11): use WindowInsetsController (modern replacement
+                    // for the deprecated setSystemUiVisibility) and tell Android to not
+                    // offset the content area for system bars. Fixes a gap at the top of
+                    // the screen on some tablets (e.g. Lenovo Tab One #582) where the
+                    // deprecated API doesn't fully prevent content insets.
+                    window.callMethod<void>("setDecorFitsSystemWindows", "(Z)V", false);
+
+                    QJniObject insetsController = window.callObjectMethod(
+                        "getInsetsController",
+                        "()Landroid/view/WindowInsetsController;");
+                    if (insetsController.isValid()) {
+                        jint statusBars = QJniObject::callStaticMethod<jint>(
+                            "android/view/WindowInsets$Type", "statusBars", "()I");
+                        jint navBars = QJniObject::callStaticMethod<jint>(
+                            "android/view/WindowInsets$Type", "navigationBars", "()I");
+                        insetsController.callMethod<void>("hide", "(I)V",
+                            statusBars | navBars);
+
+                        // BEHAVIOR_SHOW_TRANSIENT_BARS_BY_GESTURE = 2
+                        insetsController.callMethod<void>(
+                            "setSystemBarsBehavior", "(I)V", 2);
+                    }
+                } else {
+                    // API 28-29: use the legacy setSystemUiVisibility.
+                    // Not called on API 30+ — mixing it with WindowInsetsController
+                    // causes unpredictable behavior (one can override the other).
+                    // IMMERSIVE_STICKY | FULLSCREEN | HIDE_NAVIGATION | LAYOUT_STABLE | LAYOUT_HIDE_NAVIGATION | LAYOUT_FULLSCREEN
+                    // 0x1000 | 0x4 | 0x2 | 0x100 | 0x200 | 0x400 = 0x1706
+                    if (decorView.isValid()) {
+                        decorView.callMethod<void>("setSystemUiVisibility", "(I)V", 0x1706);
+                    }
+                }
+            }
+        });
+    }
+
+    // Sync launcher alias with persisted setting (APK updates reset component states)
+    settings.app()->setLauncherMode(settings.app()->launcherMode());
+#endif
+
+    // Cross-platform lifecycle handling: manage BLE connections and system state
+    // when app is suspended/resumed. Neither DE1 nor scale are put to sleep when
+    // backgrounded — users may switch apps while the machine heats up.
+    QObject::connect(&app, &QGuiApplication::applicationStateChanged, handlerScope.get(),
+                     [&physicalScale, &bleManager, &settings, &batteryManager, &de1Device, &reconnectDelays, &de1ReconnectTimer, &de1ReconnectAttempt, &scaleAutoReconnectSuppressed, &refractometerReconnectTimer, &refractometerReconnectAttempt, &mainController](Qt::ApplicationState state) {
+        static bool wasSuspended = false;
+
+        // Log every state transition so the debug log captures pre-suspend
+        // flickers (Inactive, Hidden) that precede an activity destroy.
+        // Adds one line per transition — negligible noise.
+        const char* name = "Unknown";
+        switch (state) {
+            case Qt::ApplicationSuspended: name = "Suspended"; break;
+            case Qt::ApplicationHidden:    name = "Hidden";    break;
+            case Qt::ApplicationInactive:  name = "Inactive";  break;
+            case Qt::ApplicationActive:    name = "Active";    break;
+        }
+        // Not bracketed, for the same reason as the startup timing line above.
+            DIAG_DEBUG(APP, "main").noquote() << QStringLiteral("App state changed -> %1").arg(name);
+
+        // Gate BatteryManager's poll while suspended; re-arm on any other state
+        // so a missed Active transition can't strand it (see m_appActive in
+        // batterymanager.h for the full rationale).
+        batteryManager.setAppActive(state != Qt::ApplicationSuspended);
+
+        if (state == Qt::ApplicationSuspended) {
+            wasSuspended = true;
+
+#ifdef Q_OS_ANDROID
+            // Disable accessibility bridge before surface is destroyed.
+            // Prevents deadlock between QtAndroidAccessibility::runInObjectContext()
+            // and QAndroidPlatformOpenGLWindow::eglSurface() that causes SIGABRT
+            // when the render thread tries to swap buffers after Android destroys
+            // the EGL surface while the accessibility thread holds the lock.
+            QAccessible::setActive(false);
+#endif
+
+            // Scale is NOT put to sleep when the app is backgrounded — scale sleep
+            // is tied to the machine going to sleep, not the app lifecycle. Users
+            // frequently switch to other apps (e.g., Claude) and expect the scale
+            // to remain connected when they return. On Android, the scale BLE
+            // connection stays alive only while the DE1 foreground service is
+            // running (provides the wake lock); without it the OS may freeze
+            // the event loop and drop the scale. The reconnect-on-resume path
+            // below handles that case.
+
+            // DE1 intentionally NOT put to sleep - user may be checking other apps
+            // while machine heats up
+
+            // IMPORTANT: Ensure charger is ON when app goes to background (unless
+            // the user switched USB Charger off) so the tablet doesn't die if the
+            // user doesn't return to the app.
+            // Previously skipped on iOS because the old BLE command queue raced with
+            // CoreBluetooth suspension, causing SIGSEGV. ensureChargerOn() uses
+            // setUsbChargerOnUrgent(), which puts the write at the FRONT of the shared
+            // GATT queue. That is a position, not a bypass, and since the queue moved
+            // to posted dispatch the write leaves one event-loop turn after this call
+            // rather than during it.
+            //
+            // That turn is available: this handler runs FROM the event loop (it is a
+            // QGuiApplication::applicationStateChanged slot), so returning from it
+            // returns to the loop, which then delivers the queued dispatch. iOS does
+            // not suspend us inside our own slot. The write was never synchronous in
+            // the sense that mattered anyway — QLowEnergyService::writeCharacteristic
+            // only ever handed the payload to DarwinBTCentralManager's own request
+            // queue, which drains on the LE dispatch queue. The bluetooth-central
+            // background mode keeps CoreBluetooth alive longer during backgrounding.
+            batteryManager.ensureChargerOn();
+
+            // Flush queued database writes LAST in this branch, and last for the
+            // same reason the quit-path call is last: it pumps events, so it must
+            // not be queued in front of anything time-critical. Here that is
+            // QAccessible::setActive(false) above — which exists to close an
+            // EGL-surface/accessibility deadlock window — and ensureChargerOn(),
+            // whose comment records a SIGSEGV from racing CoreBluetooth teardown.
+            // The database is local and loses nothing by waiting.
+            //
+            // Why it is needed at all: aboutToQuit is not emitted when the OS kills
+            // a backgrounded process, which on Android is the common way this app
+            // ends, so this is the last hook a queued dose/note/rating gets.
+            //
+            // Usually a no-op via drainDbWork()'s early-out — the worker is a
+            // separate thread that keeps draining after this returns, so there is
+            // normally nothing outstanding by the time it is asked. What it defends
+            // against is the process being frozen (Android's cached-process freezer,
+            // Doze) or killed before the worker reaches a queued task.
+            //
+            // It cannot hang the UI thread here, and that safety is NOT obvious:
+            // drainDbWork relies on timers, and Android's dispatcher suppresses
+            // timer activation while suspended (QEventLoop::X11ExcludeTimers,
+            // qandroideventdispatcher.cpp:54-56) — which would block until resume.
+            // It does not apply to us because that stopper is only registered when
+            // blockEventLoopsWhenSuspended() is true (qandroideventdispatcher.cpp:12-14),
+            // and android/AndroidManifest.xml.in declares
+            // android.app.background_running="true", which sets
+            // QT_BLOCK_EVENT_LOOPS_WHEN_SUSPENDED=0 (QtLoader.java, androidjnimain.cpp).
+            // Flip that manifest line and this becomes a blocking wait.
+            mainController.drainDbWork(250, MainController::DrainReason::Backgrounding);
+        }
+        else if (state == Qt::ApplicationActive && wasSuspended) {
+            DIAG_DEBUG(APP, "main") << "App resumed from suspended state";
+            wasSuspended = false;
+            // Unified entry point: refreshes both the Decenza app-update
+            // checker and the HDS scale-firmware catalog. UpdateChecker's own
+            // hourly timer doesn't fire a check specifically on resume, so
+            // this is the only resume-triggered check either of them gets.
+            // Not user-initiated: honors the auto-check-updates setting (and
+            // is a no-op for the app side on iOS) rather than forcing a check
+            // the user may have turned off — see checkForSoftwareUpdates().
+            mainController.checkForSoftwareUpdates(false);
+
+#ifdef Q_OS_ANDROID
+            // Re-enable accessibility bridge now that the EGL surface is valid again
+            QAccessible::setActive(true);
+#endif
+
+            // Sync settings from disk to ensure we have latest values
+            // (prevents theme colors from falling back to defaults on wake)
+            settings.sync();
+
+            // Try to reconnect/wake DE1 — reset the reconnect counter so we get
+            // a fresh set of retries after resume (the DE1 may still be waking up).
+            if (!de1Device.isConnected() && !de1Device.isConnecting()) {
+                de1ReconnectAttempt = 0;
+                if (!de1ReconnectTimer.isActive()) {
+                    de1ReconnectTimer.start(500);  // Short delay to let BLE stack initialize
+                }
+            }
+
+            // Scale was not put to sleep on suspend, so it should still be connected.
+            // If the OS dropped the BLE connection anyway, start the reconnect sequence.
+            // If the scale was deliberately disconnected on DE1 sleep, the user
+            // returning to the app is a signal that they want it back — clear the
+            // suppression flag so the normal reconnect runs.
+            scaleAutoReconnectSuppressed = false;
+            if (physicalScale && physicalScale->isConnected()) {
+                DIAG_DEBUG(SCALE, "main") << "App resumed - scale still connected";
+            } else {
+                bleManager.requestScaleReconnectRampRestart(QStringLiteral("App resumed"));
+            }
+
+            // Refractometer disconnected while suspended: resume its reconnect if the
+            // review-page hunt is on (a resume onto that page). Off the page the tick
+            // would only stop itself; hunt activation re-arms it. Same gate as the
+            // screensaver-exit path.
+            if (bleManager.isRefractometerHunt()
+                && !bleManager.isRefractometerConnected()
+                && !settings.savedRefractometerAddress().isEmpty()
+                && !refractometerReconnectTimer.isActive()) {
+                refractometerReconnectAttempt = 0;
+                refractometerReconnectTimer.start(reconnectDelays[0]);
+                bleManager.refractometerDebug(QStringLiteral("App resumed - resuming the reconnect sequence"),
+                                              QStringLiteral("main"));
+            }
+
+            // Resume smart charging check now that app is active again
+            batteryManager.checkBattery();
+        }
+    });
+
+    // Pause BLE scan-reconnect loops while the screensaver is showing.
+    //
+    // With a saved-but-absent scale (or refractometer), the reconnect timers
+    // keep running 60 s passive scans indefinitely. Each scan parks the radio
+    // active for the Qt LowEnergy discovery timeout (currently 15 s, set in
+    // BLEManager::setLowEnergyDiscoveryTimeout). Over the unattended hours the
+    // user typically spends on the screensaver, those scans can run hundreds
+    // of times and contend with the DE1 link's keepalive traffic. Issue #1309
+    // hypothesised this state as a contributing factor to a P80X DE1 wedge:
+    // ~7 h of scale-absent scans during screensaver before an MMR keepalive
+    // write timed out and the link couldn't recover. Root cause isn't proven —
+    // this PR cuts the most plausible upstream input.
+    //
+    // The screensaver doesn't suspend the app (we're still Qt::ApplicationActive),
+    // so the existing applicationStateChanged path above doesn't catch it. We
+    // mirror that path here, stopping both timers on entry and restarting them
+    // on exit. Stopping alone does not hold the scale timer (a failing scan
+    // re-arms it), so its tick and scaleRetryNeeded check the flag too. Resume
+    // gates differ: scale goes through requestScaleReconnectRampRestart's
+    // gates; refractometer checks the hunt, saved address and not connected
+    // (no suppression flag or USB-routing for it).
+    QObject::connect(&screensaverManager, &ScreensaverVideoManager::screensaverActiveChanged,
+                     &de1Device, [&screensaverManager, &de1Device]() {
+        de1Device.setAppAsleep(screensaverManager.screensaverActive());
+    });
+    QObject::connect(&screensaverManager, &ScreensaverVideoManager::screensaverActiveChanged,
+                     handlerScope.get(), [&screensaverManager, &bleManager, &settings,
+                      &scaleReconnectTimer, &reconnectDelays, scaleRampRunsUnderScreensaver,
+                      &physicalScale,
+                      &refractometerReconnectTimer, &refractometerReconnectAttempt]() {
+        const bool active = screensaverManager.screensaverActive();
+        // Covers a scale still mid-handshake when the screensaver starts, and on
+        // exit lights a display held off by a connect under the screensaver.
+        if (physicalScale) {
+            const bool wasHeld = physicalScale->displayHeldOff();
+            physicalScale->setDisplayHeldOff(active);
+            if (!active && wasHeld && physicalScale->isConnected())
+                physicalScale->wake();
+        }
+        if (active) {
+            if (scaleReconnectTimer.isActive() && !scaleRampRunsUnderScreensaver()) {
+                DIAG_DEBUG(SCALE, "main") << "Screensaver entered - pausing scale reconnect loop";
+                scaleReconnectTimer.stop();
+            }
+            if (refractometerReconnectTimer.isActive()) {
+                bleManager.refractometerDebug(QStringLiteral("Screensaver entered - pausing the reconnect loop"),
+                                              QStringLiteral("main"));
+                refractometerReconnectTimer.stop();
+            }
+            return;
+        }
+
+        // We deliberately do NOT clear scaleAutoReconnectSuppressed here: a brief
+        // glance at the tablet isn't the same signal as switching back from
+        // another app, and DE1 sleep semantics already manage that flag.
+        bleManager.requestScaleReconnectRampRestart(QStringLiteral("Screensaver exited"));
+
+        // Same gate as the app-resume path: off the review page the tick only stops itself.
+        if (bleManager.isRefractometerHunt()
+            && !bleManager.isRefractometerConnected()
+            && !settings.savedRefractometerAddress().isEmpty()
+            && !refractometerReconnectTimer.isActive()) {
+            refractometerReconnectAttempt = 0;
+            refractometerReconnectTimer.start(reconnectDelays[0]);
+            bleManager.refractometerDebug(QStringLiteral("Screensaver exited - resuming the reconnect sequence"),
+                                          QStringLiteral("main"));
+        }
+    });
+
+    // Manage scale power state when the DE1 sleeps/wakes. This is the only
+    // place a DE1 sleep touches the scale, whatever started it (app, GHC,
+    // MCP, REST, MQTT) — all of them land here as a Sleep phase.
+    //   keepScaleOn=true (default): LCD off. BT stays connected and wake()
+    //     restores the LCD. WiFi holds the WS closed so the tablet's radio can
+    //     park (Android power-save kills it anyway, and the HDS then reaps the
+    //     session), and checks in instead, since the HDS powers itself off after
+    //     15 min with no client. DecentScaleWifi::onConnected's "display on"
+    //     restores its LCD on the wake reconnect.
+    //   keepScaleOn=false: sleep(), then drop the link once the write completes
+    //     (de1app's default for battery-only scales).
+    // de1EverAwake/wasInSleep: see "DE1-phase tracking flags".
+    QObject::connect(&machineState, &MachineState::phaseChanged, handlerScope.get(),
+                     [&physicalScale, &machineState, &settings, &de1EverAwake,
+                      &wasInSleep, &scaleLcdRestorePending, &bleManager,
+                      &scaleAutoReconnectSuppressed, &scaleReconnectTimer]() {
+        auto phase = machineState.phase();
+        if (phase == MachineState::Phase::Disconnected) {
+            // wasInSleep survives: a link that drops while asleep can reconnect
+            // still asleep, and the eventual wake must still clear
+            // scaleAutoReconnectSuppressed below.
+            de1EverAwake = false;
+        } else if (phase == MachineState::Phase::Sleep) {
+            // Only treat this as a real sleep event if DE1 was previously
+            // awake — otherwise it's the initial-connect-while-sleeping case
+            // and we don't want the next non-Sleep phase to fire wake actions
+            // for a "wake event" that never had a matching sleep.
+            if (!de1EverAwake)
+                return;
+            wasInSleep = true;
+            // Released by the wake branch below; see scaleAutoReconnectSuppressed.
+            const auto holdReconnectUntilWake = [&]() {
+                scaleAutoReconnectSuppressed = true;
+                scaleReconnectTimer.stop();
+                bleManager.cancelScaleReconnectAttempt();
+            };
+            auto* wifi = qobject_cast<DecentScaleWifi*>(physicalScale.get());
+            if (wifi && settings.keepScaleOn()) {
+                // Also when the WS had already dropped: nothing reconnects it
+                // until wake, so it needs the check-ins as much as a live one.
+                const bool wasConnected = wifi->isConnected();
+                if (wasConnected) {
+                    DIAG_DEBUG(SCALE, "main") << "DE1 sleep + WiFi scale - closing WS for the sleep interval";
+                    wifi->disableLcd();
+                } else {
+                    bleManager.scaleInfo(QStringLiteral(
+                        "Scale reconnect held until the DE1 wakes"), QStringLiteral("main"));
+                }
+                holdReconnectUntilWake();
+                wifi->disconnectFromScale();
+                wifi->beginSleepKeepAwake(/*checkInNow=*/!wasConnected);
+            } else if (physicalScale && physicalScale->isConnected()) {
+                if (settings.keepScaleOn()) {
+                    DIAG_DEBUG(SCALE, "main") << "DE1 going to sleep - disabling scale LCD (keepScaleOn=true)";
+                    physicalScale->disableLcd();
+                    // The BLE radio doesn't have WiFi's idle-park pathology.
+                    // See scaleLcdRestorePending for why this is tracked.
+                    scaleLcdRestorePending = true;
+                } else {
+                    DIAG_DEBUG(SCALE, "main") << "DE1 going to sleep - putting scale to sleep and disconnecting (keepScaleOn=false)";
+                    holdReconnectUntilWake();
+                    QObject::connect(physicalScale.get(), &ScaleDevice::sleepCompleted,
+                                     physicalScale.get(),
+                                     [scale = physicalScale.get()]() {
+                                         if (scale) scale->disconnectFromScale();
+                                     },
+                                     Qt::SingleShotConnection);
+                    physicalScale->sleep();
+                }
+            }
+        } else {
+            // Fire the wake actions once, on the first non-Sleep phase: the DE1
+            // usually wakes into Heating or Ready and may never reach Idle.
+            if (wasInSleep) {
+                wasInSleep = false;
+                if (physicalScale)
+                    physicalScale->setDisplayHeldOff(false);
+                // Also ended by the reconnect below; ended here too for the
+                // case where no reconnect is armed.
+                if (auto* wifi = qobject_cast<DecentScaleWifi*>(physicalScale.get()))
+                    wifi->endSleepKeepAwake();
+                if (physicalScale && physicalScale->isConnected()
+                    && !scaleAutoReconnectSuppressed) {
+                    // BT keepScaleOn=true happy path: scale stayed connected
+                    // through DE1 sleep. LCD was turned off by disableLcd() —
+                    // restore it. (WiFi keepScaleOn=true closes the WS and
+                    // takes the next branch; its onConnected() handles LCD
+                    // restore via "display on" on the reconnect handshake.)
+                    DIAG_DEBUG(SCALE, "main") << "DE1 woke up - waking scale LCD";
+                    physicalScale->wake();
+                    scaleLcdRestorePending = false;
+                } else if (scaleAutoReconnectSuppressed
+                           && !settings.scaleAddress().isEmpty()) {
+                    // The sleep branch held the reconnect; release it. A fresh
+                    // reconnect's onConnected() sends `display on` itself.
+                    scaleAutoReconnectSuppressed = false;
+                    // Short first attempt on this path only: the sleep check-ins
+                    // kept a WiFi scale awake, and a powered-off BT scale fails
+                    // fast into the normal backoff.
+                    constexpr int kWakeReconnectFirstAttemptMs = 200;
+                    bleManager.requestScaleReconnectRampRestart(
+                        QStringLiteral("DE1 woke up"), kWakeReconnectFirstAttemptMs);
+                } else {
+                    // Neither branch fired: scale exists but is mid-reconnect
+                    // (BT link dropped during sleep — connectedChanged armed a
+                    // reconnect on its own) or app-resume already cleared the
+                    // suppression flag. Leave scaleLcdRestorePending intact so
+                    // connectedChanged restores the LCD when the scale lands.
+                    DIAG_DEBUG(SCALE, "main") << "DE1 woke up - no immediate wake action"
+                             << "(physicalScale=" << (physicalScale ? "yes" : "no")
+                             << "connected=" << (physicalScale && physicalScale->isConnected())
+                             << "suppressed=" << scaleAutoReconnectSuppressed
+                             << "lcdRestorePending=" << scaleLcdRestorePending << ")";
+
+                    // …but a DE1 that just woke is a strong signal the user is
+                    // back at the machine with the scale switched on, so restart
+                    // the ramp from the top. Only when the ladder is actually
+                    // running: with no saved scale, or a USB primary (owned by
+                    // UsbScaleManager), there is nothing to re-arm.
+                    // isActive stays a caller gate: the ladder is deliberately
+                    // stopped while the screensaver runs (past the keepScaleOn
+                    // ramp), and a DE1 wake behind it should not resurrect it.
+                    if (scaleReconnectTimer.isActive()) {
+                        bleManager.requestScaleReconnectRampRestart(
+                            QStringLiteral("DE1 woke up"));
+                    }
+                }
+            }
+            de1EverAwake = true;
+        }
+    });
+
+    // Cleanup on exit
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, [&accessibilityManager, &batteryManager, &de1Device, &de1ReconnectTimer, &physicalScale, &engine, &weightThread, &relayClient, &machineStatusSnapshot, &mainController, &scaleReconnectTimer, &bleManager, &shotHistoryExporter, &settings]() {
+        DIAG_DEBUG(APP, "main") << "Application exiting - shutting down devices";
+
+        // Leave an honest "disconnected" snapshot so the Home Screen widget
+        // doesn't keep showing the last live state after the app is gone.
+        machineStatusSnapshot.publishDisconnected();
+
+        // Stop relay client and screen capture FIRST — the capture timer grabs
+        // frames from the render thread. If it fires during the BLE drain wait
+        // loop below, grabWindow() can deadlock against a stopping render thread,
+        // freezing the app on quit (especially on Android/Samsung A8).
+        // Use shutdown() instead of setEnabled(false) because setEnabled(false) is
+        // a no-op when already disabled, and uses async socket close. shutdown()
+        // unconditionally destroys the capture service and aborts the socket.
+        relayClient.shutdown();
+
+        // Set QML shuttingDown flag to prevent screensaver from activating.
+        // Qt.quit() does NOT trigger ApplicationWindow.onClosing, so the QML-side
+        // shuttingDown flag may not be set. Setting it here covers all exit paths.
+        if (!engine.rootObjects().isEmpty()) {
+            engine.rootObjects().constFirst()->setProperty("shuttingDown", true);
+        }
+
+        // Stop weight processor thread first (before BLE shutdown).
+        // Any pending SOW commands are no longer needed since we're exiting.
+        weightThread.quit();
+        weightThread.wait(1000);
+
+        bool needBleWait = false;
+
+        // transport() is null in simulation mode (sim uses the simulator, not a
+        // real transport), yet de1Device.isConnected() is unconditionally true
+        // in sim. Gate the drain wait on a real connected transport: otherwise
+        // every sim-mode quit enters the wait with no queueDrained source and
+        // always trips the safety-net timeout with a misleading warning.
+        auto* de1Transport = de1Device.transport();
+        const bool de1TransportConnected = de1Transport && de1Transport->isConnected();
+
+        // Put DE1 to sleep if connected (this is more reliable than QML onClosing on mobile)
+        if (de1Device.isConnected()) {
+            DIAG_DEBUG(DE1, "main") << "Sending DE1 to sleep on app exit";
+            de1Device.goToSleep();
+            needBleWait = de1TransportConnected;
+        }
+
+        // "Keep scale on" covers quitting the app too (#1981): display off, as when
+        // the DE1 sleeps, but the scale stays on. The display write has no completion
+        // signal of its own, so on BLE the wait below holds for the shared GATT queue
+        // to drain. A WiFi scale's command is a socket write, not queued there.
+        const bool scaleConnected = physicalScale && physicalScale->isConnected();
+        const bool sleepScaleOnExit = scaleConnected && !settings.keepScaleOn();
+        bool waitForGattQueue = false;
+        if (sleepScaleOnExit) {
+            DIAG_DEBUG(SCALE, "main") << "Sending physical scale to sleep on app exit";
+            needBleWait = true;
+        } else if (scaleConnected) {
+            DIAG_DEBUG(SCALE, "main") << "Turning the scale display off on app exit (keep scale on)";
+            physicalScale->disableLcd();
+            const BleGattQueue& gatt = BleGattQueue::instance();
+            waitForGattQueue = gatt.isBusy() || gatt.pendingCount() > 0;
+            needBleWait = needBleWait || waitForGattQueue;
+        }
+
+        // IMPORTANT: Ensure charger is ON before exiting, unless the user switched
+        // USB Charger off. Matches de1app's app_exit behaviour — leave the charger
+        // ON so the tablet can charge while the app is not running to manage it.
+        //
+        // BEFORE the drain wait below, not after, and that ordering is the whole
+        // point. The write goes to the FRONT of the shared GATT queue and its
+        // dispatch is posted, so it needs one event-loop turn; after the wait
+        // there may be no such turn on a quiet quit (drainDbWork() returns
+        // immediately when nothing is queued, and the export loop runs zero
+        // iterations), and de1Device.disconnect() below would then forget() the
+        // write unissued — leaving the DE1 USB port off, which is the
+        // tablet-dies-overnight case this call exists to prevent.
+        batteryManager.ensureChargerOn();
+
+        // Wait for BLE writes to complete before exiting. Every write this exit
+        // issued must finish, not just the first: the DE1's queue draining used
+        // to end the wait with the scale's command still queued.
+        if (needBleWait) {
+            QEventLoop waitLoop;
+            bool de1Done = !de1TransportConnected;
+            bool de1Delivered = !de1TransportConnected;
+            bool scaleDone = !sleepScaleOnExit && !waitForGattQueue;
+            const auto quitWhenAllDone = [&]() {
+                if (de1Done && scaleDone) waitLoop.quit();
+            };
+            int timeoutMs = 1500; // Safety-net timeout
+
+            if (de1TransportConnected) {
+                QObject::connect(de1Transport, &DE1Transport::queueDrained,
+                                 &waitLoop, [&]() { de1Done = de1Delivered = true; quitWhenAllDone(); });
+                QObject::connect(de1Transport, &DE1Transport::disconnected,
+                                 &waitLoop, [&]() { de1Done = true; quitWhenAllDone(); });
+                timeoutMs = 2000;
+            }
+
+            if (waitForGattQueue) {
+                QObject::connect(&BleGattQueue::instance(), &BleGattQueue::drained,
+                                 &waitLoop, [&]() { scaleDone = true; quitWhenAllDone(); });
+            }
+
+            if (sleepScaleOnExit) {
+                QObject::connect(physicalScale.get(), &ScaleDevice::sleepCompleted,
+                                 &waitLoop, [&]() { scaleDone = true; quitWhenAllDone(); });
+                physicalScale->sleep();
+            }
+
+            DIAG_DEBUG(BLUETOOTH, "main") << "Waiting for BLE queue to drain before exit...";
+            QTimer::singleShot(timeoutMs, &waitLoop, [&]() { waitLoop.quit(); });
+            if (!(de1Done && scaleDone))  // a source can finish synchronously above
+                waitLoop.exec();
+
+            const bool drained = de1Delivered && scaleDone;
+            if (drained)
+                DIAG_DEBUG(BLUETOOTH, "main") << "BLE queue drained successfully, exiting.";
+            else
+                DIAG_WARN(BLUETOOTH, "main") << "BLE queue drain timed out after" << timeoutMs << "ms — sleep command may not have been delivered.";
+        }
+
+        // Neutralize the auto-reconnect path before BLE disconnect, otherwise
+        // de1Device.disconnect() below fires connectedChanged, which triggers
+        // the auto-reconnect lambda and schedules a 5s QTimer. That timer
+        // stays alive through stack unwinding and hangs the event dispatcher
+        // on Android when it tries to fire after teardown.
+        //
+        // Stop the timer first (belt) and disconnect only connectedChanged
+        // (suspenders). Do NOT use the wildcard form
+        // QObject::disconnect(&de1Device, nullptr, nullptr, nullptr) here:
+        // de1Device is reachable from QML, so QQmlEngine holds internal
+        // bookkeeping tied to its lifetime. The wildcard disconnect form
+        // acquires receiver locks in a different order than the per-signal
+        // pointer form, and on Android shutdown that contends with the QML
+        // engine and hard-deadlocks the main thread (#877). The per-signal
+        // form has no such problem.
+        //
+        // This said "exposed to QML via setContextProperty" until DE1Device
+        // became a QML_SINGLETON (contextsingletons_qml.h). The mechanism
+        // changed — the engine now tracks it through QQmlData and
+        // addOwnedObject rather than a context property's destroyed()
+        // connection — but the hazard and the fix are unchanged, so do not
+        // read the new registration as a reason to relax this back to the
+        // wildcard form.
+        de1ReconnectTimer.stop();
+        QObject::disconnect(&de1Device, &DE1Device::connectedChanged, nullptr, nullptr);
+        scaleReconnectTimer.stop();
+        // The scale disconnect below asks for the reconnect ramp, which would restart the timer.
+        QObject::disconnect(&bleManager, &BLEManager::scaleReconnectRampRestartRequested, nullptr, nullptr);
+
+        // Let the database write workers finish before the storages are
+        // destroyed. The BLE work above protects the machine; this protects the
+        // user's data. Until now nothing waited: a dose, note, rating or
+        // Visualizer id written seconds before quit could be discarded by
+        // ~SerialDbWorker with only a warning nobody was around to read.
+        //
+        // Placed HERE, not earlier, for two reasons found in review:
+        //
+        //  - It pumps events, and every reconnect ladder must be disarmed first.
+        //    A DE1 or scale reconnect tick landing inside the drain would start a
+        //    BLE scan microseconds before the disconnect below — the stale-GATT
+        //    state the comment above exists to avoid. Before this drain existed,
+        //    a quit with nothing BLE-connected processed no events here at all,
+        //    so that window is new and had to be closed rather than inherited.
+        //  - Both BLE waits above talk to hardware over a link that is about to
+        //    go away, including the charger write labelled important for safety.
+        //    The database is local and loses nothing by waiting, so it must not
+        //    be queued in front of either.
+        //
+        // ExcludeUserInputEvents because a second tap on Quit, delivered inside
+        // this loop, reaches QCoreApplication::exit() — which exits EVERY loop in
+        // data->eventLoops (qcoreapplication.cpp:1547-1556), including this one.
+        // That would abandon the drain and discard exactly the write it is here
+        // to save, at the hand of an impatient user.
+        //
+        // Bounded for the same reason the BLE waits are: Android kills a process
+        // that lingers on quit.
+        mainController.drainDbWork();
+
+        // A drained write may have just spawned an export thread (the exporter
+        // subscribes to shotSaved/shotMetadataUpdated), and this object is
+        // destroyed BEFORE MainController at scope exit — every export thread
+        // body starts with `if (*destroyed) return;`. Waiting on the database
+        // alone therefore made the DB row current while the exported JSON stayed
+        // stale, silently. Same bounded shape as the drain above.
+        {
+            QElapsedTimer waited;
+            waited.start();
+            while (!shotHistoryExporter.isExportWorkIdle() && waited.elapsed() < 750)
+                QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 20);
+            if (!shotHistoryExporter.isExportWorkIdle())
+                STORAGE_WARN_STDERR("Export", QStringLiteral(
+                    "shot export threads still running at exit - the exported JSON for a "
+                    "just-edited shot may be stale"));
+        }
+
+        // Explicitly disconnect BLE so the GATT connection is released cleanly.
+        // Without this, if the app is force-killed (e.g. after a hang), Android's
+        // Bluetooth stack keeps the stale GATT connection — on Samsung devices this
+        // can prevent the app from reconnecting until the device is rebooted.
+        de1Device.disconnect();
+        if (physicalScale) {
+            physicalScale->disconnectFromScale();
+        }
+
+        // Note: no need to null context properties here — but NOT because of a
+        // blanket "everything is declared before the engine" guarantee. This
+        // comment used to claim exactly that, and a refractometer teardown
+        // crash proved it wrong: the device was declared AFTER the engine, so
+        // it died first, while bindings reading it were still live.
+        //
+        // What actually holds: most context-property backing objects are
+        // declared above `engine` and so outlive it (`refractometer` now among
+        // them, and `flowCalibrationModel`, which moved up there when it became
+        // a singleton — a singleton has NO self-nulling mechanism, so for it
+        // declaration order is the whole of the safety, not a belt on a brace).
+        // Where that is not true — `de1SimulatorPtr`, see the note after
+        // app.exec(); also GHCSimulator further down, still a context property —
+        // safety comes from QML dropping a context property itself when its
+        // object emits destroyed(), plus the C++ side holding it via QPointer
+        // so it self-nulls at the same moment (BLEManager::m_refractometerDevice
+        // is the worked example). A new context-property object declared after
+        // the engine and held by a raw pointer has neither, and would need one.
+
+        // Disable Qt's accessibility bridge before window destruction
+        // This prevents iOS crash (SIGBUS) where the accessibility system tries to
+        // sync with already-destroyed QML items during app exit
+        QAccessible::setActive(false);
+
+        // Shutdown accessibility to stop TTS before any other cleanup
+        // This prevents race conditions with Android's hwuiTask thread
+        accessibilityManager.shutdown();
+    });
+
+    int result = app.exec();
+
+#ifdef Q_OS_ANDROID
+    BtLogFilter::setGcMismatchHandler({});
+    QObject::disconnect(gcStateConnection);
+    QObject::disconnect(gcConnectionChange);
+#endif
+
+    // Sever the main() signal handlers before any local they captured is
+    // destroyed — see the `handlerScope` comment where it is declared. This has
+    // to stay ahead of ~QQmlApplicationEngine, which runs at scope exit below and
+    // can still re-enter C++ setters that emit into those lambdas.
+    handlerScope.reset();
+
+    // Same lifetime problem, but NOT a signal connection, so handlerScope cannot
+    // reach it: de1SimulatorPtr is declared after `engine` and dies before
+    // de1Device (declared at the top), which holds a RAW DE1Simulator*. Clear it
+    // while both ends are still alive.
+    //
+    // The simulated scale needs no equivalent: MachineState::m_scale and
+    // ShotTimingController::m_scale are both QPointer, so they self-null when the
+    // scale is destroyed. Only this pointer is unguarded.
+    de1Device.setSimulator(nullptr);
+
+    // DE1 signals already disconnected in aboutToQuit handler before BLE disconnect.
+
+    // Disable crash handler before cleanup - crashes during C++ runtime destruction
+    // are not actionable and shouldn't prompt users to submit bug reports
+    CrashHandler::uninstall();
+
+    // Drain remaining log messages and restore default handler.
+    // Must be after CrashHandler (reverse of installation order).
+    AsyncLogger::uninstall();
+
+    return result;
+}

@@ -1,0 +1,277 @@
+#pragma once
+
+#include <QObject>
+#include "appsettings.h"
+#include <QString>
+#include <QStringList>
+#include <QVariant>
+#include <QVariantList>
+#include <QVariantMap>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QPair>
+#include <QVector>
+
+// Network/web/layout settings: shot server, web security, auto-favorites,
+// saved searches, shot history sort, layout configuration, Discuss-Shot URLs.
+// Split from Settings to keep settings.h's transitive-include footprint small.
+class SettingsNetwork : public QObject {
+    Q_OBJECT
+
+    // Saved searches & shot history sort
+    Q_PROPERTY(QStringList savedSearches READ savedSearches WRITE setSavedSearches NOTIFY savedSearchesChanged FINAL)
+    Q_PROPERTY(QString shotHistorySortField READ shotHistorySortField WRITE setShotHistorySortField NOTIFY shotHistorySortFieldChanged FINAL)
+    Q_PROPERTY(QString shotHistorySortDirection READ shotHistorySortDirection WRITE setShotHistorySortDirection NOTIFY shotHistorySortDirectionChanged FINAL)
+
+    // Recipes page sort (recipe-list-organization)
+    Q_PROPERTY(QString recipeSortField READ recipeSortField WRITE setRecipeSortField NOTIFY recipeSortFieldChanged FINAL)
+    Q_PROPERTY(QString recipeSortDirection READ recipeSortDirection WRITE setRecipeSortDirection NOTIFY recipeSortDirectionChanged FINAL)
+
+    // Beans page sort
+    Q_PROPERTY(QString bagSortField READ bagSortField WRITE setBagSortField NOTIFY bagSortFieldChanged FINAL)
+    Q_PROPERTY(QString bagSortDirection READ bagSortDirection WRITE setBagSortDirection NOTIFY bagSortDirectionChanged FINAL)
+
+    // Shot server (HTTP API)
+    Q_PROPERTY(bool shotServerEnabled READ shotServerEnabled WRITE setShotServerEnabled NOTIFY shotServerEnabledChanged FINAL)
+    Q_PROPERTY(QString shotServerHostname READ shotServerHostname WRITE setShotServerHostname NOTIFY shotServerHostnameChanged FINAL)
+    Q_PROPERTY(int shotServerPort READ shotServerPort WRITE setShotServerPort NOTIFY shotServerPortChanged FINAL)
+    Q_PROPERTY(bool webSecurityEnabled READ webSecurityEnabled WRITE setWebSecurityEnabled NOTIFY webSecurityEnabledChanged FINAL)
+    // Remote Web Access: the web interface through the embedded Tailscale Funnel,
+    // authorized by its own capability token (separate from the MCP connector's).
+    Q_PROPERTY(bool remoteWebEnabled READ remoteWebEnabled WRITE setRemoteWebEnabled NOTIFY remoteWebEnabledChanged FINAL)
+    Q_PROPERTY(QString remoteWebToken READ remoteWebToken NOTIFY remoteWebTokenChanged FINAL)
+
+    Q_PROPERTY(double autoFavoriteGraphHeight READ autoFavoriteGraphHeight WRITE setAutoFavoriteGraphHeight NOTIFY autoFavoriteGraphHeightChanged FINAL)
+
+    // Auto-favorites
+    Q_PROPERTY(QString autoFavoritesGroupBy READ autoFavoritesGroupBy WRITE setAutoFavoritesGroupBy NOTIFY autoFavoritesGroupByChanged FINAL)
+    Q_PROPERTY(int autoFavoritesMaxItems READ autoFavoritesMaxItems WRITE setAutoFavoritesMaxItems NOTIFY autoFavoritesMaxItemsChanged FINAL)
+    Q_PROPERTY(bool autoFavoritesOpenBrewSettings READ autoFavoritesOpenBrewSettings WRITE setAutoFavoritesOpenBrewSettings NOTIFY autoFavoritesOpenBrewSettingsChanged FINAL)
+    Q_PROPERTY(bool autoFavoritesHideUnrated READ autoFavoritesHideUnrated WRITE setAutoFavoritesHideUnrated NOTIFY autoFavoritesHideUnratedChanged FINAL)
+
+    // Shot export
+    Q_PROPERTY(bool exportShotsToFile READ exportShotsToFile WRITE setExportShotsToFile NOTIFY exportShotsToFileChanged FINAL)
+
+    // Layout configuration
+    Q_PROPERTY(QString layoutConfiguration READ layoutConfiguration WRITE setLayoutConfiguration NOTIFY layoutConfigurationChanged FINAL)
+
+    // Discuss Shot URLs
+    Q_PROPERTY(int discussShotApp READ discussShotApp WRITE setDiscussShotApp NOTIFY discussShotAppChanged FINAL)
+    Q_PROPERTY(QString discussShotCustomUrl READ discussShotCustomUrl WRITE setDiscussShotCustomUrl NOTIFY discussShotCustomUrlChanged FINAL)
+    Q_PROPERTY(QString claudeRcSessionUrl READ claudeRcSessionUrl WRITE setClaudeRcSessionUrl NOTIFY claudeRcSessionUrlChanged FINAL)
+    Q_PROPERTY(int discussAppNone READ discussAppNone CONSTANT FINAL)
+    Q_PROPERTY(int discussAppClaudeDesktop READ discussAppClaudeDesktop CONSTANT FINAL)
+
+public:
+    explicit SettingsNetwork(QObject* parent = nullptr);
+    // Detached layout preview. Layout mutators update only this instance's
+    // cache, without persisting or publishing their intermediate results.
+    explicit SettingsNetwork(const QJsonObject& layoutPreview, QObject* parent = nullptr);
+
+    int discussAppNone() const { return 6; }
+    int discussAppClaudeDesktop() const { return 7; }
+    // Whether the Discuss app reads the shot itself, so nothing is pasted: the
+    // Claude apps and ChatGPT through a live remote connector, Claude Desktop
+    // through the local server. Any other app gets the shot on the clipboard.
+    static bool discussAppReadsShot(int app, bool localMcpServing, bool remoteConnectorLive);
+
+    // Saved searches
+    QStringList savedSearches() const;
+    void setSavedSearches(const QStringList& searches);
+    Q_INVOKABLE void addSavedSearch(const QString& search);
+    Q_INVOKABLE void removeSavedSearch(const QString& search);
+
+    // Shot history sort
+    QString shotHistorySortField() const;
+    void setShotHistorySortField(const QString& field);
+    QString shotHistorySortDirection() const;
+    void setShotHistorySortDirection(const QString& direction);
+
+    // Recipes page sort
+    QString recipeSortField() const;
+    void setRecipeSortField(const QString& field);
+    QString recipeSortDirection() const;
+    void setRecipeSortDirection(const QString& direction);
+
+    // Beans page sort
+    QString bagSortField() const;
+    void setBagSortField(const QString& field);
+    QString bagSortDirection() const;
+    void setBagSortDirection(const QString& direction);
+
+    // Shot server
+    bool shotServerEnabled() const;
+    void setShotServerEnabled(bool enabled);
+    QString shotServerHostname() const;
+    void setShotServerHostname(const QString& hostname);
+    int shotServerPort() const;
+    void setShotServerPort(int port);
+    bool webSecurityEnabled() const;
+    void setWebSecurityEnabled(bool enabled);
+    bool remoteWebEnabled() const;
+    void setRemoteWebEnabled(bool enabled);
+    // Generated on first read; rotation replaces it (the old URL stops working).
+    QString remoteWebToken() const;
+    void rotateRemoteWebToken();
+
+    // Auto-favorites
+    double autoFavoriteGraphHeight() const;
+    void setAutoFavoriteGraphHeight(double height);
+    QString autoFavoritesGroupBy() const;
+    void setAutoFavoritesGroupBy(const QString& groupBy);
+    int autoFavoritesMaxItems() const;
+    void setAutoFavoritesMaxItems(int maxItems);
+    bool autoFavoritesOpenBrewSettings() const;
+    void setAutoFavoritesOpenBrewSettings(bool open);
+    bool autoFavoritesHideUnrated() const;
+    void setAutoFavoritesHideUnrated(bool hide);
+
+    // Shot export
+    bool exportShotsToFile() const;
+    void setExportShotsToFile(bool enabled);
+
+    // Discuss Shot
+    int discussShotApp() const;
+    void setDiscussShotApp(int app);
+    QString discussShotCustomUrl() const;
+    void setDiscussShotCustomUrl(const QString& url);
+    QString claudeRcSessionUrl() const;
+    void setClaudeRcSessionUrl(const QString& url);
+    Q_INVOKABLE QString discussShotUrl() const;
+    Q_INVOKABLE void openDiscussUrl(const QString& url);
+    Q_INVOKABLE void dismissDiscussOverlay();
+
+    // WiFi scale IP cache (mDNS resilience). Keyed by bare hostname
+    // (no "wifi:" prefix). Empty string means "no entry — go straight
+    // to hostname resolution".
+    Q_INVOKABLE QString wifiScaleIp(const QString& hostname) const;
+    Q_INVOKABLE void setWifiScaleIp(const QString& hostname, const QString& ip);
+
+    // Layout configuration (dynamic IdlePage layout)
+    QString layoutConfiguration() const;
+    void setLayoutConfiguration(const QString& json);
+    Q_INVOKABLE QVariantList getZoneItems(const QString& zoneName) const;
+    Q_INVOKABLE void moveItem(const QString& itemId, const QString& fromZone, const QString& toZone, int toIndex);
+    Q_INVOKABLE void addItem(const QString& type, const QString& zone, int index = -1);
+    Q_INVOKABLE void removeItem(const QString& itemId, const QString& zone);
+    Q_INVOKABLE void reorderItem(const QString& zoneName, int fromIndex, int toIndex);
+    Q_INVOKABLE void resetLayoutToDefault();
+    Q_INVOKABLE bool hasItemType(const QString& type) const;
+    Q_INVOKABLE int getZoneYOffset(const QString& zoneName) const;
+    Q_INVOKABLE void setZoneYOffset(const QString& zoneName, int offset);
+    Q_INVOKABLE double getZoneScale(const QString& zoneName) const;
+    Q_INVOKABLE void setZoneScale(const QString& zoneName, double scale);
+    // Per-zone layout/appearance options (composable-brew-bar), stored in a
+    // zone-keyed map alongside offsets/scales. Keys: "distribution", "alignment",
+    // "style". Absent => defaultValue (preserves current behaviour).
+    Q_INVOKABLE QString getZoneOption(const QString& zoneName, const QString& key, const QString& defaultValue) const;
+    Q_INVOKABLE void setZoneOption(const QString& zoneName, const QString& key, const QString& value);
+    // Replace a zone's items in one step (used by "populate from preset").
+    Q_INVOKABLE void setZoneItems(const QString& zoneName, const QVariantList& items);
+    // Atomically replace a zone's items and selected options for a built-in preset.
+    void applyZonePreset(const QString& zoneName, const QVariantList& items,
+                         const QVariantMap& options);
+    // Reset a single zone to its default items + options (counterpart to clear).
+    Q_INVOKABLE void resetZoneToDefault(const QString& zoneName);
+    // Ensure at least one placed widget can reach Settings (a "settings" item,
+    // or a "custom" item whose action is "navigate:settings"); if none is found
+    // across the standard zones, adds a settings widget to bottomRight. Shared
+    // by the in-app layout editor and the web layout editor so both mutation
+    // paths keep Settings reachable from the home screen. The scan used to
+    // live in QML (SettingsLayoutTab.ensureSettingsAccessible); that function
+    // now just delegates here so there is a single implementation.
+    Q_INVOKABLE void ensureSettingsAccessible();
+
+    // Both setters return false when the write was refused (unstorable value)
+    // or no item with itemId exists (e.g. deleted from another device while an
+    // editor was open) — callers should surface that instead of assuming success.
+    Q_INVOKABLE bool setItemProperty(const QString& itemId, const QString& key, const QVariant& value);
+    // Array-valued properties set from QML must use this typed variant: the
+    // engine converts a JS array to QVariantList for a typed parameter, but
+    // hands the generic QVariant one a wrapped QJSValue, which would store as
+    // null (setItemProperty refuses that write instead of corrupting the value).
+    Q_INVOKABLE bool setItemPropertyList(const QString& itemId, const QString& key, const QVariantList& value);
+    // Apply one editor's related properties in a single persisted layout
+    // revision. The shared LayoutService uses this for multi-field popups.
+    Q_INVOKABLE bool setItemProperties(const QString& itemId, const QVariantMap& properties);
+    Q_INVOKABLE QVariantMap getItemProperties(const QString& itemId) const;
+
+    // Shared per-instance option and display defaults.
+    Q_INVOKABLE static bool typeHasOptions(const QString& type);
+    Q_INVOKABLE static QStringList optionKeysForType(const QString& type);
+    Q_INVOKABLE static QString defaultDisplayModeForType(const QString& type);
+    Q_INVOKABLE static QVariantMap sleepOptionDefaults();
+
+    // Shared palette, chip labels, categories and action catalog.
+    Q_INVOKABLE static QVariantList widgetCatalog();
+    Q_INVOKABLE static QVariantMap widgetChipNames();
+    Q_INVOKABLE static QVariantList widgetCategoryNames();
+    Q_INVOKABLE static QVariantList layoutActionCatalog();
+    // Label lookup for EVERY action id, including ones no longer offered in the
+    // picker — the analogue of widgetChipNames(). Without it a stored legacy
+    // action renders as its raw id.
+    Q_INVOKABLE static QVariantMap layoutActionLabels();
+    // For a widget type whose page is reachable ONLY by gesture, the navigate action
+    // its RESERVED gesture performs — empty for types that open their page on tap and
+    // may therefore override both gestures. Both editors derive the lock and the
+    // destination label from this rather than carrying a list.
+    // See: layout-widget-gesture-overrides.
+    Q_INVOKABLE static QString gestureReservedActionForType(const QString& type);
+    Q_INVOKABLE static bool typeSupportsGestureOverrides(const QString& type);
+
+    // Every (translation key, English fallback) pair declared by the C++ catalog
+    // tables in this file — action labels, widget palette/chip labels, category
+    // names.
+    //
+    // TranslationManager's completeness scan parses QML SOURCE only, and the
+    // registry is otherwise filled lazily by translate() actually running. So a
+    // key that lives in C++ is absent from the registry unless the user happens
+    // to open the screen that renders it — and a bulk AI translation or a
+    // community upload run before that publishes without it, silently, leaving
+    // those labels English in every locale. That was already true of the widget
+    // catalog before the action catalog joined it. The scan calls this so both
+    // are declared rather than discovered.
+    static QVector<QPair<QString, QString>> layoutCatalogTranslationStrings();
+    // Whether a placed item instance is "configured" — its type has options, or
+    // it carries any per-instance property beyond the bare type/id. Used to gate
+    // remove-confirmation so an accidental tap can't discard a set-up widget.
+    Q_INVOKABLE bool itemIsConfigured(const QString& itemId) const;
+
+signals:
+    void savedSearchesChanged();
+    void shotHistorySortFieldChanged();
+    void shotHistorySortDirectionChanged();
+    void recipeSortFieldChanged();
+    void recipeSortDirectionChanged();
+    void bagSortFieldChanged();
+    void bagSortDirectionChanged();
+    void shotServerEnabledChanged();
+    void shotServerHostnameChanged();
+    void shotServerPortChanged();
+    void webSecurityEnabledChanged();
+    void remoteWebEnabledChanged();
+    void remoteWebTokenChanged();
+    void autoFavoriteGraphHeightChanged();
+    void autoFavoritesGroupByChanged();
+    void autoFavoritesMaxItemsChanged();
+    void autoFavoritesOpenBrewSettingsChanged();
+    void autoFavoritesHideUnratedChanged();
+    void exportShotsToFileChanged();
+    void discussShotAppChanged();
+    void discussShotCustomUrlChanged();
+    void claudeRcSessionUrlChanged();
+    void layoutConfigurationChanged();
+
+private:
+    QString defaultLayoutJson() const;
+    QJsonObject getLayoutObject() const;
+    void saveLayoutObject(const QJsonObject& layout);
+    QString generateItemId(const QString& type) const;
+    void invalidateLayoutCache();
+
+    mutable AppSettings m_settings;
+    mutable QJsonObject m_layoutCache;
+    mutable QString m_layoutJsonCache;
+    mutable bool m_layoutCacheValid = false;
+    bool m_layoutPreview = false;
+};

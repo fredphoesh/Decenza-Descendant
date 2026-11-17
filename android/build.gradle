@@ -1,0 +1,75 @@
+// Written in the AGP 9 DSL of Qt's own Gradle templates
+// (qtbase/src/android/templates_cmake/app/build.gradle.in in 6.12.0), not the
+// legacy single-module template androiddeployqt would otherwise copy.
+// Repositories and plugin resolution live in settings.gradle.
+plugins {
+    id 'com.android.application' version '9.2.1'
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
+    implementation 'androidx.core:core:1.17.0'
+}
+
+// androiddeployqt passes the compile platform as a string, "android-<api>[.<minor>]"
+// (qtbase/src/tools/androiddeployqt/main.cpp:3144-3148). CMakeLists.txt chooses it.
+def compilePlatform = (androidCompileSdkVersion - 'android-').tokenize('.')
+
+android {
+    namespace = androidPackageName
+    compileSdk {
+        version = release(compilePlatform[0].toInteger()) {
+            minorApiLevel = compilePlatform.size() > 1 ? compilePlatform[1].toInteger() : 0
+        }
+    }
+    buildToolsVersion = androidBuildToolsVersion
+    ndkVersion = androidNdkVersion
+
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = [qtAndroidDir + '/src', 'src', 'java']
+            aidl.srcDirs = [qtAndroidDir + '/src', 'src', 'aidl']
+            res.srcDirs = [qtAndroidDir + '/res', 'res']
+            resources.srcDirs = ['resources']
+            assets.srcDirs = ['assets']
+            jniLibs.srcDirs = ['libs']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError = false
+    }
+
+    androidResources {
+        noCompress += ['rcc'] // Qt mmaps the resource bundle
+        // Decenza's UI strings are not Android resources; this drops the libraries' translations.
+        localeFilters += ['en']
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = legacyPackaging.toBoolean()
+        }
+    }
+
+    defaultConfig {
+        // Decenza-Lab: own install identity so it sits beside the official app.
+        applicationId = "io.github.fredphoesh.lab"
+        minSdk = qtMinSdkVersion.toInteger()
+        targetSdk = qtTargetSdkVersion.toInteger()
+        ndk {
+            // A List, not split()'s String[]: AGP 9 adds an array as one element.
+            abiFilters.addAll(qtTargetAbiList.split(',').toList())
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += ['-Xlint:all']
+}

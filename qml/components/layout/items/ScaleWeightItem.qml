@@ -1,0 +1,400 @@
+import QtQuick
+import QtQuick.Layouts
+import Decenza
+
+LayoutWidgetItem {
+    id: root
+
+    // Per-instance data mode (composable-brew-bar): "" / "gross" (raw weight,
+    // default), "netBeans" (minus dose-cup tare), "netMilk" (minus pitcher
+    // weight), "contextAware" (net milk while steaming, else net beans),
+    // "expectedYield" (the active stop-at-weight target, ProfileManager.targetWeight:
+    // the brew-yield override when set — dose × ratio in brew-by-ratio mode — else
+    // the profile's fixed target).
+    readonly property string dataMode: (modelData && modelData.dataMode) ? modelData.dataMode : ""
+
+    // A computed mode (currently only expectedYield) shows a derived value, not a
+    // measurement: it renders without a scale, never shows the scale warning, and
+    // never gets the flow-scale "~" suffix.
+    readonly property bool isComputedMode: dataMode === "expectedYield"
+
+    // Per-instance display mode (composable-status-bar): "text" (default, a
+    // connected-dot + value) or "icon" (a scale icon ahead of the value).
+    readonly property string displayMode: (modelData && modelData.displayMode) ? modelData.displayMode : "text"
+
+    // Per-instance "show ratio" toggle: when brew-by-ratio is active the weight
+    // is suffixed with "1:X.X". Defaults to true (today's behaviour); set false
+    // to suppress where the ratio is already shown elsewhere (ratio pill / status
+    // bar).
+    readonly property bool showRatio: (modelData && modelData.showRatio !== undefined) ? modelData.showRatio : true
+
+    function _pitcherWeight() {
+        var p = SteamService.getSteamPitcherPreset(SteamService.state.selectedSteamPitcher)
+        return (p && !p.disabled) ? (p.pitcherWeightG ?? 0) : 0
+    }
+
+    // Apply the per-instance data mode to the raw scale reading.
+    function displayedWeight() {
+        var w = MachineState.scaleWeight
+        if (root.dataMode === "netBeans")
+            return Math.max(0, w - RecipeContext.preferences.doseCupTareWeight)
+        if (root.dataMode === "netMilk")
+            return Math.max(0, SteamLabels.milkScaleLoad() - root._pitcherWeight())
+        if (root.dataMode === "contextAware") {
+            let steaming = MachineState.phase === MachineState.Phase.Steaming
+            return Math.max(0, w - (steaming ? root._pitcherWeight() : RecipeContext.preferences.doseCupTareWeight))
+        }
+        if (root.dataMode === "expectedYield")
+            return ProfileManager.targetWeight
+        return w
+    }
+
+    property bool isFlowScale: ScaleDevice && ScaleDevice.isFlowScale
+    property bool scaleConnected: ScaleDevice && ScaleDevice.connected
+    property bool accessibilityEnabled: typeof AccessibilityManager !== "undefined" && AccessibilityManager !== null && AccessibilityManager.enabled
+
+    // Scale warning: saved BLE scale not connected or connection failed, or app fell back to simulated scale
+    // Don't warn if a USB scale is connected — it satisfies the "have a real scale" requirement (not available on iOS)
+    property bool showScaleWarning: !root.isComputedMode
+        && (!root.scaleConnected || root.isFlowScale)
+        && (BLEManager.scaleConnectionFailed || Settings.primaryScaleAddress !== "")
+        && (Qt.platform.os === "ios" || !UsbScaleManager.scaleConnected)
+
+    // The value renders whenever a scale is connected — or, for a computed mode,
+    // whenever there is a real target: targetWeight == 0 is the profile's
+    // "stop-at-weight off" sentinel (same > 0 convention as ShotGraph /
+    // ShotPlanText), so show the "--" placeholder then, not a fake "0.0 g".
+    // Drives the value rows, the compact tare/settings tap overlay, and the "--"
+    // placeholders (shown when neither the value nor the warning shows; compact
+    // also hides them for flow scales).
+    readonly property bool showValue: !root.showScaleWarning
+        && (root.isComputedMode ? ProfileManager.targetWeight > 0 : root.scaleConnected)
+
+    implicitWidth: isCompact ? compactContent.implicitWidth : fullContent.implicitWidth
+    implicitHeight: isCompact ? compactContent.implicitHeight : fullContent.implicitHeight
+
+    // Accessibility: expose weight/status to screen readers
+    // Reactive computed property so TalkBack re-announces when scale state or weight changes.
+    readonly property string _accessibleName: {
+        if (root.showScaleWarning)
+            return BLEManager.scaleConnectionFailed
+                ? TranslationManager.translate("statusbar.scale_not_found_tap", "Scale not found. Tap to scan")
+                : TranslationManager.translate("statusbar.scale_connecting", "Scale connecting")
+        if (root.isComputedMode)  // a computed target, not a scale reading ("--" when the profile has none); tap edits it
+            return TranslationManager.translate("idle.label.expectedOutput", "Expected output") + ": "
+                   + (root.showValue ? root.weightText() : "--")
+        if (root.scaleConnected)
+            return TranslationManager.translate("idle.accessible.scale.weight", "Scale weight:") + " " + root.weightText() + ". " + TranslationManager.translate("idle.accessible.scale.tare", "Tap to tare")
+        return TranslationManager.translate("idle.accessible.scale.none", "No scale connected")
+    }
+
+    Accessible.role: Accessible.Button
+    Accessible.name: root._accessibleName
+    // Long-press for brew settings is only available in compact mode (scaleMouseArea).
+    // Long-press is also gated on accessibilityEnabled — safe to advertise to screen reader users.
+    Accessible.description: root.isCompact && root.scaleConnected
+        ? TranslationManager.translate("idle.accessible.scale.hint", "Long-press for brew settings.")
+        : ""
+    Accessible.focusable: true
+    Accessible.onPressAction: {
+        if (root.showScaleWarning)
+            HomePresetActions.scanForDevices()
+        else if (root.isComputedMode)  // tare is meaningless for a computed target — edit it instead
+            AppShell.brewSettingsRequested()
+        else if (root.scaleConnected)
+            SteamService.request("tare", {}, SteamService.state.controlContextId)
+    }
+
+    // Per-instance color override; "default"/unset keeps the dynamic state color
+    // below (tap feedback, ratio/flow-scale state). A named choice forces a
+    // static tint over all of it.
+    readonly property string colorChoice: (modelData && modelData.color) ? modelData.color : "default"
+
+    // Shared color logic
+    function scaleColor(pressed) {
+        var natural
+        if (pressed) natural = Theme.accentColor
+        else if (ProfileManager.brewByRatioActive) natural = Theme.weightColor
+        else if (root.isFlowScale) natural = Theme.textSecondaryColor
+        else natural = Theme.weightColor
+        return WidgetColor.resolve(root.colorChoice, natural)
+    }
+
+    function weightText() {
+        var weight = root.displayedWeight().toFixed(1)
+        var suffix = (root.isFlowScale && !root.isComputedMode) ? "g~" : "g"
+        if (root.showRatio && ProfileManager.brewByRatioActive) {
+            return weight + suffix + " 1:" + ProfileManager.brewByRatio.toFixed(1)
+        }
+        return weight + suffix
+    }
+
+    // --- COMPACT MODE ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: compactWarning.visible ? compactWarning.width : compactScaleRow.implicitWidth
+        implicitHeight: compactWarning.visible ? compactWarning.implicitHeight : compactScaleRow.implicitHeight
+
+        // Scale warning (connecting / not found / simulated fallback) - tap to scan
+        Rectangle {
+            id: compactWarning
+            visible: root.showScaleWarning
+            Accessible.ignored: true
+            anchors.centerIn: parent
+            width: compactWarningRow.implicitWidth + Theme.spacingMedium
+            height: Theme.touchTargetMin
+            color: BLEManager.scaleConnectionFailed ? Theme.errorColor : "transparent"
+            radius: Theme.scaled(4)
+
+            Row {
+                id: compactWarningRow
+                anchors.centerIn: parent
+                spacing: Theme.spacingSmall
+
+                Tr {
+                    key: "statusbar.scale_not_found"
+                    fallback: "Scale not found"
+                    visible: BLEManager.scaleConnectionFailed
+                    color: Theme.primaryContrastColor
+                    font: Theme.bodyFont
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+
+                Tr {
+                    key: "statusbar.scale_ellipsis"
+                    fallback: "Scale..."
+                    visible: !BLEManager.scaleConnectionFailed
+                    color: Theme.textSecondaryColor
+                    font: Theme.bodyFont
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.ignored: true
+                }
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: HomePresetActions.scanForDevices()
+            }
+        }
+
+        // Scale connected: weight display with tare/ratio interaction
+        Row {
+            id: compactScaleRow
+            anchors.centerIn: parent
+            spacing: Theme.spacingSmall
+            visible: root.showValue
+
+            ThemedIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.displayMode === "icon"
+                source: "qrc:/icons/scale.svg"
+                iconSize: Theme.scaled(18)
+                color: root.scaleColor(scaleMouseArea.pressed)
+            }
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.displayMode !== "icon"
+                width: Theme.scaled(8)
+                height: Theme.scaled(8)
+                radius: Theme.scaled(4)
+                color: root.scaleColor(scaleMouseArea.pressed)
+            }
+
+            Text {
+                text: root.weightText()
+                color: root.scaleColor(scaleMouseArea.pressed)
+                font: Theme.bodyFont
+                Accessible.ignored: true
+            }
+        }
+
+        // Disconnected (no saved scale)
+        Text {
+            anchors.centerIn: parent
+            visible: !root.showValue && !root.showScaleWarning && !root.isFlowScale
+            text: "--"
+            color: Theme.textSecondaryColor
+            font: Theme.bodyFont
+            Accessible.ignored: true
+        }
+
+        // Tare / ratio interaction overlay
+        MouseArea {
+            id: scaleMouseArea
+            anchors.fill: parent
+            anchors.margins: -Theme.spacingSmall
+            visible: root.showValue
+            cursorShape: Qt.PointingHandCursor
+
+            property int tapCount: 0
+            property var lastTapTime: 0
+            property bool longPressTriggered: false
+
+            onPressed: {
+                longPressTriggered = false
+                if (root.accessibilityEnabled && !MachineState.isFlowing) {
+                    longPressTimer.start()
+                }
+            }
+
+            onReleased: {
+                longPressTimer.stop()
+                if (longPressTriggered) {
+                    longPressTriggered = false
+                    return
+                }
+            }
+
+            onCanceled: {
+                longPressTimer.stop()
+                longPressTriggered = false
+            }
+
+            onClicked: {
+                if (longPressTriggered) return
+
+                // A computed target has nothing to tare (a tap would silently
+                // no-op or mark a phantom tare complete) — tap edits it instead.
+                if (root.isComputedMode) {
+                    AppShell.brewSettingsRequested()
+                    return
+                }
+
+                if (MachineState.isFlowing) {
+                    SteamService.request("tare", {}, SteamService.state.controlContextId)
+                    return
+                }
+
+                var now = Date.now()
+                var timeSinceLast = now - lastTapTime
+
+                if (timeSinceLast < 300) {
+                    tapCount++
+                } else {
+                    tapCount = 1
+                }
+                lastTapTime = now
+
+                if (tapCount >= 2) {
+                    tapCount = 0
+                    singleTapTimer.stop()
+                    AppShell.brewSettingsRequested()
+                } else {
+                    singleTapTimer.restart()
+                }
+            }
+        }
+
+        Timer {
+            id: longPressTimer
+            interval: 600
+            onTriggered: {
+                scaleMouseArea.longPressTriggered = true
+                AppShell.brewSettingsRequested()
+            }
+        }
+
+        Timer {
+            id: singleTapTimer
+            interval: 300
+            onTriggered: {
+                if (scaleMouseArea.tapCount === 1) {
+                    SteamService.request("tare", {}, SteamService.state.controlContextId)
+                }
+                scaleMouseArea.tapCount = 0
+            }
+        }
+    }
+
+    // --- FULL MODE ---
+    Item {
+        id: fullContent
+        visible: !root.isCompact
+        anchors.fill: parent
+        implicitWidth: fullColumn.implicitWidth
+        implicitHeight: fullColumn.implicitHeight
+
+        ColumnLayout {
+            id: fullColumn
+            anchors.centerIn: parent
+            spacing: Theme.spacingSmall
+
+            ThemedIcon {
+                Layout.alignment: Qt.AlignHCenter
+                visible: root.displayMode === "icon"
+                source: "qrc:/icons/scale.svg"
+                iconSize: Theme.scaled(26)
+                color: root.scaleColor(fullTapArea.pressed)
+            }
+
+            Text {
+                Layout.alignment: Qt.AlignHCenter
+                visible: root.showValue
+                text: root.weightText()
+                color: root.scaleColor(fullTapArea.pressed)
+                font: Theme.valueFont
+                Accessible.ignored: true
+            }
+
+            Text {
+                Layout.alignment: Qt.AlignHCenter
+                visible: !root.showValue && !root.showScaleWarning
+                text: "--"
+                color: Theme.textSecondaryColor
+                font: Theme.valueFont
+                Accessible.ignored: true
+            }
+
+            Tr {
+                Layout.alignment: Qt.AlignHCenter
+                visible: root.showScaleWarning && BLEManager.scaleConnectionFailed
+                key: "statusbar.scale_not_found_tap"
+                fallback: "Scale not found. Tap to scan"
+                color: Theme.errorColor
+                font: Theme.labelFont
+                Accessible.ignored: true
+            }
+
+            Tr {
+                Layout.alignment: Qt.AlignHCenter
+                visible: root.showScaleWarning && !BLEManager.scaleConnectionFailed
+                key: "statusbar.scale_ellipsis"
+                fallback: "Scale..."
+                color: Theme.textSecondaryColor
+                font: Theme.labelFont
+                Accessible.ignored: true
+            }
+
+            Text {
+                Layout.alignment: Qt.AlignHCenter
+                // A computed target labelled "Scale Weight" would misrepresent
+                // what the number is — caption it as what it shows.
+                text: root.isComputedMode
+                      ? TranslationManager.translate("idle.label.expectedOutput", "Expected output")
+                      : TranslationManager.translate("idle.label.scaleweight", "Scale Weight")
+                color: Theme.textSecondaryColor
+                font: Theme.labelFont
+                Accessible.ignored: true
+            }
+        }
+
+        MouseArea {
+            id: fullTapArea
+            anchors.fill: parent
+            cursorShape: (root.showScaleWarning || root.isComputedMode) ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onClicked: {
+                if (root.showScaleWarning)
+                    HomePresetActions.scanForDevices()
+                else if (root.isComputedMode)  // computed target: tap edits it, never tares
+                    AppShell.brewSettingsRequested()
+                else if (root.scaleConnected)
+                    SteamService.request("tare", {}, SteamService.state.controlContextId)
+            }
+        }
+    }
+}

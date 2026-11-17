@@ -1,0 +1,341 @@
+#include <QtTest>
+#include <QStandardPaths>
+#include <QSettings>
+
+#include "ble/blemanager.h"
+#include "ble/bleepochgate.h"
+#include "core/settings_hardware.h"
+#include "core/settings.h"
+
+// BLEManager::ScaleSkipHighLatch — the in-memory dual-HIGH skip-HIGH latch
+// value type (#1093/#1176, D7 review hardening). Pure: set()/clear() enforce
+// the invariant "triggerKind non-empty AND setTime valid IFF latched", so the
+// three correlated fields cannot drift. No BLEManager construction needed —
+// the struct is header-inline and Qt-Core-only.
+//
+// Also covers the D9 persisted (build-scoped) classification storage on
+// SettingsHardware (the dumb store; BLEManager owns the build-code gating).
+// QStandardPaths test mode isolates QSettings so the real user settings are
+// untouched.
+
+class tst_ScaleSkipHighLatch : public QObject {
+    Q_OBJECT
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    void defaultIsUnlatchedAndEmpty() {
+        BLEManager::ScaleSkipHighLatch l;
+        QVERIFY(!l.latched);
+        QVERIFY(l.triggerKind.isEmpty());
+        QVERIFY(!l.setTime.isValid());
+    }
+
+    void setEstablishesCorrelatedState() {
+        BLEManager::ScaleSkipHighLatch l;
+        const QDateTime before = QDateTime::currentDateTime();
+        l.set(QStringLiteral("scale-feed-stall"));
+        QVERIFY(l.latched);
+        QCOMPARE(l.triggerKind, QStringLiteral("scale-feed-stall"));
+        QVERIFY(l.setTime.isValid());
+        QVERIFY(l.setTime >= before);  // stamped at set() time
+    }
+
+    void emptyKindIsSalvagedToUnknownNotBlank() {
+        // Belt-and-suspenders: the public BLEManager API mandates a kind, but
+        // the value type must never record a latched-but-blank state.
+        BLEManager::ScaleSkipHighLatch l;
+        l.set(QString());
+        QVERIFY(l.latched);
+        QCOMPARE(l.triggerKind, QStringLiteral("unknown"));
+        QVERIFY(l.setTime.isValid());
+    }
+
+    void clearRestoresUnlatchedInvariant() {
+        BLEManager::ScaleSkipHighLatch l;
+        l.set(QStringLiteral("de1-fault-cluster"));
+        l.clear();
+        QVERIFY(!l.latched);
+        QVERIFY(l.triggerKind.isEmpty());
+        QVERIFY(!l.setTime.isValid());
+    }
+
+    void reSetOverwritesKindAndTimestamp() {
+        BLEManager::ScaleSkipHighLatch l;
+        l.set(QStringLiteral("de1-fault-cluster"));
+        const QDateTime first = l.setTime;
+        QTest::qWait(5);  // ensure a measurable timestamp delta
+        l.set(QStringLiteral("scale-feed-stall"));
+        QCOMPARE(l.triggerKind, QStringLiteral("scale-feed-stall"));
+        QVERIFY(l.setTime >= first);
+        QVERIFY(l.latched);
+    }
+
+    // rehydrate(): the persistence trust boundary. Unlike set() it preserves
+    // the original set-time, and it sanitises corrupt persisted input so the
+    // "kind non-empty AND time valid IFF latched" invariant cannot be broken
+    // by a partial write / manual edit / ISO drift (review finding A).
+
+    void rehydrateValidPreservesOriginalTime() {
+        BLEManager::ScaleSkipHighLatch l;
+        const QDateTime original = QDateTime::currentDateTime().addSecs(-3600);
+        QVERIFY(l.rehydrate(QStringLiteral("scale-feed-stall"), original));
+        QVERIFY(l.latched);
+        QCOMPARE(l.triggerKind, QStringLiteral("scale-feed-stall"));
+        QCOMPARE(l.setTime, original);  // preserved, NOT re-stamped (vs set())
+    }
+
+    void rehydrateEmptyKindBecomesUnknown() {
+        BLEManager::ScaleSkipHighLatch l;
+        QVERIFY(l.rehydrate(QString(), QDateTime::currentDateTime()));
+        QVERIFY(l.latched);
+        QCOMPARE(l.triggerKind, QStringLiteral("unknown"));
+    }
+
+    void rehydrateInvalidTimeSanitisedInvariantHolds() {
+        BLEManager::ScaleSkipHighLatch l;
+        // Corrupt/missing persisted timestamp → fromString() yields invalid.
+        const bool timeOk =
+            l.rehydrate(QStringLiteral("de1-fault-cluster"),
+                        QDateTime::fromString(QStringLiteral("garbled"), Qt::ISODate));
+        QVERIFY(!timeOk);                 // signals the anomaly for logging
+        QVERIFY(l.latched);               // classification kept (load-bearing)
+        QCOMPARE(l.triggerKind, QStringLiteral("de1-fault-cluster"));
+        QVERIFY(l.setTime.isValid());     // substituted — invariant intact
+    }
+
+    // --- SettingsHardware persisted record (epoch-scoped store) ---
+
+    void initTestCase() {
+        // Isolate QSettings so the real user prefs are untouched.
+        QStandardPaths::setTestModeEnabled(true);
+    }
+
+    void persistedDefaultIsUnlatched() {
+        SettingsHardware s;
+        s.clearConnectionPriorityLatch();  // ensure clean slate
+        QVERIFY(!s.cpLatched());
+        QVERIFY(s.cpTriggerKind().isEmpty());
+        QVERIFY(s.cpSetTimeIso().isEmpty());
+        QCOMPARE(s.cpBuildCode(), 0);
+        QCOMPARE(s.cpEpoch(), -1);   // no epoch key ⇒ legacy/absent sentinel
+    }
+
+    void persistedRoundTrips() {
+        SettingsHardware s;
+        const QString iso = QDateTime::currentDateTime().toString(Qt::ISODate);
+        s.setConnectionPriorityLatch(QStringLiteral("scale-feed-stall"), iso,
+                                     3388, BLEManager::kBleDetectionEpoch);
+        QVERIFY(s.cpLatched());
+        QCOMPARE(s.cpTriggerKind(), QStringLiteral("scale-feed-stall"));
+        QCOMPARE(s.cpSetTimeIso(), iso);
+        QCOMPARE(s.cpBuildCode(), 3388);
+        QCOMPARE(s.cpEpoch(), BLEManager::kBleDetectionEpoch);
+
+        // A fresh instance reads the same persisted values (true persistence).
+        SettingsHardware s2;
+        QVERIFY(s2.cpLatched());
+        QCOMPARE(s2.cpBuildCode(), 3388);
+        QCOMPARE(s2.cpEpoch(), BLEManager::kBleDetectionEpoch);
+
+        s.clearConnectionPriorityLatch();
+        SettingsHardware s3;
+        QVERIFY(!s3.cpLatched());
+        QVERIFY(s3.cpTriggerKind().isEmpty());
+        QCOMPARE(s3.cpBuildCode(), 0);
+        QCOMPARE(s3.cpEpoch(), -1);   // clear is fully fresh (epoch key gone)
+    }
+
+    void epochIsTheGateNotBuild() {
+        // Same-epoch ⇒ rehydrate, regardless of buildCode (now diagnostic
+        // only). (Legacy `-1` records ALSO rehydrate, via migrate-forward —
+        // the full trichotomy is exhaustively pinned by the epochGate_*
+        // tests below.) This pins that the epoch is faithfully retrievable
+        // and a differing buildCode does NOT change the gate (decision logic:
+        // decideBleEpochGate; the build-scoped behavior is removed).
+        SettingsHardware s;
+        s.setConnectionPriorityLatch(QStringLiteral("de1-fault-cluster"),
+                                     QStringLiteral("2026-05-18T12:00:00"),
+                                     3388, BLEManager::kBleDetectionEpoch);
+        QCOMPARE(s.cpEpoch(), BLEManager::kBleDetectionEpoch);  // same-epoch ⇒ seed
+        QCOMPARE(s.cpBuildCode(), 3388);                        // diagnostic only
+        QVERIFY(s.cpEpoch() != BLEManager::kBleDetectionEpoch + 1);  // bumped ⇒ wipe
+        s.clearConnectionPriorityLatch();
+    }
+
+    void legacyRecordHasNoEpochSentinel() {
+        // A pre-epoch record (written by the old 3-arg world) has no
+        // detectionEpoch key. cpEpoch() MUST report -1 so BLEManager takes
+        // the forward-migration path (honor + stamp), not the discard path.
+        SettingsHardware s;
+        s.clearConnectionPriorityLatch();
+        // Simulate a legacy latch: latched + buildCode but NO epoch key.
+        // (Re-create via the modern setter then strip the epoch key the way
+        // an old build would never have written it.)
+        s.setConnectionPriorityLatch(QStringLiteral("scale-feed-stall"),
+                                     QStringLiteral("2026-05-18T12:00:00"),
+                                     3388, BLEManager::kBleDetectionEpoch);
+        {
+            QSettings raw(Settings::testQSettingsPath(), QSettings::IniFormat);
+            raw.remove("connectionPriority/detectionEpoch");  // → legacy shape
+        }
+        SettingsHardware s2;
+        QVERIFY(s2.cpLatched());
+        QCOMPARE(s2.cpBuildCode(), 3388);
+        QCOMPARE(s2.cpEpoch(), -1);   // legacy sentinel ⇒ migrate-forward path
+        s2.clearConnectionPriorityLatch();
+    }
+
+    void isoSetTimeRoundTripsToValidDateTime() {
+        // The exact path BLEManager::setSettings() depends on: a timestamp
+        // written via toString(Qt::ISODate) must parse back via
+        // fromString(Qt::ISODate) to a VALID, equivalent QDateTime. If Qt's
+        // ISO write/read ever diverge (platform/locale/tz), setSettings()
+        // would silently seed an invalid set-time (review finding / test gap).
+        SettingsHardware s;
+        const QDateTime before = QDateTime::currentDateTime();
+        s.setConnectionPriorityLatch(QStringLiteral("scale-feed-stall"),
+                                     before.toString(Qt::ISODate),
+                                     3388, BLEManager::kBleDetectionEpoch);
+
+        const QDateTime parsed =
+            QDateTime::fromString(s.cpSetTimeIso(), Qt::ISODate);
+        QVERIFY2(parsed.isValid(),
+                 qPrintable(QStringLiteral("ISO round-trip invalid: stored=\"%1\"")
+                                .arg(s.cpSetTimeIso())));
+        // toString(Qt::ISODate) drops sub-second precision → allow 1 s.
+        QVERIFY(qAbs(parsed.secsTo(before)) <= 1);
+        s.clearConnectionPriorityLatch();
+    }
+
+    // --- Backoff policy mode persistence (observe-mode change) ---
+
+    void cpModeDefaultsEmptyAndRoundTrips() {
+        SettingsHardware s;
+        s.clearConnectionPriorityLatch();
+        QVERIFY(s.cpMode().isEmpty());          // absent ⇒ caller treats as enforce
+        s.setCpMode(QStringLiteral("observe"));
+        QCOMPARE(s.cpMode(), QStringLiteral("observe"));
+        SettingsHardware s2;                    // simulated restart
+        QCOMPARE(s2.cpMode(), QStringLiteral("observe"));
+        s.setCpMode(QStringLiteral("enforce"));
+        QCOMPARE(SettingsHardware().cpMode(), QStringLiteral("enforce"));
+    }
+
+    // The critical correctness fix: clearing the latch (MCP reset /
+    // epoch re-detect) must NOT wipe the sibling policyMode key.
+    void cpModeSurvivesLatchClear() {
+        SettingsHardware s;
+        s.setCpMode(QStringLiteral("observe"));
+        s.setConnectionPriorityLatch(QStringLiteral("scale-feed-stall"),
+                                     QDateTime::currentDateTime().toString(Qt::ISODate),
+                                     3388, BLEManager::kBleDetectionEpoch);
+        QVERIFY(s.cpLatched());
+
+        s.clearConnectionPriorityLatch();       // latch sub-keys only
+
+        QVERIFY(!s.cpLatched());                // latch gone
+        QCOMPARE(s.cpMode(), QStringLiteral("observe"));  // mode preserved
+        QVERIFY(s.cpTriggerKind().isEmpty());   // no stale latch metadata
+        QVERIFY(s.cpSetTimeIso().isEmpty());
+        QCOMPARE(s.cpBuildCode(), 0);
+        QCOMPARE(s.cpEpoch(), -1);              // epoch key also cleared (fresh)
+        s.setCpMode(QString());                 // tidy for the next test
+    }
+
+    // --- ObserveEvent factories + ObserveEventRing (observe-mode change) ---
+
+    void observeEventFactoriesStampAndClamp() {
+        using OE = BLEManager::ObserveEvent;
+        const OE w = OE::wouldBackoff(QStringLiteral("scale-feed-stall"), 4.2);
+        QCOMPARE(w.kind, QStringLiteral("wouldBackoff"));
+        QCOMPARE(w.triggerKind, QStringLiteral("scale-feed-stall"));
+        QCOMPARE(w.durationSec, 4.2);
+        QVERIFY(w.time.isValid());
+
+        const OE r = OE::recovered(QStringLiteral("scale-feed-stall"), 7.5);
+        QCOMPARE(r.kind, QStringLiteral("recovered"));
+        QCOMPARE(r.durationSec, 7.5);
+
+        // Negative ("n/a", e.g. de1-fault-cluster wouldBackoff) clamps to 0 —
+        // the kind↔duration-meaning correlation cannot be set wrong.
+        const OE n = OE::wouldBackoff(QStringLiteral("de1-fault-cluster"), -1.0);
+        QCOMPARE(n.durationSec, 0.0);
+        QCOMPARE(n.kind, QStringLiteral("wouldBackoff"));
+    }
+
+    void observeRingIsNewestFirst() {
+        BLEManager::ObserveEventRing ring;
+        for (int i = 0; i < 3; ++i)
+            ring.append(BLEManager::ObserveEvent::wouldBackoff(
+                QStringLiteral("scale-feed-stall"), double(i)));
+        const auto out = ring.snapshotNewestFirst();
+        QCOMPARE(out.size(), qsizetype(3));
+        QCOMPARE(out[0].durationSec, 2.0);  // most recent first
+        QCOMPARE(out[1].durationSec, 1.0);
+        QCOMPARE(out[2].durationSec, 0.0);  // oldest last
+    }
+
+    void observeRingBoundsAtCapacityDroppingOldest() {
+        BLEManager::ObserveEventRing ring;
+        const int cap = BLEManager::ObserveEventRing::kCapacity;
+        for (int i = 0; i < cap + 5; ++i)
+            ring.append(BLEManager::ObserveEvent::recovered(
+                QStringLiteral("scale-feed-stall"), double(i)));
+        const auto out = ring.snapshotNewestFirst();
+        QCOMPARE(out.size(), qsizetype(cap));         // bounded
+        QCOMPARE(out.first().durationSec, double(cap + 4));  // newest kept
+        QCOMPARE(out.last().durationSec, 5.0);        // 0..4 dropped (oldest)
+    }
+
+    // --- Epoch-gate decision trichotomy (pure logic, no BLEManager TU) ---
+    // Regression-locks the headline backward-compat guarantee + the
+    // corrupt-negative handling at the DECISION level (PR Kulitorum/Decenza#1220 review
+    // Crit-9/8 + silent-failure #2). decideBleEpochGate() is the exact
+    // function BLEManager::setSettings() dispatches on.
+
+    void epochGate_notLatched_isNoRecord() {
+        QCOMPARE(decideBleEpochGate(false, -1, 1), BleEpochDecision::NoRecord);
+        QCOMPARE(decideBleEpochGate(false, 1, 1),  BleEpochDecision::NoRecord);
+    }
+
+    void epochGate_sameEpoch_rehydrates() {
+        QCOMPARE(decideBleEpochGate(true, 1, 1), BleEpochDecision::Rehydrate);
+        QCOMPARE(decideBleEpochGate(true, 7, 7), BleEpochDecision::Rehydrate);
+        // Build code is irrelevant — only the epoch gates (function has no
+        // build param at all, which is the point of the build→epoch move).
+    }
+
+    void epochGate_legacyMinusOne_migratesForward() {
+        // The ONLY value that means "legacy / no epoch key" → migrate forward
+        // (honor + stamp), ZERO extra detection. This is the upgrade promise.
+        QCOMPARE(decideBleEpochGate(true, -1, 1),
+                 BleEpochDecision::MigrateForward);
+        QCOMPARE(decideBleEpochGate(true, -1, 9),
+                 BleEpochDecision::MigrateForward);
+    }
+
+    void epochGate_deliberateBump_discards() {
+        // A different non-negative epoch = an intentional global reclassify.
+        QCOMPARE(decideBleEpochGate(true, 1, 2), BleEpochDecision::Discard);
+        QCOMPARE(decideBleEpochGate(true, 2, 1), BleEpochDecision::Discard);
+        QCOMPARE(decideBleEpochGate(true, 0, 1), BleEpochDecision::Discard);
+    }
+
+    void epochGate_corruptNegative_discardsNotMigrates() {
+        // Any negative OTHER than -1 is corrupt persisted input — must
+        // re-detect, NOT be silently honored as a clean legacy latch
+        // (silent-failure #2). -1 is the only legacy sentinel.
+        QCOMPARE(decideBleEpochGate(true, -2, 1),   BleEpochDecision::Discard);
+        QCOMPARE(decideBleEpochGate(true, -7, 1),   BleEpochDecision::Discard);
+        QCOMPARE(decideBleEpochGate(true, -999, 5), BleEpochDecision::Discard);
+    }
+
+    void cleanupTestCase() {
+        SettingsHardware s;
+        s.clearConnectionPriorityLatch();
+        s.setCpMode(QString());
+    }
+};
+
+QTEST_GUILESS_MAIN(tst_ScaleSkipHighLatch)
+#include "tst_scaleskiphighlatch.moc"

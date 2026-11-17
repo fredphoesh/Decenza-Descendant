@@ -1,0 +1,382 @@
+#include "core/diagnosticlogging.h"
+#include "profilesavehelper.h"
+#include "../controllers/maincontroller.h"
+#include "../core/profilestorage.h"
+#include <QDir>
+#include <QFile>
+#include <QRegularExpression>
+#include <QStandardPaths>
+#include <QDebug>
+
+ProfileSaveHelper::ProfileSaveHelper(MainController* controller, QObject* parent)
+    : QObject(parent)
+    , m_controller(controller)
+{
+}
+
+bool ProfileSaveHelper::compareProfiles(const Profile& a, const Profile& b)
+{
+    return Profile::functionallyEqual(a, b);
+}
+
+QVariantMap ProfileSaveHelper::checkProfileStatus(const QString& profileTitle, const Profile* incomingProfile)
+{
+    QVariantMap result;
+    result["exists"] = false;
+    result["identical"] = false;
+    result["source"] = "";
+    result["filename"] = "";
+
+    if (!m_controller) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "checkProfileStatus: m_controller is null, cannot check status for" << profileTitle;
+        return result;
+    }
+
+    QString filename = titleToFilename(profileTitle);
+    result["filename"] = filename;
+
+    ProfileStorage* storage = m_controller->profileStorage();
+
+    // Check external/downloaded storage first
+    if (storage && storage->isConfigured() && storage->profileExists(filename)) {
+        result["exists"] = true;
+        result["source"] = "D";  // Downloaded
+    }
+
+    // Check local downloaded folder
+    QString downloadedPath = ProfileSaveHelper::downloadedProfilesPath() + "/" + filename + ".json";
+    if (QFile::exists(downloadedPath)) {
+        result["exists"] = true;
+        result["source"] = "D";
+    }
+
+    // Check built-in profiles
+    QString builtinPath = ":/profiles/" + filename + ".json";
+    if (QFile::exists(builtinPath)) {
+        result["exists"] = true;
+        if (result["source"].toString().isEmpty()) {
+            result["source"] = "B";  // Built-in (only if not already found as Downloaded)
+        }
+    }
+
+    // If exists and we have incoming profile, compare frames
+    if (result["exists"].toBool() && incomingProfile && incomingProfile->isValid()) {
+        Profile localProfile = loadLocalProfile(filename);
+        if (localProfile.isValid()) {
+            bool identical = compareProfiles(*incomingProfile, localProfile);
+            result["identical"] = identical;
+        }
+    }
+
+    return result;
+}
+
+Profile ProfileSaveHelper::loadLocalProfile(const QString& filename) const
+{
+    ProfileStorage* storage = m_controller ? m_controller->profileStorage() : nullptr;
+
+    // Try profile storage first
+    if (storage && storage->isConfigured() && storage->profileExists(filename)) {
+        QString content = storage->readProfile(filename);
+        if (!content.isEmpty()) {
+            return Profile::loadFromJsonString(content);
+        }
+    }
+
+    // Try local downloaded folder
+    QString localPath = ProfileSaveHelper::downloadedProfilesPath() + "/" + filename + ".json";
+    if (QFile::exists(localPath)) {
+        return Profile::loadFromFile(localPath);
+    }
+
+    // Try built-in profiles
+    QString builtinPath = ":/profiles/" + filename + ".json";
+    if (QFile::exists(builtinPath)) {
+        return Profile::loadFromFile(builtinPath);
+    }
+
+    return Profile();  // Empty/invalid profile
+}
+
+ProfileSaveHelper::SaveResult ProfileSaveHelper::saveProfile(const Profile& profile, const QString& filename)
+{
+    if (m_pending.has_value()) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveProfile: called while pending resolution for"
+                   << m_pending->profile.title() << "- ignoring" << profile.title();
+        emit importFailed("Cannot save: another profile is awaiting duplicate resolution.");
+        return SaveResult::Failed;
+    }
+
+    QString dlPath = ProfileSaveHelper::downloadedProfilesPath();
+    if (dlPath.isEmpty()) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveProfile: Cannot determine profile storage path for" << profile.title();
+        return SaveResult::Failed;
+    }
+
+    QString fullPath = dlPath + "/" + filename + ".json";
+
+    // Check for duplicates in downloaded folder
+    if (QFile::exists(fullPath)) {
+        m_pending = PendingResolution{profile, filename};
+        DIAG_DEBUG(PROFILES, "ProfileSaveHelper") << "Duplicate found for" << profile.title();
+        emit duplicateFound(profile.title(), filename);
+        return SaveResult::PendingResolution;
+    }
+
+    // Also check built-in profiles
+    QString builtinPath = ":/profiles/" + filename + ".json";
+    if (QFile::exists(builtinPath)) {
+        m_pending = PendingResolution{profile, filename};
+        DIAG_DEBUG(PROFILES, "ProfileSaveHelper") << "Matches built-in profile" << profile.title();
+        emit duplicateFound(profile.title(), filename);
+        return SaveResult::PendingResolution;
+    }
+
+    if (profile.saveToFile(fullPath)) {
+        DIAG_DEBUG(PROFILES, "ProfileSaveHelper") << "Saved" << profile.title() << "to" << fullPath;
+        if (m_controller) {
+            m_controller->profileManager()->refreshProfiles();
+        }
+        return SaveResult::Saved;
+    }
+
+    DIAG_WARN(PROFILES, "ProfileSaveHelper") << "Failed to save" << profile.title() << "to" << fullPath;
+    return SaveResult::Failed;
+}
+
+void ProfileSaveHelper::saveOverwrite()
+{
+    if (!m_pending.has_value()) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveOverwrite: No pending profile to overwrite";
+        emit importFailed("No pending profile to overwrite");
+        return;
+    }
+
+    QString destDir = ProfileSaveHelper::downloadedProfilesPath();
+    if (destDir.isEmpty()) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveOverwrite: Cannot determine profile storage path";
+        emit importFailed("Cannot access profile storage folder. Check app permissions.");
+        m_pending.reset();
+        return;
+    }
+
+    QString fullPath = destDir + "/" + m_pending->filename + ".json";
+
+    DIAG_DEBUG(PROFILES, "ProfileSaveHelper") << "saveOverwrite: Saving to" << fullPath;
+
+    if (m_pending->profile.saveToFile(fullPath)) {
+        emit importSuccess(m_pending->profile.title());
+        if (m_controller) {
+            m_controller->profileManager()->refreshProfiles();
+        }
+    } else {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveOverwrite: saveToFile() failed for" << fullPath;
+        emit importFailed("Failed to overwrite: " + m_pending->profile.title() + " (check app permissions)");
+    }
+
+    m_pending.reset();
+}
+
+void ProfileSaveHelper::saveAsNew()
+{
+    if (!m_pending.has_value()) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveAsNew: No pending profile to save";
+        emit importFailed("No pending profile to save");
+        return;
+    }
+
+    QString dlPath = ProfileSaveHelper::downloadedProfilesPath();
+    if (dlPath.isEmpty()) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveAsNew: Cannot determine profile storage path";
+        emit importFailed("Cannot access profile storage folder. Check app permissions.");
+        m_pending.reset();
+        return;
+    }
+
+    QString baseTitle = m_pending->profile.title();
+    QString baseFilename = titleToFilename(baseTitle);
+    QString duplicatePath = dlPath + "/" + baseFilename + ".json";
+
+    // Check if there's a duplicate to differentiate from
+    if (QFile::exists(duplicatePath) || QFile::exists(":/profiles/" + baseFilename + ".json")) {
+        Profile existingProfile = loadLocalProfile(baseFilename);
+
+        QString newTitle;
+        QString newFilename;
+
+        // Strategy 1: Different author
+        if (existingProfile.isValid() &&
+            !m_pending->profile.author().isEmpty() &&
+            !existingProfile.author().isEmpty() &&
+            m_pending->profile.author() != existingProfile.author()) {
+            newTitle = baseTitle + " (by " + m_pending->profile.author() + ")";
+            newFilename = titleToFilename(newTitle);
+        }
+        // Strategy 2: Different step count
+        else if (existingProfile.isValid() &&
+                 m_pending->profile.steps().size() != existingProfile.steps().size()) {
+            newTitle = baseTitle + " (" + QString::number(m_pending->profile.steps().size()) + " steps)";
+            newFilename = titleToFilename(newTitle);
+        }
+        // Fallback: Numbered suffix
+        else {
+            int counter = 2;
+            const int MAX_ATTEMPTS = 999;
+            do {
+                newTitle = baseTitle + " (" + QString::number(counter) + ")";
+                newFilename = titleToFilename(newTitle);
+                counter++;
+                if (counter > MAX_ATTEMPTS) {
+                    DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveAsNew: Could not find unique name after"
+                               << MAX_ATTEMPTS << "attempts for" << baseTitle;
+                    emit importFailed("Could not find a unique name for: " + baseTitle);
+                    m_pending.reset();
+                    return;
+                }
+            } while (QFile::exists(dlPath + "/" + newFilename + ".json") ||
+                     QFile::exists(":/profiles/" + newFilename + ".json"));
+        }
+
+        // Check if the descriptive name is already taken, fall back to numbered suffix
+        if (!newTitle.isEmpty() &&
+            (QFile::exists(dlPath + "/" + newFilename + ".json") ||
+             QFile::exists(":/profiles/" + newFilename + ".json"))) {
+            int counter = 2;
+            const int MAX_ATTEMPTS = 999;
+            do {
+                newTitle = baseTitle + " (" + QString::number(counter) + ")";
+                newFilename = titleToFilename(newTitle);
+                counter++;
+                if (counter > MAX_ATTEMPTS) {
+                    DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveAsNew: Could not find unique numbered name after"
+                               << MAX_ATTEMPTS << "attempts for" << baseTitle;
+                    emit importFailed("Could not find a unique name for: " + baseTitle);
+                    m_pending.reset();
+                    return;
+                }
+            } while (QFile::exists(dlPath + "/" + newFilename + ".json") ||
+                     QFile::exists(":/profiles/" + newFilename + ".json"));
+        }
+
+        m_pending->profile.setTitle(newTitle);
+        baseFilename = newFilename;
+    }
+
+    // At this point baseFilename is unique
+    QString newTitle = m_pending->profile.title();
+    QString fullPath = dlPath + "/" + baseFilename + ".json";
+
+    if (m_pending->profile.saveToFile(fullPath)) {
+        emit importSuccess(newTitle);
+        if (m_controller) {
+            m_controller->profileManager()->refreshProfiles();
+        }
+    } else {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveAsNew: saveToFile() failed for" << fullPath;
+        emit importFailed("Failed to save: " + newTitle + " (check app permissions)");
+    }
+
+    m_pending.reset();
+}
+
+void ProfileSaveHelper::saveWithNewName(const QString& newName)
+{
+    if (!m_pending.has_value() || newName.isEmpty()) {
+        emit importFailed(newName.isEmpty() ? "Profile name cannot be empty" : "No pending profile to save");
+        return;
+    }
+
+    QString dlPath = ProfileSaveHelper::downloadedProfilesPath();
+    if (dlPath.isEmpty()) {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveWithNewName: Cannot determine profile storage path";
+        emit importFailed("Cannot access profile storage folder. Check app permissions.");
+        m_pending.reset();
+        return;
+    }
+
+    m_pending->profile.setTitle(newName);
+
+    QString filename = titleToFilename(newName);
+
+    // Auto-deduplicate if name already taken, using " (N)" suffix to match saveAsNew()
+    if (QFile::exists(dlPath + "/" + filename + ".json") ||
+        QFile::exists(":/profiles/" + filename + ".json")) {
+        int counter = 2;
+        const int MAX_ATTEMPTS = 999;
+        QString dedupedTitle;
+        QString newFilename;
+        do {
+            dedupedTitle = newName + " (" + QString::number(counter) + ")";
+            newFilename = titleToFilename(dedupedTitle);
+            counter++;
+            if (counter > MAX_ATTEMPTS) {
+                DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveWithNewName: Could not find unique name after"
+                           << MAX_ATTEMPTS << "attempts for" << newName;
+                emit importFailed("Could not find a unique name for: " + newName);
+                m_pending.reset();
+                return;
+            }
+        } while (QFile::exists(dlPath + "/" + newFilename + ".json") ||
+                 QFile::exists(":/profiles/" + newFilename + ".json"));
+        // Keep title and filename in sync
+        m_pending->profile.setTitle(dedupedTitle);
+        filename = newFilename;
+    }
+
+    QString fullPath = dlPath + "/" + filename + ".json";
+    if (m_pending->profile.saveToFile(fullPath)) {
+        emit importSuccess(m_pending->profile.title());
+        if (m_controller) {
+            m_controller->profileManager()->refreshProfiles();
+        }
+    } else {
+        DIAG_WARN(PROFILES, "ProfileSaveHelper") << "saveWithNewName: Failed to save"
+                   << m_pending->profile.title() << "as" << filename << "to" << fullPath;
+        emit importFailed("Failed to save \"" + m_pending->profile.title() + "\" (check app permissions)");
+    }
+
+    m_pending.reset();
+}
+
+void ProfileSaveHelper::cancelPending()
+{
+    m_pending.reset();
+}
+
+bool ProfileSaveHelper::hasPending() const
+{
+    return m_pending.has_value();
+}
+
+QString ProfileSaveHelper::downloadedProfilesPath()
+{
+    QString path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    path += "/profiles/downloaded";
+
+    // Ensure directory exists — return empty string on failure so callers can detect it
+    QDir dir(path);
+    if (!dir.exists()) {
+        if (!dir.mkpath(".")) {
+            DIAG_WARN(PROFILES, "ProfileSaveHelper") << "Failed to create directory:" << path;
+            return QString();
+        }
+    }
+
+    return path;
+}
+
+QString ProfileSaveHelper::titleToFilename(const QString& title) const
+{
+    if (m_controller) {
+        return m_controller->profileManager()->titleToFilename(title);
+    }
+    DIAG_WARN(PROFILES, "ProfileSaveHelper") << "titleToFilename: m_controller is null, falling back to simple sanitization for" << title;
+    // Fallback: simple sanitization (shouldn't happen in practice)
+    QString filename = title.toLower();
+    filename.replace(QRegularExpression("[^a-z0-9]+"), "_");
+    filename.replace(QRegularExpression("^_+|_+$"), "");
+    filename.replace(QRegularExpression("_+"), "_");
+    if (filename.length() > 50) filename = filename.left(50);
+    if (filename.isEmpty()) filename = "profile";
+    return filename;
+}

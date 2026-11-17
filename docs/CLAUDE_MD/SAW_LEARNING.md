@@ -1,0 +1,314 @@
+# SAW (Stop-At-Weight) Learning
+
+## Problem
+
+The DE1's stop-at-weight feature has to send the stop command *before* the target weight is reached, because there is unavoidable lag between the command and pump shutdown:
+
+```
+total drip ≈ flow_at_stop × (BLE_round_trip_lag + DE1_machine_lag) + post_shutoff_drip
+```
+
+The two hardware lags are scale-specific (`Settings::sensorLag()` documents them; e.g., Decent Scale 0.38 s, Acaia 0.69 s, Bookoo 0.50 s) and the post-shutoff drip is profile- and portafilter-specific. Together they yield a total "drip after stop trigger" the controller has to predict in advance, then trigger the stop when `current_weight + predicted_drip ≥ target`.
+
+For years the predictor learned a single drip-vs-flow curve per scale type, stored as a rolling history of `{drip, flow, scale, overshoot}` records in QSettings (`saw/learningHistory`). That model worked for users on a single profile but gradually accumulated systematic error for users who alternate between profiles with different drip dynamics.
+
+[Issue #847](https://github.com/Kulitorum/Decenza/issues/847) reported the failure mode in unambiguous terms: a user alternating between an open-spout portafilter with one profile and a double-spout portafilter with another saw the model overshoot for the dominant pairing and undershoot for the secondary pairing. The learning was being pulled by whichever profile-portafilter combo the user pulled most often, contaminating the prediction for the rarer one.
+
+## Empirical evidence (this device, Apr 2026)
+
+Pulling SAW debug logs from real shots on a Decent Scale showed the contamination directly:
+
+| Shot | Profile | Trigger flow | expectedDrip | Settled drip | Result |
+|------|---------|--------------|--------------|--------------|--------|
+| 1056 | 80's Espresso | 1.99 g/s | 1.04 g | ~0.9 g | close |
+| 1059 | 80's Espresso | 2.04 g/s | 1.13 g | 1.1 g | accurate |
+| 1054 | 80's Espresso (short shot, fast end-flow) | 5.20 g/s | 1.27 g | ~2.5 g | **2× under-predicted** |
+| 1047 | **D-Flow / Q** | 2.30 g/s | 1.24 g | ~0.8 g | **0.4 g over-predicted** |
+
+Shot 1047 is the smoking gun. D-Flow / Q's actual drip is consistently ~0.8 g but the global model predicted 1.24 g — a systematic 0.4 g undershoot per shot, exactly the issue #847 pattern. The model was being pulled toward 80's Espresso's drip dynamics because that is the user's more frequent profile. D-Flow's lower drip rate never got a chance to teach the model its own signature.
+
+Shot 1054 is a separate point: even within a single profile, end-of-shot flow can vary 2.5×. The drip-vs-flow regression already in place handles that, so we kept it.
+
+## Solution: per-(profile, scale) batched learning
+
+The same architecture that fixed the analogous problem in flow calibration ([AUTO_FLOW_CALIBRATION.md](AUTO_FLOW_CALIBRATION.md), issue [#739](https://github.com/Kulitorum/Decenza/issues/739)) applies cleanly to SAW:
+
+1. **Per-(profile, scale) history** — each pair learns its own drip dynamics. Switching profiles or scales does not contaminate the active pair's data.
+2. **Batched median commits** — accumulate 3 shots' worth of pending entries before changing the model. The median is robust to single-shot outliers (channeling, scale glitches, cup interaction). N=3 is chosen because SAW has no feedback loop (a stop command does not alter pump dynamics for the next shot), so a single confirmed 3-shot batch is sufficient signal — the conservative N=5 from flow calibration is not needed here.
+3. **Batch-level dispersion check** — if the 3 lags within a batch are too spread out (any single lag > 1.5 s from the batch median), the whole batch is dropped. Dispersion that high indicates the user changed conditions mid-batch (different beans, different grinder, manual stop). IQR gating requires ≥ 4 values; with N=3 the per-element deviation check handles all outlier cases.
+4. **Global bootstrap** — the median lag across the `(profile, scale, basket)` buckets on the same scale that have ANY committed history (graduation is a stricter, separate bar for the read path — see the storage table) is published as `saw/globalBootstrapLag/<scaleType>`. New pairs use this as their first-shot default instead of the scale's hardware-only `sensorLag()`.
+5. **Read-path fallback chain** — `perProfile` (≥ `kSawMinMediansForGraduation` committed batches, currently 1 = 3 SAW shots minimum) → `globalBootstrap` → `globalPool` (legacy entries) → `scaleDefault`. New users / new pairs degrade gracefully.
+
+### Why this is the right shape
+
+The two systems (flow cal and SAW) are learning the same kind of correction: a per-shot scalar that depends on (profile dynamics × hardware quirks), where the hardware quirk has a known prior (sensor lag for SAW, density correction for flow cal) and the profile contribution is what we have to learn from data. Both benefit from:
+
+- **Isolation by profile** — to eliminate cross-profile bias.
+- **Median over mean** — to absorb single-shot anomalies without explicit outlier detection.
+- **Batched updates** — to break the feedback loop where each model change alters the conditions for the next shot.
+- **Global fallback** — to cold-start new profiles from the system's collective experience instead of from a constant.
+
+Reusing flow cal's design for SAW reduces risk because the patterns are already in production and have a year of operational evidence behind them.
+
+## Storage schema
+
+Three QSettings keys, each a JSON object keyed by `"<profileFilename>::<scaleType>::<basketKey>"`:
+
+| Key | Shape | Trim | Purpose |
+|-----|-------|------|---------|
+| `saw/perProfileHistory` | array of committed batch entries `{drip, flow, overshoot, scale, profile, basket, ts, batchSize}`. **`drip` and `flow` are one batch shot's own pair** — the shot whose lag is nearest the batch's median lag — not `median(drips)` over `median(flows)`, which would be a point no shot produced and a lag no shot had. A batch in which no shot had a usable flow is dropped rather than committed, so there is no composite-pair exception. `overshoot` IS an independent median: it gates the auto-reset and, through the pool mirror, `isSawConverged`, and is never paired with a drip or a flow to form a lag. | 10 medians (~30 shots-worth) | Source of truth for `sawLearnedLagFor` / `getExpectedDripFor` once the triple has graduated (≥ `kSawMinMediansForGraduation` medians, currently 1). |
+| `saw/perProfileBatch` | array of pending raw entries `{drip, flow, overshoot, scale, profile, basket, ts}` (target size 3) | 3 (commit point) | Pending accumulator; flushed on commit or rejection. |
+| `saw/globalBootstrapLag/<scaleType>` | scalar `double` (seconds) | n/a | IQR-fenced median of the last committed median lag from each THREE-SEGMENT bucket on this scale whose newest median is not `inherited` (so neither the seed copies nor the frozen pre-basket bucket they came from can vote). Used as first-shot default for new pairs. (Graduation for the per-profile *read* path is a stricter `kSawMinMediansForGraduation` medians; the bootstrap is a cold-start prior, so it accepts pairs with any committed history — IQR fencing handles the rest.) |
+
+The legacy `saw/learningHistory` key is preserved as a **global pool**: every committed batch-median is mirrored into it (trim 50). This keeps `isSawConverged()` and the legacy convergence-divergence detection working without changes, and provides a final read-path fallback for users with pre-update data.
+
+The per-entry shape gains one optional field, `profile`. Old entries without it are still readable.
+
+### The basket segment, and why there is no migration
+
+`basketKey` is the active equipment package's basket brand + model, lowercased with every run of non-alphanumerics collapsed to `-` (`Graph Coffee` + `Stepped 58→46mm` → `graph-coffee-stepped-58-46mm`). A package with no basket keys on the literal `(none)`, which a real basket cannot produce because `(` and `)` are not alphanumeric and so never reach the output (the output is NOT restricted to `[a-z0-9-]`: any Unicode letter or digit passes). `SettingsCalibration::sawBasketKey()` is the only producer.
+
+**Pre-basket history was copied once, in 2.0.3,** into `"<profile>::<scale>::<basket>"` for every basket that profile had been pulled with. The two-segment source keys stay in place, inert. The copies are tagged `inherited`, and `recomputeGlobalSawBootstrap()` skips buckets whose newest median carries that tag, and the two-segment sources too: one batch copied into N baskets must not vote N times in the cross-basket median.
+
+**A permanent basket-blind fallback tier was built and rejected, worth knowing about because it reads as the safer choice:** nothing ever writes those buckets, so they never trim and never age out — the claim that they would was simply false — and keeping them alive meant a second reader, a blended "warmup" tier, and two extra `sawModelSource` values with their UI and advisor branches, forever, to smooth about six shots per user once.
+
+### Why the basket is in the key (and the grinder is not)
+
+The split was made on 3 Graph-basket shots: D-Flow / Q on a Decent Scale, same bean and dose, the Decent 18g Ridged basket dripping 1.00–1.48 g (mean 1.32) against the Graph Stepped 58→46mm's 0.52–0.70 g (mean 0.63) — every Graph shot under-delivering by ~0.7 g, an offset flow-similarity weighting cannot absorb because it is basket-shaped, not flow-shaped. Shot duration was ruled out at the time by one duration-matched Decent shot.
+
+**That finding has not reproduced, and the section above is kept only as the reasoning of record.** Four more Graph shots (2026-08-21 onward) average a lag of 0.882 s against the Decent basket's 0.819 s over the same window — Graph slightly *higher*, the opposite sign. Over a 250-shot corpus the between-basket mean lag gap is 0.082 s against a within-basket lag standard deviation of 0.41 s, and `saw_parity --ignore-basket` shows the segment is close to neutral — it changes 11 of 250 predictions, costs about 0.001 g of MAE overall, and helps the Graph shots by about 0.005 g while costing the Decent shots in that window about 0.011 g, because their pool is now split. The sign on the Graph slice flips between builds that differ by ~1% MAE, which is the actual finding at n=7. What separates the original three Graph shots from the later four is that they ran 52–58 s at grind 15–16.5 against 32–36 s at grind 17–17.5; duration does not generalize as an explanation either (r = −0.007 corpus-wide), so both stories rest on the same three shots.
+
+**The segment stays anyway.** Both baskets measured are 58 mm and differ mainly in wall shape, which is a weak test of the hypothesis; a genuinely high-flow basket is where a real difference would show. Seven shots on a second basket is enough to say no effect is demonstrated, not that none exists. Revisit with a basket that differs materially in outlet geometry, or at ≥30 shots on a second basket. Numbers in the openspec change `fix-saw-lag-prediction`.
+
+Grinder, burrs, RPM and puck prep stay OUT of the key: they act on drip through puck permeability, which already reaches the model as flow at stop. Portafilter/spout is not modelled at all — the responsible geometry is basket plus spout, but nearly all users run bottomless. Full evidence and the rejected alternatives are in the openspec change `key-saw-learning-by-basket`.
+
+### Why the three Half Decent Scale transports stay separate
+
+`decent`, `decent-wifi` and `decent-usb` are one physical scale, and collapsing them into one SAW bucket looks free: `sensorLag()` returns an identical 0.38 s for all three, and the sample cadence is ~100 ms on both (BLE notify measured off shot 1091's settling samples at ~104 ms; the WiFi driver requests `rate 10k` and logs the ack). **It is not free — it was measured and refused.** Per-shot lag (drip ÷ flow) over 31 shots on one profile and basket, with the transports interleaved through the history rather than forming eras:
+
+| group | n | median lag | range |
+|---|---|---|---|
+| BT (`decent`) | 13 | 0.598 s | 0.224–0.824 |
+| WiFi (`decent-wifi`) | 18 | 0.840 s | 0.638–1.223 |
+| BT, flow 1.30–1.70 g/s | 10 | 0.591 s | 0.224–0.734 |
+| WiFi, flow 1.30–1.70 g/s | 7 | 0.848 s | 0.755–0.914 |
+
+0.242 s apart — 0.36 g of drip at 1.5 g/s. Only 16 of 234 cross pairs have BT above WiFi (Mann-Whitney z = −4.04), and in the matched flow band the two ranges do not overlap. Four consecutive-day shots with bean, grind, dose, basket and profile all fixed: WiFi 0.879 (1089) and 1.016 (1092) against BT 0.584 (1090) and 0.658 (1091).
+
+Which layer owns the 0.24 s is **not** established. Nagle is off at both ends (Qt sets TCP_NODELAY on connect, `qtwebsockets/src/websockets/qwebsocket_p.cpp:490-493`; the HDS firmware's ESPAsyncWebServer 3.11.2 sets it on every client, `WebServer.cpp:112`), so Nagle is excluded; cadence parity excludes a lower publish rate; a cross-correlation of DE1 flow against scale flow could not measure it (DE1 `flow` is water into the puck, scale flow is liquid out, and puck compliance decouples them — two of four shots correlated at |r| < 0.1). The leading hypothesis is batching or extra smoothing in the scale's WiFi firmware path, which would also explain WiFi's lower lag variance. Treat that as unproven. What is proven is the 0.242 s, and it is why the split stays.
+
+## Algorithm Details
+
+### Read path
+
+```
+sawLearnedLagFor(profile, scale, basket):
+  if perProfileSawHistory(profile, scale, basket).size ≥ kSawMinMediansForGraduation:
+    return mean(drip / flow over last 3 medians)        ← perProfile
+  if globalSawBootstrapLag(scale) > 0:
+    return globalSawBootstrapLag(scale)                 ← globalBootstrap
+  return sawLearnedLag()                                ← globalPool / scaleDefault
+
+sawModelSource(profile, scale, basket):
+  → "perProfile" | "globalBootstrap" | "globalPool" | "scaleDefault"
+
+An empty scale or basket argument RESOLVES (currentScaleType() / currentBasketKey()) —
+see the class comment in settings_calibration.h. The learning path is the exception and
+takes both latched, from espressoCycleStarted.
+```
+
+`getExpectedDripFor` mirrors `getExpectedDrip`'s recency- and flow-similarity-weighted regression, but on the per-pair history when available. The flow-similarity weighting is what handles within-profile flow variation (e.g. shot 1054's 2.5× end-flow): the predictor weights past shots whose flow rate is close to the current shot's flow rate.
+
+### Write path
+
+```
+addSawLearningPoint(drip, flow, scale, overshoot, profile):
+  apply existing entry-level guards:                ← unchanged
+    drip < 0 or flow < 0       → reject
+    drip / flow > 4 s          → reject (implausible BLE lag)
+    converged + |drip - expected| > max(3, expected)  → reject
+
+  if profile is empty:                              ← legacy path preserved
+    append to global pool, trim 50, save
+    return
+
+  append entry to perProfileBatch[profile::scale]
+  if pending.size < 3:
+    log "[SAW][Learning] Accumulated drip=… flow=… (n/3) lag=…"
+    return
+
+  lags := drip / flow, for each batch shot whose flow > 0.5 g/s
+  if lags is empty:
+    log "[SAW][Learning] batch rejected — no shot had a usable flow …"
+    drop pending, return
+
+  commit_drip, commit_flow := the pair of the shot whose lag is nearest median(lags)
+  median_lag := commit_drip / commit_flow      ← a real shot's lag, so the gate and the
+                                                 commit log describe the same shot
+  median_overshoot := median of the overshoots ← independent; gates the reset below
+  if any |lag - median_lag| > 1.5 s:
+    log "[SAW][Learning] batch rejected — outlier lag=… deviates …s > …s from median …"
+    drop pending, return
+
+  if median_overshoot < -6 g and last committed median for pair was also < -6 g:
+    log "[SAW][Learning] 2nd consecutive overshoot<-6g … clearing committed history"
+    perProfileSawHistory[pair] := []                ← per-pair auto-reset
+
+  append entry {commit_drip, commit_flow, median_overshoot, …} to perProfileSawHistory[pair], trim 10
+  append same median to global pool, trim 50
+  clear pending
+  recomputeGlobalSawBootstrap(scale)
+  emit sawLearnedLagChanged()
+```
+
+### Why batched, with median
+
+Per-shot updates create a feedback loop: each update changes the predicted-drip threshold, which changes when the stop command fires, which changes the observed drip. The model partially chases its own tail.
+
+Batching to N=3 holds the model constant for 3 shots, so the 3 ideals are pulled under identical conditions and are directly comparable. Taking the **median** of those 3 ideals is a built-in outlier filter: a single bad shot (channeling, scale glitch, manual stop, runaway) cannot move the model.
+
+The median is taken over the **lags**, and the committed entry is then the shot that produced that lag. Taking `median(drips)` and `median(flows)` separately is not the same thing: with N=3 those two medians usually come from different shots, so their quotient is a lag none of the three had — which the dispersion gate above would then be measuring every shot against.
+
+Measured over a 250-shot corpus (`tools/saw_parity`): −1.0% MAE overall, −2.3% mid-flow, +2.4% *worse* at high flow on n=14 — inside the noise of which shots land in which batch. The correction is made because four readers divide or smooth that stored pair (`sawLearningEntriesFor`, whose pairs reach the WeightProcessor snapshot that fires the stop; `getExpectedDripFor`; `sawLearnedLagFor`; `recomputeGlobalSawBootstrap`), so it has to describe a shot that happened. Not because it predicts better — do not cite it as a performance result.
+
+Flow calibration uses N=5 for the same reason, but SAW has no feedback loop: a stop command does not alter pump pressure or flow dynamics for the next shot. Because the model update cannot shift the conditions it is measuring, N=3 converges 2× faster with equal or better accuracy. A post-hoc simulation over real shot data (Apr 2026) confirmed this: N=3 graduated D-Flow/Q at shot 6 vs never within 9 shots for N=5 (outlier in shot 3 was cleanly isolated rather than absorbed), and graduated 80's Espresso at shot 3 vs shot 10.
+
+### Why dispersion guards on top of the median
+
+Median rejects single outliers but does not detect the case where the user changed conditions mid-batch (new beans, new grind setting). In that case all 3 ideals have shifted, and committing the median would lock in a half-changed model. The deviation gate (`|lag - median| > 1.5 s`) drops the batch entirely in that case, forcing the user to start a fresh batch under stable conditions. (IQR gating requires ≥ 4 values; N=3 relies exclusively on the per-element deviation check.)
+
+### Why a global bootstrap median instead of just the scale default
+
+A new profile starting from `sensorLag(scaleType) + 0.1 s` will be off until 3 shots populate its history (one batch). With `globalSawBootstrapLag`, it starts from "what we have learned about this user's machine on this scale across their other profiles" — a much closer prior. Flow cal uses the same idea (median of espresso per-profile multipliers) and it noticeably reduces the cold-start error.
+
+## Settling and final-weight capture
+
+After SAW fires the stop command, [`ShotTimingController`](../../src/controllers/shottimingcontroller.cpp) runs a settling state machine that watches the scale stabilize. The cup gains a bit more weight from post-stop drip (typically 0.5–1.5 g) before reaching its true final weight, and learning needs both `m_weightAtStop` (the trigger weight) and the settled value (`m_weight`) to compute drip and update the model.
+
+### Stability gate and clean-avg capture
+
+Each settling sample is added to a 6-sample rolling window. The "stable enough to commit" gate fires when all three hold:
+
+- `avgDrift < SETTLING_AVG_THRESHOLD` (0.3 g) — window mean has stopped shifting
+- `weight ≤ avg + SETTLING_ABOVE_AVG_MARGIN` (0.2 g) — current reading has caught up to the mean (drip has effectively stopped)
+- `avg ≥ m_weightAtStop − 0.5` — the average isn't still recovering from pump-vibration artifacts
+
+Once the gate has held for `SETTLING_STABLE_MS = 1000 ms`, `onSettlingComplete` writes `m_weight = avg` and the learning point is committed.
+
+After the gate has held *continuously* for `SETTLING_CLEAN_CAPTURE_MS = 250 ms` (≈ 3 consecutive samples at typical scale rates), each subsequent gate-firing sample also writes the avg into `m_lastCleanSettlingAvg` — the last-known-good settled value held in reserve for the cup-lift case below. The 250 ms minimum filters out single-sample transients where the rolling avg fortuitously satisfies the gate amid noisy settling (a corpus scan of 953 shots found 2/953 such false-positive transients without this guard).
+
+### Final-weight on cup removal
+
+If the user lifts the cup before settling completes, the cup-removal detector fires on a >20 g drop below the settling peak, at any absolute weight. (It used to additionally require the weight to have exceeded 20 g, which hid the lift entirely on a ristretto or a small SAW target — a lift reads as the cup's tared-out mass, tens of grams negative, so the drop was never the marginal case that precondition guarded.) A lift that lands near *zero* on a small shot is still a sub-20 g drop and remains undetected. The handler **skips learning** (a corrupted weight stream can't teach the predictor) but the shot still needs a `finalWeightG` to persist.
+
+Before issue [#1280](https://github.com/Kulitorum/Decenza/issues/1280), `m_weight` was left at whatever value the last accepted sample had. In practice that was often a *cup-lift spike artifact* that squeaked past the 20 g cup-removal threshold — e.g. shot 5470 persisted `38.5 g` even though the cup had actually settled at `42.3 g` for ~700 ms and SAW had correctly stopped at `41.2 g`. The AI advisor then reasoned from `yield=38.5, target=42` and invented a "you stopped manually" narrative.
+
+### Final-weight on a disturbance
+
+Two upward twins of a lift end settling the same way: weight arriving faster than drip can run, or more weight than drip can add. Both need two readings in a row. A lone disturbed reading is dropped (one corrupted packet is not a hand), unless settling would end before the next sample arrives, in which case it counts (shot 1016 went silent for 2.3 s straight after one). `Settling::classifySettleSample()` makes the call for the app and for `shot_eval`.
+
+A rejected packet remains in the worker's flow-regression window. When the next weight returns to the last accepted weight's 0.2 g band, `Settling::RateRiseRecovery` prevents that packet's residual flow from confirming itself. Only flow-based candidates in that recovered band are suppressed; normal flow or a fresh rise beyond the band ends recovery, and the amount check remains active. Runtime and timestamped replay share this handling.
+
+- **Flow test, every beverage.** After the pump stops, drip only slows; a hand or a pressed scale makes the weight rise faster. A short flow more than 4 g/s above the reference is not drip. The reference is the short flow at the SAW trigger, or at the first settling sample if higher (a stop the DE1 acts on late was still pouring faster). The flow is `WeightProcessor`'s own estimate (`ScaleFlow::slopeGps`, `src/machine/scaleflow.h`): de-jittered, with a window that widens to cover three samples on slow scales, the same one SAW stops on with every supported scale. On the tablet corpus (Oct 2026) clean shots never went more than 2.38 g/s over the reference; 23 of 30 disturbed shots passed 4. A draining filter bed slows down, so it never trips this.
+- **Amount test, espresso group only** (`BeverageType::group`). A reading more than `maxPlausibleDripG(flowAtStop)` = `clamp(3 s × flow at the stop, 5 g, 12 g)` above the settle base, the SAW trigger weight or the weight when settling started if higher. On 362 undisturbed shots drip after settling started ÷ flow was p99 1.74 s, max 2.17 s, and the largest drip a real 6.85 g at 4.3 g/s from a gusher SAW caught late (shot 939); the 12 g ceiling bounds the short flow at the stop, which has been logged at 26 and 60 g/s. It catches the slow drifts the flow test misses (shot 881 crept to 61 g at 3.6 g/s). Filter, pourover and tea, including legacy `{pourover}` and `{tea_portafilter}` values, skip it: their beds keep draining standing water after the stop, past any amount an espresso puck drips.
+
+What these catch is a hand gripping the cup (shot 5470's 44 → 48.4 → 51 g came *before* its drop) or resting on it (a 36 g shot climbed to 57 g and was saved at 57.3 g with a "grind much finer" verdict). The thresholds come from one machine and one scale; they sit at 1.7× the clean-shot maximum for the flow test and 1.4× the longest drip for the amount test, and both are measured against what the shot itself did at the stop, not absolute weights.
+
+Corpus flow statistics above are estimates reconstructed from stored graph curves, not raw worker-flow validation. See the offline replay limitations below.
+
+### What is saved
+
+Both paths skip learning and save `Settling::abandonedSettleWeight()` (`settlingconstants.h`), which `shot_eval` calls too:
+
+1. **Last clean settling avg**, if one was captured. It is always within the amount limit: every sample averaged into it already passed the check. (This replaced a separate "implausible clean avg = scale fault" branch, which rejected anything over a flat 5 g and so would have rejected shot 939's real drip; shot 825's frozen 75 g reading is now rejected on arrival.)
+2. **The settle base**, if no clean avg was captured and either the reading fell below the base (drip only adds) or the event was a disturbance (the reading before it may be the disturbance starting).
+3. **The last reading** otherwise: a lift before any signal, at or above the base.
+
+**Hot water starting during settling** (started by hand before the shot settled, `endSettlingForHotWater`; a sequenced americano waits for the settle) ends it at hot water's flow-start edge, before its 200 ms tare can reach the reading. A captured clean avg completes the settle normally, so learning still runs. Without one, the shot is saved as for a lift (rule 2 or 3 above), and learning is skipped.
+
+The fallback only affects the persisted `finalWeightG` (and therefore the shot review's verdict, the AI advisor's `yieldG`, the visualizer export, and `DyeSettings::dyeDrinkWeight`).
+
+### Offline replay
+
+`./shot_eval --settling ~/shot_corpus/*.json` parses the `app.data.debug_log` embedded in each saved shot (old `[SAW] Settling:` per-sample logs) and prints `recorded` vs `postFix` (what the abandoned-settle fallback would persist); changed rows carry `***`. For current shots, `--settle-replay` provides an approximate simulation from stored graph curves. Graph-derived flow can differ from the worker’s raw stream; use it for exploration rather than runtime rate-rise validation — see `TESTING.md`.
+
+## User Experience
+
+- **Default ON, automatic** — there is no setting; SAW learning is always on.
+- **Calibration tab** ([qml/pages/settings/SettingsCalibrationTab.qml](../../qml/pages/settings/SettingsCalibrationTab.qml)) shows the current effective lag for the active `(profile, scale, basket)` triple, the scale and basket it belongs to, and a source suffix: `(per-profile)`, `(global bootstrap)`, `(global)`, or `(default)`. The lag and suffix bindings carry a dye dependency, because `sawLearnedLagChanged` does not fire on an equipment switch — without it the card named the new basket beside the old basket's number.
+- Two reset actions in the same card:
+  - **Reset profile** — clears every basket bucket for the active profile and scale, plus their pending batches. Visible when that scope has DATA to clear, NOT when its tier happens to be winning: gating on the tier hid it exactly when the number came from a global tier, leaving the full wipe as the only button on the card, one tap, no confirmation. A per-BASKET reset was built and removed — the card names one basket at a time, so a third button bought a granularity nobody asked for.
+  - **Reset all** — clears every SAW key (global pool, all per-pair history + batch, all bootstrap values, the basket-seed flag, hot-water SAW offset). **Behind a confirmation**, unlike the scoped reset: it discards months of learning for every profile and scale the user owns.
+- MCP tools: `reset_saw_learning` (existing, now clears the new keys too) and `reset_saw_learning_for_profile` (new, takes optional `profileFilename` and `scaleType` arguments).
+
+## Logging
+
+Two audiences. **System log** (qDebug/qWarning) for live debugging. **Per-shot debug log** ([src/history/shotdebuglogger.cpp](../../src/history/shotdebuglogger.cpp)), which captures qDebug output via Qt's message handler hook so any single shot's debug log is self-contained for accuracy analysis.
+
+System log lines:
+
+| Event | Format |
+|-------|--------|
+| Entry accepted into batch | `[SAW] accumulated drip=… flow=… for <profile>::<scale>::<basket> (n/3) lag=…` |
+| Batch rejected (dispersion) | `[SAW] batch rejected — outlier lag=… deviates …s > …s from median median_lag=… for <pair> — dropping batch` |
+| Batch committed | `[SAW] committed median lag=… (drip=… flow=…) for <pair> — n_medians=k` |
+| Auto-reset | `[SAW] 2nd consecutive overshoot<-6g for <pair> — clearing committed history` |
+| Bootstrap recompute | `[SAW] global bootstrap lag for <scale> updated to … (median of n graduated pairs)` |
+| Reset (per-pair / all) | `[SAW] reset perProfileHistory for <pair>` / `[SAW] reset all SAW learning` |
+
+Per-shot debug log adds two key lines (and the system log lines above are also captured here, since the shot debug logger hooks the global message handler):
+
+- `[SAW] model: source=<…> lag=… profile=<…> scale=<…> basket=<…> historyN=k` — emitted at extraction start when WeightProcessor's snapshot is taken. Records which model is driving the prediction for *this* shot, including the basket whose bucket it came from.
+- `[SAW] accuracy: predictedDrip=… actualDrip=… delta=… overshoot=… flow=… scale=… profile=… basket=…` — emitted at settling completion. Headline number for "did SAW work for this shot."
+
+Together, opening any saved shot via the shot page or the `shots_get_debug_log` MCP tool is enough to reconstruct what model the controller used, how accurate it was, and whether this shot fed the model.
+
+## Storage Migration
+
+No explicit migration. The new keys are written lazily as users pull shots; the legacy `saw/learningHistory` continues to be read as the fallback global pool. Existing users do not lose any data and do not need to re-learn — they just gradually accumulate per-pair history alongside the global pool.
+
+A user who hits "Reset all" gets a clean slate (legacy + new keys both wiped) and starts fresh with the new architecture.
+
+## Why the yield-ratio anchor (add-yield-ratio-anchor) needs NO changes here
+
+A recipe/bag/session yield can now be a **ratio of the dose** that re-derives
+the gram target whenever the dose changes pre-shot. SAW learning is unaffected
+by design, and this section exists so nobody "fixes" the apparent mismatch:
+
+- The model **stores no absolute target**. It learns a drip-vs-flow regression:
+  `drip = m_weight − m_weightAtStop` ([shottimingcontroller.cpp](../../src/controllers/shottimingcontroller.cpp),
+  the settling capture) is measured against the **trigger weight**, and
+  predicted purely from end-of-shot flow. A 1:2 and a 1:3 shot on one profile
+  teach the same drip model — correctly, since drip is a lag × flow quantity.
+- The one target-dependent value, `overshoot`, uses `m_targetWeightAtStop`
+  captured **at trigger time** (fed by `sawTriggered`'s live payload), so it is
+  already correct against a target that moved — the `+10 g` mid-shot bump
+  forced that property long before ratios existed.
+- Learning being keyed per `(baseProfileName, scaleType)` while the target is
+  per-recipe *looks* like a mismatch and is not: the flow-similarity weighting
+  in the read path already absorbs ristretto-vs-lungo end-flow differences.
+- The **resolved target** is latched at `espressoCycleStarted`
+  (`ProfileManager::latchForShot`, called right beside the SAW model snapshot
+  in [src/main.cpp](../../src/main.cpp)) and released at `espressoCycleEnded`,
+  so the target the snapshot captures cannot move mid-shot — not from a dose
+  write, and not from an anchor write or clear (a bean switch). Latching the
+  dose alone was not enough: it left every write that changes the anchor
+  itself free to move the target mid-pour.
+
+## Files
+
+- [src/core/settings_calibration.h](../../src/core/settings_calibration.h) / [src/core/settings_calibration.cpp](../../src/core/settings_calibration.cpp) — schema, batch accumulator, read-path fallback chain, bootstrap recompute. The public API mirrors flow cal: `sawLearnedLagFor`, `getExpectedDripFor`, `sawLearningEntriesFor`, `sawModelSource`, `resetSawLearningForProfile`, `globalSawBootstrapLag` (a plain getter — `recomputeGlobalSawBootstrap` is what derives the value), `addSawLearningPoint(…, profileFilename, basketKey)`.
+- [src/main.cpp](../../src/main.cpp) — wires `ProfileManager::baseProfileName()` into the WeightProcessor snapshot path and the `sawLearningComplete` handler, latches the scale AND basket key for the shot, and emits the per-shot `model:` / `accuracy:` log lines.
+- [src/controllers/shottimingcontroller.cpp](../../src/controllers/shottimingcontroller.cpp) — settling state machine, stability gate, `m_lastCleanSettlingAvg` capture, cup-removed fallback chain (#1280).
+- [qml/pages/settings/SettingsCalibrationTab.qml](../../qml/pages/settings/SettingsCalibrationTab.qml) — Calibration tab UI changes (source suffix, per-profile reset).
+- [src/mcp/mcptools_control.cpp](../../src/mcp/mcptools_control.cpp) — `reset_saw_learning_for_profile` tool.
+- [tests/tst_saw_settings.cpp](../../tests/tst_saw_settings.cpp) — per-pair isolation, batch commit at N=3, dispersion-rejection, bootstrap recompute, fallback chain, reset behaviour, legacy-path preservation.
+- [tests/tst_settling.cpp](../../tests/tst_settling.cpp) — settling-state-machine tests including the #1280 cup-lift-mid-settle regression replays.
+- [tools/shot_eval/main.cpp](../../tools/shot_eval/main.cpp) — `--settling` mode for offline replay against a saved shot corpus.
+
+## Related
+
+- [AUTO_FLOW_CALIBRATION.md](AUTO_FLOW_CALIBRATION.md) — the architectural template this design copies from.
+- [BLE_PROTOCOL.md](BLE_PROTOCOL.md) — BLE round-trip lag context for `Settings::sensorLag()`.
+- Issue [#847](https://github.com/Kulitorum/Decenza/issues/847) — the bug report this addresses.
+- Issue [#739](https://github.com/Kulitorum/Decenza/issues/739) — auto flow calibration evolution thread; the data and reasoning there directly informed this design.

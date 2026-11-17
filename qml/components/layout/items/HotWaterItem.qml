@@ -1,0 +1,261 @@
+// `layer.effect` declares an inline component, so this file's ids are not statically
+// resolvable inside it without this pragma. No delegate in this file takes an injected
+// model role, so no `required property` is needed -- see ThemedIcon.qml for the same case.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import QtQuick.Effects
+import QtQuick.Window
+import Decenza
+import "../PillFit.js" as PillFit
+
+LayoutWidgetItem {
+    id: root
+
+    // `Window` is an ATTACHED property: it resolves against the current scope, so it is read here
+    // on the item itself rather than as `root.appWindow` from inside the popup below. That
+    // spelling works at runtime but is an attached lookup through an id, which qmllint cannot see
+    // — it reports `Member "Window" not found on type "HotWaterItem"`. Reading it once also removes the
+    // duplicate lookups.
+    readonly property var appWindow: Window.window
+
+    // See EspressoItem.qml for rationale.
+    readonly property bool canStartOperations: DE1Device.isHeadless || DE1Device.simulationMode
+
+    property var idlePage: {
+        var p = root.parent
+        while (p) {
+            if (p.objectName === "idlePage") return p
+            p = p.parent
+        }
+        return null
+    }
+
+    // Live two-row fit for the water-vessel pills (descriptive-recipe-names,
+    // mirrors EspressoItem). selectedWaterVessel is an ABSOLUTE index → taps map
+    // through _hotWaterPageStart. No icon. Widths MIRROR PresetPillRow's metrics
+    // (font 16 bold, padding 40, spacing 12) — keep in sync (see PillFit.js).
+    property int hotWaterPageIndex: 0
+    readonly property real _pillFitAvail: hotWaterPillRow ? hotWaterPillRow.effectiveMaxWidth - 2 * hotWaterPillRow.ringOutset : Theme.scaled(600)
+    // FontMetrics.advanceWidth() (not a mutated TextMetrics.text/.width) so
+    // measuring inside a reactive binding doesn't self-trigger a binding loop.
+    FontMetrics { id: hotWaterPillMetrics; font.pixelSize: Theme.scaled(16); font.bold: true }
+    readonly property var _hotWaterPageSizes: {
+        var favs = RecipeContext.preferences.waterVesselPresets
+        var w = []
+        for (let i = 0; i < favs.length; ++i)
+            w.push(hotWaterPillMetrics.advanceWidth((favs[i] && favs[i].name) || "") + Theme.scaled(40))
+        var sizes = PillFit.packPageSizes(w, Theme.scaled(12), _pillFitAvail, 2)
+        if (sizes.length <= 1)
+            return sizes
+        return PillFit.packPageSizes(w, Theme.scaled(12), Math.max(0, _pillFitAvail - 2 * Theme.scaled(48)), 2)
+    }
+    readonly property int hotWaterPageCount: Math.max(1, _hotWaterPageSizes.length)
+    readonly property int _hotWaterPageStart: {
+        var idx = Math.max(0, Math.min(hotWaterPageIndex, _hotWaterPageSizes.length - 1))
+        var start = 0
+        for (let p = 0; p < idx; ++p)
+            start += _hotWaterPageSizes[p]
+        return start
+    }
+    readonly property var visibleWaterVessels: {
+        var favs = RecipeContext.preferences.waterVesselPresets
+        if (!favs || favs.length === 0)
+            return []
+        var idx = Math.max(0, Math.min(hotWaterPageIndex, _hotWaterPageSizes.length - 1))
+        return favs.slice(_hotWaterPageStart, _hotWaterPageStart + (_hotWaterPageSizes[idx] || 0))
+    }
+
+    // Highlight this button while its mode is selected on the home screen (the
+    // centre preset row is expanded), or — in compact mode, where tapping opens
+    // presetPopup instead of setting activePresetFunction — while its popup is open.
+    readonly property bool isActive:
+        (idlePage ? idlePage.activePresetFunction : "") === "hotwater" || presetPopup.visible
+
+    // Compact (bar) rendering only: full-size placements of this type compile to
+    // CustomItem in LayoutItemDelegate (isCompiled), so this item never loads
+    // non-compact and carries no full-mode rendering.
+    implicitWidth: compactContent.implicitWidth
+    implicitHeight: compactContent.implicitHeight
+
+    function togglePresets() {
+        if (root.isCompact) {
+            if (presetPopup.visible) presetPopup.close()
+            else if (HomePresetActions.selectPreparationMode("hotwater")) presetPopup.open()
+        } else if (root.idlePage) {
+            root.idlePage.togglePresetFunction("hotwater")
+        }
+    }
+
+    function goToHotWater() {
+            AppShell.hotWaterRequested()
+    }
+
+    // --- COMPACT MODE ---
+    Item {
+        id: compactContent
+        visible: root.isCompact
+        anchors.fill: parent
+        implicitWidth: compactRow.implicitWidth + Theme.scaled(16)
+        implicitHeight: Theme.bottomBarHeight
+
+        RowLayout {
+            id: compactRow
+            anchors.centerIn: parent
+            spacing: Theme.spacingSmall
+
+            Image {
+                source: "qrc:/icons/water.svg"
+                sourceSize.height: Theme.scaled(20)
+                fillMode: Image.PreserveAspectFit
+                opacity: DE1Device.guiEnabled ? 1.0 : 0.5
+                Accessible.ignored: true
+                layer.enabled: true
+                layer.smooth: true
+                layer.effect: MultiEffect {
+                    colorization: 1.0
+                    colorizationColor: root.isActive ? Theme.accentColor : Theme.textColor
+                }
+            }
+            Tr {
+                key: "idle.button.hotwater"
+                fallback: "Hot Water"
+                font: Theme.bodyFont
+                color: !DE1Device.guiEnabled ? Theme.textSecondaryColor
+                       : (root.isActive ? Theme.accentColor : Theme.textColor)
+                Accessible.ignored: true
+            }
+        }
+
+        AccessibleTapHandler {
+            anchors.fill: parent
+            enabled: DE1Device.guiEnabled
+            supportLongPress: true
+            supportDoubleClick: LayoutActions.hasGesture(root.modelData, "doubleclickAction")
+            accessibleName: TranslationManager.translate("idle.button.hotwater", "Hot Water")
+                            + (root.isActive ? ", " + TranslationManager.translate("accessibility.selected", "selected") : "")
+            accessibleDescription: TranslationManager.translate("idle.accessible.hotwater.hint", "Tap to toggle presets. Double-tap or long-press to configure hot water.")
+            onAccessibleClicked: root.togglePresets()
+            onAccessibleDoubleClicked: LayoutActions.runGestureOrReserved(root.modelData, "doubleclickAction", { idlePage: root.idlePage })
+            onAccessibleLongPressed: LayoutActions.runGestureOrReserved(root.modelData, "longPressAction", { idlePage: root.idlePage })
+        }
+    }
+
+    // --- PRESET POPUP ---
+    // Dialog (not Popup) so TalkBack/VoiceOver scope traversal to the pill list,
+    // matching BeansItem/EquipmentItem/RecipesItem: Dialog carries the accessible
+    // dialog role that screen readers use to trap focus, which `Popup { modal }`
+    // alone (already set below) does not provide. header/footer null strip the
+    // Dialog chrome so it still renders as the same bare dropdown.
+    DecenzaDialog {
+        id: presetPopup
+        modal: true
+        dim: false
+        header: null
+        footer: null
+        padding: Theme.spacingMedium
+        closePolicy: Popup.CloseOnPressOutside
+
+        // Reopen on the first (most-recent) page, matching RecipesItem/BeansItem.
+        onAboutToShow: root.hotWaterPageIndex = 0
+
+        // Full-mode hot-water path runs IdlePage.onActivePresetFunctionChanged which
+        // announces the preset list to TalkBack. The compact-mode popup bypasses that
+        // path, so announce here directly to keep feature parity for screen-reader users.
+        onClosed: { if (root.idlePage) root.idlePage.releasePanelClearance() }
+        onOpened: {
+            if (root.idlePage) {
+                let rootTopInPage = root.mapToItem(root.idlePage, 0, 0).y
+                root.idlePage.requestPanelClearance(rootTopInPage + presetPopup.y, presetPopup.height)
+            }
+            if (typeof AccessibilityManager === "undefined" || AccessibilityManager === null || !AccessibilityManager.enabled) return
+            // Announce the visible page (just reset to page 1), not the full list.
+            var presets = root.visibleWaterVessels
+            if (presets.length === 0) return
+            var names = []
+            var selectedName = ""
+            for (let i = 0; i < presets.length; ++i) {
+                names.push(presets[i].name)
+            }
+            var selRel = RecipeContext.preferences.selectedWaterVessel - root._hotWaterPageStart
+            if (selRel >= 0 && selRel < presets.length) {
+                selectedName = presets[selRel].name
+            }
+            var announcement = presets.length + " " + TranslationManager.translate("idle.accessible.presets", "presets") + ": " + names.join(", ")
+            if (selectedName !== "") {
+                announcement += ". " + selectedName + " " + TranslationManager.translate("idle.accessible.isSelected", "is selected")
+            }
+            AccessibilityManager.announce(announcement)
+        }
+
+        width: {
+            var win = root.appWindow
+            var w = Theme.scaled(600) + 2 * padding
+            return win ? Math.min(w, win.width) : w
+        }
+
+        y: {
+            var _v = visible // Force re-evaluation when popup opens (mapToItem is not reactive)
+            var win = root.appWindow
+            if (win) {
+                let globalY = root.mapToItem(null, 0, 0).y
+                let spaceBelow = win.height - globalY - root.height - Theme.spacingSmall
+                let spaceAbove = globalY - Theme.spacingSmall
+                if (height > spaceBelow && spaceAbove > spaceBelow)
+                    return -height - Theme.spacingSmall
+            }
+            return parent.height + Theme.spacingSmall
+        }
+
+        x: {
+            var _v = visible // Force re-evaluation when popup opens (mapToItem is not reactive)
+            var win = root.appWindow
+            if (win) {
+                let globalX = root.mapToItem(null, 0, 0).x
+                let centered = -width / 2 + parent.width / 2
+                if (globalX + centered + width > win.width)
+                    centered = win.width - globalX - width
+                if (globalX + centered < 0)
+                    centered = -globalX
+                return centered
+            }
+            return -width / 2 + parent.width / 2
+        }
+
+        background: Rectangle {
+            // With the glass chrome on, float the pills directly (matching
+            // the center inline preset rows) instead of showing a panel; keep the
+            // opaque surface panel when the glass chrome is off.
+            readonly property bool hasGlassChrome: Theme.glassChrome
+            color: hasGlassChrome ? "transparent" : Theme.surfaceColor
+            radius: Theme.cardRadius
+            border.color: Theme.borderColor
+            border.width: hasGlassChrome ? 0 : 1
+        }
+
+        contentItem: PresetPillRow {
+            id: hotWaterPillRow
+            maxWidth: Theme.scaled(600)
+            presets: root.visibleWaterVessels
+            selectedIndex: {
+                var rel = RecipeContext.preferences.selectedWaterVessel - root._hotWaterPageStart
+                return (rel >= 0 && rel < root.visibleWaterVessels.length) ? rel : -1
+            }
+
+            pageCount: root.hotWaterPageCount
+            pageIndex: root.hotWaterPageIndex
+            prevPageAccessibleName: TranslationManager.translate("idle.pagination.previousHotWater", "Previous vessels")
+            nextPageAccessibleName: TranslationManager.translate("idle.pagination.nextHotWater", "Next vessels")
+            onPageChangeRequested: function(delta) {
+                root.hotWaterPageIndex = Math.max(0, Math.min(root.hotWaterPageIndex + delta, root.hotWaterPageCount - 1))
+            }
+
+            onPresetSelected: function(index) {
+                HomePresetActions.tapWaterVessel(root._hotWaterPageStart + index)
+                presetPopup.close()
+            }
+        }
+    }
+}

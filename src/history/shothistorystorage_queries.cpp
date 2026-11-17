@@ -1,0 +1,2853 @@
+// ShotHistoryStorage queries — filtered list, recents-by-kbId, auto-favorites,
+// distinct-value getters, grinder context. Split out of the main TU so the
+// query / read-projection code lives separately from DB lifecycle, save,
+// load+recompute, and the badge cascade. All concerns share the same
+// `ShotHistoryStorage` class — these are member function definitions in a
+// separate translation unit, no behaviour or API change.
+//
+// Owning concerns (per openspec/changes/split-shothistorystorage-by-concern/):
+//   - filtered queries: requestShotsFiltered + buildFilterQuery + parseFilterMap +
+//     formatFtsQuery (FTS5 query construction) + s_sortColumnMap (sort-column whitelist).
+//   - recents-by-kbId: loadRecentShotsByKbIdStatic.
+//   - distinct-value getters: queryDistinctList + getDistinctValues +
+//     getDistinct* getters + s_allowedColumns whitelist + sortGrinderSettings.
+//   - auto-favorites: requestAutoFavorites + requestAutoFavoriteGroupDetails.
+//   - grinder context: queryGrinderContext.
+
+#include "core/diagnosticlogging.h"
+#include "shothistorystorage.h"
+#include "equipmentjoin.h"
+#include "shothistorystorage_internal.h"
+
+#include "core/dbutils.h"
+#include "core/grinderaliases.h"
+#include "equipmentlogging.h"
+#include "core/yieldspec.h"
+
+#include <QSet>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QDateTime>
+#include <QDebug>
+#include <QRegularExpression>
+#include <QThread>
+#include <QMap>
+#include <algorithm>
+#include <utility>
+#include <tuple>
+#include <cmath>
+
+using decenza::storage::detail::use12h;
+
+static double deriveGrindStep(const QList<double>& sortedDistinct);
+static QList<double> grinderWideNumericSettings(QSqlDatabase& db,
+                                                const QString& grinderModel,
+                                                bool* queryOk);
+static QList<double> grinderWideRpms(QSqlDatabase& db, const QString& grinderModel,
+                                     bool* queryOk);
+
+namespace {
+
+bool queryDistinctValues(QSqlDatabase& db, const QString& sql,
+                         const QVariantList& binds, QStringList* values,
+                         qsizetype maxEntries = -1, qsizetype maxBytes = -1,
+                         QString* failureReason = nullptr)
+{
+    if (!values) {
+        if (failureReason) *failureReason = QStringLiteral("queryFailed");
+        return false;
+    }
+    QSqlQuery query(db);
+    if (!query.prepare(sql)) {
+        if (failureReason) *failureReason = QStringLiteral("queryFailed");
+        return false;
+    }
+    for (const QVariant& bind : binds)
+        query.addBindValue(bind);
+    if (!query.exec()) {
+        if (failureReason) *failureReason = QStringLiteral("queryFailed");
+        return false;
+    }
+
+    QStringList result;
+    qsizetype bytes = 0;
+    while (query.next()) {
+        const QString value = query.value(0).toString();
+        if (value.isEmpty())
+            continue;
+        bytes += value.toUtf8().size();
+        if ((maxEntries >= 0 && result.size() >= maxEntries)
+            || (maxBytes >= 0 && bytes > maxBytes)) {
+            if (failureReason) *failureReason = QStringLiteral("tooManyValues");
+            return false;
+        }
+        result.append(value);
+    }
+    *values = std::move(result);
+    if (failureReason) failureReason->clear();
+    return true;
+}
+
+// LIKE-escaping, in ONE place. Three sites now build a contains-match against a
+// user-typed string (the grinder identity clause, the `recipe:` keyword filter,
+// and the free-text recipe-name clause); each was free to forget a
+// metacharacter on its own, and a forgotten one is not a crash — it silently
+// turns a user's literal '%' or '_' into a wildcard.
+//
+// Order matters: backslash MUST be doubled first, or the backslashes this adds
+// for '%' and '_' get escaped a second time.
+QString escapeLikeWildcards(const QString& in)
+{
+    QString out = in;
+    out.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    return out;
+}
+
+// Inline SQL literal for a contains-match on ONE term. Every recipe/grinder
+// clause is spliced into the SQL string rather than bound, because the number of
+// terms varies with what the user typed and positional binds would have to be
+// reordered to match. Single quotes are doubled here because the value lands
+// inside a string literal; wildcards are escaped above, so user input is inert.
+QString likeContainsLiteral(const QString& in)
+{
+    QString v = escapeLikeWildcards(in.trimmed().toLower());
+    v.replace('\'', "''");
+    return QStringLiteral("'%") + v + QStringLiteral("%' ESCAPE '\\'");
+}
+
+// A word-order-INDEPENDENT contains-match: every whitespace-separated term must
+// appear somewhere in `expr`, in any order. Returns "" for an empty input so the
+// caller can skip the clause entirely.
+//
+// Why this exists: FTS5 treats space-separated terms as AND regardless of order,
+// so a free-text search reaches beans and profiles however the user types them.
+// The two clauses that resolve the OTHER tables (recipe name, grinder identity)
+// LIKEd the whole raw search string, so "dad monday" found "Dad Monday" and
+// "monday dad" found nothing — same query, same data, silently different answer
+// depending on word order. Splitting matches what the FTS half already does.
+QString likeAllTermsLiteral(const QString& expr, const QString& in)
+{
+    const QStringList terms = in.trimmed().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+    if (terms.isEmpty())
+        return QString();
+    QStringList parts;
+    parts.reserve(terms.size());
+    for (const QString& t : terms)
+        parts << expr + QStringLiteral(" LIKE ") + likeContainsLiteral(t);
+    return parts.join(QStringLiteral(" AND "));
+}
+
+} // namespace
+
+// THE single place the getDistinct* family touches the database. Runs the query
+// synchronously on m_db and returns the non-empty values in the order the SQL
+// asked for.
+//
+// These used to go through an async cache: a getter returned {} on a miss, kicked
+// off a background fetch, and relied on a distinctCacheReady() signal to make QML
+// re-evaluate. That is the bug this change removes — requestDistinctCache()
+// cleared every key
+// but refilled only six bare columns, so composite keys were dropped by every
+// shot save, and a re-fetch overtaken by a refresh was discarded in silence with
+// nobody left to re-ask. Worse, the cache was invalidated far more often than it
+// was read: every shot save, delete, and metadata edit (a rating, a note, one
+// taste slider) wiped it and kicked a six-query refresh, to serve dialogs that
+// might not open at all.
+//
+// Measured live on a real 18.5 MB / 1,124-shot database, fresh connection per
+// run: 0.36-1.9 ms per column, 4.66 ms for all six. On a 16x copy (157 MB):
+// 1.6-17 ms per column. Each getter is called when a dialog or picker opens.
+QStringList ShotHistoryStorage::queryDistinctList(const QString& sql, const QVariantList& binds)
+{
+    if (!m_ready)
+        return {};
+    QStringList values;
+    QString reason;
+    if (!queryDistinctValues(m_db, sql, binds, &values, -1, -1, &reason)) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "queryDistinctList failed:" << reason
+                                                   << "sql=" << sql;
+        return {};
+    }
+    return values;
+}
+
+ShotFilter ShotHistoryStorage::parseFilterMap(const QVariantMap& filterMap)
+{
+    ShotFilter filter;
+    filter.profileName = filterMap.value("profileName").toString();
+    filter.beanBrand = filterMap.value("beanBrand").toString();
+    filter.beanType = filterMap.value("beanType").toString();
+    filter.grinderBrand = filterMap.value("grinderBrand").toString();
+    filter.grinderModel = filterMap.value("grinderModel").toString();
+    filter.grinderBurrs = filterMap.value("grinderBurrs").toString();
+    filter.grinderSetting = filterMap.value("grinderSetting").toString();
+    // Not value(key, -1): QVariantMap returns the default only when the key is
+    // ABSENT, so a present-but-malformed value (null, a non-numeric string) would
+    // convert to 0 — and 0 is a real bucket here, the unpackaged pool, so a bad
+    // value would silently scope to the wrong group instead of being ignored.
+    // bagId two hundred lines down guards the same shape; its guard is allowed to
+    // be simpler because a bag id is AUTOINCREMENT and never 0, which is exactly
+    // what is not true of an equipment bucket.
+    {
+        const QVariant rawEquipmentId = filterMap.value("equipmentId");
+        bool equipmentIdOk = false;
+        const qint64 parsed = rawEquipmentId.toLongLong(&equipmentIdOk);
+        filter.equipmentId = equipmentIdOk ? parsed : -1;
+    }
+    filter.roastLevel = filterMap.value("roastLevel").toString();
+    filter.minEnjoyment = filterMap.value("minEnjoyment", -1).toInt();
+    filter.maxEnjoyment = filterMap.value("maxEnjoyment", -1).toInt();
+    filter.minDose = filterMap.value("minDose", -1).toDouble();
+    filter.maxDose = filterMap.value("maxDose", -1).toDouble();
+    filter.minYield = filterMap.value("minYield", -1).toDouble();
+    filter.maxYield = filterMap.value("maxYield", -1).toDouble();
+    filter.targetWeight = filterMap.value("targetWeight", -1).toDouble();
+    filter.minDuration = filterMap.value("minDuration", -1).toDouble();
+    filter.maxDuration = filterMap.value("maxDuration", -1).toDouble();
+    filter.minTds = filterMap.value("minTds", -1).toDouble();
+    filter.maxTds = filterMap.value("maxTds", -1).toDouble();
+    filter.minEy = filterMap.value("minEy", -1).toDouble();
+    filter.maxEy = filterMap.value("maxEy", -1).toDouble();
+    filter.dateFrom = filterMap.value("dateFrom", 0).toLongLong();
+    filter.dateTo = filterMap.value("dateTo", 0).toLongLong();
+    filter.searchText = filterMap.value("searchText").toString();
+    filter.recipeId = filterMap.value("recipeId", -1).toLongLong();
+    filter.recipeName = filterMap.value("recipeName").toString();
+    filter.bagId = filterMap.value("bagId", -1).toLongLong();
+    filter.bagTerm = filterMap.value("bagTerm").toString();
+    filter.onlyWithVisualizer = filterMap.value("onlyWithVisualizer", false).toBool();
+    filter.filterChanneling = filterMap.value("filterChanneling", false).toBool();
+    filter.filterGrindIssue = filterMap.value("filterGrindIssue", false).toBool();
+    filter.filterSkipFirstFrame = filterMap.value("filterSkipFirstFrame", false).toBool();
+    filter.filterPourTruncated = filterMap.value("filterPourTruncated", false).toBool();
+    filter.sortColumn = filterMap.value("sortField", "timestamp").toString();
+    filter.sortDirection = filterMap.value("sortDirection", "DESC").toString();
+    return filter;
+}
+
+// EVERY column here is qualified `shots.`, and new ones must be too. The data
+// query this feeds now reads `FROM shots LEFT JOIN recipes r` (history-recipe-
+// identity), and the two tables collide on TEN names. SQLite
+// rejects an ambiguous bare name outright ("ambiguous column name"), so the
+// failure is loud — but it lands at runtime, not at compile time, and only for
+// the filters that happen to name a colliding column.
+//
+// Do NOT hand-maintain the list. An earlier version of this comment enumerated
+// six names, omitted `profile_json`, and that omission is precisely what broke
+// the MCP shots_list query when the same join was added there. Recompute from
+// the two CREATE TABLEs plus their ALTER TABLE ADD COLUMN migrations if you
+// ever need it; qualifying unconditionally is what makes the list not matter.
+// Qualified names stay valid in the count query, which does NOT join.
+QString ShotHistoryStorage::buildFilterQuery(const ShotFilter& filter, QVariantList& bindValues)
+{
+    QStringList conditions;
+
+    if (!filter.profileName.isEmpty()) {
+        conditions << "shots.profile_name = ?";
+        bindValues << filter.profileName;
+    }
+    if (!filter.beanBrand.isEmpty()) {
+        conditions << "shots.bean_brand = ?";
+        bindValues << filter.beanBrand;
+    }
+    if (!filter.beanType.isEmpty()) {
+        conditions << "shots.bean_type = ?";
+        bindValues << filter.beanType;
+    }
+    // Grinder identity filters resolve through the equipment_id pointer rather
+    // than the dropped grinder_brand/model/burrs columns (add-equipment-packages
+    // task 4.1): match the equipment_items grinder row, then keep shots pointing
+    // at one of those packages. The three fields combine into one subquery so
+    // any subset (brand only, brand+model, …) works.
+    {
+        QStringList grinderItemConds;
+        QVariantList grinderItemBinds;
+        if (!filter.grinderBrand.isEmpty()) {
+            grinderItemConds << "brand = ?";
+            grinderItemBinds << filter.grinderBrand;
+        }
+        if (!filter.grinderModel.isEmpty()) {
+            grinderItemConds << "model = ?";
+            grinderItemBinds << filter.grinderModel;
+        }
+        if (!filter.grinderBurrs.isEmpty()) {
+            grinderItemConds << "json_extract(attrs, '$.burrs') = ?";
+            grinderItemBinds << filter.grinderBurrs;
+        }
+        if (!grinderItemConds.isEmpty()) {
+            conditions << QString("shots.equipment_id IN (SELECT package_id FROM equipment_items "
+                                  "WHERE kind = 'grinder' AND %1)").arg(grinderItemConds.join(" AND "));
+            bindValues << grinderItemBinds;
+        }
+    }
+    // Exact package. Applied INSTEAD of nothing — it composes with the grinder
+    // identity conditions above, but a caller that knows the package (an
+    // auto-favourite card) passes this and gets the card's own set rather than
+    // every basket that shares the grinder.
+    if (filter.equipmentId >= 0)
+        conditions << AdviceScope(filter.equipmentId).sql(QStringLiteral("shots"));
+    if (!filter.grinderSetting.isEmpty()) {
+        conditions << "shots.grinder_setting = ?";
+        bindValues << filter.grinderSetting;
+    }
+    if (!filter.roastLevel.isEmpty()) {
+        conditions << "shots.roast_level = ?";
+        bindValues << filter.roastLevel;
+    }
+    // Identity keywords resolve through a SUBQUERY on the other table rather
+    // than through the display join, so they work identically in the count
+    // query, which does not join. One helper because the shape — and especially
+    // the empty-term sentinel — is subtle enough to have needed a paragraph of
+    // comment each time it was written out:
+    //
+    // a whitespace-only term is an explicit NO-MATCH, never a no-op. The search
+    // box sends `" "` for an explicitly empty quoted term (`recipe:""`,
+    // `bag:""`), and a clause that treated that as "nothing to filter by" would
+    // return EVERYTHING — the opposite of what the user asked for.
+    //
+    // Terms are spliced as literals rather than bound because the term count
+    // varies with what was typed; likeAllTermsLiteral escapes each one, so user
+    // input stays inert.
+    auto identitySubquery = [&](const QString& fkCol, const QString& table,
+                                const QString& identityExpr, const QString& term) {
+        if (term.isEmpty())
+            return;
+        const QString terms = likeAllTermsLiteral(identityExpr, term);
+        conditions << (terms.isEmpty()
+            ? QStringLiteral("0")
+            : QStringLiteral("shots.%1 IN (SELECT id FROM %2 WHERE %3)")
+                  .arg(fkCol, table, terms));
+    };
+
+    // Recipe identity (history-recipe-identity). recipeId is the exact
+    // tap-through: an id, so a rename cannot move it and two same-named recipes
+    // stay distinct. recipeName is the `recipe:` keyword — a case-insensitive
+    // substring on recipes.name ONLY, which is what makes it narrower than the
+    // free-text clause in requestShotsFiltered. Word-order independent, matching
+    // that clause and FTS: recipe:"tuesday dad" means the same recipe as
+    // "dad tuesday".
+    if (filter.recipeId > 0) {
+        conditions << "shots.recipe_id = ?";
+        bindValues << filter.recipeId;
+    }
+    identitySubquery(QStringLiteral("recipe_id"), QStringLiteral("recipes"),
+                     QStringLiteral("LOWER(name)"), filter.recipeName);
+
+    // Bag identity (history-bag-filter), the same two scopes. bagIdIsSet()
+    // rather than a hand-rolled `> 0` — bagid.h defines the sentinel once and
+    // says in as many words not to re-spell it here.
+    //
+    // What that guard actually protects against is NOT pre-bag shots: a NULL
+    // bag_id fails `bag_id = 0` under SQL three-valued logic no matter what the
+    // guard is (verified against sqlite3; an earlier version of this comment
+    // claimed otherwise and was wrong in the opposite direction). It protects
+    // against parseFilterMap yielding 0 for a present-but-malformed value —
+    // coffee_bags.id is INTEGER PRIMARY KEY AUTOINCREMENT, never 0, so a filter
+    // of 0 would return an empty history rather than an over-broad one.
+    if (bagIdIsSet(filter.bagId)) {
+        conditions << "shots.bag_id = ?";
+        bindValues << filter.bagId;
+    }
+    // ONE concatenated identity expression rather than three OR'd columns, so
+    // word-order independence works ACROSS fields: bag:"guji 2026-07" matches a
+    // coffee named Guji roasted in July, which a per-column OR would miss
+    // (neither column holds both terms). Roast dates are stored ISO
+    // (YYYY-MM-DD), so the date half of such a term is a numeric prefix —
+    // "july" appears nowhere and would match nothing. Same construction as
+    // grinderIdentityExpr in requestShotsFiltered.
+    //
+    // Every column QUALIFIED, like the shots.* rule above and for the same
+    // reason: `roast_date` also exists on `shots` (shothistorystorage.cpp:295).
+    // Unqualified it resolves to the inner scope and is correct today, but a
+    // rename or drop of the bags column would silently turn this into a
+    // correlated subquery matching the shot's own denormalised date — a
+    // plausible wrong row set with NO SQL error, so none of the errorOccurred
+    // machinery would fire. Qualified, that same change is a hard "no such
+    // column" the error path reports.
+    identitySubquery(QStringLiteral("bag_id"), QStringLiteral("coffee_bags"),
+                     QStringLiteral("LOWER(IFNULL(coffee_bags.coffee_name,'') || ' ' "
+                                    "|| IFNULL(coffee_bags.roaster_name,'') || ' ' "
+                                    "|| IFNULL(coffee_bags.roast_date,''))"),
+                     filter.bagTerm);
+    if (filter.minEnjoyment >= 0) {
+        conditions << "shots.enjoyment >= ?";
+        bindValues << filter.minEnjoyment;
+    }
+    if (filter.maxEnjoyment >= 0) {
+        conditions << "shots.enjoyment <= ?";
+        bindValues << filter.maxEnjoyment;
+    }
+    if (filter.minDose >= 0) { conditions << "shots.dose_weight >= ?"; bindValues << filter.minDose; }
+    if (filter.maxDose >= 0) { conditions << "shots.dose_weight <= ?"; bindValues << filter.maxDose; }
+    if (filter.minYield >= 0) { conditions << "shots.final_weight >= ?"; bindValues << filter.minYield; }
+    if (filter.maxYield >= 0) { conditions << "shots.final_weight <= ?"; bindValues << filter.maxYield; }
+    if (filter.targetWeight >= 0) { conditions << "COALESCE(shots.yield_override, 0) = ?"; bindValues << filter.targetWeight; }
+    if (filter.minDuration >= 0) { conditions << "shots.duration_seconds >= ?"; bindValues << filter.minDuration; }
+    if (filter.maxDuration >= 0) { conditions << "shots.duration_seconds <= ?"; bindValues << filter.maxDuration; }
+    if (filter.minTds >= 0) { conditions << "shots.drink_tds >= ?"; bindValues << filter.minTds; }
+    if (filter.maxTds >= 0) { conditions << "shots.drink_tds <= ?"; bindValues << filter.maxTds; }
+    if (filter.minEy >= 0) { conditions << "shots.drink_ey >= ?"; bindValues << filter.minEy; }
+    if (filter.maxEy >= 0) { conditions << "shots.drink_ey <= ?"; bindValues << filter.maxEy; }
+    if (filter.dateFrom > 0) {
+        conditions << "shots.timestamp >= ?";
+        bindValues << filter.dateFrom;
+    }
+    if (filter.dateTo > 0) {
+        conditions << "shots.timestamp <= ?";
+        bindValues << filter.dateTo;
+    }
+    if (filter.onlyWithVisualizer) {
+        conditions << "shots.visualizer_id IS NOT NULL";
+    }
+    if (filter.filterChanneling) {
+        conditions << "shots.channeling_detected = 1";
+    }
+    if (filter.filterGrindIssue) {
+        conditions << "shots.grind_issue_detected = 1";
+    }
+    if (filter.filterSkipFirstFrame) {
+        conditions << "shots.skip_first_frame_detected = 1";
+    }
+    if (filter.filterPourTruncated) {
+        conditions << "shots.pour_truncated_detected = 1";
+    }
+
+    if (conditions.isEmpty()) {
+        return QString();
+    }
+    return " WHERE " + conditions.join(" AND ");
+}
+
+QString ShotHistoryStorage::formatFtsQuery(const QString& userInput)
+{
+    // FTS5 tokenizes on punctuation (hyphens, slashes, etc)
+    // So "D-Flow / Q" becomes tokens: "D", "Flow", "Q"
+    // We need to split user input the same way to match
+
+    QString cleaned = userInput.simplified();
+    if (cleaned.isEmpty()) {
+        return QString();
+    }
+
+    // Replace common punctuation with spaces so "d-flo" becomes "d flo"
+    // This matches how FTS5 tokenizes the indexed data
+    QString normalized = cleaned;
+    normalized.replace(QRegularExpression("[\\-/\\.]"), " ");
+
+    QStringList words = normalized.split(' ', Qt::SkipEmptyParts);
+    QStringList terms;
+
+    for (const QString& word : words) {
+        // Escape double quotes by doubling them
+        QString escaped = word;
+        escaped.replace('"', "\"\"");
+        // Escape single quotes (for SQL string literal embedding)
+        escaped.replace('\'', "''");
+        // Use prefix matching with * for partial word matches
+        // Wrap in quotes to handle special characters
+        terms << QString("\"%1\"*").arg(escaped);
+    }
+
+    // Join with AND (implicit in FTS5 when space-separated)
+    return terms.join(" ");
+}
+
+// Whitelist for sort columns — maps user-facing keys to SQL ORDER BY expressions
+
+// Values are spliced into the data query's ORDER BY, which JOINs `recipes` — so
+// they are qualified for the same reason buildFilterQuery's are. None of these
+// nine names collides with a `recipes` column TODAY; qualifying anyway is what
+// stops a future column addition from emptying the whole history list through a
+// sort nobody re-tested.
+static const QHash<QString, QString> s_sortColumnMap = {
+    {"timestamp",        "shots.timestamp"},
+    {"profile_name",     "LOWER(shots.profile_name)"},
+    {"bean_brand",       "LOWER(shots.bean_brand)"},
+    {"bean_type",        "LOWER(shots.bean_type)"},
+    {"enjoyment",        "shots.enjoyment"},
+    {"ratio",            "CASE WHEN shots.dose_weight > 0 THEN CAST(shots.final_weight AS REAL) / shots.dose_weight ELSE 0 END"},
+    {"duration_seconds", "shots.duration_seconds"},
+    {"dose_weight",      "shots.dose_weight"},
+    {"final_weight",     "shots.final_weight"},
+};
+
+void ShotHistoryStorage::requestShotsFiltered(const QVariantMap& filterMap, int offset, int limit)
+{
+    requestShotsFilteredImpl({}, filterMap, offset, limit);
+}
+
+void ShotHistoryStorage::requestShotsFilteredForRequest(const QString& requestId,
+                                                        const QVariantMap& filterMap,
+                                                        int offset, int limit)
+{
+    requestShotsFilteredImpl(requestId, filterMap, offset, limit);
+}
+
+void ShotHistoryStorage::requestShotsFilteredImpl(const QString& requestId,
+                                                  const QVariantMap& filterMap,
+                                                  int offset, int limit)
+{
+    bool isAppend = (offset > 0);
+
+    if (!m_ready) {
+        if (requestId.isEmpty())
+            emit shotsFilteredReady(QVariantList(), isAppend, 0);
+        else
+            emit shotsFilteredRequestReady(requestId, offset, {}, 0,
+                                           QStringLiteral("database not ready"));
+        return;
+    }
+
+    const int serial = requestId.isEmpty() ? ++m_filterSerial : -1;
+    const QString dbPath = m_dbPath;
+
+    // Build SQL on main thread (pure computation, fast)
+    ShotFilter filter = parseFilterMap(filterMap);
+    QVariantList bindValues;
+    QString whereClause = buildFilterQuery(filter, bindValues);
+
+    QString orderByExpr = s_sortColumnMap.value(filter.sortColumn, "shots.timestamp");
+    QString sortDir = (filter.sortDirection == "ASC") ? "ASC" : "DESC";
+    QString orderByClause = QString("ORDER BY %1 %2").arg(orderByExpr, sortDir);
+
+    QString ftsQuery;
+    if (!filter.searchText.isEmpty())
+        ftsQuery = formatFtsQuery(filter.searchText);
+
+    // Grinder identity is no longer in shots_fts (migration 23), so a free-text
+    // search resolves the term against equipment_items and matches shots via the
+    // equipment_id pointer (add-equipment-packages 4b.6) — without this, typing a
+    // grinder name like "niche" finds nothing. Substring LIKE on the combined
+    // brand/model/burrs identity, OR'd with the FTS hit below. Built by
+    // concatenation (NOT QString::arg): the escaped LIKE value carries '%'
+    // wildcards that would collide with arg's %N placeholders. The literal is
+    // single-quote- and wildcard-escaped (ESCAPE '\') so user input is inert.
+    QString grinderMatchClause;
+    if (!ftsQuery.isEmpty()) {
+        const QString grinderIdentityExpr = QStringLiteral(
+            "LOWER(IFNULL(brand,'') || ' ' || IFNULL(model,'') || ' ' || "
+            "IFNULL(json_extract(attrs,'$.burrs'),''))");
+        const QString grinderTerms = likeAllTermsLiteral(grinderIdentityExpr, filter.searchText);
+        if (!grinderTerms.isEmpty())
+            grinderMatchClause = QStringLiteral(
+                " OR shots.equipment_id IN (SELECT package_id FROM equipment_items "
+                "WHERE kind = 'grinder' AND ") + grinderTerms + QStringLiteral(")");
+    }
+
+    // A recipe's name lives in `recipes`, not in shots_fts (which is external-
+    // content on `shots` and so can only ever index shots columns), so a bare
+    // search term reaches it the same way a grinder name does: resolve the term
+    // against the other table and match shots through the id pointer. Without
+    // this, typing a recipe's name finds nothing at all — and for the many users
+    // who replace the wizard's suggested name with one of their own, that name
+    // is the ONLY handle they would think to type.
+    QString recipeMatchClause;
+    if (!ftsQuery.isEmpty()) {
+        const QString recipeTerms = likeAllTermsLiteral(QStringLiteral("LOWER(name)"),
+                                                       filter.searchText);
+        if (!recipeTerms.isEmpty())
+            recipeMatchClause = QStringLiteral(
+                " OR shots.recipe_id IN (SELECT id FROM recipes WHERE ")
+                + recipeTerms + QStringLiteral(")");
+    }
+
+    // ONE column list, read positionally below. It used to be written out twice
+    // — once per branch — against a single positional reader, so adding a column
+    // to one copy and not the other would have mis-assigned every field after
+    // it, silently, with no compiler or test able to see it.
+    //
+    // Every name is qualified `shots.`: the display join below brings in
+    // `recipes`, and the two tables collide on ten names — see the note on
+    // buildFilterQuery for why that count is not enumerated here.
+    static const QString kShotListColumns = QStringLiteral(
+        "shots.id, shots.uuid, shots.timestamp, shots.profile_name, shots.duration_seconds, "
+        "shots.final_weight, shots.dose_weight, shots.bean_brand, shots.bean_type, "
+        "shots.enjoyment, shots.visualizer_id, shots.grinder_setting, "
+        "shots.temperature_override, shots.yield_override, shots.beverage_type, "
+        "shots.drink_tds, shots.drink_ey, "
+        "shots.channeling_detected, shots.grind_issue_detected, "
+        "shots.skip_first_frame_detected, shots.pour_truncated_detected, shots.rpm, "
+        "shots.recipe_id, r.name, r.drink_type, r.archived, "
+        "shots.portal_mean_ec, shots.bag_id, shots.portal_estimate_reliable, shots.portal_mounting_mode");
+
+    // Recipe identity is resolved HERE, in the list query, and never per row: a
+    // RecipeResolver in the delegate (correct on the shot page, which shows one
+    // shot) would be one async database request per visible row, re-fired on
+    // every scroll recycle. The join is on the recipes primary key, inside a
+    // query that already runs off the main thread, and adds no per-row work —
+    // nothing to cache. (Deliberately no row-count figure here: an unmeasured
+    // "it's a small table" is the kind of premise that stops being re-derived.)
+    //
+    // LEFT, not INNER: a shot with no recipe must still be listed. Name, type
+    // and archived arrive NULL for those rows and read as empty/0 below.
+    static const QString kShotListFrom =
+        QStringLiteral(" FROM shots LEFT JOIN recipes r ON r.id = shots.recipe_id ");
+
+    // The count query deliberately does NOT join — it selects no recipe column,
+    // and buildFilterQuery's output is qualified, so it stays valid either way.
+    QString sql;
+    QString countSql;
+    if (!ftsQuery.isEmpty()) {
+        QString extraConditions;
+        if (!whereClause.isEmpty()) {
+            extraConditions = whereClause;
+            extraConditions.replace(extraConditions.indexOf("WHERE"), 5, "AND");
+        }
+        const QString ftsMatch = QString("shots.id IN (SELECT rowid FROM shots_fts WHERE shots_fts MATCH '%1')")
+                                     .arg(ftsQuery);
+        const QString freeTextMatch =
+            QStringLiteral("(") + ftsMatch + grinderMatchClause + recipeMatchClause + QStringLiteral(") ");
+
+        sql = QStringLiteral("SELECT ") + kShotListColumns + kShotListFrom
+              + QStringLiteral("WHERE ") + freeTextMatch
+              + extraConditions + " " + orderByClause + " LIMIT ? OFFSET ?";
+
+        countSql = QStringLiteral("SELECT COUNT(*) FROM shots WHERE ") + freeTextMatch
+                   + extraConditions;
+    } else {
+        sql = QStringLiteral("SELECT ") + kShotListColumns + kShotListFrom
+              + whereClause + " " + orderByClause + " LIMIT ? OFFSET ?";
+
+        countSql = "SELECT COUNT(*) FROM shots" + whereClause;
+    }
+
+    // Separate bind values: data query gets limit+offset appended
+    QVariantList countBindValues = bindValues;
+    bindValues << limit << offset;
+
+    if (requestId.isEmpty() && !m_loadingFiltered) {
+        m_loadingFiltered = true;
+        emit loadingFilteredChanged();
+    }
+
+    auto destroyed = m_destroyed;
+    runDetachedDbThread(
+        [this, dbPath, sql, countSql, bindValues, countBindValues, requestId, offset,
+         serial, isAppend, destroyed]() {
+            QVariantList results;
+            int totalCount = 0;
+            QString queryError;
+
+            const bool databaseOpened = withTempDb(dbPath, "shs_filter", [&](QSqlDatabase& db) {
+                using PortalFitKey = std::tuple<qint64, QString, QString, PortalTailAnalyzer::MountingMode>;
+                // nullopt: the reference read failed (logged) for that coffee on this page.
+                QMap<PortalFitKey, std::optional<PortalTailAnalyzer::CalibrationFit>> portalFits;
+                // Data query
+                QSqlQuery query(db);
+                // Every failure below used to fall through silently, leaving results
+                // empty and totalCount 0 — which reaches the user as the ordinary
+                // "no shots" empty state, indistinguishable from a broken query.
+                // That is exactly how an unqualified column emptied the MCP
+                // shots_list tool without anyone noticing, and this list now depends
+                // on a second table too.
+                if (!query.prepare(sql)) {
+                    queryError = query.lastError().text();
+                    DIAG_WARN(STORAGE, "ShotHistoryStorage") << "shot list prepare failed -" << queryError;
+                } else {
+                    for (int i = 0; i < bindValues.size(); ++i)
+                        query.bindValue(i, bindValues[i]);
+
+                    if (!query.exec()) {
+                        queryError = query.lastError().text();
+                        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "shot list query failed -" << queryError;
+                    } else {
+                        while (query.next()) {
+                            QVariantMap shot;
+                            const qint64 rowShotId = query.value(0).toLongLong();
+                            const double rowFinalWeight = query.value(5).toDouble();
+                            const double rowDoseWeight = query.value(6).toDouble();
+                            const QString rowBeanBrand = query.value(7).toString();
+                            const QString rowBeanType = query.value(8).toString();
+                            const double rowDrinkTds = query.value(15).toDouble();
+                            shot["id"] = rowShotId;
+                            shot["uuid"] = query.value(1).toString();
+                            shot["timestamp"] = query.value(2).toLongLong();
+                            shot["profileName"] = query.value(3).toString();
+                            shot["durationSec"] = query.value(4).toDouble();
+                            shot["finalWeightG"] = rowFinalWeight;
+                            shot["doseWeightG"] = rowDoseWeight;
+                            shot["beanBrand"] = rowBeanBrand;
+                            shot["beanType"] = rowBeanType;
+                            shot["enjoyment0to100"] = query.value(9).toInt();
+                            shot["hasVisualizerUpload"] = !query.value(10).isNull();
+                            shot["grinderSetting"] = query.value(11).toString();
+                            shot["temperatureOverrideC"] = query.value(12).toDouble();
+                            shot["targetWeightG"] = query.value(13).toDouble();
+                            shot["beverageType"] = query.value(14).toString();
+                            shot["drinkTdsPct"] = rowDrinkTds;
+                            shot["drinkEyPct"] = query.value(16).toDouble();
+                            shot["channelingDetected"] = query.value(17).toInt() != 0;
+                            shot["grindIssueDetected"] = query.value(18).toInt() != 0;
+                            shot["skipFirstFrameDetected"] = query.value(19).toInt() != 0;
+                            shot["pourTruncatedDetected"] = query.value(20).toInt() != 0;
+                            shot["rpm"] = query.value(21).toLongLong();  // RPM half of the dial-in
+
+                            // Recipe identity, live from the join — NOT snapshotted onto
+                            // the shot. Safe because a recipe with linked shots can only
+                            // be archived, never hard-deleted, so recipe_id always
+                            // resolves; renaming a recipe therefore relabels its whole
+                            // history, which is the same rule shot-recipe-card already
+                            // applies on the shot page. NULL for a shot with no recipe:
+                            // recipeId reads 0, the rest empty/false.
+                            shot["recipeId"] = query.value(22).toLongLong();
+                            shot["recipeName"] = query.value(23).toString();
+                            shot["recipeDrinkType"] = query.value(24).toString();
+                            shot["recipeArchived"] = query.value(25).toInt() != 0;
+
+                            const double portalMeanEc = query.value(26).toDouble();
+                            const qint64 rowBagId = query.value(27).isNull() ? -1 : query.value(27).toLongLong();
+                            shot["portalMeanEc"] = portalMeanEc;
+                            const bool portalReliable = query.value(28).toBool();
+                            // Retained History rows need explicit resets when calibration disappears.
+                            shot["portalEstEyPct"] = 0.0;
+                            shot["portalEstimateReliable"] = false;
+                            shot["portalEstimateUnavailable"] = false;
+                            if (portalMeanEc > 0.0 && rowDrinkTds > 0.0 && shot["drinkEyPct"].toDouble() <= 0.0)
+                                shot["drinkEyPct"] = PortalTailAnalyzer::extractionYieldPct(
+                                    rowDrinkTds, rowFinalWeight, rowDoseWeight);
+                            if (portalMeanEc > 0.0 && rowDrinkTds <= 0.0) {
+                                const auto mode = PortalTailAnalyzer::mountingModeFromString(query.value(29).toString());
+                                const PortalFitKey key{rowBagId > 0 ? rowBagId : -1, PortalTailAnalyzer::coffeeNameKey(rowBeanBrand),
+                                                       PortalTailAnalyzer::coffeeNameKey(rowBeanType), mode};
+                                auto cached = portalFits.find(key);
+                                if (cached == portalFits.end()) {
+                                    // No measured TDS on these targets: none can train its own fit.
+                                    const auto points = loadPortalCalibrationPointsStatic(db, rowBagId, rowBeanBrand, rowBeanType);
+                                    cached = portalFits.insert(key, points
+                                        ? std::optional(PortalTailAnalyzer::fitCalibration(
+                                              *points, rowBagId, rowBeanBrand, rowBeanType, 0, mode))
+                                        : std::nullopt);
+                                }
+                                if (!cached.value()) {
+                                    shot["portalEstimateUnavailable"] = true;
+                                } else {
+                                    const auto prediction = cached.value()->predict(
+                                        portalMeanEc, rowFinalWeight, rowDoseWeight, portalReliable);
+                                    if (prediction.available) {
+                                        shot["portalEstEyPct"] = prediction.eyPct;
+                                        shot["portalEstimateReliable"] = prediction.uncertaintyReasons.isEmpty();
+                                    }
+                                }
+                            }
+
+                            QDateTime dt = QDateTime::fromSecsSinceEpoch(
+                                query.value(2).toLongLong());
+                            shot["dateTime"] = dt.toString(use12h() ? "yyyy-MM-dd h:mm AP" : "yyyy-MM-dd HH:mm");
+
+                            results.append(shot);
+                        }
+                    }
+                }
+
+                // Count query
+                QSqlQuery countQuery(db);
+                if (!countQuery.prepare(countSql)) {
+                    DIAG_WARN(STORAGE, "ShotHistoryStorage") << "shot count prepare failed -"
+                               << countQuery.lastError().text();
+                } else {
+                    for (int i = 0; i < countBindValues.size(); ++i)
+                        countQuery.bindValue(i, countBindValues[i]);
+                    if (!countQuery.exec())
+                        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "shot count query failed -"
+                                   << countQuery.lastError().text();
+                    else if (countQuery.next())
+                        totalCount = countQuery.value(0).toInt();
+                }
+            });
+            if (!databaseOpened && queryError.isEmpty())
+                queryError = QStringLiteral("Could not open shot database");
+
+            if (*destroyed) return;
+            QMetaObject::invokeMethod(
+                this,
+            [this, ownedResults = std::move(results), requestId, offset, serial, isAppend,
+             totalCount, destroyed, queryError]() mutable {
+                    if (*destroyed) {
+                        DIAG_DEBUG(STORAGE, "ShotHistoryStorage") << "shotsFiltered callback dropped (object destroyed)";
+                        return;
+                    }
+                    if (requestId.isEmpty()) {
+                        if (serial != m_filterSerial) return;
+                        m_loadingFiltered = false;
+                        emit loadingFilteredChanged();
+                    }
+                    // Without this the caller cannot tell a failed query from an
+                    // empty history — QML renders the ordinary "no shots" state
+                    // either way, which is the exact criticism this change levels
+                    // at the code it replaced. errorOccurred is already wired to a
+                    // user-visible toast in main.qml.
+                    if (!queryError.isEmpty() && requestId.isEmpty())
+                        emit errorOccurred(tr("Could not load shot history: %1").arg(queryError));
+                    if (requestId.isEmpty())
+                        emit shotsFilteredReady(ownedResults, isAppend, totalCount);
+                    else
+                        emit shotsFilteredRequestReady(requestId, offset, ownedResults,
+                                                       totalCount, queryError);
+                },
+                Qt::QueuedConnection);
+        });
+
+}
+
+
+QVariantList ShotHistoryStorage::loadRecentShotsByKbIdStatic(QSqlDatabase& db, const QString& kbId,
+                                                            const AdviceScope& scope, int limit,
+                                                            qint64 excludeShotId, bool* ok)
+{
+    QVariantList results;
+    if (ok) *ok = false;
+    // Equipment resolves through the shot's equipment_id pointer (the per-shot
+    // grinder columns are dropped in migration 23). The whole package rides
+    // along, not just the grinder — see EquipmentJoin.
+    QString sql = QStringLiteral(R"(
+        SELECT s.id, s.timestamp, s.profile_name, s.duration_seconds, s.final_weight, s.dose_weight,
+               s.bean_brand, s.bean_type, s.roast_level,
+               )") + EquipmentJoin::selectList() + QStringLiteral(R"(,
+               s.grinder_setting, s.drink_tds, s.drink_ey, s.enjoyment,
+               s.espresso_notes, s.roast_date, s.temperature_override, s.yield_override, s.profile_json, s.beverage_type,
+               s.stopped_by,
+               s.frozen_date, s.defrost_date, s.storage_hint, s.opened_date
+        FROM shots s
+    )") + EquipmentJoin::joins() + QStringLiteral(R"(
+        WHERE s.profile_kb_id = ?
+    )");
+    if (excludeShotId >= 0)
+        sql += QStringLiteral(" AND s.id != ?");
+    sql += QStringLiteral(" AND ") + scope.sql(QStringLiteral("s"));
+    sql += QStringLiteral(" ORDER BY s.timestamp DESC LIMIT ?");
+
+    QSqlQuery query(db);
+    if (!query.prepare(sql)) {
+        // kbId and bucket named: this failure surfaces as "the advisor sees no
+        // history", and the bucket is now embedded in the SQL rather than bound,
+        // so it is not recoverable from a bind list in the log.
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadRecentShotsByKbIdStatic: prepare failed for kbId"
+                   << kbId << "bucket" << scope.bucket() << ":" << query.lastError().text();
+        return results;
+    }
+
+    int idx = 0;
+    query.bindValue(idx++, kbId);
+    if (excludeShotId >= 0)
+        query.bindValue(idx++, excludeShotId);
+    query.bindValue(idx, limit);
+
+    if (query.exec()) {
+        if (ok) *ok = true;
+        while (query.next()) {
+            QVariantMap shot;
+            shot["id"] = query.value("id").toLongLong();
+            qint64 ts = query.value("timestamp").toLongLong();
+            shot["timestamp"] = ts;
+            shot["profileName"] = query.value("profile_name").toString();
+            shot["doseWeightG"] = query.value("dose_weight").toDouble();
+            shot["finalWeightG"] = query.value("final_weight").toDouble();
+            shot["durationSec"] = query.value("duration_seconds").toDouble();
+            shot["enjoyment0to100"] = query.value("enjoyment").toInt();
+            shot["grinderSetting"] = query.value("grinder_setting").toString();
+            EquipmentJoin::readInto(query, shot);
+            shot["espressoNotes"] = query.value("espresso_notes").toString();
+            shot["beanBrand"] = query.value("bean_brand").toString();
+            shot["beanType"] = query.value("bean_type").toString();
+            shot["roastLevel"] = query.value("roast_level").toString();
+            shot["roastDate"] = query.value("roast_date").toString();
+            shot["drinkTdsPct"] = query.value("drink_tds").toDouble();
+            shot["drinkEyPct"] = query.value("drink_ey").toDouble();
+            shot["temperatureOverrideC"] = query.value("temperature_override").toDouble();
+            shot["targetWeightG"] = query.value("yield_override").toDouble();
+            shot["profileJson"] = query.value("profile_json").toString();
+            shot["beverageType"] = query.value("beverage_type").toString();
+            // Bean storage lifecycle (bean-freshness-followup): needed for the
+            // dialInSessions per-shot hoist/override. Sparse-emit so an unset
+            // field stays absent from the map (ShotProjection::fromVariantMap
+            // defaults it empty), matching the toVariantMap sparse convention.
+            {
+                const QString fd = query.value("frozen_date").toString();
+                if (!fd.isEmpty()) shot["frozenDate"] = fd;
+                const QString dd = query.value("defrost_date").toString();
+                if (!dd.isEmpty()) shot["defrostDate"] = dd;
+                const QString sh = query.value("storage_hint").toString();
+                if (!sh.isEmpty()) shot["storageHint"] = sh;
+                const QString od = query.value("opened_date").toString();
+                if (!od.isEmpty()) shot["openedDate"] = od;
+            }
+            // #1161: sparse-emit (see ShotProjection::toVariantMap) so a
+            // future consumer of this map can't surface "profileEnd"/"".
+            {
+                const QString sb = query.value("stopped_by").toString();
+                if (sb == QStringLiteral("manual")
+                    || sb == QStringLiteral("weight")
+                    || sb == QStringLiteral("volume"))
+                    shot["stoppedBy"] = sb;
+            }
+
+            // ISO 8601 with timezone for API/AI consumption (CLAUDE.md convention).
+            // Written into ShotProjection::timestampIso so it does not collide with
+            // dateTime, which convertShotRecord populates with a locale-formatted
+            // display string for QML.
+            QDateTime dt = QDateTime::fromSecsSinceEpoch(ts);
+            shot["timestampIso"] = dt.toOffsetFromUtc(dt.offsetFromUtc()).toString(Qt::ISODate);
+
+            results.append(shot);
+        }
+    } else {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadRecentShotsByKbIdStatic: query failed for kbId"
+                   << kbId << "bucket" << scope.bucket() << ":" << query.lastError().text();
+    }
+    return results;
+}
+
+void ShotHistoryStorage::requestRankedProfilesForBean(const QString& beanBrand,
+                                                      const QString& beanType,
+                                                      const QString& roastLevel,
+                                                      const QString& teaType)
+{
+    if (!m_ready) {
+        emit rankedProfilesForBeanReady(QVariantMap());
+        return;
+    }
+
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, beanBrand, beanType, roastLevel, teaType, destroyed]() {
+        QVariantMap result;
+        withTempDb(dbPath, "shs_rankedprof", [&](QSqlDatabase& db) {
+            result = loadRankedProfilesForBeanStatic(db, beanBrand, beanType, roastLevel, teaType);
+        });
+        // Echo the queried bean so a caller can drop a stale reply that lands
+        // after the user switched beans (the QML wizard's stale-reply guard).
+        result.insert(QStringLiteral("queryBrand"), beanBrand);
+        result.insert(QStringLiteral("queryType"), beanType);
+
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, ownedResult = std::move(result), destroyed]() {
+            if (*destroyed) return;
+            emit rankedProfilesForBeanReady(ownedResult);
+        }, Qt::QueuedConnection);
+    });
+
+}
+
+QVariantMap ShotHistoryStorage::loadRankedProfilesForBeanStatic(QSqlDatabase& db,
+                                                                const QString& beanBrand,
+                                                                const QString& beanType,
+                                                                const QString& roastLevel,
+                                                                const QString& teaType)
+{
+    // Recency, not frequency: a re-dial makes the old pairing stale, and
+    // frequency is sticky in the wrong direction. Rows are
+    // {profileName, lastUsed} (epoch seconds), newest pairing first.
+    const auto runTier = [&db](const QString& sql,
+                               const QVariantList& binds) -> QVariantList {
+        QVariantList tier;
+        QSqlQuery query(db);
+        if (!query.prepare(sql)) {
+            DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadRankedProfilesForBeanStatic: prepare failed:"
+                       << query.lastError().text();
+            return tier;
+        }
+        for (qsizetype i = 0; i < binds.size(); ++i)
+            query.bindValue(static_cast<int>(i), binds.at(i));
+        if (!query.exec()) {
+            DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadRankedProfilesForBeanStatic: query failed:"
+                       << query.lastError().text();
+            return tier;
+        }
+        while (query.next()) {
+            QVariantMap row;
+            row["profileName"] = query.value(0).toString();
+            row["lastUsed"] = query.value(1).toLongLong();
+            tier.append(row);
+        }
+        return tier;
+    };
+
+    QVariantMap result;
+
+    // Tier ①: profiles used with THIS bean (exact identity match).
+    QVariantList withBean;
+    if (!beanBrand.isEmpty() || !beanType.isEmpty()) {
+        withBean = runTier(QStringLiteral(
+            "SELECT profile_name, MAX(timestamp) AS last_used FROM shots "
+            "WHERE COALESCE(bean_brand,'') = ? AND COALESCE(bean_type,'') = ? "
+            "AND COALESCE(profile_name,'') != '' "
+            "GROUP BY profile_name ORDER BY last_used DESC"),
+            {beanBrand, beanType});
+    }
+    result["withBean"] = withBean;
+
+    // Tier ②: profiles used with SIMILAR beans — same teaType (bag-blob JOIN)
+    // for tea, same roast level for coffee — excluding this bean's own shots.
+    QVariantList similar;
+    if (!teaType.isEmpty()) {
+        similar = runTier(QStringLiteral(
+            "SELECT s.profile_name, MAX(s.timestamp) AS last_used FROM shots s "
+            "JOIN coffee_bags b ON b.id = s.bag_id "
+            "WHERE LOWER(COALESCE(json_extract(b.beanbase_json,'$.teaType'),'')) = LOWER(?) "
+            "AND NOT (COALESCE(s.bean_brand,'') = ? AND COALESCE(s.bean_type,'') = ?) "
+            "AND COALESCE(s.profile_name,'') != '' "
+            "GROUP BY s.profile_name ORDER BY last_used DESC"),
+            {teaType, beanBrand, beanType});
+    } else if (!roastLevel.isEmpty()) {
+        similar = runTier(QStringLiteral(
+            "SELECT profile_name, MAX(timestamp) AS last_used FROM shots "
+            "WHERE COALESCE(roast_level,'') = ? "
+            "AND NOT (COALESCE(bean_brand,'') = ? AND COALESCE(bean_type,'') = ?) "
+            "AND COALESCE(profile_name,'') != '' "
+            "GROUP BY profile_name ORDER BY last_used DESC"),
+            {roastLevel, beanBrand, beanType});
+    }
+
+    // Dedupe: a profile already in tier ① never repeats in tier ②.
+    QSet<QString> seen;
+    for (const QVariant& v : std::as_const(withBean))
+        seen.insert(v.toMap().value(QStringLiteral("profileName")).toString());
+    QVariantList similarDeduped;
+    for (const QVariant& v : std::as_const(similar)) {
+        if (!seen.contains(v.toMap().value(QStringLiteral("profileName")).toString()))
+            similarDeduped.append(v);
+    }
+    result["similar"] = similarDeduped;
+
+    return result;
+}
+
+void ShotHistoryStorage::requestProfileUsage()
+{
+    if (!m_ready) {
+        emit profileUsageReady(QVariantMap());
+        return;
+    }
+
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, destroyed]() {
+        QVariantMap result;
+        withTempDb(dbPath, "shs_profusage", [&](QSqlDatabase& db) {
+            result = loadProfileUsageStatic(db);
+        });
+
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, ownedResult = std::move(result), destroyed]() {
+            if (*destroyed) return;
+            emit profileUsageReady(ownedResult);
+        }, Qt::QueuedConnection);
+    });
+}
+
+QVariantMap ShotHistoryStorage::loadProfileUsageStatic(QSqlDatabase& db)
+{
+    // Keyed by profile TITLE — shots.profile_name stores the title, not a
+    // filename, so a rename drops a profile to never-used until its next shot
+    // (profile-usage-history spec, accepted).
+    // Measured 2026-09-14, M2 MacBook Pro, sqlite3 CLI, plan = SCAN USING
+    // INDEX idx_shots_profile: 20 MB / 1188 shots / 27 titles: 37 ms cold,
+    // 1.1 ms warm; 31 MB / 2376 shots: 2.0 ms warm. A covering
+    // (profile_name, timestamp) index cut it to 0.4 ms — not worth a migration
+    // for a threaded query nothing waits on.
+    QVariantMap result;
+    QSqlQuery query(db);
+    if (!query.exec(QStringLiteral(
+            "SELECT profile_name, MAX(timestamp) AS last_used, COUNT(*) AS shot_count "
+            "FROM shots WHERE COALESCE(profile_name,'') != '' GROUP BY profile_name"))) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadProfileUsageStatic: query failed:"
+                   << query.lastError().text();
+        return result;
+    }
+    while (query.next()) {
+        QVariantMap usage;
+        usage["lastTimestamp"] = query.value(1).toLongLong();
+        usage["count"] = query.value(2).toInt();
+        result[query.value(0).toString()] = usage;
+    }
+    return result;
+}
+
+void ShotHistoryStorage::requestLatestShotForBeanProfile(const QString& beanBrand,
+                                                         const QString& beanType,
+                                                         const QString& profileName)
+{
+    if (!m_ready || profileName.isEmpty() || (beanBrand.isEmpty() && beanType.isEmpty())) {
+        emit latestShotForBeanProfileReady(QVariantMap());
+        return;
+    }
+
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, beanBrand, beanType, profileName, destroyed]() {
+        QVariantMap shot;
+        withTempDb(dbPath, "shs_beanprof", [&](QSqlDatabase& db) {
+            shot = loadLatestShotForBeanProfileStatic(db, beanBrand, beanType, profileName);
+        });
+
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, ownedShot = std::move(shot), destroyed]() {
+            if (*destroyed) return;
+            emit latestShotForBeanProfileReady(ownedShot);
+        }, Qt::QueuedConnection);
+    });
+
+}
+
+QVariantMap ShotHistoryStorage::loadLatestShotForBeanProfileStatic(QSqlDatabase& db,
+                                                                   const QString& beanBrand,
+                                                                   const QString& beanType,
+                                                                   const QString& profileName)
+{
+    QVariantMap shot;
+    QSqlQuery query(db);
+    // targetWeightG prefers the shot's SAW target (the user's intent) over
+    // the landed final weight (target + stop error + drips).
+    if (!query.prepare(QStringLiteral(
+            "SELECT id, timestamp, dose_weight, yield_override, final_weight, "
+            "temperature_override, grinder_setting, rpm, "
+            "yield_mode, yield_anchor_value FROM shots "
+            "WHERE COALESCE(bean_brand,'') = ? AND COALESCE(bean_type,'') = ? "
+            "AND profile_name = ? "
+            "ORDER BY timestamp DESC LIMIT 1"))) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadLatestShotForBeanProfileStatic: prepare failed:"
+                   << query.lastError().text();
+        return shot;
+    }
+    query.bindValue(0, beanBrand);
+    query.bindValue(1, beanType);
+    query.bindValue(2, profileName);
+    if (!query.exec()) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadLatestShotForBeanProfileStatic: query failed:"
+                   << query.lastError().text();
+        return shot;
+    }
+    if (!query.next())
+        return shot;
+
+    shot["shotId"] = query.value("id").toLongLong();
+    shot["timestamp"] = query.value("timestamp").toLongLong();
+    shot["doseWeightG"] = query.value("dose_weight").toDouble();
+    const double yieldOverride = query.value("yield_override").toDouble();
+    shot["targetWeightG"] = yieldOverride > 0 ? yieldOverride
+                                              : query.value("final_weight").toDouble();
+    shot["temperatureOverrideC"] = query.value("temperature_override").toDouble();
+    shot["grinderSetting"] = query.value("grinder_setting").toString();
+    shot["rpm"] = query.value("rpm").toLongLong();
+    // The shot's yield anchor (add-yield-ratio-anchor). The recipe wizard
+    // prefills from this: without the mode it can only ever see grams, so a
+    // bean+profile last pulled at 1:2 would seed a recipe with that ratio
+    // FLATTENED to a frozen weight — the exact loss this change exists to
+    // stop. Same NULL relabel as loadShotRecordStatic (a pre-34 row reads
+    // absolute when a target was recorded, else none).
+    const QVariant modeVal = query.value("yield_mode");
+    shot["yieldMode"] = YieldSpec::normalizedMode(modeVal.toString());
+    shot["yieldAnchorValue"] = query.value("yield_anchor_value").toDouble();
+    if (modeVal.isNull() && shot["targetWeightG"].toDouble() > 0) {
+        shot["yieldMode"] = YieldSpec::modeAbsolute();
+        shot["yieldAnchorValue"] = shot["targetWeightG"].toDouble();
+    }
+    return shot;
+}
+
+void ShotHistoryStorage::requestLatestGrindForBean(const QString& beanBrand,
+                                                   const QString& beanType,
+                                                   const QString& roastLevel,
+                                                   qint64 equipmentId)
+{
+    if (!m_ready || (beanBrand.isEmpty() && beanType.isEmpty() && roastLevel.isEmpty())) {
+        emit latestGrindForBeanReady(QVariantMap());
+        return;
+    }
+
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, beanBrand, beanType, roastLevel, equipmentId, destroyed]() {
+        QVariantMap grind;
+        withTempDb(dbPath, "shs_beangrind", [&](QSqlDatabase& db) {
+            grind = loadLatestGrindForBeanStatic(db, beanBrand, beanType, roastLevel, equipmentId);
+        });
+        // Echo the query so QML can drop a stale reply (a "no grind" result is
+        // still tagged so its own stale copy can be filtered — the QML side
+        // keys the empty case on the absence of grinderSetting, not the map).
+        // queryEquipmentId lets the wizard drop a reply for a since-changed
+        // equipment selection (the package is part of what the query answered).
+        grind.insert(QStringLiteral("queryBrand"), beanBrand);
+        grind.insert(QStringLiteral("queryType"), beanType);
+        grind.insert(QStringLiteral("queryRoast"), roastLevel);
+        grind.insert(QStringLiteral("queryEquipmentId"), equipmentId);
+
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, ownedGrind = std::move(grind), destroyed]() {
+            if (*destroyed) return;
+            emit latestGrindForBeanReady(ownedGrind);
+        }, Qt::QueuedConnection);
+    });
+
+}
+
+void ShotHistoryStorage::requestShotForRequest(const QString& requestId, qint64 shotId)
+{
+    if (!m_ready) {
+        emit shotRequestReady(requestId, shotId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, shotId, requestId, destroyed]() {
+        ShotRecord record;
+        const bool opened = withTempDb(dbPath, "shs_recipe_ctx_shot", [&](QSqlDatabase& db) {
+            record = loadShotRecordStatic(db, shotId, nullptr, Q_FUNC_INFO);
+        });
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, shotId, requestId, recordData = std::move(record),
+                                         opened, destroyed]() {
+            if (*destroyed) return;
+            if (!opened) {
+                emit shotRequestReady(requestId, shotId, {}, QStringLiteral("unavailable"));
+            } else if (recordData.summary.id <= 0) {
+                emit shotRequestReady(requestId, shotId, {}, QStringLiteral("notFound"));
+            } else {
+                emit shotRequestReady(requestId, shotId,
+                                      convertShotRecord(recordData).toVariantMap(), {});
+            }
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ShotHistoryStorage::requestRankedProfilesForBeanRequest(const QString& requestId,
+                                                             const QString& beanBrand,
+                                                             const QString& beanType,
+                                                             const QString& roastLevel,
+                                                             const QString& teaType)
+{
+    if (!m_ready) {
+        emit rankedProfilesRequestReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, beanBrand, beanType, roastLevel, teaType,
+                         requestId, destroyed]() {
+        QVariantMap result;
+        const bool opened = withTempDb(dbPath, "shs_recipe_ctx_ranked", [&](QSqlDatabase& db) {
+            result = loadRankedProfilesForBeanStatic(db, beanBrand, beanType, roastLevel, teaType);
+        });
+        result.insert(QStringLiteral("queryBrand"), beanBrand);
+        result.insert(QStringLiteral("queryType"), beanType);
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, requestId, resultData = std::move(result),
+                                         opened, destroyed]() {
+            if (!*destroyed)
+                emit rankedProfilesRequestReady(requestId, resultData, opened ? QString() : QStringLiteral("unavailable"));
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ShotHistoryStorage::requestLatestShotForBeanProfileRequest(const QString& requestId,
+                                                                const QString& beanBrand,
+                                                                const QString& beanType,
+                                                                const QString& profileName)
+{
+    if (!m_ready) {
+        emit latestShotForBeanProfileRequestReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    if (profileName.isEmpty() || (beanBrand.isEmpty() && beanType.isEmpty())) {
+        emit latestShotForBeanProfileRequestReady(requestId, {}, {});
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, beanBrand, beanType, profileName, requestId, destroyed]() {
+        QVariantMap result;
+        const bool opened = withTempDb(dbPath, "shs_recipe_ctx_beanprof", [&](QSqlDatabase& db) {
+            result = loadLatestShotForBeanProfileStatic(db, beanBrand, beanType, profileName);
+        });
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, requestId, resultData = std::move(result),
+                                         opened, destroyed]() {
+            if (!*destroyed)
+                emit latestShotForBeanProfileRequestReady(requestId, resultData, opened ? QString() : QStringLiteral("unavailable"));
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ShotHistoryStorage::requestLatestGrindForBeanRequest(const QString& requestId,
+                                                          const QString& beanBrand,
+                                                          const QString& beanType,
+                                                          const QString& roastLevel,
+                                                          qint64 equipmentId)
+{
+    if (!m_ready) {
+        emit latestGrindForBeanRequestReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    if (beanBrand.isEmpty() && beanType.isEmpty() && roastLevel.isEmpty()) {
+        emit latestGrindForBeanRequestReady(requestId, {}, {});
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, beanBrand, beanType, roastLevel, equipmentId, requestId, destroyed]() {
+        QVariantMap result;
+        const bool opened = withTempDb(dbPath, "shs_recipe_ctx_beangrind", [&](QSqlDatabase& db) {
+            result = loadLatestGrindForBeanStatic(db, beanBrand, beanType, roastLevel, equipmentId);
+        });
+        result.insert(QStringLiteral("queryBrand"), beanBrand);
+        result.insert(QStringLiteral("queryType"), beanType);
+        result.insert(QStringLiteral("queryRoast"), roastLevel);
+        result.insert(QStringLiteral("queryEquipmentId"), equipmentId);
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, requestId, resultData = std::move(result),
+                                         opened, destroyed]() {
+            if (!*destroyed)
+                emit latestGrindForBeanRequestReady(requestId, resultData, opened ? QString() : QStringLiteral("unavailable"));
+        }, Qt::QueuedConnection);
+    });
+}
+
+// Reads every shot: name matching folds Unicode case, which SQL cannot prefilter.
+// Measured 2026-11-08 on a 2023 MacBook Pro, warm cache: 5 ms at 1,339 shots
+// (24 MB DB), 36 ms at 13,390 (140 MB). It runs on a DB thread when a bean is
+// picked, so nothing waits on it.
+QVariantMap ShotHistoryStorage::loadRecipeGrindDefaultStatic(QSqlDatabase& db,
+                                                            const QString& beanBaseId,
+                                                            const QString& beanBrand,
+                                                            const QString& beanType,
+                                                            QString* error)
+{
+    if (error) error->clear();
+    auto failed = [&](const char* what, const QSqlQuery& query) -> QVariantMap {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "recipe grind default:" << what << "query failed -"
+                                                 << query.lastError().text();
+        if (error) *error = QStringLiteral("queryFailed");
+        return {};
+    };
+    const QString id = beanBaseId.trimmed();
+    const QString brand = beanBrand.trimmed().toCaseFolded();
+    const QString type = beanType.trimmed().toCaseFolded();
+    const bool haveNames = !brand.isEmpty() && !type.isEmpty();
+    if (id.isEmpty() && !haveNames)
+        return {};
+
+    auto namesMatch = [&](const QString& b, const QString& t) {
+        return haveNames && b.trimmed().toCaseFolded() == brand
+                         && t.trimmed().toCaseFolded() == type;
+    };
+    QSet<QString> identities;
+    if (haveNames) {
+        QSqlQuery bags(db);
+        if (!bags.exec(QStringLiteral("SELECT roaster_name, coffee_name, beanbase_id FROM coffee_bags")))
+            return failed("bag", bags);
+        while (bags.next()) {
+            const QString candidate = bags.value(2).toString().trimmed();
+            if (!candidate.isEmpty() && namesMatch(bags.value(0).toString(), bags.value(1).toString()))
+                identities.insert(candidate);
+        }
+        if (bags.lastError().isValid()) return failed("bag", bags);
+    }
+
+    QSqlQuery shots(db);
+    if (!shots.exec(QStringLiteral("SELECT id, timestamp, bean_brand, bean_type, beanbase_id, "
+                                   "grinder_setting, rpm, profile_name, equipment_id FROM shots "
+                                   "ORDER BY timestamp DESC, id DESC")))
+        return failed("shot", shots);
+    QVariantMap exact, fallback;
+    while (shots.next()) {
+        const QString shotId = shots.value(4).toString().trimmed();
+        const bool sameName = namesMatch(shots.value(2).toString(), shots.value(3).toString());
+        if (sameName && !shotId.isEmpty())
+            identities.insert(shotId);
+        const QString grind = shots.value(5).toString().trimmed();
+        if (grind.isEmpty())
+            continue;
+        const bool exactId = !id.isEmpty() && !shotId.isEmpty() && id == shotId;
+        const bool nameFallback = sameName && (id.isEmpty() || shotId.isEmpty());
+        if ((!exactId || !exact.isEmpty()) && (!nameFallback || !fallback.isEmpty()))
+            continue;
+        QVariantMap candidate{{QStringLiteral("shotId"), shots.value(0)},
+                              {QStringLiteral("timestamp"), shots.value(1)},
+                              {QStringLiteral("beanBaseId"), shotId},
+                              {QStringLiteral("grinderSetting"), grind},
+                              {QStringLiteral("rpm"), shots.value(6)},
+                              {QStringLiteral("profileName"), shots.value(7)},
+                              {QStringLiteral("equipmentId"), shots.value(8)}};
+        if (exactId && exact.isEmpty()) exact = candidate;
+        if (nameFallback && fallback.isEmpty()) fallback = candidate;
+    }
+    if (shots.lastError().isValid()) return failed("shot", shots);
+    if (!id.isEmpty())
+        identities.insert(id);
+    if (identities.size() > 1)
+        fallback.clear();
+    QVariantMap result = exact;
+    if (!fallback.isEmpty() && (result.isEmpty()
+        || fallback.value(QStringLiteral("timestamp")).toLongLong() > result.value(QStringLiteral("timestamp")).toLongLong()
+        || (fallback.value(QStringLiteral("timestamp")) == result.value(QStringLiteral("timestamp"))
+            && fallback.value(QStringLiteral("shotId")).toLongLong() > result.value(QStringLiteral("shotId")).toLongLong())))
+        result = fallback;
+    if (!result.isEmpty() && result.value(QStringLiteral("equipmentId")).toLongLong() > 0) {
+        QSqlQuery package(db);
+        // The name is context only: the default stands without it.
+        if (package.prepare(QStringLiteral("SELECT name FROM equipment_packages WHERE id = ?"))) {
+            package.addBindValue(result.value(QStringLiteral("equipmentId")));
+            if (package.exec()) {
+                if (package.next())
+                    result.insert(QStringLiteral("equipmentName"), package.value(0));
+            }
+        }
+        if (package.lastError().isValid())
+            DIAG_WARN(STORAGE, "ShotHistoryStorage") << "recipe grind default: package name lookup failed -"
+                                                     << package.lastError().text();
+    }
+    return result;
+}
+
+void ShotHistoryStorage::requestRecipeGrindDefault(const QString& requestId,
+                                                    const QString& beanBaseId,
+                                                    const QString& beanBrand,
+                                                    const QString& beanType)
+{
+    if (!m_ready) {
+        emit recipeGrindDefaultReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, requestId, beanBaseId, beanBrand, beanType, destroyed]() {
+        QVariantMap result;
+        QString reason;
+        const bool opened = withTempDb(dbPath, "shs_recipe_grind_default", [&](QSqlDatabase& db) {
+            result = loadRecipeGrindDefaultStatic(db, beanBaseId, beanBrand, beanType, &reason);
+        });
+        if (!opened && reason.isEmpty()) reason = QStringLiteral("unavailable");
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, requestId, resultData = std::move(result), reason, destroyed]() {
+            if (!*destroyed)
+                emit recipeGrindDefaultReady(requestId, resultData, reason);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ShotHistoryStorage::requestDistinctBeanBrandsForRequest(const QString& requestId)
+{
+    if (!m_ready) {
+        emit distinctBeanBrandsRequestReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, requestId, destroyed]() {
+        QStringList values;
+        QString reason;
+        const bool opened = withTempDb(dbPath, "shs_recipe_ctx_brands", [&](QSqlDatabase& db) {
+            queryDistinctValues(db,
+                QStringLiteral("SELECT DISTINCT bean_brand FROM shots "
+                               "WHERE bean_brand IS NOT NULL AND bean_brand != '' "
+                               "ORDER BY bean_brand"), {}, &values, 4096, 256 * 1024, &reason);
+        });
+        if (!opened && reason.isEmpty()) reason = QStringLiteral("unavailable");
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, requestId, valuesData = std::move(values),
+                                         reason, destroyed]() {
+            if (!*destroyed)
+                emit distinctBeanBrandsRequestReady(requestId, valuesData, reason);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ShotHistoryStorage::requestDistinctBeanTypesForBrandForRequest(
+    const QString& requestId, const QString& beanBrand)
+{
+    if (!m_ready) {
+        emit distinctBeanTypesForBrandRequestReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, requestId, beanBrand, destroyed]() {
+        QStringList values;
+        QString reason;
+        const bool opened = withTempDb(dbPath, "shs_recipe_ctx_beantypes", [&](QSqlDatabase& db) {
+            const QString sql = beanBrand.isEmpty()
+                ? QStringLiteral("SELECT DISTINCT bean_type FROM shots "
+                                 "WHERE bean_type IS NOT NULL AND bean_type != '' "
+                                 "ORDER BY bean_type")
+                : QStringLiteral("SELECT DISTINCT bean_type FROM shots "
+                                 "WHERE bean_brand = ? AND bean_type IS NOT NULL AND bean_type != '' "
+                                 "ORDER BY bean_type");
+            const QVariantList binds = beanBrand.isEmpty() ? QVariantList{} : QVariantList{beanBrand};
+            queryDistinctValues(db, sql, binds, &values, 4096, 256 * 1024, &reason);
+        });
+        if (!opened && reason.isEmpty()) reason = QStringLiteral("unavailable");
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, requestId, valuesData = std::move(values),
+                                         reason, destroyed]() {
+            if (!*destroyed)
+                emit distinctBeanTypesForBrandRequestReady(requestId, valuesData, reason);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ShotHistoryStorage::requestGrindContextForRequest(const QString& requestId,
+                                                       const QString& grinderModel)
+{
+    if (!m_ready) {
+        emit grindContextRequestReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, grinderModel, requestId, destroyed]() {
+        QVariantMap context;
+        const bool opened = withTempDb(dbPath, "shs_grind_context", [&](QSqlDatabase& db) {
+            bool queryOk = false;
+            QList<double> numeric = grinderWideNumericSettings(db, grinderModel, &queryOk);
+            double step = deriveGrindStep(numeric);
+            if (step <= 0.0 && !grinderModel.isEmpty()) {
+                QList<double> pooled = grinderWideNumericSettings(db, QString(), &queryOk);
+                step = deriveGrindStep(pooled);
+            }
+            context.insert(QStringLiteral("grindStep"), step > 0.0 ? step : 1.0);
+
+            double rpmStep = 0.0;
+            if (!grinderModel.isEmpty()) {
+                const QList<double> rpms = grinderWideRpms(db, grinderModel, &queryOk);
+                rpmStep = deriveGrindStep(rpms);
+            }
+            context.insert(QStringLiteral("rpmStep"), rpmStep > 0.0 ? rpmStep : 50.0);
+
+            QStringList observed;
+            if (!grinderModel.isEmpty()) {
+                QSqlQuery query(db);
+                const QString sql = QStringLiteral(
+                    "SELECT DISTINCT grinder_setting FROM shots WHERE %1 "
+                    "AND grinder_setting IS NOT NULL AND grinder_setting != '' "
+                    "ORDER BY grinder_setting LIMIT 8193")
+                    .arg(ShotHistoryStorage::grinderModelMatchSql(":model"));
+                if (!query.prepare(sql)) {
+                    context.insert(QStringLiteral("error"), QStringLiteral("queryFailed"));
+                    return;
+                }
+                query.bindValue(":model", grinderModel);
+                if (!query.exec()) {
+                    context.insert(QStringLiteral("error"), QStringLiteral("queryFailed"));
+                    return;
+                }
+                qsizetype bytes = 0;
+                while (query.next()) {
+                    const QString setting = query.value(0).toString();
+                    bytes += setting.toUtf8().size();
+                    // The service serializes this list to remote QML. Fail the
+                    // whole snapshot explicitly instead of allocating or
+                    // shipping an unbounded history-derived catalog.
+                    if (observed.size() >= 8192 || bytes > 512 * 1024) {
+                        context.insert(QStringLiteral("error"),
+                                       QStringLiteral("tooManySettings"));
+                        return;
+                    }
+                    observed.append(setting);
+                }
+                sortGrinderSettings(observed);
+            }
+            context.insert(QStringLiteral("observedSettings"), observed);
+        });
+
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, requestId, contextData = std::move(context),
+                                         opened, destroyed]() {
+            if (!*destroyed) {
+                const QString reason = !opened ? QStringLiteral("unavailable")
+                    : contextData.value(QStringLiteral("error")).toString();
+                emit grindContextRequestReady(requestId, contextData, reason);
+            }
+        }, Qt::QueuedConnection);
+    });
+}
+
+QVariantMap ShotHistoryStorage::loadLatestGrindForBeanStatic(QSqlDatabase& db,
+                                                             const QString& beanBrand,
+                                                             const QString& beanType,
+                                                             const QString& roastLevel,
+                                                             qint64 equipmentId)
+{
+    // Exact bean identity first; same roast level as the similar-bean
+    // fallback. Only shots that actually recorded a grind qualify.
+    const auto tryQuery = [&db](const QString& where, const QVariantList& binds) -> QVariantMap {
+        QVariantMap grind;
+        QSqlQuery query(db);
+        if (!query.prepare(QStringLiteral(
+                "SELECT grinder_setting, rpm, profile_name FROM shots WHERE %1 "
+                "AND COALESCE(grinder_setting,'') != '' "
+                "ORDER BY timestamp DESC LIMIT 1").arg(where))) {
+            DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadLatestGrindForBeanStatic: prepare failed:"
+                       << query.lastError().text();
+            return grind;
+        }
+        for (qsizetype i = 0; i < binds.size(); ++i)
+            query.bindValue(static_cast<int>(i), binds.at(i));
+        if (!query.exec()) {
+            DIAG_WARN(STORAGE, "ShotHistoryStorage") << "loadLatestGrindForBeanStatic: query failed:"
+                       << query.lastError().text();
+            return grind;
+        }
+        if (!query.next())
+            return grind;
+        grind["grinderSetting"] = query.value(0).toString();
+        grind["rpm"] = query.value(1).toLongLong();
+        grind["profileName"] = query.value(2).toString();
+        return grind;
+    };
+
+    // Equipment scoping (equipmentId > 0): prefer the SELECTED package, then
+    // packages sharing its grinder+basket identity (puck prep ignored). A
+    // different grinder or basket never qualifies, and there is no unscoped
+    // fallback — absence of both tiers yields no hint. equipmentId <= 0 keeps
+    // the original unscoped behavior for recipes with no package.
+    QString selPred;          // " AND equipment_id = <sel>"    (A tier)
+    QString matchPred;        // " AND equipment_id IN (<set>)" (B tier); empty when skipped
+    QVariantList matchBinds;  // the 5 identity values, in subquery order
+    if (equipmentId > 0) {
+        // equipmentId is an integer we control — formatting it is injection-safe.
+        selPred = QStringLiteral(" AND equipment_id = %1").arg(QString::number(equipmentId));
+
+        // Resolve the selected package's grinder(brand/model/burrs) + basket
+        // (brand/model) identity from its first row of each kind, the canonical
+        // row EquipmentStorage reads. COALESCE to '' so an absent item reads as "no
+        // grinder" / "no basket" and matches other packages lacking the same.
+        QString gBrand, gModel, gBurrs, bBrand, bModel;
+        {
+            QSqlQuery idq(db);
+            if (idq.prepare(QStringLiteral(
+                    "SELECT COALESCE(eg.brand,''), COALESCE(eg.model,''), "
+                    "COALESCE(json_extract(eg.attrs,'$.burrs'),''), "
+                    "COALESCE(eb.brand,''), COALESCE(eb.model,'') "
+                    "FROM equipment_packages p "
+                    "LEFT JOIN equipment_items eg ON eg.id = (SELECT id FROM equipment_items "
+                    "WHERE package_id = p.id AND kind = 'grinder' ORDER BY id LIMIT 1) "
+                    "LEFT JOIN equipment_items eb ON eb.id = (SELECT id FROM equipment_items "
+                    "WHERE package_id = p.id AND kind = 'basket' ORDER BY id LIMIT 1) "
+                    "WHERE p.id = ?"))) {
+                idq.bindValue(0, equipmentId);
+                if (idq.exec() && idq.next()) {
+                    gBrand = idq.value(0).toString();
+                    gModel = idq.value(1).toString();
+                    gBurrs = idq.value(2).toString();
+                    bBrand = idq.value(3).toString();
+                    bModel = idq.value(4).toString();
+                }
+            }
+        }
+        // When the package has NO grinder and NO basket identity, skip the B
+        // tier: a matchset of "every package that also lacks both" degrades to
+        // near-unscoped and could let a different grinder supply a hint, which
+        // the scope exists to forbid. (A basket-less package still matches other
+        // basket-less packages when the grinder identity is non-empty.)
+        const bool hasIdentity = !gBrand.isEmpty() || !gModel.isEmpty() || !gBurrs.isEmpty()
+                              || !bBrand.isEmpty() || !bModel.isEmpty();
+        if (hasIdentity) {
+            // Case- and whitespace-folded, as grinderModelMatchSql() matches dial history.
+            matchPred = QStringLiteral(
+                " AND equipment_id IN ("
+                "SELECT p.id FROM equipment_packages p "
+                "LEFT JOIN equipment_items eg ON eg.id = (SELECT id FROM equipment_items "
+                    "WHERE package_id = p.id AND kind = 'grinder' ORDER BY id LIMIT 1) "
+                "LEFT JOIN equipment_items eb ON eb.id = (SELECT id FROM equipment_items "
+                    "WHERE package_id = p.id AND kind = 'basket' ORDER BY id LIMIT 1) "
+                "WHERE LOWER(TRIM(COALESCE(eg.brand,''))) = LOWER(TRIM(?)) "
+                "AND LOWER(TRIM(COALESCE(eg.model,''))) = LOWER(TRIM(?)) "
+                "AND LOWER(TRIM(COALESCE(json_extract(eg.attrs,'$.burrs'),''))) = LOWER(TRIM(?)) "
+                "AND LOWER(TRIM(COALESCE(eb.brand,''))) = LOWER(TRIM(?)) "
+                "AND LOWER(TRIM(COALESCE(eb.model,''))) = LOWER(TRIM(?)))");
+            matchBinds = {gBrand, gModel, gBurrs, bBrand, bModel};
+        }
+    }
+
+    const bool haveBean = !beanBrand.isEmpty() || !beanType.isEmpty();
+    const QString beanWhere = QStringLiteral(
+        "COALESCE(bean_brand,'') = ? AND COALESCE(bean_type,'') = ?");
+    const QVariantList beanBinds = {beanBrand, beanType};
+    const QString roastWhere = QStringLiteral("COALESCE(roast_level,'') = ?");
+    const QVariantList roastBinds = {roastLevel};
+
+    // Run one lane (bean or roast) scoped by an equipment clause. The base
+    // predicate's '?' bind first, then the clause's (the subquery's identity
+    // values), matching their left-to-right order in the composed SQL.
+    const auto lane = [&](const QString& baseWhere, const QVariantList& baseBinds,
+                          const QString& equipClause, const QVariantList& equipBinds,
+                          const char* level) -> QVariantMap {
+        QVariantList binds = baseBinds;
+        binds.append(equipBinds);
+        QVariantMap r = tryQuery(baseWhere + equipClause, binds);
+        if (!r.isEmpty())
+            r["matchLevel"] = QString::fromLatin1(level);
+        return r;
+    };
+
+    if (equipmentId > 0) {
+        // Bean-first ACROSS the package tiers (A1, B1, A2, B2): the matchset
+        // packages share the grinder+basket by construction, so a dial value
+        // transfers losslessly and exact-bean identity — the dominant signal
+        // for a grind setting — must beat a same-package similar-roast shot.
+        if (haveBean) {
+            QVariantMap r = lane(beanWhere, beanBinds, selPred, {}, "bean");       // A1
+            if (!r.isEmpty()) return r;
+            if (!matchPred.isEmpty()) {
+                r = lane(beanWhere, beanBinds, matchPred, matchBinds, "bean");     // B1
+                if (!r.isEmpty()) return r;
+            }
+        }
+        if (!roastLevel.isEmpty()) {
+            QVariantMap r = lane(roastWhere, roastBinds, selPred, {}, "similarRoast");   // A2
+            if (!r.isEmpty()) return r;
+            if (!matchPred.isEmpty()) {
+                r = lane(roastWhere, roastBinds, matchPred, matchBinds, "similarRoast"); // B2
+                if (!r.isEmpty()) return r;
+            }
+        }
+        return {};
+    }
+
+    // Unscoped (equipmentId <= 0): original behavior, byte-identical.
+    if (haveBean) {
+        QVariantMap r = lane(beanWhere, beanBinds, QString(), {}, "bean");
+        if (!r.isEmpty()) return r;
+    }
+    if (!roastLevel.isEmpty()) {
+        QVariantMap r = lane(roastWhere, roastBinds, QString(), {}, "similarRoast");
+        if (!r.isEmpty()) return r;
+    }
+    return {};
+}
+
+// convertShotRecord (the QVariantMap projection consumed by requestShot,
+// ShotServer, and the AI advisor) lives in shothistorystorage_serialize.cpp.
+
+
+// Estimator: the "common smallest adjustment" — the finest gap between the
+// user's observed settings that they make REPEATEDLY. This is the single source
+// of truth for a grinder's effective step, shared by the widget and the AI
+// grinderContext. `sortedDistinct` MUST be sorted ascending and de-duplicated.
+// Returns 0 when it cannot derive (fewer than 2 distinct values) so callers
+// apply their own default.
+//
+// Why smallest-repeated rather than the raw minimum or the modal gap:
+//   - raw minimum: a single mistyped setting (an 8.1 among 7.5/8/8.5/9) creates
+//     a one-off 0.1 gap that would force the step to 0.1 forever.
+//   - modal (most common) gap: a user who mostly makes coarse moves (0.5) with
+//     occasional fine ones gets 0.5, hiding the 0.25 their grinder actually does.
+// The step is the finest increment the user genuinely dials — the grinder's
+// effective resolution. So take the SMALLEST gap that occurs at least twice: a
+// real, repeated fine move survives; a lone typo or a one-off jump when
+// switching beans (occurring once) is skipped. Fall back to the smallest gap
+// only when nothing repeats (very sparse history). Clamped to a 0.05 floor.
+static double deriveGrindStep(const QList<double>& sortedDistinct)
+{
+    if (sortedDistinct.size() < 2)
+        return 0.0;
+
+    // Histogram of consecutive gaps, rounded to 2 decimals to absorb float dirt
+    // (e.g. 8.75 - 8.5 == 0.24999999). QMap keeps keys sorted ascending.
+    QMap<double, int> freq;
+    for (qsizetype i = 1; i < sortedDistinct.size(); ++i) {
+        double gap = std::round((sortedDistinct[i] - sortedDistinct[i - 1]) * 100.0) / 100.0;
+        if (gap > 0.0)
+            freq[gap] += 1;
+    }
+    if (freq.isEmpty())
+        return 0.0;
+
+    // Smallest gap the user makes repeatedly (>= 2). Ascending iteration returns
+    // the first such gap = the smallest common adjustment.
+    for (auto it = freq.constBegin(); it != freq.constEnd(); ++it) {
+        if (it.value() >= 2)
+            return it.key() < 0.05 ? 0.05 : it.key();
+    }
+
+    // Nothing repeats (sparse/scattered history): fall back to the smallest gap.
+    const double smallest = freq.constBegin().key();
+    return smallest < 0.05 ? 0.05 : smallest;
+}
+
+// The grinder's distinct NUMERIC settings, sorted. The step is a property of the
+// grinder (its effective dial resolution), not of the bean or the drink, so this
+// is deliberately not scoped to either.
+//
+// Returning the values rather than the step is what lets both callers derive AND
+// report from one query: the widget needs the sample count for its log line, and
+// the AI's queryGrinderContext needs the values themselves.
+//
+// An empty model means "no grinder selected" and pools every grinder's history —
+// including shots with no equipment row at all. That is a LAST RESORT, not a
+// neutral default: pooling mixes every grinder's dial resolution into one
+// estimate, and the caller gets no signal that it did. It reads as correct to a
+// one-grinder user because the pool IS their grinder, so nothing has ever
+// flagged it; it was found by reading the log attached to #1726, where the
+// post-shot review reached this branch with an empty model.
+//
+// So callers must exhaust their own identity first, and both surfaces now do:
+// GrindRowSource.grindStep() and ShotServer::handleGrindCandidatesApi each
+// resolve to the ACTIVE grinder before querying. queryGrinderContext returns
+// early on an empty model and never reaches here at all.
+//
+// What still legitimately pools is a user with no grinder anywhere — no
+// injected identity and none selected — for whom every grinder IS the only
+// pool available, and a grinder whose own history is too thin to derive from,
+// where grindStep() prefers the pool to a blind 1.0 default. Both are second
+// attempts after a scoped one failed, never a first choice.
+//
+// Served by idx_shots_equip_grind (migration 40). Without it this is a full
+// `SCAN shots` whose cost tracks table BYTES, not row count, because a page read
+// drags profile_json and debug_log along. Indexed, the plan is `SEARCH shots
+// USING COVERING INDEX` and the table is never opened.
+//
+// Measured: 435 ms and 483 ms for this and its RPM twin on a 5,788-shot Android
+// database (user log 2026-09-01) — a ~0.9 s hang, since
+// GrindPickerDialog.onAboutToShow calls both before painting. Desktop SQLite on
+// synthetic copies: 3.6 / 5.1 / 10.5 ms at 13.6 / 24.2 / 61.1 MB before, 0.17 ms
+// after. Do not judge an unindexed variant by the desktop figures — the gap
+// between 10.5 ms and 483 ms is the machine this has to hold for.
+//
+// Three call paths reach it: GrindRowSource.grindStep() and the ShotServer's
+// grind-candidates endpoint build a picker's rows, while queryGrinderContext
+// (below) builds the AI dialing/advisor context. None is per frame, per
+// keystroke, or a binding.
+//
+// (Until PR Kulitorum/Decenza#1725 the QML side WAS a binding, and this sentence described it as
+// one; do not read the old shape back into it. It then listed only the two
+// picker callers, which read as exhaustive and was not — queryGrinderContext
+// returns early on an EMPTY model, which is a narrower thing than never
+// calling this.)
+//
+// `queryOk` reports whether the QUERY ran, not whether it found anything. A failed
+// query and a grinder with no numeric history both yield an empty list, and the
+// caller must not describe them the same way — see reportGrindStep.
+static QList<double> grinderWideNumericSettings(QSqlDatabase& db, const QString& grinderModel,
+                                                bool* queryOk = nullptr)
+{
+    if (queryOk) *queryOk = false;
+    static const QString kAll = QStringLiteral(
+        "SELECT DISTINCT grinder_setting FROM shots "
+        "WHERE grinder_setting IS NOT NULL AND grinder_setting != ''");
+    const QString kScoped = kAll + QStringLiteral(" AND ")
+                          + ShotHistoryStorage::grinderModelMatchSql(":model");
+
+    QSqlQuery q(db);
+    if (!q.prepare(grinderModel.isEmpty() ? kAll : kScoped)) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "grinderWideNumericSettings: prepare failed:"
+                   << q.lastError().text() << "grinderModel=" << grinderModel;
+        return {};
+    }
+    if (!grinderModel.isEmpty())
+        q.bindValue(":model", grinderModel);
+    if (!q.exec()) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "grinderWideNumericSettings: query failed:"
+                   << q.lastError().text() << "grinderModel=" << grinderModel;
+        return {};
+    }
+    if (queryOk) *queryOk = true;
+    QSet<double> numericSet;
+    while (q.next()) {
+        bool ok = false;
+        const double v = q.value(0).toString().trimmed().toDouble(&ok);
+        if (ok)
+            numericSet.insert(v);
+    }
+    QList<double> numeric(numericSet.begin(), numericSet.end());
+    std::sort(numeric.begin(), numeric.end());
+    return numeric;
+}
+
+// RPM counterpart of grinderWideNumericSettings, over the integer shots.rpm
+// column (rpm > 0 = a real dial-in), so the widget and the AI grinderContext
+// never disagree.
+//
+// Returns the VALUES, not the step, for the same reason as its settings sibling:
+// the caller needs the sample count for its log line. Returning only the step
+// forced grindRpmStepForGrinder to report a hard-coded 0, so a successful
+// derivation logged "= 100, derived from 0 distinct numeric setting(s)".
+//
+// REQUIRES a non-empty model — unlike its settings sibling there is no
+// all-grinders branch, because pooling RPMs across different grinders describes
+// no real dial. Both callers guard for that.
+//
+// Same shape and same cost as grinderWideNumericSettings above — see its comment
+// for the measurements and for why the covering index matters more on slow
+// storage. Served by idx_shots_equip_rpm (migration 40), over the integer rpm
+// column instead of the text one. `queryOk` reports whether the query RAN, so the
+// caller can tell a failure from a grinder that simply has no recorded RPMs.
+static QList<double> grinderWideRpms(QSqlDatabase& db, const QString& grinderModel,
+                                     bool* queryOk = nullptr)
+{
+    if (queryOk) *queryOk = false;
+    QSqlQuery q(db);
+    const QString sql = QStringLiteral("SELECT DISTINCT rpm FROM shots WHERE %1 AND rpm > 0")
+                            .arg(ShotHistoryStorage::grinderModelMatchSql(":model"));
+    if (!q.prepare(sql)) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "grinderWideRpms: prepare failed:"
+                   << q.lastError().text() << "grinderModel=" << grinderModel;
+        return {};
+    }
+    q.bindValue(":model", grinderModel);
+    if (!q.exec()) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "grinderWideRpms: query failed:"
+                   << q.lastError().text() << "grinderModel=" << grinderModel;
+        return {};
+    }
+    if (queryOk) *queryOk = true;
+    QList<double> rpms;
+    while (q.next()) {
+        const int r = q.value(0).toInt();
+        if (r > 0)
+            rpms.append(r);
+    }
+    std::sort(rpms.begin(), rpms.end());
+    return rpms;
+}
+
+GrinderContext ShotHistoryStorage::queryGrinderContext(QSqlDatabase& db,
+    const QString& grinderModel, const AdviceScope& scope, const QString& beverageType,
+    const QString& beanBrand)
+{
+    GrinderContext ctx;
+    if (grinderModel.isEmpty()) return ctx;
+
+    ctx.model = grinderModel;
+    ctx.beverageType = beverageType.isEmpty() ? QStringLiteral("espresso") : beverageType;
+
+    // Package-scoped, not grinder-scoped: a setting dialled on another basket is
+    // not one this user dialled on this gear. The scope implies the grinder, so
+    // the grinder-model subquery and its `:model` bind are gone.
+    // ctx.stepSize is the grinder-wide half — see grinderWideNumericSettings().
+    QString sql = QStringLiteral(
+        "SELECT DISTINCT grinder_setting FROM shots WHERE ") + scope.sql()
+        + QStringLiteral(" AND beverage_type = :bev "
+                         "AND grinder_setting != ''");
+    if (!beanBrand.isEmpty()) {
+        sql += QStringLiteral(" AND bean_brand = :brand");
+    }
+
+    QSqlQuery q(db);
+    q.prepare(sql);
+    q.bindValue(":bev", ctx.beverageType);
+    if (!beanBrand.isEmpty()) {
+        q.bindValue(":brand", beanBrand);
+    }
+    if (!q.exec()) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "queryGrinderContext: query failed:"
+                   << q.lastError().text()
+                   << "grinderModel=" << grinderModel
+                   << "beverageType=" << ctx.beverageType
+                   << "beanBrand=" << beanBrand;
+        return ctx;
+    }
+
+    QSet<double> numericSet;
+    ctx.allNumeric = true;
+    bool hasAny = false;
+
+    while (q.next()) {
+        QString s = q.value(0).toString().trimmed();
+        if (s.isEmpty()) continue;
+        hasAny = true;
+        ctx.settingsObserved.append(s);
+        bool ok;
+        double v = s.toDouble(&ok);
+        if (ok) {
+            numericSet.insert(v);
+        } else {
+            ctx.allNumeric = false;
+        }
+    }
+
+    if (!hasAny) {
+        ctx.allNumeric = false;
+        return ctx;
+    }
+
+    QList<double> numeric(numericSet.begin(), numericSet.end());
+    std::sort(numeric.begin(), numeric.end());
+    // stepSize is a GRINDER property, not bean- or beverage-scoped: derive it
+    // grinder-model-wide (all beans/beverages) so it reflects the grinder's true
+    // resolution and matches the widget exactly — a user who mostly makes coarse
+    // moves on the current bean still gets the fine step their grinder can do.
+    // (settingsObserved / min / max stay bean-scoped below — those are per-bean
+    // context, unlike the step.)
+    ctx.stepSize = deriveGrindStep(grinderWideNumericSettings(db, grinderModel));
+    // min/max stay gated on an all-numeric history — a mixed list has no
+    // meaningful numeric range to report.
+    if (ctx.allNumeric && numeric.size() >= 2) {
+        ctx.minSetting = numeric.first();
+        ctx.maxSetting = numeric.last();
+    }
+
+    // Scoped like settingsObserved. rpm > 0 = a real dial-in; ORDER BY rpm makes
+    // first()/last() the min/max. ctx.rpmStepSize is the grinder-wide half.
+    {
+        QString rpmSql = QStringLiteral(
+            "SELECT DISTINCT rpm FROM shots WHERE ") + scope.sql()
+            + QStringLiteral(" AND beverage_type = :bev "
+                             "AND rpm > 0");
+        if (!beanBrand.isEmpty())
+            rpmSql += QStringLiteral(" AND bean_brand = :brand");
+        rpmSql += QStringLiteral(" ORDER BY rpm");
+
+        QSqlQuery rq(db);
+        rq.prepare(rpmSql);
+        rq.bindValue(":bev", ctx.beverageType);
+        if (!beanBrand.isEmpty())
+            rq.bindValue(":brand", beanBrand);
+        if (!rq.exec()) {
+            DIAG_WARN(STORAGE, "ShotHistoryStorage") << "queryGrinderContext: rpm query failed:"
+                       << rq.lastError().text()
+                       << "grinderModel=" << grinderModel;
+        } else {
+            while (rq.next()) {
+                const int r = rq.value(0).toInt();
+                if (r > 0)
+                    ctx.rpmsObserved.append(r);
+            }
+            if (ctx.rpmsObserved.size() >= 2) {
+                ctx.rpmMin = ctx.rpmsObserved.first();
+                ctx.rpmMax = ctx.rpmsObserved.last();
+            }
+        }
+    }
+    // rpmStepSize is a GRINDER property like stepSize — grinder-model-wide, not
+    // bean/beverage-scoped — so it matches the widget's grindRpmStepForGrinder.
+    ctx.rpmStepSize = deriveGrindStep(grinderWideRpms(db, grinderModel));
+
+    return ctx;
+}
+
+
+// The model compare is case- and whitespace-FOLDED so it agrees with the identity
+// lookup that decides two packages are the same gear
+// (findPackageByGrinderIdentityStatic, which has always used LOWER). An exact
+// compare meant a model string differing only in case or padding — two packages
+// the write path considers the same grinder — read back as a grinder with NO
+// history. That is invisible: an empty result is indistinguishable from a new
+// grinder, so the step silently falls back to 1.0 and the wheel loses the
+// resolution the user actually dials.
+//
+// One definition for every model-scoped lookup in THIS file — there were six
+// hand-written copies, which is exactly the drift CLAUDE.md's centralization rule
+// describes. %1 is the placeholder style the call site uses (":model" or "?").
+QString ShotHistoryStorage::grinderModelMatchSql(const QString& placeholder)
+{
+    return QStringLiteral(
+        "equipment_id IN (SELECT package_id FROM equipment_items "
+        "WHERE kind = 'grinder' AND LOWER(TRIM(IFNULL(model,''))) = LOWER(TRIM(%1)))")
+        .arg(placeholder);
+}
+
+static const QStringList s_allowedColumns = {
+    "profile_name", "bean_brand", "bean_type",
+    "grinder_setting", "barista", "roast_level"
+};
+
+QStringList ShotHistoryStorage::getDistinctValues(const QString& column)
+{
+    // The column name is interpolated, not bound — SQLite cannot bind an
+    // identifier — so it must come from the allow-list or not at all.
+    if (!s_allowedColumns.contains(column)) {
+        DIAG_WARN(STORAGE, "ShotHistoryStorage") << "getDistinctValues: rejected column" << column;
+        return {};
+    }
+    return queryDistinctList(
+        QStringLiteral("SELECT DISTINCT %1 FROM shots "
+                       "WHERE %1 IS NOT NULL AND %1 != '' ORDER BY %1").arg(column));
+}
+
+QStringList ShotHistoryStorage::getDistinctBeanBrands()
+{
+    return getDistinctValues("bean_brand");
+}
+
+QStringList ShotHistoryStorage::getDistinctBeanTypes()
+{
+    return getDistinctValues("bean_type");
+}
+
+QStringList ShotHistoryStorage::getDistinctGrinders()
+{
+    // Grinder models come from the equipment inventory, not the dropped
+    // shots.grinder_model column (add-equipment-packages task 4.2). All grinder
+    // items across every package (inventory or superseded) so history retains
+    // sold/retired grinders.
+    return queryDistinctList(
+        QStringLiteral("SELECT DISTINCT model FROM equipment_items "
+                       "WHERE kind = 'grinder' AND model IS NOT NULL AND model != '' "
+                       "ORDER BY model"));
+}
+
+QStringList ShotHistoryStorage::getDistinctGrinderSettings()
+{
+    QStringList settings = getDistinctValues("grinder_setting");
+    sortGrinderSettings(settings);
+    return settings;
+}
+
+QStringList ShotHistoryStorage::getDistinctBaristas()
+{
+    return getDistinctValues("barista");
+}
+
+void ShotHistoryStorage::requestDistinctBaristasForRequest(const QString& requestId)
+{
+    if (!m_ready) {
+        emit distinctBaristasRequestReady(requestId, {}, QStringLiteral("notReady"));
+        return;
+    }
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+    runDetachedDbThread([this, dbPath, requestId, destroyed]() {
+        QStringList values;
+        QString reason;
+        const bool opened = withTempDb(dbPath, "shs_baristas", [&](QSqlDatabase& db) {
+            queryDistinctValues(db,
+                QStringLiteral("SELECT DISTINCT barista FROM shots "
+                               "WHERE barista IS NOT NULL AND barista != '' "
+                               "ORDER BY barista"), {}, &values, 4096, 256 * 1024, &reason);
+        });
+        if (!opened && reason.isEmpty())
+            reason = QStringLiteral("unavailable");
+        if (*destroyed)
+            return;
+        QMetaObject::invokeMethod(this, [this, requestId, ownedValues = std::move(values),
+                                         reason, destroyed]() {
+            if (!*destroyed)
+                emit distinctBaristasRequestReady(requestId, ownedValues, reason);
+        }, Qt::QueuedConnection);
+    });
+}
+
+
+void ShotHistoryStorage::requestAutoFavorites(const QString& groupBy, int maxItems,
+                                             const QString& requestId)
+{
+    if (!m_ready) {
+        if (requestId.isEmpty()) emit autoFavoritesReady({});
+        else emit autoFavoritesRequestReady(requestId, {}, QStringLiteral("unavailable"));
+        return;
+    }
+
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+
+    // Build SQL on main thread (pure string manipulation, fast)
+    QString selectColumns;
+    QString groupColumns;
+    QString joinConditions;
+
+    // "bean_profile_grinder_weight" shares grinder-level grouping and also splits
+    // by target yield (exact) and dose rounded to the nearest 0.5 g, so shots with
+    // different dose/yield targets on the same bean + profile + grinder get their
+    // own cards.
+    const bool weightAware = (groupBy == "bean_profile_grinder_weight");
+
+    if (groupBy == "bean") {
+        selectColumns = "COALESCE(bean_brand, '') AS gb_bean_brand, "
+                        "COALESCE(bean_type, '') AS gb_bean_type";
+        groupColumns = "COALESCE(bean_brand, ''), COALESCE(bean_type, '')";
+        joinConditions = "COALESCE(s.bean_brand, '') = g.gb_bean_brand "
+                         "AND COALESCE(s.bean_type, '') = g.gb_bean_type";
+    } else if (groupBy == "profile") {
+        selectColumns = "COALESCE(profile_name, '') AS gb_profile_name";
+        groupColumns = "COALESCE(profile_name, '')";
+        joinConditions = "COALESCE(s.profile_name, '') = g.gb_profile_name";
+    } else if (groupBy == "bean_profile_grinder" || weightAware) {
+        // Grinder identity is the equipment_id pointer, not the dropped
+        // grinder_brand/model columns (add-equipment-packages task 4.1).
+        // Grouping on equipment_id is equivalent to the old brand+model key
+        // (shots with the same identity share a package) and additionally
+        // honours burrs, which the old key ignored. grinder_setting (per-shot
+        // dial-in) stays in the key so different settings still split cards.
+        selectColumns = "COALESCE(bean_brand, '') AS gb_bean_brand, "
+                        "COALESCE(bean_type, '') AS gb_bean_type, "
+                        "COALESCE(profile_name, '') AS gb_profile_name, "
+                        "COALESCE(equipment_id, 0) AS gb_equipment_id, "
+                        "COALESCE(grinder_setting, '') AS gb_grinder_setting";
+        groupColumns = "COALESCE(bean_brand, ''), COALESCE(bean_type, ''), "
+                       "COALESCE(profile_name, ''), COALESCE(equipment_id, 0), "
+                       "COALESCE(grinder_setting, '')";
+        joinConditions = "COALESCE(s.bean_brand, '') = g.gb_bean_brand "
+                         "AND COALESCE(s.bean_type, '') = g.gb_bean_type "
+                         "AND COALESCE(s.profile_name, '') = g.gb_profile_name "
+                         "AND COALESCE(s.equipment_id, 0) = g.gb_equipment_id "
+                         "AND COALESCE(s.grinder_setting, '') = g.gb_grinder_setting";
+    } else {
+        // Default: bean_profile. The equipment package is part of the key, not
+        // an extra the "+ Grinder" mode adds: the same bean and profile on two
+        // baskets are two different dial-ins, and pooling them puts a grind
+        // setting on the card that is wrong for both. What "+ Grinder" adds
+        // over this is the per-shot grind SETTING.
+        selectColumns = "COALESCE(bean_brand, '') AS gb_bean_brand, "
+                        "COALESCE(bean_type, '') AS gb_bean_type, "
+                        "COALESCE(profile_name, '') AS gb_profile_name, "
+                        "COALESCE(equipment_id, 0) AS gb_equipment_id";
+        groupColumns = "COALESCE(bean_brand, ''), COALESCE(bean_type, ''), "
+                       "COALESCE(profile_name, ''), COALESCE(equipment_id, 0)";
+        joinConditions = "COALESCE(s.bean_brand, '') = g.gb_bean_brand "
+                         "AND COALESCE(s.bean_type, '') = g.gb_bean_type "
+                         "AND COALESCE(s.profile_name, '') = g.gb_profile_name "
+                         "AND COALESCE(s.equipment_id, 0) = g.gb_equipment_id";
+    }
+
+    if (weightAware) {
+        selectColumns += ", ROUND(COALESCE(dose_weight, 0) * 2) / 2.0 AS gb_dose_bucket, "
+                         "COALESCE(yield_override, 0) AS gb_yield_override";
+        groupColumns += ", ROUND(COALESCE(dose_weight, 0) * 2) / 2.0, "
+                        "COALESCE(yield_override, 0)";
+        joinConditions += " AND ROUND(COALESCE(s.dose_weight, 0) * 2) / 2.0 = g.gb_dose_bucket "
+                          "AND COALESCE(s.yield_override, 0) = g.gb_yield_override";
+    }
+
+    // dose_weight is always the raw latest shot's dose so dialing-in users see
+    // (and load) their most recent setting, even while the 0.5 g bucket keeps
+    // 18.1 / 18.2 shots collapsed into one card in weight mode.
+    //
+    // yield_override is the latest shot's saved target yield (for the chip's
+    // "dose → yield" display). Weight mode substitutes the group's exact bucket
+    // value, which is the same number by grouping. When the latest shot has no
+    // saved override (legacy rows), QML's favoriteYield() helper falls back to
+    // finalWeight.
+    //
+    // dose_bucket exposes the group's rounded dose separately so Info / Show
+    // can filter by the bucket range even though the card displays raw dose.
+    const QString yieldCol = weightAware ? "g.gb_yield_override AS yield_override" : "s.yield_override";
+    const QString bucketCol = weightAware ? "g.gb_dose_bucket AS dose_bucket" : "0 AS dose_bucket";
+
+    QString sql = QString(
+        // Recipe identity, same shape as the history list: the card shows the
+        // recipe that made the group's latest shot, and the id also gates the
+        // promote-to-recipe button.
+        "SELECT s.id, r.id AS recipe_id, r.name AS recipe_name, r.drink_type AS recipe_drink_type, "
+        "r.archived AS recipe_archived, "
+        "s.profile_name, s.bean_brand, s.bean_type, "
+        "COALESCE(s.equipment_id, 0) AS equipment_bucket, "
+        "ep.name AS equipment_name, "
+        "eg.brand AS grinder_brand, eg.model AS grinder_model, "
+        "json_extract(eg.attrs, '$.burrs') AS grinder_burrs, s.grinder_setting, "
+        "s.dose_weight, s.final_weight, %5, %6, "
+        "s.timestamp, g.shot_count, g.avg_enjoyment "
+        "FROM shots s "
+        "LEFT JOIN equipment_items eg ON eg.package_id = s.equipment_id AND eg.kind = 'grinder' "
+        "LEFT JOIN equipment_packages ep ON ep.id = s.equipment_id "
+        // The recipe's own profile MUST equal the group's profile. A favourites
+        // card is a bean+profile group and a recipe is a bean+profile+extras, so
+        // the two are the same grain — a card captioned with a recipe built on a
+        // different profile contradicts the line right below it. That is not
+        // hypothetical: a 65-shot `D-Flow / Q` group was captioned with an
+        // A-Flow recipe, because the card takes the LATEST shot's recipe and that
+        // recipe covered 3 of the 65.
+        //
+        // Deliberately NOT unanimity across the group. It reads as the stricter,
+        // safer rule, but measured against a real 1,100-shot database exactly ONE
+        // group would still qualify — the feature would be dead rather than
+        // careful. Profile agreement removes the contradiction; the residual is
+        // that a matching-profile recipe may describe only some of the group's
+        // shots, which is coherent rather than self-contradicting.
+        "INNER JOIN ("
+        "  SELECT %1, MAX(timestamp) as max_ts, "
+        "  COUNT(*) as shot_count, "
+        // The card may claim a recipe only when the group used exactly ONE.
+        // COUNT(DISTINCT) ignores NULLs, which is deliberate: a card is allowed
+        // to mix recipe and recipe-less shots, so long as the grouping itself
+        // makes sense. Two different recipes in one group means there is no
+        // single answer and the card says nothing.
+        //
+        // Taking the LATEST shot's recipe instead — which this did first — put an
+        // A-Flow recipe on a 65-shot D-Flow card, because that recipe covered 3
+        // of the 65. Requiring EVERY shot to carry it was the other overcorrection:
+        // measured against a real 1,100-shot database, one group qualified.
+        "  COUNT(DISTINCT recipe_id) as gb_recipe_variants, "
+        "  MAX(recipe_id) as gb_recipe_id, "
+
+        "  AVG(CASE WHEN enjoyment > 0 THEN enjoyment ELSE NULL END) as avg_enjoyment "
+        "  FROM shots "
+        "  WHERE (bean_brand IS NOT NULL AND bean_brand != '') "
+        "     OR (profile_name IS NOT NULL AND profile_name != '') "
+        "  GROUP BY %2"
+        ") g ON s.timestamp = g.max_ts AND %3 "
+        // AFTER the subquery that defines `g` — SQLite resolves joins left to
+        // right, so referencing g.gb_recipe_id before `g` exists is a hard error
+        // that empties the whole page ("no shots yet").
+        "LEFT JOIN recipes r ON r.id = g.gb_recipe_id AND g.gb_recipe_variants = 1 "
+        // Profile agreement is a GUARD, not the rule: shots exist whose
+        // profile_name disagrees with their active recipe's profile_title (a
+        // recipe that outlived a profile switch instead of deactivating). Until
+        // that is fixed, this stops the card contradicting the line below it.
+        "  AND COALESCE(r.profile_title, '') = COALESCE(s.profile_name, '') "
+        "ORDER BY s.timestamp DESC "
+        "LIMIT %4"
+    ).arg(selectColumns, groupColumns, joinConditions).arg(maxItems).arg(yieldCol, bucketCol);
+
+    runDetachedDbThread([this, dbPath, sql, requestId, destroyed]() {
+        QVariantList results;
+        QString reason;
+        if (!withTempDb(dbPath, "shs_raf", [&](QSqlDatabase& db) {
+            QSqlQuery query(db);
+            if (query.exec(sql)) {
+                while (query.next()) {
+                    QVariantMap entry;
+                    entry["shotId"] = query.value("id").toLongLong();
+                    entry["recipeId"] = query.value("recipe_id").toLongLong();
+                    // UNCONDITIONAL, unlike the sparse emit everywhere else in this
+                    // feature — deliberately. These rows go to a QML ListModel via
+                    // append(), and a ListModel takes its roles from the FIRST item
+                    // appended: if the newest favorite happened to have no recipe,
+                    // sparse-emitting would leave the role undeclared and every
+                    // later row's recipe silently dropped. Empty string is the
+                    // "no recipe" value here; the delegate gates on recipeId AND a
+                    // non-empty name.
+                    entry["recipeName"] = query.value("recipe_name").toString();
+                    entry["recipeDrinkType"] = query.value("recipe_drink_type").toString();
+                    entry["recipeArchived"] = query.value("recipe_archived").toInt() != 0;
+                    entry["profileName"] = query.value("profile_name").toString();
+                    entry["beanBrand"] = query.value("bean_brand").toString();
+                    entry["beanType"] = query.value("bean_type").toString();
+                    // The bucket this group was keyed on. The card hands it back
+                    // to requestAutoFavoriteGroupDetails so the stats scope to the
+                    // same package the group boundary used.
+                    entry["equipmentId"] = query.value("equipment_bucket").toLongLong();
+                    entry["equipmentName"] = query.value("equipment_name").toString();
+                    entry["grinderBrand"] = query.value("grinder_brand").toString();
+                    entry["grinderModel"] = query.value("grinder_model").toString();
+                    entry["grinderBurrs"] = query.value("grinder_burrs").toString();
+                    entry["grinderSetting"] = query.value("grinder_setting").toString();
+                    entry["doseWeightG"] = query.value("dose_weight").toDouble();
+                    entry["finalWeightG"] = query.value("final_weight").toDouble();
+                    entry["targetWeightG"] = query.value("yield_override").toDouble();
+                    entry["doseBucket"] = query.value("dose_bucket").toDouble();
+                    entry["lastUsedTimestamp"] = query.value("timestamp").toLongLong();
+                    entry["shotCount"] = query.value("shot_count").toInt();
+                    entry["avgEnjoyment"] = query.value("avg_enjoyment").toInt();
+                    results.append(entry);
+                }
+            } else {
+                reason = QStringLiteral("queryFailed");
+                DIAG_WARN(STORAGE, "ShotHistoryStorage") << "Async getAutoFavorites query failed:" << query.lastError().text();
+            }
+        })) {
+            reason = QStringLiteral("databaseUnavailable");
+            if (*destroyed) return;
+            QMetaObject::invokeMethod(this, [this, destroyed]() {
+                if (*destroyed) return;
+                emit errorOccurred("Failed to open database for auto-favorites");
+            }, Qt::QueuedConnection);
+        }
+
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, results, requestId, reason, destroyed]() {
+            if (*destroyed) {
+                DIAG_DEBUG(STORAGE, "ShotHistoryStorage") << "autoFavorites callback dropped (object destroyed)";
+                return;
+            }
+            if (requestId.isEmpty()) emit autoFavoritesReady(results);
+            else emit autoFavoritesRequestReady(requestId, results, reason);
+        }, Qt::QueuedConnection);
+    });
+
+}
+
+void ShotHistoryStorage::requestAutoFavoriteGroupDetails(const QString& groupBy,
+                                                          const QString& beanBrand,
+                                                          const QString& beanType,
+                                                          const QString& profileName,
+                                                          qint64 equipmentId,
+                                                          const QString& grinderSetting,
+                                                          double doseBucket,
+                                                          double targetWeight,
+                                                          const QString& requestId)
+{
+    if (!m_ready) {
+        if (requestId.isEmpty()) emit autoFavoriteGroupDetailsReady({});
+        else emit autoFavoriteGroupDetailsRequestReady(requestId, {}, QStringLiteral("unavailable"));
+        return;
+    }
+
+    const QString dbPath = m_dbPath;
+    auto destroyed = m_destroyed;
+
+    // Build WHERE clause on main thread (pure computation, fast)
+    QStringList conditions{
+        QStringLiteral("(COALESCE(bean_brand, '') != '' OR COALESCE(profile_name, '') != '')")
+    };
+    QVariantList bindValues;
+
+    auto addCondition = [&](const QString& column, const QString& value) {
+        conditions << QString("COALESCE(%1, '') = ?").arg(column);
+        bindValues << value;
+    };
+
+    // Every mode that KEYS on the package must also scope its stats to it, or
+    // the card counts one package and its details average another. The two
+    // coarse modes (bean, profile) deliberately span packages, so they are the
+    // two branches below without a scope. This used to approximate the package
+    // with correlated brand+model subqueries, which pulled in every package
+    // sharing a brand and model — two baskets on one grinder grouped apart and
+    // then shared one set of stats.
+    if (groupBy == "bean") {
+        addCondition("bean_brand", beanBrand);
+        addCondition("bean_type", beanType);
+    } else if (groupBy == "profile") {
+        addCondition("profile_name", profileName);
+    } else if (groupBy == "bean_profile_grinder" || groupBy == "bean_profile_grinder_weight") {
+        addCondition("bean_brand", beanBrand);
+        addCondition("bean_type", beanType);
+        addCondition("profile_name", profileName);
+        conditions << AdviceScope(equipmentId).sql(QStringLiteral("shots"));
+        addCondition("grinder_setting", grinderSetting);
+        if (groupBy == "bean_profile_grinder_weight") {
+            // Match requestAutoFavorites's weight-mode bucketing exactly so stats scope
+            // to the same (dose bucket, target yield) group the card belongs to. The
+            // card itself displays the latest shot's raw dose, but the group boundary
+            // is the rounded bucket.
+            conditions << "ROUND(COALESCE(dose_weight, 0) * 2) / 2.0 = ?";
+            bindValues << doseBucket;
+            conditions << "COALESCE(yield_override, 0) = ?";
+            bindValues << targetWeight;
+        }
+    } else {
+        // bean_profile (default)
+        addCondition("bean_brand", beanBrand);
+        addCondition("bean_type", beanType);
+        addCondition("profile_name", profileName);
+        conditions << AdviceScope(equipmentId).sql(QStringLiteral("shots"));
+    }
+
+    QString whereClause = " WHERE " + conditions.join(" AND ");
+
+    QString statsSql = "SELECT "
+        "COUNT(*) as shot_count, "
+        "AVG(CASE WHEN enjoyment > 0 THEN enjoyment ELSE NULL END) as avg_enjoyment, "
+        "AVG(CASE WHEN drink_tds > 0 THEN drink_tds ELSE NULL END) as avg_tds, "
+        "AVG(CASE WHEN drink_ey > 0 THEN drink_ey ELSE NULL END) as avg_ey, "
+        "AVG(CASE WHEN duration_seconds > 0 THEN duration_seconds ELSE NULL END) as avg_duration, "
+        "AVG(CASE WHEN dose_weight > 0 THEN dose_weight ELSE NULL END) as avg_dose, "
+        "AVG(CASE WHEN final_weight > 0 THEN final_weight ELSE NULL END) as avg_yield, "
+        "AVG(CASE WHEN temperature_override > 0 THEN temperature_override ELSE NULL END) as avg_temperature "
+        "FROM shots" + whereClause;
+
+    QString notesSql = "SELECT espresso_notes, timestamp FROM shots" + whereClause +
+        " AND espresso_notes IS NOT NULL AND espresso_notes != '' "
+        "ORDER BY timestamp DESC";
+
+    runDetachedDbThread([this, dbPath, statsSql, notesSql, bindValues, requestId, destroyed]() {
+        QVariantMap result;
+        QString reason;
+        if (!withTempDb(dbPath, "shs_ragd", [&](QSqlDatabase& db) {
+            // Stats query
+            QSqlQuery statsQuery(db);
+            statsQuery.prepare(statsSql);
+            for (int i = 0; i < bindValues.size(); ++i)
+                statsQuery.bindValue(i, bindValues[i]);
+
+            if (statsQuery.exec() && statsQuery.next()) {
+                result["shotCount"] = statsQuery.value("shot_count").toInt();
+                result["avgEnjoyment"] = statsQuery.value("avg_enjoyment").toInt();
+                result["avgTds"] = statsQuery.value("avg_tds").toDouble();
+                result["avgEy"] = statsQuery.value("avg_ey").toDouble();
+                result["avgDuration"] = statsQuery.value("avg_duration").toDouble();
+                result["avgDose"] = statsQuery.value("avg_dose").toDouble();
+                result["avgYield"] = statsQuery.value("avg_yield").toDouble();
+                result["avgTemperature"] = statsQuery.value("avg_temperature").toDouble();
+            } else {
+                reason = QStringLiteral("queryFailed");
+            }
+
+            // Notes query
+            QSqlQuery notesQuery(db);
+            notesQuery.prepare(notesSql);
+            for (int i = 0; i < bindValues.size(); ++i)
+                notesQuery.bindValue(i, bindValues[i]);
+
+            QVariantList notes;
+            if (notesQuery.exec()) {
+                while (notesQuery.next()) {
+                    QVariantMap note;
+                    note["text"] = notesQuery.value("espresso_notes").toString();
+                    qint64 ts = notesQuery.value("timestamp").toLongLong();
+                    note["timestamp"] = ts;
+                    note["dateTime"] = QDateTime::fromSecsSinceEpoch(ts).toString(use12h() ? "yyyy-MM-dd h:mm AP" : "yyyy-MM-dd HH:mm");
+                    notes.append(note);
+                }
+            }
+            if (notesQuery.lastError().isValid()) reason = QStringLiteral("queryFailed");
+            result["notes"] = notes;
+        })) {
+            reason = QStringLiteral("databaseUnavailable");
+            if (*destroyed) return;
+            QMetaObject::invokeMethod(this, [this, destroyed]() {
+                if (*destroyed) return;
+                emit errorOccurred("Failed to open database for auto-favorite details");
+            }, Qt::QueuedConnection);
+        }
+
+        if (*destroyed) return;
+        QMetaObject::invokeMethod(this, [this, result, requestId, reason, destroyed]() {
+            if (*destroyed) {
+                DIAG_DEBUG(STORAGE, "ShotHistoryStorage") << "autoFavoriteGroupDetails callback dropped (object destroyed)";
+                return;
+            }
+            if (requestId.isEmpty()) emit autoFavoriteGroupDetailsReady(result);
+            else emit autoFavoriteGroupDetailsRequestReady(requestId, result, reason);
+        }, Qt::QueuedConnection);
+    });
+
+}
+
+
+QStringList ShotHistoryStorage::getDistinctBeanTypesForBrand(const QString& beanBrand)
+{
+    if (beanBrand.isEmpty())
+        return getDistinctBeanTypes();
+
+    return queryDistinctList(
+        QStringLiteral("SELECT DISTINCT bean_type FROM shots "
+                       "WHERE bean_brand = ? AND bean_type IS NOT NULL AND bean_type != '' "
+                       "ORDER BY bean_type"),
+        {beanBrand});
+}
+
+QStringList ShotHistoryStorage::getDistinctGrinderBrands()
+{
+    // Grinder brands come from the equipment inventory (every grinder item,
+    // inventory or superseded), not the dropped shots.grinder_brand column
+    // (add-equipment-packages task 4.2).
+    return queryDistinctList(
+        QStringLiteral("SELECT DISTINCT brand FROM equipment_items "
+                       "WHERE kind = 'grinder' AND brand IS NOT NULL AND brand != '' "
+                       "ORDER BY brand"));
+}
+
+QStringList ShotHistoryStorage::getDistinctGrinderModelsForBrand(const QString& grinderBrand)
+{
+    if (grinderBrand.isEmpty())
+        return getDistinctGrinders();
+
+    return queryDistinctList(
+        QStringLiteral("SELECT DISTINCT model FROM equipment_items "
+                       "WHERE kind = 'grinder' AND brand = ? AND model IS NOT NULL AND model != '' "
+                       "ORDER BY model"),
+        {grinderBrand});
+}
+
+QStringList ShotHistoryStorage::getDistinctGrinderBurrsForModel(const QString& grinderBrand, const QString& grinderModel)
+{
+    // burrs lives in the grinder item's attrs JSON blob.
+    return queryDistinctList(
+        QStringLiteral("SELECT DISTINCT json_extract(attrs, '$.burrs') AS burrs FROM equipment_items "
+                       "WHERE kind = 'grinder' AND brand = ? AND model = ? "
+                       "AND burrs IS NOT NULL AND burrs != '' "
+                       "ORDER BY burrs"),
+        {grinderBrand, grinderModel});
+}
+
+QStringList ShotHistoryStorage::getDistinctGrinderSettingsForGrinder(const QString& grinderModel)
+{
+    if (grinderModel.isEmpty())
+        return getDistinctGrinderSettings();
+
+    // Settings are per-shot dial-in (grinder_setting stays on shots); the grinder
+    // model resolves through the equipment_id pointer (task 4.2), folded by
+    // grinderModelMatchSql().
+    QStringList settings = queryDistinctList(
+        QStringLiteral("SELECT DISTINCT grinder_setting FROM shots WHERE %1 "
+                       "AND grinder_setting IS NOT NULL AND grinder_setting != '' "
+                       "ORDER BY grinder_setting").arg(grinderModelMatchSql("?")),
+        {grinderModel});
+    sortGrinderSettings(settings);
+    return settings;
+}
+
+// Say what was derived and from how much, ONCE per (grinder, sample size, answer).
+//
+// This line exists because #1713 could not be diagnosed from the 25,720-line log
+// attached to it: "grind" appeared three times, none of them reporting the step,
+// and the reported symptom (whole numbers only, no 1.2) is entirely a consequence
+// of what grindStepForGrinder() returns. That value is derived from the user's OWN
+// history, so it differs per install and cannot be inferred from the version number
+// — exactly the kind of fact a log has to carry, because nobody can reconstruct it
+// afterwards.
+//
+// One function rather than one call site per return, because grindStepForGrinder()
+// has THREE ways to answer 0 — not-ready, query-failed and too-thin — and they
+// must not describe it in three wordings, or worse, in one.
+//
+// Naming the outcome is the point. All three return 0.0 with sampleCount 0, so a
+// line that says only "derived from 0 distinct numeric setting(s) — too thin"
+// tells a reader the user has no numeric history when the truth may be that the
+// SELECT errored. That reader closes the investigation, which is exactly how
+// #1713 survived a 25,720-line log.
+//
+// Deduped PER MODEL, and the key includes the outcome. The caller is a QML
+// binding (and the ShotServer /grind-candidates handler), and more than one
+// GrindRowSource is live at once — startup builds two, one usually with an empty
+// model — so a single scalar alternated between them and deduped nothing. The
+// outcome belongs in the key because otherwise a model that has already reported
+// "0 / too thin" stays silent when its query later starts FAILING, the one
+// transition most worth seeing.
+void ShotHistoryStorage::reportGrindStep(const QString& grinderModel, qsizetype sampleCount,
+                                         double step, GrindStepOutcome outcome)
+{
+    const QString observed = QStringLiteral("%1:%2:%3")
+                                 .arg(sampleCount).arg(step).arg(int(outcome));
+    if (m_lastGrindStepReport.value(grinderModel) == observed)
+        return;
+    m_lastGrindStepReport.insert(grinderModel, observed);
+
+    QString why;
+    switch (outcome) {
+    case GrindStepOutcome::Derived:
+        break;
+    case GrindStepOutcome::NotReady:
+        why = QStringLiteral(" — the database is not ready yet; the caller's "
+                             "fallback step is used instead");
+        break;
+    case GrindStepOutcome::QueryFailed:
+        why = QStringLiteral(" — the history QUERY FAILED (see the preceding warning); "
+                             "this is NOT a grinder without history, and the caller's "
+                             "fallback step is used instead");
+        break;
+    case GrindStepOutcome::TooThin:
+        why = QStringLiteral(" — too thin to derive; the caller's fallback step is "
+                             "used instead");
+        break;
+    case GrindStepOutcome::NoGrinder:
+        why = QStringLiteral(" — no grinder was supplied, so there is no history to "
+                             "pool; the caller's fallback step is used instead");
+        break;
+    }
+
+    DIAG_DEBUG(STORAGE, "ShotHistoryStorage").noquote()
+        << QStringLiteral("grind step for %1 = %2, derived from %3 "
+                          "distinct numeric setting(s)%4")
+               .arg(grinderModel.isEmpty() ? QStringLiteral("(no grinder)") : grinderModel)
+               .arg(step)
+               .arg(sampleCount)
+               .arg(why);
+}
+
+double ShotHistoryStorage::grindStepForGrinder(const QString& grinderModel)
+{
+    // Every return is narrated, including the ones that answer 0 — they are the
+    // returns a reader most needs to tell apart. See reportGrindStep.
+    if (!m_ready) {
+        reportGrindStep(grinderModel, 0, 0.0, GrindStepOutcome::NotReady);
+        return 0.0;
+    }
+
+    bool queryOk = false;
+    const QList<double> numeric = grinderWideNumericSettings(m_db, grinderModel, &queryOk);
+    const double step = deriveGrindStep(numeric);
+    reportGrindStep(grinderModel, numeric.size(), step,
+                    !queryOk     ? GrindStepOutcome::QueryFailed
+                  : step > 0.0   ? GrindStepOutcome::Derived
+                                 : GrindStepOutcome::TooThin);
+    return step;
+}
+
+double ShotHistoryStorage::grindRpmStepForGrinder(const QString& grinderModel)
+{
+    // RPM mode always has an identified grinder; an empty model has no meaningful
+    // RPM history to pool, which is also grinderWideRpms' stated precondition.
+    //
+    // Narrated for the same reason as its settings twin: this also returns 0.0 for
+    // "no grinder", "not ready" and "query failed" alike, and the caller silently
+    // substitutes a 50 RPM default. The bug behind this whole change was
+    // undiagnosable precisely because the value behind the symptom was never
+    // written down.
+    //
+    // NoGrinder is its own outcome, not TooThin. "Too thin to derive" would tell a
+    // reader the user has no recorded RPMs, when in fact no grinder was supplied.
+    if (grinderModel.isEmpty() || !m_ready) {
+        reportGrindStep(QStringLiteral("%1 (rpm)").arg(
+                            grinderModel.isEmpty() ? QStringLiteral("(no grinder)") : grinderModel),
+                        0, 0.0,
+                        grinderModel.isEmpty() ? GrindStepOutcome::NoGrinder
+                                               : GrindStepOutcome::NotReady);
+        return 0.0;
+    }
+
+    bool queryOk = false;
+    const QList<double> rpms = grinderWideRpms(m_db, grinderModel, &queryOk);
+    const double step = deriveGrindStep(rpms);
+    reportGrindStep(QStringLiteral("%1 (rpm)").arg(grinderModel), rpms.size(), step,
+                    !queryOk     ? GrindStepOutcome::QueryFailed
+                  : step > 0.0   ? GrindStepOutcome::Derived
+                                 : GrindStepOutcome::TooThin);
+    return step;
+}
+
+// See the declaration for why this exists. Three small queries rather than one
+// clever one: SQLite cannot tell a numeric setting from a text one, and that
+// distinction is the whole point — "1102 shots, 0 numeric" and "0 shots" look
+// identical in the grind-step line and mean opposite things.
+void ShotHistoryStorage::logGrinderCensus()
+{
+    const QString dbPath = m_dbPath;
+    runOnDbThread([dbPath]() {
+        withTempDb(dbPath, "shs_census", [](QSqlDatabase& db) {
+            // Keyed on the folded model, because that is what the step query
+            // matches on (grinderModelMatchSql folds case and whitespace). Two
+            // packages spelled "Niche Zero" and "niche zero" are ONE grinder to
+            // every query this census is meant to explain, and reporting them
+            // as two rows would invent a discrepancy that does not exist. The
+            // first spelling seen is kept for display.
+            // Numeric settings are deduped as DOUBLES, not as strings, because
+            // that is what deriveGrindStep() sees: grinderWideNumericSettings
+            // parses into a QSet<double>, so "3", "3.0" and "03" are ONE sample
+            // to the step and would be three to a string count. That is not
+            // hypothetical here — GrindRowSource writes the setting with
+            // toFixed() at a width derived from the current step, so one dial
+            // position genuinely lands in history at several decimal widths as
+            // the step changes. Both log lines say "distinct numeric setting(s)"
+            // precisely so a reader can compare them; if they counted different
+            // things, the census would manufacture the false diagnosis it exists
+            // to prevent. Deduping here also makes the case-folded key hold: two
+            // spellings of one grinder collapse instead of counting twice.
+            struct Row {
+                QString display;
+                qint64 shots = 0;
+                QSet<double> numeric;
+                QSet<QString> nonNumeric;
+            };
+            QMap<QString, Row> byModel;
+            const auto fold = [](const QString& m) { return m.trimmed().toLower(); };
+
+            // Shots per attributed grinder. The LEFT JOIN is what makes an
+            // unlinked shot visible: it lands under the empty model rather than
+            // dropping out of the result, which is the number a reader needs
+            // when a scoped query "found nothing".
+            QSqlQuery q(db);
+            if (!q.exec(QStringLiteral(
+                    // COUNT(DISTINCT s.id), not COUNT(*): nothing constrains
+                    // equipment_items to one grinder row per package (no unique
+                    // key on (package_id, kind), which is why readers elsewhere
+                    // use ORDER BY id LIMIT 1), and a second grinder row would
+                    // double-count every shot on that package — making this line
+                    // disagree with the shot total logged beside it at startup.
+                    "SELECT COALESCE(eg.model, ''), COUNT(DISTINCT s.id) FROM shots s "
+                    "LEFT JOIN equipment_items eg ON eg.package_id = s.equipment_id "
+                    "AND eg.kind = 'grinder' "
+                    "GROUP BY LOWER(TRIM(COALESCE(eg.model, '')))"))) {
+                EQUIP_WARN_STDERR("Census", QStringLiteral("shot count query failed: %1")
+                                                .arg(q.lastError().text()));
+                return;
+            }
+            qint64 total = 0;
+            qint64 unlinked = 0;
+            while (q.next()) {
+                const QString model = q.value(0).toString().trimmed();
+                const qint64 n = q.value(1).toLongLong();
+                total += n;
+                if (model.isEmpty()) {
+                    unlinked += n;
+                    continue;  // reported as the headline "not attributed" count
+                }
+                Row& row = byModel[fold(model)];
+                if (row.display.isEmpty())
+                    row.display = model;
+                row.shots += n;
+            }
+
+            // Distinct (model, setting) pairs, not per-shot rows — this is the
+            // same population deriveGrindStep() sees, so a mismatch between the
+            // count here and the count in the grind-step line is itself a
+            // finding rather than noise.
+            QSqlQuery s(db);
+            if (!s.exec(QStringLiteral(
+                    "SELECT DISTINCT COALESCE(eg.model, ''), TRIM(s.grinder_setting) FROM shots s "
+                    "LEFT JOIN equipment_items eg ON eg.package_id = s.equipment_id "
+                    "AND eg.kind = 'grinder' "
+                    "WHERE s.grinder_setting IS NOT NULL AND TRIM(s.grinder_setting) != ''"))) {
+                EQUIP_WARN_STDERR("Census", QStringLiteral("distinct settings query failed: %1")
+                                                .arg(s.lastError().text()));
+                return;
+            }
+            while (s.next()) {
+                const QString model = s.value(0).toString().trimmed();
+                if (model.isEmpty())
+                    continue;
+                Row& row = byModel[fold(model)];
+                if (row.display.isEmpty())
+                    row.display = model;
+                const QString setting = s.value(1).toString().trimmed();
+                bool numeric = false;
+                const double v = setting.toDouble(&numeric);
+                if (numeric)
+                    row.numeric.insert(v);
+                else
+                    row.nonNumeric.insert(setting);
+            }
+
+            // Grinders that exist as equipment but own no shots. Without this a
+            // package nothing points at is simply absent, which reads as "no
+            // such grinder" when the truth is "nothing was ever attributed to
+            // it" — the fork-detaches-history failure in one line.
+            QSqlQuery g(db);
+            if (!g.exec(QStringLiteral(
+                    "SELECT DISTINCT COALESCE(model, '') FROM equipment_items "
+                    "WHERE kind = 'grinder' AND TRIM(COALESCE(model, '')) != ''"))) {
+                // Warn but carry on, unlike the two above: their results ARE the
+                // census, while this query only ADDS zero-shot grinders. What must
+                // not happen is losing it silently — a census that quietly drops
+                // the row proving "this grinder owns nothing" fails at exactly the
+                // job it was added for.
+                EQUIP_WARN_STDERR("Census",
+                                  QStringLiteral("grinder list query failed, zero-shot "
+                                                 "grinders omitted below: %1")
+                                      .arg(g.lastError().text()));
+            }
+            while (g.next()) {
+                const QString model = g.value(0).toString().trimmed();
+                Row& row = byModel[fold(model)];
+                if (row.display.isEmpty())
+                    row.display = model;
+            }
+
+            EQUIP_LOG_STDERR("Census", QStringLiteral(
+                                           "%1 shot(s), %2 attributed to a grinder package, %3 not")
+                                           .arg(total).arg(total - unlinked).arg(unlinked));
+
+            for (const Row& row : std::as_const(byModel)) {
+                EQUIP_LOG_STDERR("Census", QStringLiteral(
+                                               "\"%1\" - %2 shot(s), %3 distinct numeric "
+                                               "setting(s), %4 non-numeric")
+                                               .arg(row.display)
+                                               .arg(row.shots)
+                                               .arg(row.numeric.size())
+                                               .arg(row.nonNumeric.size()));
+            }
+        });
+    });
+}
+
+void ShotHistoryStorage::sortGrinderSettings(QStringList& settings)
+{
+    if (settings.isEmpty()) {
+        return;
+    }
+
+    // Check if all values parse as numbers
+    bool allNumeric = true;
+    for (const QString& setting : settings) {
+        bool ok = false;
+        setting.toDouble(&ok);
+        if (!ok) {
+            allNumeric = false;
+            break;
+        }
+    }
+
+    if (allNumeric) {
+        // Sort numerically
+        std::sort(settings.begin(), settings.end(), [](const QString& a, const QString& b) {
+            return a.toDouble() < b.toDouble();
+        });
+    } else {
+        // Sort alphabetically with natural ordering
+        std::sort(settings.begin(), settings.end(), [](const QString& a, const QString& b) {
+            return QString::localeAwareCompare(a, b) < 0;
+        });
+    }
+}

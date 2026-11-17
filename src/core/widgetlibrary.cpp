@@ -1,0 +1,888 @@
+#include "core/diagnosticlogging.h"
+#include "widgetlibrary.h"
+#include "settings.h"
+#include "settings_network.h"
+#include "settings_theme.h"
+#include "version.h"
+
+#include <QStandardPaths>
+#include <QDir>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QUuid>
+#include <QDateTime>
+#include <QUrl>
+#include <QPainter>
+#include <QDebug>
+#include <cmath>
+
+WidgetLibrary::WidgetLibrary(Settings* settings, QObject* parent)
+    : QObject(parent)
+    , m_settings(settings)
+{
+    ensureDirectories();
+    loadIndex();
+    populateThumbnailCache();
+}
+
+// --- Properties ---
+
+QVariantList WidgetLibrary::entries() const
+{
+    return m_index;
+}
+
+QVariantList WidgetLibrary::entriesForRemote() const
+{
+    QVariantList result = m_index;
+    for (QVariant& value : result) {
+        QVariantMap entry = value.toMap();
+        const QString id = entry.value(QStringLiteral("id")).toString();
+        if (id.isEmpty()) continue;
+        const QString encoded = QString::fromLatin1(QUrl::toPercentEncoding(id));
+        if (hasThumbnail(id))
+            entry.insert(QStringLiteral("thumbnailFullUrl"),
+                         QStringLiteral("/api/library/thumbnail?id=") + encoded);
+        if (hasThumbnailCompact(id))
+            entry.insert(QStringLiteral("thumbnailCompactUrl"),
+                         QStringLiteral("/api/library/thumbnail?id=") + encoded
+                         + QStringLiteral("&compact=1"));
+        value = entry;
+    }
+    return result;
+}
+
+QVariantMap WidgetLibrary::entryForRemote(const QString& entryId) const
+{
+    for (const QVariant& entry : entriesForRemote()) {
+        const QVariantMap map = entry.toMap();
+        if (map.value(QStringLiteral("id")).toString() == entryId)
+            return map;
+    }
+    return {};
+}
+
+int WidgetLibrary::count() const
+{
+    return static_cast<int>(m_index.size());
+}
+
+QString WidgetLibrary::selectedEntryId() const
+{
+    return m_selectedEntryId;
+}
+
+void WidgetLibrary::setSelectedEntryId(const QString& id)
+{
+    if (m_selectedEntryId != id) {
+        m_selectedEntryId = id;
+        emit selectedEntryIdChanged();
+    }
+}
+
+// --- Save from layout ---
+
+QString WidgetLibrary::addItemFromLayout(const QString& itemId)
+{
+    QVariantMap props = m_settings->network()->getItemProperties(itemId);
+    if (props.isEmpty()) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Item not found:" << itemId;
+        return QString();
+    }
+
+    // Strip the layout-specific ID (will be regenerated on apply)
+    QJsonObject itemObj = QJsonObject::fromVariantMap(props);
+    itemObj.remove("id");
+
+    QJsonObject data;
+    data["item"] = itemObj;
+
+    QJsonObject envelope = buildEnvelope("item", data);
+
+    QString entryId = saveEntryFile(envelope);
+    if (!entryId.isEmpty()) {
+        emit entryAdded(entryId);
+    }
+    return entryId;
+}
+
+QString WidgetLibrary::addZoneFromLayout(const QString& zoneName)
+{
+    QVariantList zoneItems = m_settings->network()->getZoneItems(zoneName);
+    if (zoneItems.isEmpty()) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Zone empty or not found:" << zoneName;
+        return QString();
+    }
+
+    QJsonArray itemsArray;
+    for (const QVariant& v : zoneItems) {
+        QJsonObject item = QJsonObject::fromVariantMap(v.toMap());
+        item.remove("id");  // Strip layout IDs
+        itemsArray.append(item);
+    }
+
+    QJsonObject data;
+    data["zoneName"] = zoneName;
+    data["yOffset"] = m_settings->network()->getZoneYOffset(zoneName);
+    data["items"] = itemsArray;
+
+    QJsonObject envelope = buildEnvelope("zone", data);
+
+    QString entryId = saveEntryFile(envelope);
+    if (!entryId.isEmpty()) {
+        emit entryAdded(entryId);
+    }
+    return entryId;
+}
+
+QString WidgetLibrary::addCurrentLayout(bool includeTheme)
+{
+    QJsonObject layoutObj = QJsonDocument::fromJson(
+        m_settings->network()->layoutConfiguration().toUtf8()).object();
+
+    if (layoutObj.isEmpty()) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Current layout is empty";
+        return QString();
+    }
+
+    // Strip all item IDs from the layout
+    QJsonObject zones = layoutObj["zones"].toObject();
+    for (const QString& zoneName : zones.keys()) {
+        QJsonArray items = zones[zoneName].toArray();
+        QJsonArray cleanedItems;
+        for (const QJsonValue& val : items) {
+            QJsonObject item = val.toObject();
+            item.remove("id");
+            cleanedItems.append(item);
+        }
+        zones[zoneName] = cleanedItems;
+    }
+    layoutObj["zones"] = zones;
+
+    QJsonObject data;
+    data["layout"] = layoutObj;
+    data["theme"] = includeTheme
+        ? QJsonObject::fromVariantMap(m_settings->theme()->customThemeColors())
+        : QJsonValue(QJsonValue::Null);
+
+    QJsonObject envelope = buildEnvelope("layout", data);
+
+    QString entryId = saveEntryFile(envelope);
+    if (!entryId.isEmpty()) {
+        emit entryAdded(entryId);
+    }
+    return entryId;
+}
+
+// --- Theme entries ---
+
+QString WidgetLibrary::addCurrentTheme(const QString& name)
+{
+    QJsonObject themeObj;
+
+    // Colors
+    QVariantMap colors = m_settings->theme()->customThemeColors();
+    QJsonObject colorsJson = QJsonObject::fromVariantMap(colors);
+    themeObj["colors"] = colorsJson;
+
+    // Font sizes
+    QVariantMap fonts = m_settings->theme()->customFontSizes();
+    if (!fonts.isEmpty()) {
+        themeObj["fonts"] = QJsonObject::fromVariantMap(fonts);
+    }
+
+    // Screen effect (CRT, future effects) — always included so enable/disable state is saved
+    themeObj["screenEffect"] = m_settings->theme()->screenEffectJson();
+    themeObj["appearance"] = m_settings->theme()->savedAppearance();
+
+    // Theme name
+    QString themeName = name.isEmpty() ? m_settings->theme()->activeThemeName() : name;
+    themeObj["name"] = themeName;
+
+    QJsonObject data;
+    data["theme"] = themeObj;
+
+    // Check if an existing library entry has the same name — update it
+    // instead of creating a duplicate (re-saving "Pip-Boy" updates the existing "Pip-Boy")
+    for (const QVariant& v : m_index) {
+        QVariantMap meta = v.toMap();
+        if (meta["type"].toString() != "theme")
+            continue;
+        QString existingId = meta["id"].toString();
+        QJsonObject existing = readEntryFile(existingId);
+        QString existingName = existing["data"].toObject()["theme"].toObject()["name"].toString();
+        if (existingName == themeName) {
+            existing["data"] = data;
+            saveEntryFile(existing);
+            generateThemeThumbnail(existingId);
+            emit entriesChanged();
+            DIAG_DEBUG(APP, "WidgetLibrary") << "Updated existing theme entry" << existingId
+                     << "name:" << themeName;
+            return existingId;
+        }
+    }
+
+    QJsonObject envelope = buildEnvelope("theme", data);
+
+    QString entryId = saveEntryFile(envelope);
+    if (!entryId.isEmpty()) {
+        generateThemeThumbnail(entryId);
+        emit entryAdded(entryId);
+    }
+    return entryId;
+}
+
+bool WidgetLibrary::applyThemeEntry(const QString& entryId)
+{
+    QJsonObject entry = readEntryFile(entryId);
+    if (entry.isEmpty() || entry["type"].toString() != "theme") {
+        DIAG_WARN(APP, "WidgetLibrary") << "Invalid theme entry:" << entryId;
+        return false;
+    }
+
+    QJsonObject data = entry["data"].toObject();
+    QJsonObject themeObj = data["theme"].toObject();
+
+    // Apply colors
+    QJsonObject colorsJson = themeObj["colors"].toObject();
+    if (!colorsJson.isEmpty()) {
+        m_settings->theme()->setCustomThemeColors(colorsJson.toVariantMap());
+    }
+
+    // Apply font sizes
+    QJsonObject fontsJson = themeObj["fonts"].toObject();
+    if (!fontsJson.isEmpty()) {
+        m_settings->theme()->setCustomFontSizes(fontsJson.toVariantMap());
+    }
+
+    // Apply screen effect (or disable if theme has none)
+    if (themeObj.contains("screenEffect")) {
+        m_settings->theme()->applyScreenEffect(themeObj["screenEffect"].toObject());
+    } else {
+        m_settings->theme()->setActiveShader("");  // Old theme = no effect
+    }
+
+    m_settings->theme()->applySavedAppearance(themeObj.value(QStringLiteral("appearance")).toObject());
+
+    // Apply theme name and save as preset
+    QString themeName = themeObj["name"].toString();
+    if (!themeName.isEmpty()) {
+        m_settings->theme()->setActiveThemeName(themeName);
+        m_settings->theme()->saveCurrentTheme(themeName);
+    }
+
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Applied theme" << entryId << "name:" << themeName;
+    return true;
+}
+
+// CPU approximation of CRT shader effects for thumbnails.
+// Applies: phosphor tint, scanlines, bloom (self-glow), vignette, glass reflection.
+// Skips temporal effects (noise, flicker, jitter, glitch) — invisible in a static thumbnail.
+static void applyCrtEffect(QImage& img, const QJsonObject& params)
+{
+    const double tint      = params["tintStrength"].toDouble(1.0);
+    const double scanInt   = params["scanlineIntensity"].toDouble(0.36);
+    const double scanSize  = qMax(params["scanlineSize"].toDouble(4.5), 1.0);
+    const double bloom     = params["bloomStrength"].toDouble(0.52);
+    const double vigStr    = params["vignetteStrength"].toDouble(1.4);
+    const double reflStr   = params["reflectionStrength"].toDouble(0.22);
+
+    const int w = img.width(), h = img.height();
+    const double pi2 = 6.28318;
+
+    for (int y = 0; y < h; y++) {
+        QRgb* line = reinterpret_cast<QRgb*>(img.scanLine(y));
+        const double uy = static_cast<double>(y) / h;
+
+        // Scanline: sin wave matching GPU shader
+        const double scan = std::sin(y / scanSize * pi2) * 0.5 + 0.5;
+        const double scanMul = 1.0 - scanInt * (1.0 - scan);
+
+        // Vignette: same formula as shader
+        const double vigY = uy * (1.0 - uy);
+
+        // Reflection: top half, stronger at edges (inverted-U)
+        const double vRefl = (uy < 0.5) ? (1.0 - uy * 2.0) : 0.0;
+
+        for (int x = 0; x < w; x++) {
+            const double ux = static_cast<double>(x) / w;
+
+            double r = qRed(line[x]) / 255.0;
+            double g = qGreen(line[x]) / 255.0;
+            double b = qBlue(line[x]) / 255.0;
+
+            // Scanlines
+            r *= scanMul; g *= scanMul; b *= scanMul;
+
+            // Phosphor tint (luminance → green phosphor)
+            const double lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            r += (lum * 0.15 - r) * tint;
+            g += (lum * 1.0  - g) * tint;
+            b += (lum * 0.1  - b) * tint;
+
+            // Self-bloom: boost bright pixels
+            const double selfLum = 0.299 * r + 0.587 * g + 0.114 * b;
+            const double selfBloom = qBound(0.0, (selfLum - 0.4) / 0.5, 1.0);  // smoothstep(0.4, 0.9)
+            r += r * selfBloom * bloom * 0.4;
+            g += g * selfBloom * bloom * 0.4;
+            b += b * selfBloom * bloom * 0.4;
+
+            // Glass reflection
+            const double hRefl = std::pow(std::abs(ux * 2.0 - 1.0), 0.7);
+            const double refl = vRefl * hRefl * reflStr;
+            r += refl; g += refl; b += refl;
+
+            // Vignette
+            const double vigX = ux * (1.0 - ux);
+            const double vig = qBound(0.0, std::pow(16.0 * vigX * vigY, 0.25), 1.0);
+            const double vigMul = 1.0 + (vig - 1.0) * vigStr;
+            r *= vigMul; g *= vigMul; b *= vigMul;
+
+            line[x] = qRgba(qBound(0, static_cast<int>(r * 255), 255),
+                            qBound(0, static_cast<int>(g * 255), 255),
+                            qBound(0, static_cast<int>(b * 255), 255),
+                            qAlpha(line[x]));
+        }
+    }
+}
+
+void WidgetLibrary::generateThemeThumbnail(const QString& entryId)
+{
+    QJsonObject entry = readEntryFile(entryId);
+    QJsonObject data = entry["data"].toObject();
+    QJsonObject themeObj = data["theme"].toObject();
+    QJsonObject colors = themeObj["colors"].toObject();
+
+    // Screen effect info (CRT params if active)
+    QJsonObject screenEffect = themeObj["screenEffect"].toObject();
+    QString activeEffect = screenEffect["active"].toString();
+    QJsonObject effectParams = screenEffect["effects"].toObject()[activeEffect].toObject();
+
+    // Key colors to show in the thumbnail grid (3 rows x 4 cols)
+    static const QStringList keyColors = {
+        "backgroundColor", "surfaceColor", "primaryColor", "accentColor",
+        "textColor", "successColor", "warningColor", "errorColor",
+        "pressureColor", "flowColor", "temperatureColor", "weightColor"
+    };
+
+    // Default fallbacks
+    static const QMap<QString, QString> defaults = {
+        {"backgroundColor", "#1a1a2e"}, {"surfaceColor", "#303048"},
+        {"primaryColor", "#4e85f4"}, {"accentColor", "#e94560"},
+        {"textColor", "#ffffff"}, {"successColor", "#00cc6d"},
+        {"warningColor", "#ffaa00"}, {"errorColor", "#ff4444"},
+        {"pressureColor", "#18c37e"}, {"flowColor", "#4e85f4"},
+        {"temperatureColor", "#e73249"}, {"weightColor", "#a2693d"}
+    };
+
+    auto paintColorGrid = [&](QImage& img) {
+        QPainter p(&img);
+        p.setRenderHint(QPainter::Antialiasing);
+        int cols = 4, rows = 3;
+        int sw = img.width() / cols, sh = img.height() / rows;
+        for (int i = 0; i < keyColors.size(); i++) {
+            QString val = colors[keyColors[i]].toString();
+            if (val.isEmpty()) val = defaults.value(keyColors[i], "#333333");
+            p.fillRect((i % cols) * sw, (i / cols) * sh, sw, sh, QColor(val));
+        }
+    };
+
+    // Full thumbnail (300x200)
+    QImage full(300, 200, QImage::Format_ARGB32);
+    full.fill(Qt::transparent);
+    paintColorGrid(full);
+    if (!activeEffect.isEmpty())
+        applyCrtEffect(full, effectParams);
+    saveThumbnail(entryId, full);
+
+    // Compact thumbnail (128x100)
+    QImage compact(128, 100, QImage::Format_ARGB32);
+    compact.fill(Qt::transparent);
+    paintColorGrid(compact);
+    if (!activeEffect.isEmpty())
+        applyCrtEffect(compact, effectParams);
+    saveThumbnailCompact(entryId, compact);
+}
+
+// --- Manage entries ---
+
+bool WidgetLibrary::removeEntry(const QString& entryId)
+{
+    if (!deleteEntryFile(entryId))
+        return false;
+
+    // Remove thumbnails if they exist
+    m_thumbExists.remove(entryId);
+    m_thumbCompactExists.remove(entryId);
+    QString thumbPath = thumbnailPath(entryId);
+    QFile::remove(thumbPath);  // no-op if absent
+    QString compactThumbPath = thumbnailCompactPath(entryId);
+    QFile::remove(compactThumbPath);
+
+    // Remove from index
+    for (int i = 0; i < m_index.size(); ++i) {
+        if (m_index[i].toMap()["id"].toString() == entryId) {
+            m_index.removeAt(i);
+            break;
+        }
+    }
+    saveIndex();
+    emit entriesChanged();
+    emit entryRemoved(entryId);
+
+    if (m_selectedEntryId == entryId) {
+        setSelectedEntryId(QString());
+    }
+    return true;
+}
+
+
+
+QVariantMap WidgetLibrary::getEntry(const QString& entryId) const
+{
+    // Return metadata from index (fast, no file I/O)
+    for (const QVariant& v : m_index) {
+        QVariantMap meta = v.toMap();
+        if (meta["id"].toString() == entryId)
+            return meta;
+    }
+    return QVariantMap();
+}
+
+QVariantMap WidgetLibrary::getEntryData(const QString& entryId) const
+{
+    // Read full entry from file (includes data payload)
+    QJsonObject entry = readEntryFile(entryId);
+    return entry.toVariantMap();
+}
+
+// --- Apply to layout ---
+
+bool WidgetLibrary::applyItem(const QString& entryId, const QString& targetZone)
+{
+    QJsonObject entry = readEntryFile(entryId);
+    if (entry.isEmpty() || entry["type"].toString() != "item") {
+        DIAG_WARN(APP, "WidgetLibrary") << "Invalid item entry:" << entryId;
+        return false;
+    }
+
+    QJsonObject data = entry["data"].toObject();
+    QJsonObject item = data["item"].toObject();
+    QString type = item["type"].toString();
+
+    // Add new item to the zone
+    m_settings->network()->addItem(type, targetZone);
+
+    // The newly added item gets the last position - find it
+    QVariantList zoneItems = m_settings->network()->getZoneItems(targetZone);
+    if (zoneItems.isEmpty())
+        return false;
+
+    QString newItemId = zoneItems.last().toMap()["id"].toString();
+
+    // Apply all custom properties from the library entry
+    QStringList skipKeys = {"type", "id"};
+    for (auto it = item.begin(); it != item.end(); ++it) {
+        if (!skipKeys.contains(it.key())) {
+            m_settings->network()->setItemProperty(newItemId, it.key(), it.value().toVariant());
+        }
+    }
+
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Applied item" << entryId
+             << "to zone" << targetZone << "as" << newItemId;
+    return true;
+}
+
+bool WidgetLibrary::applyZone(const QString& entryId, const QString& targetZone)
+{
+    QJsonObject entry = readEntryFile(entryId);
+    if (entry.isEmpty() || entry["type"].toString() != "zone") {
+        DIAG_WARN(APP, "WidgetLibrary") << "Invalid zone entry:" << entryId;
+        return false;
+    }
+
+    QJsonObject data = entry["data"].toObject();
+    QJsonArray items = data["items"].toArray();
+
+    // Clear the target zone first - remove all existing items
+    QVariantList existingItems = m_settings->network()->getZoneItems(targetZone);
+    for (qsizetype i = existingItems.size() - 1; i >= 0; --i) {
+        QString itemId = existingItems[i].toMap()["id"].toString();
+        m_settings->network()->removeItem(itemId, targetZone);
+    }
+
+    // Add each item from the library zone
+    for (const QJsonValue& val : items) {
+        QJsonObject item = val.toObject();
+        QString type = item["type"].toString();
+
+        m_settings->network()->addItem(type, targetZone);
+
+        // Find the newly added item
+        QVariantList zoneItems = m_settings->network()->getZoneItems(targetZone);
+        if (zoneItems.isEmpty()) continue;
+        QString newItemId = zoneItems.last().toMap()["id"].toString();
+
+        // Apply properties
+        QStringList skipKeys = {"type", "id"};
+        for (auto it = item.begin(); it != item.end(); ++it) {
+            if (!skipKeys.contains(it.key())) {
+                m_settings->network()->setItemProperty(newItemId, it.key(), it.value().toVariant());
+            }
+        }
+    }
+
+    // Apply Y offset if available
+    if (data.contains("yOffset")) {
+        m_settings->network()->setZoneYOffset(targetZone, data["yOffset"].toInt());
+    }
+
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Applied zone" << entryId
+             << "to" << targetZone << "with" << items.size() << "items";
+    return true;
+}
+
+bool WidgetLibrary::applyLayout(const QString& entryId, bool applyTheme)
+{
+    QJsonObject entry = readEntryFile(entryId);
+    if (entry.isEmpty() || entry["type"].toString() != "layout") {
+        DIAG_WARN(APP, "WidgetLibrary") << "Invalid layout entry:" << entryId;
+        return false;
+    }
+
+    QJsonObject data = entry["data"].toObject();
+    QJsonObject layoutObj = data["layout"].toObject();
+
+    if (layoutObj.isEmpty())
+        return false;
+
+    // Regenerate IDs for all items in the layout
+    QJsonObject zones = layoutObj["zones"].toObject();
+    int counter = 1;
+    for (const QString& zoneName : zones.keys()) {
+        QJsonArray items = zones[zoneName].toArray();
+        QJsonArray itemsWithIds;
+        for (const QJsonValue& val : items) {
+            QJsonObject item = val.toObject();
+            item["id"] = item["type"].toString() + QString::number(counter++);
+            itemsWithIds.append(item);
+        }
+        zones[zoneName] = itemsWithIds;
+    }
+    layoutObj["zones"] = zones;
+
+    // Apply the full layout
+    QString layoutJson = QString::fromUtf8(QJsonDocument(layoutObj).toJson(QJsonDocument::Compact));
+    m_settings->network()->setLayoutConfiguration(layoutJson);
+
+    // Apply theme if requested and available
+    if (applyTheme && !data["theme"].isNull()) {
+        QVariantMap themeColors = data["theme"].toObject().toVariantMap();
+        if (!themeColors.isEmpty()) {
+            m_settings->theme()->setCustomThemeColors(themeColors);
+        }
+    }
+
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Applied layout" << entryId
+             << "(theme:" << applyTheme << ")";
+    return true;
+}
+
+// --- Thumbnails ---
+
+void WidgetLibrary::saveThumbnail(const QString& entryId, const QImage& image)
+{
+    QString path = thumbnailPath(entryId);
+    if (image.save(path, "PNG")) {
+        m_thumbExists.insert(entryId);
+        DIAG_DEBUG(APP, "WidgetLibrary") << "Saved thumbnail for" << entryId;
+        emit thumbnailSaved(entryId);
+    } else {
+        DIAG_WARN(APP, "WidgetLibrary") << "Failed to save thumbnail:" << path;
+    }
+}
+
+void WidgetLibrary::saveThumbnailCompact(const QString& entryId, const QImage& image)
+{
+    QString path = thumbnailCompactPath(entryId);
+    if (image.save(path, "PNG")) {
+        m_thumbCompactExists.insert(entryId);
+        DIAG_DEBUG(APP, "WidgetLibrary") << "Saved compact thumbnail for" << entryId;
+        emit thumbnailSaved(entryId);
+    } else {
+        DIAG_WARN(APP, "WidgetLibrary") << "Failed to save compact thumbnail:" << path;
+    }
+}
+
+QString WidgetLibrary::thumbnailPath(const QString& entryId) const
+{
+    return thumbnailsPath() + "/" + entryId + ".png";
+}
+
+QString WidgetLibrary::thumbnailCompactPath(const QString& entryId) const
+{
+    return thumbnailsPath() + "/" + entryId + "_compact.png";
+}
+
+bool WidgetLibrary::hasThumbnail(const QString& entryId) const
+{
+    return m_thumbExists.contains(entryId);
+}
+
+bool WidgetLibrary::hasThumbnailCompact(const QString& entryId) const
+{
+    return m_thumbCompactExists.contains(entryId);
+}
+
+void WidgetLibrary::triggerThumbnailCapture(const QString& entryId)
+{
+    if (entryId.isEmpty()) return;
+    QVariantMap entry = getEntry(entryId);
+    if (entry.isEmpty()) return;
+    emit requestThumbnailCapture(entryId);
+}
+
+// --- Filtering ---
+
+QVariantList WidgetLibrary::entriesByType(const QString& type) const
+{
+    QVariantList filtered;
+    for (const QVariant& v : m_index) {
+        if (v.toMap()["type"].toString() == type)
+            filtered.append(v);
+    }
+    return filtered;
+}
+
+// --- Private helpers ---
+
+QString WidgetLibrary::libraryPath() const
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/library";
+}
+
+QString WidgetLibrary::thumbnailsPath() const
+{
+    return libraryPath() + "/thumbnails";
+}
+
+void WidgetLibrary::ensureDirectories()
+{
+    QDir().mkpath(libraryPath());
+    QDir().mkpath(thumbnailsPath());
+}
+
+void WidgetLibrary::loadIndex()
+{
+    QString indexPath = libraryPath() + "/index.json";
+    QFile file(indexPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        // No index yet - try to rebuild from files
+        rebuildIndex();
+        return;
+    }
+
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    file.close();
+
+    if (!doc.isArray()) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Invalid index, rebuilding";
+        rebuildIndex();
+        return;
+    }
+
+    m_index.clear();
+    QJsonArray arr = doc.array();
+    bool needsRebuild = false;
+    QSet<QString> seenIds;
+    int duplicates = 0;
+    for (const QJsonValue& val : arr) {
+        QJsonObject obj = val.toObject();
+        if (!obj.contains("data"))
+            needsRebuild = true;
+        QString id = obj["id"].toString();
+        if (seenIds.contains(id)) {
+            duplicates++;
+            continue;  // Skip duplicate
+        }
+        seenIds.insert(id);
+        m_index.append(obj.toVariantMap());
+    }
+
+    if (duplicates > 0) {
+        DIAG_DEBUG(APP, "WidgetLibrary") << "Removed" << duplicates << "duplicate entries from index";
+        saveIndex();  // Persist the cleaned-up index
+    }
+
+    if (needsRebuild && !arr.isEmpty()) {
+        DIAG_DEBUG(APP, "WidgetLibrary") << "Index missing data fields, rebuilding";
+        rebuildIndex();
+        return;
+    }
+
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Loaded index with" << m_index.size() << "entries";
+}
+
+void WidgetLibrary::saveIndex()
+{
+    QJsonArray arr;
+    for (const QVariant& v : m_index) {
+        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+    }
+
+    QString indexPath = libraryPath() + "/index.json";
+    QFile file(indexPath);
+    if (!file.open(QIODevice::WriteOnly)) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Failed to save index:" << indexPath;
+        return;
+    }
+    file.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    file.close();
+}
+
+void WidgetLibrary::rebuildIndex()
+{
+    m_index.clear();
+
+    QDir dir(libraryPath());
+    QStringList jsonFiles = dir.entryList({"*.json"}, QDir::Files);
+
+    for (const QString& filename : jsonFiles) {
+        if (filename == "index.json")
+            continue;
+
+        QFile file(dir.filePath(filename));
+        if (!file.open(QIODevice::ReadOnly))
+            continue;
+
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+        file.close();
+
+        if (!doc.isObject())
+            continue;
+
+        QJsonObject entry = doc.object();
+        // The folder can hold JSON that is not an entry: the retired community
+        // library left its listing cache here as community_cache.json.
+        if (entry["id"].toString().isEmpty() || entry["type"].toString().isEmpty())
+            continue;
+
+        // Build metadata for index (includes data for preview rendering)
+        QVariantMap meta;
+        meta["id"] = entry["id"].toString();
+        meta["type"] = entry["type"].toString();
+        meta["createdAt"] = entry["createdAt"].toString();
+        meta["data"] = entry["data"].toObject().toVariantMap();
+
+        m_index.append(meta);
+    }
+
+    saveIndex();
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Rebuilt index with" << m_index.size() << "entries";
+}
+
+QString WidgetLibrary::saveEntryFile(const QJsonObject& entry)
+{
+    QString entryId = entry["id"].toString();
+    if (entryId.isEmpty()) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Entry has no ID";
+        return QString();
+    }
+
+    QString filePath = libraryPath() + "/" + entryId + ".json";
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly)) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Failed to write:" << filePath;
+        return QString();
+    }
+
+    file.write(QJsonDocument(entry).toJson(QJsonDocument::Compact));
+    file.close();
+
+    // Build metadata for index (includes data for preview rendering in QML)
+    QVariantMap meta;
+    meta["id"] = entryId;
+    meta["type"] = entry["type"].toString();
+    meta["createdAt"] = entry["createdAt"].toString();
+    meta["data"] = entry["data"].toObject().toVariantMap();
+
+    // Replace existing entry with same ID, or append if new
+    bool replaced = false;
+    for (int i = 0; i < m_index.size(); ++i) {
+        if (m_index[i].toMap()["id"].toString() == entryId) {
+            m_index[i] = meta;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced)
+        m_index.append(meta);
+    saveIndex();
+    emit entriesChanged();
+
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Saved" << entry["type"].toString()
+             << "entry:" << entryId;
+    return entryId;
+}
+
+QJsonObject WidgetLibrary::readEntryFile(const QString& entryId) const
+{
+    QString filePath = libraryPath() + "/" + entryId + ".json";
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Entry not found:" << filePath;
+        return QJsonObject();
+    }
+
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    file.close();
+
+    if (!doc.isObject()) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Invalid entry file:" << filePath;
+        return QJsonObject();
+    }
+
+    return doc.object();
+}
+
+bool WidgetLibrary::deleteEntryFile(const QString& entryId)
+{
+    QString filePath = libraryPath() + "/" + entryId + ".json";
+    if (!QFile::exists(filePath)) {
+        DIAG_WARN(APP, "WidgetLibrary") << "Entry file not found:" << filePath;
+        return false;
+    }
+    return QFile::remove(filePath);
+}
+
+void WidgetLibrary::populateThumbnailCache()
+{
+    QDir dir(thumbnailsPath());
+    const QStringList pngs = dir.entryList({"*.png"}, QDir::Files);
+    for (const QString& filename : pngs) {
+        // filename is e.g. "abc-123.png" or "abc-123_compact.png"
+        QString base = filename.chopped(4);  // strip ".png"
+        if (base.endsWith("_compact")) {
+            m_thumbCompactExists.insert(base.chopped(8));  // strip "_compact"
+        } else {
+            m_thumbExists.insert(base);
+        }
+    }
+    DIAG_DEBUG(APP, "WidgetLibrary") << "Thumbnail cache:" << m_thumbExists.size()
+             << "full," << m_thumbCompactExists.size() << "compact";
+}
+
+QJsonObject WidgetLibrary::buildEnvelope(const QString& type,
+                                          const QJsonObject& data) const
+{
+    QJsonObject envelope;
+    envelope["version"] = 1;
+    envelope["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    envelope["type"] = type;
+    envelope["createdAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    envelope["appVersion"] = QString(VERSION_STRING);
+    envelope["data"] = data;
+
+    return envelope;
+}

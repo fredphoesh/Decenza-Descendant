@@ -1,0 +1,491 @@
+// The bug this exists for: "Yirg Df" found nothing on Recipes although the coffee is
+// a Yirgacheffe and the profile "D-Flow / Q". The match now tokenizes the query and
+// DELETES `-` `/` `.` ("D-Flow" -> "dflow"), requiring every token (AND).
+//
+// Settings search lives here too, for the same reason: it is shipping JS
+// (qml/components/SettingsSearchMatcher.mjs over the vendored Fuse.js, and the generated
+// qml/components/SettingsSearchEntries.js) evaluated in a QJSEngine.
+
+#include <QtTest>
+#include <QJSEngine>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+
+class TestRecipeSearch : public QObject {
+    Q_OBJECT
+
+private slots:
+    void init() { QTest::failOnWarning(); }
+    void initTestCase();
+
+    // In-app matcher (RecipeSearch.js)
+    void crossFieldQueryMatches();
+    void tokenSpanningPunctuation();
+    void allTokensRequired();
+    void singleTokenStillMatches();
+    void emptyQueryMatchesEverything();
+    void caseInsensitive();
+    void collapsesInternalWhitespace();
+    void matchesToleratesUnnormalizedTokens();
+    void matchesNoOpTokenIsIgnored();
+
+    // In-app haystack assembly (RecipeSearch.buildHaystack, as RecipesPage uses it)
+    void appHaystackSearchesAllFields();
+
+    // Beans page: every text value a bag holds, never its ids or links
+    void bagSearchCoversAllTextAndAgreesWithWeb();
+    void bagSearchSkipsBookkeepingAtEveryDepth();
+
+    // Recipes and Beans order: blanks last both ways, ties by id
+    void sortedCopyBlanksLastAndAgreesWithWeb();
+    void recipeSortKeyUsesSharedNormalization();
+
+    // Settings search: every query the old hand-written index answered still finds its card
+    void settingsSearchSnapshotStillFound();
+    // Settings search ranking, typo/accent tolerance, AND, and availability filtering
+    void settingsSearch_data();
+    void settingsSearch();
+    // Recent picks: ids unique across the index, resolved in order, dropped when not offered
+    void settingsRecentIds();
+
+private:
+    QJSEngine m_engine;
+    QJSValue m_lib;   // RecipeSearch.js
+    QJSValue m_settingsMatcher;  // SettingsSearchMatcher.mjs
+    QJSValue m_settingsEntries;  // SettingsSearchEntries.js `entries`
+    // Matcher over the current index, with `available` conditions and a key -> text map
+    // standing in for TranslationManager.
+    QJSValue settingsMatcher(const QStringList& available, const QVariantMap& translations = {});
+    QString bagHaystack(const QJSValue& bag, const QString& kindLabel);
+    bool match(const QString& haystack, const QString& query);
+
+};
+
+static QString readSource(const QString& relPath)
+{
+    QFile f(QStringLiteral(DECENZA_SOURCE_DIR) + relPath);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return QString();
+    return QString::fromUtf8(f.readAll());
+}
+
+void TestRecipeSearch::initTestCase()
+{
+    // --- Settings search: the ES module (and the vendored Fuse.js it imports) ---
+    m_settingsMatcher = m_engine.importModule(
+        QStringLiteral(DECENZA_SOURCE_DIR "/qml/components/SettingsSearchMatcher.mjs"));
+    QVERIFY2(!m_settingsMatcher.isError(), qPrintable(m_settingsMatcher.toString()));
+    QVERIFY2(m_settingsMatcher.property("createMatcher").isCallable(), "createMatcher() not exported");
+    QString entriesJs = readSource("/qml/components/SettingsSearchEntries.js");
+    QVERIFY2(!entriesJs.isEmpty(), "could not read SettingsSearchEntries.js");
+    entriesJs.remove(QRegularExpression("^\\s*\\.pragma\\s+library\\s*$",
+                                        QRegularExpression::MultilineOption));
+    m_settingsEntries = m_engine.evaluate(QStringLiteral("(function(){ %1\n return entries; })()").arg(entriesJs));
+    QVERIFY2(!m_settingsEntries.isError() && m_settingsEntries.isArray(), qPrintable(m_settingsEntries.toString()));
+
+    // --- In-app matcher: RecipeSearch.js (strip the QML `.pragma library` line) ---
+    QString js = readSource("/qml/components/RecipeSearch.js");
+    QVERIFY2(!js.isEmpty(), "could not read RecipeSearch.js");
+    js.remove(QRegularExpression("^\\s*\\.pragma\\s+library\\s*$",
+                                 QRegularExpression::MultilineOption));
+    const QString libProgram =
+        QStringLiteral("(function(){ %1\n return { tokenize: tokenize, matches: matches,"
+                       "     normalize: normalize, buildHaystack: buildHaystack,"
+                       "     buildBagHaystack: buildBagHaystack, bagSkipKeys: _bagSkipKeys,"
+                       "     sortedCopy: sortedCopy, recipeSortKey: recipeSortKey }; })()").arg(js);
+    m_lib = m_engine.evaluate(libProgram);
+    QVERIFY2(!m_lib.isError(), qPrintable(m_lib.toString()));
+    QVERIFY2(m_lib.property("matches").isCallable(), "matches() not found in RecipeSearch.js");
+    QVERIFY2(m_lib.property("tokenize").isCallable(), "tokenize() not found in RecipeSearch.js");
+    QVERIFY2(m_lib.property("buildHaystack").isCallable(), "buildHaystack() not found in RecipeSearch.js");
+
+
+}
+
+QString TestRecipeSearch::bagHaystack(const QJSValue& bag, const QString& kindLabel)
+{
+    const QJSValue app = m_lib.property("buildBagHaystack").call({bag, QJSValue(kindLabel)});
+    return app.toString();
+}
+
+// The full pipeline as the in-app page uses it: tokenize the query, then match.
+bool TestRecipeSearch::match(const QString& haystack, const QString& query)
+{
+    QJSValue tokens = m_lib.property("tokenize").call({QJSValue(query)});
+    QJSValue r = m_lib.property("matches").call({QJSValue(haystack), tokens});
+    Q_ASSERT(!r.isError());
+    return r.toBool();
+}
+
+// The reported bug: two tokens, each in a different field (coffee vs profile).
+void TestRecipeSearch::crossFieldQueryMatches()
+{
+    // haystack mirrors name + roaster + coffee + profileTitle
+    const QString hay = "Morning cup  Ethiopia Yirgacheffe  D-Flow / Q";
+    QVERIFY2(match(hay, "Yirg Df"), "cross-field two-token query must match");
+    QVERIFY2(match(hay, "yirgacheffe q"), "coffee token + profile token must match");
+    QVERIFY2(match(hay, "df yirg"), "token order must not matter");
+}
+
+// A lone token that only lines up once punctuation is deleted.
+void TestRecipeSearch::tokenSpanningPunctuation()
+{
+    QVERIFY2(match("D-Flow / Q", "df"), "'df' must match 'D-Flow' after deletion");
+    QVERIFY2(match("D-Flow / Q", "d flow"), "'d flow' must match 'D-Flow'");
+    QVERIFY2(match("D-Flow / Q", "d-flow"), "the literal 'd-flow' must still match");
+}
+
+// Every token must be found; one miss hides the recipe.
+void TestRecipeSearch::allTokensRequired()
+{
+    const QString hay = "Ethiopia Yirgacheffe  D-Flow";
+    QVERIFY2(!match(hay, "Yirg Pressure"),
+             "a token matching no field must exclude the recipe");
+    QVERIFY2(!match(hay, "Colombia"), "a non-matching single token must not match");
+}
+
+void TestRecipeSearch::singleTokenStillMatches()
+{
+    QVERIFY2(match("Ethiopia Yirgacheffe  D-Flow", "yirg"), "single token still matches");
+    QVERIFY2(!match("Ethiopia Yirgacheffe  D-Flow", "kenya"), "single non-match excluded");
+}
+
+void TestRecipeSearch::emptyQueryMatchesEverything()
+{
+    QVERIFY2(match("anything", ""), "empty query matches");
+    QVERIFY2(match("anything", "   "), "whitespace-only query matches");
+    QVERIFY2(match("anything", " - / . "), "punctuation-only query yields no tokens => matches");
+}
+
+void TestRecipeSearch::caseInsensitive()
+{
+    QVERIFY2(match("Ethiopia YIRGACHEFFE d-flow", "yirg DF"),
+             "matching must ignore case on both sides");
+}
+
+// Any run of whitespace (spaces, tabs) splits tokens; leading/trailing whitespace is
+// dropped rather than producing empty tokens.
+void TestRecipeSearch::collapsesInternalWhitespace()
+{
+    const QString hay = "Ethiopia Yirgacheffe  D-Flow";
+    QVERIFY2(match(hay, "yirg\t df"), "a tab between tokens still splits them");
+    QVERIFY2(match(hay, "  yirg   df  "), "leading/trailing/repeated whitespace is harmless");
+}
+
+// The app builds its haystack via RecipeSearch.buildHaystack (name + roaster + coffee
+// + profile + drink label). Guards that all five fields are searchable — the app path
+// the web test cannot reach, and the one field (drink label) sourced differently here.
+void TestRecipeSearch::appHaystackSearchesAllFields()
+{
+    QJSValue r = m_engine.newObject();
+    r.setProperty("name", QJSValue(QStringLiteral("Morning cup")));
+    r.setProperty("roasterName", QJSValue(QStringLiteral("Prodigal")));
+    r.setProperty("coffeeName", QJSValue(QStringLiteral("Ethiopia Yirgacheffe")));
+    r.setProperty("profileTitle", QJSValue(QStringLiteral("D-Flow / Q")));
+    const QString hay =
+        m_lib.property("buildHaystack").call({r, QJSValue(QStringLiteral("Latte"))}).toString();
+
+    QVERIFY2(match(hay, "morning"), "name field must be searchable");
+    QVERIFY2(match(hay, "prodigal"), "roaster field must be searchable");
+    QVERIFY2(match(hay, "yirg"), "coffee field must be searchable");
+    QVERIFY2(match(hay, "df"), "profile field must be searchable (df -> D-Flow)");
+    QVERIFY2(match(hay, "latte"), "drink-label field must be searchable");
+    QVERIFY2(match(hay, "yirg latte"), "cross-field: coffee token + drink-label token");
+    QVERIFY2(!match(hay, "kenya"), "a token present in no field must exclude the recipe");
+}
+
+// #5 robustness: matches() must tolerate a raw, un-normalized token (e.g. one still
+// carrying a hyphen) rather than silently never matching.
+void TestRecipeSearch::matchesToleratesUnnormalizedTokens()
+{
+    QJSValue rawTokens = m_engine.newArray(1);
+    rawTokens.setProperty(0, QJSValue(QStringLiteral("d-flow")));   // NOT run through tokenize()
+    QJSValue r = m_lib.property("matches").call({QJSValue(QStringLiteral("D-Flow / Q")), rawTokens});
+    QVERIFY2(!r.isError(), qPrintable(r.toString()));
+    QVERIFY2(r.toBool(), "matches() must normalize raw tokens so 'd-flow' still matches 'D-Flow'");
+}
+
+// A raw token that normalizes to "" (e.g. "-") must impose NO constraint rather than
+// excluding everything — matches() relies on indexOf("") === 0. tokenize() filters
+// these out before matches() sees them, so exercise matches() directly.
+void TestRecipeSearch::matchesNoOpTokenIsIgnored()
+{
+    QJSValue toks = m_engine.newArray(2);
+    toks.setProperty(0, QJSValue(QStringLiteral("yirg")));
+    toks.setProperty(1, QJSValue(QStringLiteral("-")));   // normalizes to ""
+    QJSValue r = m_lib.property("matches").call({QJSValue(QStringLiteral("Yirgacheffe")), toks});
+    QVERIFY2(!r.isError(), qPrintable(r.toString()));
+    QVERIFY2(r.toBool(), "a token that normalizes to empty must not exclude the recipe");
+}
+
+// A bag as the inventory hands it over: its own fields, and a details blob with a
+// nested canonical snapshot, a link and ids. Every text value is searchable, and its
+// kind through the label; identifiers, links and enums are not.
+void TestRecipeSearch::bagSearchCoversAllTextAndAgreesWithWeb()
+{
+    const QJSValue bag = m_engine.evaluate(QStringLiteral(
+        "({ id: 7, kind: 'tea', roasterName: 'Saka', coffeeName: 'Gran Bar', notes: 'for milk drinks',"
+        "   visualizerBagId: 'abc-123', yieldMode: 'none',"
+        "   beanBaseData: JSON.stringify({ region: 'Minas Gerais', canonical: { producer: 'Saka Caffe' },"
+        "                                  link: 'https://example.com/gran-bar', id: 'canon-99' }) })"));
+    QVERIFY(!bag.isError());
+    const QString hay = bagHaystack(bag, QStringLiteral("Tea"));
+    QVERIFY(!hay.isEmpty());
+    for (const char* q : {"saka gran", "milk", "minas", "caffe", "tea"})
+        QVERIFY2(match(hay, q), q);
+    for (const char* q : {"example", "canon", "abc", "none"})
+        QVERIFY2(!match(hay, q), q);
+
+    // An unreadable blob costs only its own details, never the bag (or the list).
+    const QJSValue corrupt = m_engine.evaluate(QStringLiteral(
+        "({ id: 8, roasterName: 'Saka', beanBaseData: '{not json' })"));
+    const QString corruptHay = bagHaystack(corrupt, QStringLiteral("Coffee"));
+    QVERIFY(match(corruptHay, "saka coffee"));
+}
+
+// Every key the app skips, placed on the bag, on its blob and one level inside the
+// blob, with a value no field could otherwise hold: none of it may be searchable on
+// either surface. Built from the app's own list, so a key dropped from the web's copy
+// fails here too.
+void TestRecipeSearch::bagSearchSkipsBookkeepingAtEveryDepth()
+{
+    const QJSValue build = m_engine.evaluate(QStringLiteral(
+        "(function(keys) { var blob = { canonical: {} }, bag = { roasterName: 'Saka' };"
+        "  keys.forEach(function(k) { bag[k] = blob[k] = blob.canonical[k] = 'zq' + k; });"
+        "  bag.beanBaseData = JSON.stringify(blob); return bag; })"));
+    const QJSValue bag = build.call({m_lib.property("bagSkipKeys")});
+    QVERIFY(!bag.isError());
+    const QString hay = bagHaystack(bag, QString());
+    QVERIFY(match(hay, "saka"));
+    QVERIFY2(!hay.contains(QStringLiteral("zq")), qPrintable(hay));
+}
+
+void TestRecipeSearch::sortedCopyBlanksLastAndAgreesWithWeb()
+{
+    struct Case { const char* list; const char* direction; const char* ids; };
+    const Case cases[] = {
+        {"[{id:1,k:0},{id:2,k:5},{id:3,k:9},{id:4,k:5}]", "ASC",  "2,4,3,1"},
+        {"[{id:1,k:0},{id:2,k:5},{id:3,k:9},{id:4,k:5}]", "DESC", "3,4,2,1"},
+        {"[{id:1,k:''},{id:2,k:'b'},{id:3,k:'a'}]",       "ASC",  "3,2,1"},
+        {"[{id:1,k:''},{id:2,k:'b'},{id:3,k:'a'}]",       "DESC", "2,3,1"},
+        // Anything but ASC is descending, as Shot History's query reads it.
+        {"[{id:1,k:1},{id:2,k:2}]",                       "",     "2,1"},
+    };
+    const QJSValue keyOf = m_engine.evaluate(QStringLiteral("(function(x) { return x.k; })"));
+    const QJSValue ids = m_engine.evaluate(QStringLiteral(
+        "(function(l) { return l.map(function(x) { return x.id; }).join(','); })"));
+    for (const Case& c : cases) {
+        for (const QJSValue& fn : {m_lib.property("sortedCopy")}) {
+            const QJSValue list = m_engine.evaluate(QStringLiteral("(%1)").arg(QLatin1String(c.list)));
+            const QString before = ids.call({list}).toString();
+            const QJSValue sorted = fn.call({list, keyOf, QJSValue(QLatin1String(c.direction))});
+            QVERIFY2(!sorted.isError(), qPrintable(sorted.toString()));
+            QCOMPARE(ids.call({sorted}).toString(), QLatin1String(c.ids));
+            QCOMPARE(ids.call({list}).toString(), before);   // a copy: the page's own list keeps its order
+        }
+    }
+}
+
+void TestRecipeSearch::recipeSortKeyUsesSharedNormalization()
+{
+    const QJSValue key = m_lib.property("recipeSortKey");
+    QVERIFY(key.isCallable());
+    const QJSValue recipe = m_engine.evaluate(QStringLiteral(
+        "({ createdEpoch: 0, lastUsedEpoch: 1735689600, name: '  Flat White  ',"
+        " roasterName: 'ROASTER', coffeeName: 'Seasonal Blend', profileTitle: 'D-Flow / Q' })"));
+    QCOMPARE(key.call({recipe, QJSValue(QStringLiteral("dateCreated"))}).toNumber(), 0.0);
+    QCOMPARE(key.call({recipe, QJSValue(QStringLiteral("dateUsed"))}).toNumber(), 1735689600.0);
+    QCOMPARE(key.call({recipe, QJSValue(QStringLiteral("name"))}).toString(), QStringLiteral("  flat white  "));
+    QCOMPARE(key.call({recipe, QJSValue(QStringLiteral("coffee"))}).toString(),
+             QStringLiteral("roaster seasonal blend"));
+    QCOMPARE(key.call({recipe, QJSValue(QStringLiteral("profile"))}).toString(),
+             QStringLiteral("d-flow / q"));
+
+    const QJSValue list = m_engine.evaluate(QStringLiteral(
+        "([{id: 9, name: 'same'}, {id: 2, name: 'same'}])"));
+    const QJSValue keyOf = m_engine.evaluate(QStringLiteral(
+        "(function(key) { return function(r) { return key(r, 'name'); }; })")).call({key});
+    const QJSValue sorted = m_lib.property("sortedCopy").call({list, keyOf,
+        QJSValue(QStringLiteral("ASC"))});
+    QVERIFY2(!sorted.isError(), qPrintable(sorted.toString()));
+    QCOMPARE(sorted.property(0).property("id").toInt(), 2);
+    QCOMPARE(sorted.property(1).property("id").toInt(), 9);
+}
+
+QJSValue TestRecipeSearch::settingsMatcher(const QStringList& available, const QVariantMap& translations)
+{
+    const QJSValue tr = m_engine.evaluate(QStringLiteral(
+        "(function(map) { return function(key, fallback) { return map[key] || fallback } })")).call(
+        {m_engine.toScriptValue(translations)});
+    const QJSValue isAvailable = m_engine.evaluate(QStringLiteral(
+        "(function(list) { return function(c) { return !c || list.indexOf(c) !== -1 } })")).call(
+        {m_engine.toScriptValue(available)});
+    const QJSValue items = m_settingsMatcher.property("buildItems").call({m_settingsEntries, tr, isAvailable});
+    return items.isError() ? items : m_settingsMatcher.property("createMatcher").call({items});
+}
+
+// Results as "tabId/cardId" (or the external route), best first.
+static QStringList settingsTargets(const QJSValue& results)
+{
+    QStringList out;
+    const int n = results.property("length").toInt();
+    for (int i = 0; i < n; ++i) {
+        const QJSValue r = results.property(i);
+        const QString route = r.property("externalRoute").toString();
+        out << (route.isEmpty() ? r.property("tabId").toString() + "/" + r.property("cardId").toString()
+                                : route);
+    }
+    return out;
+}
+
+void TestRecipeSearch::settingsSearchSnapshotStillFound()
+{
+    const QJsonArray entries = QJsonDocument::fromJson(
+        readSource("/tests/data/settings_search_snapshot.json").toUtf8()).object().value("entries").toArray();
+    QVERIFY(entries.size() > 50);
+    const QJSValue matcher = settingsMatcher({"android", "windows", "simulator", "debug", "debugWindows"});
+    QVERIFY2(!matcher.isError(), qPrintable(matcher.toString()));
+    // With every condition met, an empty query lists every entry.
+    QCOMPARE(matcher.property("search").call({QString()}).property("length").toInt(),
+             m_settingsEntries.property("length").toInt());
+    QStringList misses;
+    for (const QJsonValue& v : entries) {
+        const QJsonObject e = v.toObject();
+        const QString target = e.contains("externalRoute") ? e.value("externalRoute").toString()
+            : e.value("tabId").toString() + "/" + e.value("cardId").toString();
+        QStringList queries{e.value("title").toString()};
+        for (const QJsonValue& k : e.value("keywords").toArray())
+            queries << k.toString();
+        for (const QString& q : queries) {
+            if (!settingsTargets(matcher.property("search").call({q})).contains(target))
+                misses << QString("\"%1\" no longer finds %2").arg(q, target);
+        }
+    }
+    QVERIFY2(misses.isEmpty(), qPrintable(misses.join("; ")));
+}
+
+void TestRecipeSearch::settingsSearch_data()
+{
+    QTest::addColumn<QString>("query");
+    QTest::addColumn<QStringList>("available");
+    QTest::addColumn<QVariantMap>("translations");
+    QTest::addColumn<QString>("first");     // expected best result, or "" for none
+    QTest::addColumn<QString>("present");   // a target that must appear anywhere, or ""
+    QTest::addColumn<QString>("absent");    // a target that must not appear, or ""
+    QTest::addColumn<QString>("firstItem"); // "kind:title" of the best result, or ""
+
+    const QStringList all{"android", "simulator", "debug"};
+    QTest::newRow("typo fahrenheit") << "farenheit" << all << QVariantMap() << "machine/temperatureUnit" << "" << "" << "";
+    QTest::newRow("typo celsius") << "celcius" << all << QVariantMap() << "machine/temperatureUnit" << "" << "" << "";
+    QTest::newRow("title beats keyword") << "backup" << all << QVariantMap() << "historyData/dailyBackup" << "" << "" << "";
+    QTest::newRow("short word ranks its title") << "ai" << all << QVariantMap() << "ai/aiProvider" << "" << "" << "";
+    QTest::newRow("weak fuzzy tail dropped once something matches well")
+        << "retain" << all << QVariantMap() << "mqtt/mqttPublishing" << "" << "screensaver/screensaver" << "";
+    QTest::newRow("every word must match") << "factory xyzzy" << all << QVariantMap() << "" << "" << "" << "";
+    QTest::newRow("accents and AND, translated")
+        << "unite temperature" << all
+        << QVariantMap{{"settings.options.temperatureUnit", QString::fromUtf8("Unité de température")}}
+        << "machine/temperatureUnit" << "" << "" << "";
+    QTest::newRow("accent folded in a short exact word")
+        << "cle" << all << QVariantMap{{"settings.ai.section.provider", QString::fromUtf8("Clé API")}}
+        << "ai/aiProvider" << "" << "" << "";
+    QTest::newRow("English keyword in German")
+        << "bluetooth" << all << QVariantMap{{"settings.bluetooth.machine", "Maschine"}}
+        << "" << "connections/machineConnection" << "" << "";
+    QTest::newRow("android-only hidden elsewhere") << "launcher" << QStringList{"simulator"} << QVariantMap()
+        << "" << "" << "machine/launcherMode" << "";
+    QTest::newRow("android-only shown on android") << "launcher" << all << QVariantMap()
+        << "machine/launcherMode" << "" << "" << "";
+    QTest::newRow("simulator compiled out") << "simulation" << QStringList{"android"} << QVariantMap()
+        << "" << "" << "machine/simulationMode" << "";
+    QTest::newRow("short word is exact, not fuzzy") << "pin" << all << QVariantMap()
+        << "profileSelector" << "" << "machine/maintenance" << "";
+    QTest::newRow("folds accents as Fuse does") << "nog" << all
+        << QVariantMap{{"settings.ai.apiKey.accessible", QString::fromUtf8("Nøgle")}}
+        << "ai/aiProvider" << "" << "" << "";
+    QTest::newRow("English fallback title in German") << "keep warm" << all
+        << QVariantMap{{"settings.preferences.keepWarmWhenIdle", "Warmhalten im Leerlauf"},
+                       {"settings.preferences.steamHeater", "Dampfheizung"}}
+        << "machine/steamHeater" << "" << "" << "adjustment:Warmhalten im Leerlauf";
+    QTest::newRow("needs every condition") << "window resolution" << all << QVariantMap()
+        << "" << "" << "debug/debugWindowResolution" << "";
+    QTest::newRow("production windows hides developer resolution")
+        << "window resolution" << QStringList{"windows"} << QVariantMap()
+        << "" << "" << "debug/debugWindowResolution" << "";
+    QTest::newRow("production log download is searchable")
+        << "save log zip" << QStringList{} << QVariantMap()
+        << "debug/debugLogDownload" << "" << "" << "adjustment:Save log ZIP";
+    QTest::newRow("weight timed steam outside settings")
+        << "weight timed steaming" << all << QVariantMap()
+        << "steam" << "" << "" << "external:Enable weight-timed steaming";
+    QTest::newRow("graph trace keyword opens curve settings")
+        << "conductance" << all << QVariantMap()
+        << "" << "graphCurves" << "" << "";
+    QTest::newRow("short typo in a multiword query")
+        << "ht water temperature" << all << QVariantMap()
+        << "" << "hotWater" << "" << "";
+}
+
+void TestRecipeSearch::settingsSearch()
+{
+    QFETCH(QString, query);
+    QFETCH(QStringList, available);
+    QFETCH(QVariantMap, translations);
+    QFETCH(QString, first);
+    QFETCH(QString, present);
+    QFETCH(QString, absent);
+    QFETCH(QString, firstItem);
+    const QJSValue matcher = settingsMatcher(available, translations);
+    QVERIFY2(!matcher.isError(), qPrintable(matcher.toString()));
+    const QJSValue results = matcher.property("search").call({query});
+    QVERIFY2(!results.isError(), qPrintable(results.toString()));
+    const QStringList got = settingsTargets(results);
+    if (first.isEmpty() && present.isEmpty() && absent.isEmpty())
+        QVERIFY2(got.isEmpty(), qPrintable(got.join(", ")));
+    if (!first.isEmpty())
+        QVERIFY2(!got.isEmpty() && got.first() == first, qPrintable(got.join(", ")));
+    if (!present.isEmpty())
+        QVERIFY2(got.contains(present), qPrintable(got.join(", ")));
+    if (!absent.isEmpty())
+        QVERIFY2(!got.contains(absent), qPrintable(got.join(", ")));
+    if (!firstItem.isEmpty()) {
+        const QJSValue top = results.property(0);
+        QCOMPARE(top.property("kind").toString() + ":" + top.property("title").toString(), firstItem);
+    }
+}
+
+void TestRecipeSearch::settingsRecentIds()
+{
+    const QJSValue all = settingsMatcher({"android", "windows", "simulator", "debug", "debugWindows"});
+    QVERIFY2(!all.isError(), qPrintable(all.toString()));
+    const QJSValue items = all.property("search").call({QString()});
+    QStringList ids, dups;
+    for (int i = 0; i < items.property("length").toInt(); ++i) {
+        const QString id = items.property(i).property("id").toString();
+        if (ids.contains(id))
+            dups << id;
+        ids << id;
+    }
+    // A shared id would make a recent pick open a different setting than the one tapped.
+    QVERIFY2(dups.isEmpty(), qPrintable(dups.join(", ")));
+
+    const QString launcher = "machine/launcherMode/settings.options.useAsLauncher";
+    const QString backup = "historyData/dailyBackup/settings.data.dailybackup";
+    QVERIFY2(ids.contains(launcher) && ids.contains(backup), "fixture ids no longer in the index");
+    const QJSValue picks = m_engine.toScriptValue(QStringList{backup, "gone/card/key", launcher});
+    const auto lookedUp = [&](const QJSValue& matcher) {
+        QStringList out;
+        const QJSValue r = matcher.property("lookup").call({picks});
+        for (int i = 0; i < r.property("length").toInt(); ++i)
+            out << r.property(i).property("id").toString();
+        return out;
+    };
+    // Pick order is the reverse of index order, so a lookup that filters the index fails.
+    QCOMPARE(lookedUp(all), (QStringList{backup, launcher}));
+    QCOMPARE(lookedUp(settingsMatcher({"simulator"})), QStringList{backup});
+}
+
+QTEST_MAIN(TestRecipeSearch)
+#include "tst_recipesearch.moc"

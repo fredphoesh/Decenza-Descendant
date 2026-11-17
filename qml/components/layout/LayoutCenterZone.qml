@@ -1,0 +1,166 @@
+// Delegates below declare their model roles with `required property`; ids from this file then
+// resolve statically inside them. See PresetPillRow.qml for the full rationale.
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import QtQuick.Layouts
+import Decenza
+
+Item {
+    id: root
+
+    required property string zoneName
+    required property var items
+    property real zoneScale: 1.0
+    // Horizontal alignment of the row within the zone: "center" (default) | "left" | "right".
+    // Reads the same per-zone "alignment" option the bar zones read (LayoutService zone
+    // options), but the gating differs: a center zone has no distribution, so alignment is
+    // suppressed only by a user spacer (hasSpacer) — not by LayoutBarZone's wider fillRow
+    // (fillWidthMode || hasSpacer). Default "center" = unchanged behavior.
+    property string alignment: "center"
+    // Zone style preset: "standard" (default) | "surface" | "accentBar". Applies to item
+    // text only. Like the top/bottom bar zones, a center zone paints no background of its
+    // own — only statusBar and lowerMidBar do. Default "standard" = unchanged behavior.
+    property string zoneStyle: "standard"
+    // Overrides the colour the zone's items draw their text and icons in. Set by
+    // LayoutPreview when it is previewing a background colour that has not been applied,
+    // where Theme's own values still describe the CURRENT background. Transparent = unset.
+    property color contentColorOverride: "transparent"
+    // Companion to contentColorOverride for the fills widgets draw — see LayoutItemDelegate.
+    property color fillColorOverride: "transparent"
+
+    // No "distribution" option by design. A center zone sizes every item from a fixed cell
+    // (buttonWidth, capped at Theme.scaled(150) * zoneScale) so action buttons never stretch,
+    // while equalWidth and spaced both require items to expand to fill the zone. With the cap
+    // kept, the two would collapse into each other and do nothing on a button-only row, so the
+    // editors hide the control here rather than offer a value that cannot apply.
+
+    // Items that size to their content instead of using fixed button width
+    // Action buttons (espresso, steam, etc.) use fixed buttonWidth; readouts auto-size
+    function isAutoSized(type) {
+        switch (type) {
+            case "spacer":
+            case "custom":
+            case "shotPlan":
+            case "temperature":
+            case "waterLevel":
+            case "connectionStatus":
+            case "machineStatus":
+            case "steamTemperature":
+            case "batteryLevel":
+            case "scaleBattery":
+            case "scaleWeight":
+            case "weather":
+            case "ghcSimulator":
+            case "clock":
+                return true
+            default:
+                return false
+        }
+    }
+
+    // Calculate button sizing with zoneScale baked in (renders at display resolution)
+    readonly property int buttonCount: {
+        if (!items) return 0
+        var count = 0
+        for (let i = 0; i < items.length; i++) {
+            if (!isAutoSized(items[i].type)) count++
+        }
+        return count
+    }
+    readonly property bool hasSpacer: {
+        if (!items) return false
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].type === "spacer") return true
+        }
+        return false
+    }
+    readonly property real scaledSpacing: Theme.scaled(10) * zoneScale
+    readonly property real availableWidth: width - Theme.scaled(20) * zoneScale -
+        (buttonCount > 1 ? (buttonCount - 1) * scaledSpacing : 0)
+    readonly property real buttonWidth: buttonCount > 0
+        ? Math.min(Theme.scaled(150) * zoneScale, availableWidth / buttonCount) : Theme.scaled(150) * zoneScale
+    readonly property real buttonHeight: Theme.scaled(120) * zoneScale
+
+    implicitHeight: contentRow.implicitHeight
+
+    RowLayout {
+        id: contentRow
+        width: root.width
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: root.scaledSpacing
+
+        // Leading auto-spacer: present for center + right alignment (absent for left → row hugs the left).
+        // Hides when the user has their own spacers (they position manually).
+        Item { Layout.fillWidth: true; visible: !root.hasSpacer && (root.alignment === "center" || root.alignment === "right") }
+
+        Repeater {
+            model: root.items
+            delegate: LayoutItemDelegate {
+                zoneName: root.zoneName
+                zoneTextColor: root.contentColorOverride.a > 0 ? root.contentColorOverride
+                                                              : Theme.zoneTextColor(root.zoneStyle)
+                zoneValueBold: Theme.zoneValueBold(root.zoneStyle)
+                zoneFillOverride: root.fillColorOverride
+                zoneStyle: root.zoneStyle
+                Layout.preferredWidth: {
+                    // Flip clock: interpolate between buttonWidth and wide based on clockScale
+                    if (modelData.type === "screensaverFlipClock") {
+                        let s = typeof modelData.clockScale === "number" ? modelData.clockScale : 1.0
+                        return root.buttonWidth + s * (root.buttonHeight * 3.7 - root.buttonWidth)
+                    }
+                    // Shot map: scale width from 1x to 1.7x buttonWidth
+                    if (modelData.type === "screensaverShotMap") {
+                        let m = typeof modelData.mapScale === "number" ? modelData.mapScale : 1.0
+                        return root.buttonWidth * m
+                    }
+                    // Last shot: scale width from 1x to 2.5x buttonWidth
+                    if (modelData.type === "lastShot") {
+                        let ls = typeof modelData.shotScale === "number" ? modelData.shotScale : 1.0
+                        return root.buttonWidth * ls
+                    }
+                    if (root.isAutoSized(modelData.type)) return -1
+                    return root.buttonWidth
+                }
+                // The shot plan sizes to its content, which can exceed the zone
+                // (long bean names, many items). RowLayout does NOT shrink items
+                // below their implicit width, so without a cap the plan paints
+                // past the screen edge; capped, the text wraps and elides inside.
+                Layout.maximumWidth: modelData.type === "shotPlan"
+                    ? root.availableWidth : Number.POSITIVE_INFINITY
+                // Mirrors Layout.preferredWidth above: an auto-sized type sizes to its
+                // CONTENT in both axes, and anything outside isAutoSized takes the fixed
+                // cell. That is NOT the same as "only action buttons" — the quick-selects,
+                // doseWeight, milkWeight, profileName, lastShot, separator, discuss and the
+                // screensaver widgets are all outside the list too, so a zone holding only
+                // one of those still measures a full cell. Whether they belong in
+                // isAutoSized is a live question; the list governs width as well, so it is
+                // not a free change.
+                //
+                // This used to exempt "spacer" alone, so every readout — the shot plan,
+                // the clock, the temperature — claimed a full buttonHeight cell and painted
+                // a line or two of text centred in it. The leftover was invisible buffer
+                // that still counted as layout height. A RowLayout takes the MAX over its
+                // children, so a zone containing any action button is unchanged; what
+                // shrinks is a readout-only zone, and that is enough to make the whole
+                // centre column measure taller than anything on screen. Anything reasoning
+                // about where the column ENDS — IdlePage's lowerMidBarColumnBottom, and the
+                // carouselOverlapsBand fallback behind it — was then reading padding rather
+                // than content, and hid the lower-mid band over a gap the user could
+                // plainly see was empty.
+                //
+                // isAutoSized already covers "spacer", so this subsumes the old case
+                // exactly rather than dropping it.
+                Layout.preferredHeight: root.isAutoSized(modelData.type) ? -1 : root.buttonHeight
+                // Stays spacer-only on purpose, despite the line above having just
+                // folded its spacer test into isAutoSized: a readout must size to its
+                // content, not expand to fill the row.
+                Layout.fillWidth: modelData.type === "spacer"
+            }
+        }
+
+        // Trailing auto-spacer: present for center + left alignment (absent for right → row hugs the right).
+        Item { Layout.fillWidth: true; visible: !root.hasSpacer && (root.alignment === "center" || root.alignment === "left") }
+    }
+}

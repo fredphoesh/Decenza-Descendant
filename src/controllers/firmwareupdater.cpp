@@ -1,0 +1,1085 @@
+#include "simulator/firmwareflashsimulator.h"
+#include "core/diagnosticlogging.h"
+#include "controllers/firmwareupdater.h"
+
+#include <QCryptographicHash>
+#include <QDebug>
+#include <QFile>
+#include <QLoggingCategory>
+
+#include "ble/de1device.h"
+#include "ble/de1transport.h"
+#include "ble/protocol/firmwarepackets.h"
+
+#include <memory>
+
+// Shared logging category with FirmwareAssetCache (defined there). Field
+// bug reports can grep "decenza.firmware" in the AsyncLogger output to
+// recover the full timeline of a failed update without sifting through
+// unrelated BLE/HTTP traffic.
+Q_DECLARE_LOGGING_CATEGORY(firmwareLog)
+
+using namespace DE1::Firmware;
+
+namespace {
+
+// Fixed wait between the erase command and the first firmware chunk, on
+// every platform.
+//
+// This was 10 s on Android and 1 s everywhere else, sourced from de1app —
+// but de1app branches on `$::has_bluetooth`, not on platform
+// (de1_comms.tcl:940-950). Its 1 s arm is the no-BLE dry run, a few lines
+// below the block that fakes the connection handles because no machine is
+// attached; every real flash it performs waits 10 s regardless of OS. We
+// read that as "Android vs everything else", so iOS, macOS, Windows and
+// Linux inherited the no-machine timing, and the docs grew a rationale
+// ("an Android-specific BLE race") that nothing in de1app supports.
+//
+// 1 s is not merely unjustified, it is too short: a captured flash on a
+// DE1+/PCB 1.3 took 1.31 s to report erase-complete, so the chunk pump
+// would have started while the bootloader was still erasing.
+constexpr int DEFAULT_POST_ERASE_WAIT_MS = 10000;
+
+// Format an elapsed count as "[+MM:SS.ms]" — fits long uploads and is
+// trivially greppable with /\[\+\d+:/ to strip back to phase order.
+QString formatElapsed(qint64 ms) {
+    if (ms < 0) return QStringLiteral("[+--:--.---]");
+    const qint64 secs = ms / 1000;
+    const qint64 mins = secs / 60;
+    return QStringLiteral("[+%1:%2.%3]")
+        .arg(mins,       2, 10, QLatin1Char('0'))
+        .arg(secs % 60,  2, 10, QLatin1Char('0'))
+        .arg(ms % 1000,  3, 10, QLatin1Char('0'));
+}
+
+}  // namespace
+
+FirmwareUpdater::FirmwareUpdater(DE1Device* device, FirmwareAssetCache* cache,
+                                 QObject* parent)
+    : QObject(parent)
+    , m_device(device)
+    , m_cache(cache)
+    , m_postEraseWaitMs(DEFAULT_POST_ERASE_WAIT_MS)
+{
+    m_postEraseWaitTimer.setSingleShot(true);
+    m_eraseTimeoutTimer.setSingleShot(true);
+    m_verifyTimeoutTimer.setSingleShot(true);
+    m_verifyDisconnectGrace.setSingleShot(true);
+    m_chunkPumpTimer.setInterval(m_chunkPumpIntervalMs);
+
+    connect(&m_postEraseWaitTimer, &QTimer::timeout,
+            this, &FirmwareUpdater::onPostEraseWaitComplete);
+    connect(&m_chunkPumpTimer, &QTimer::timeout,
+            this, &FirmwareUpdater::onChunkPumpTick);
+    connect(&m_eraseTimeoutTimer, &QTimer::timeout,
+            this, &FirmwareUpdater::onEraseTimeout);
+    connect(&m_verifyTimeoutTimer, &QTimer::timeout,
+            this, &FirmwareUpdater::onVerifyTimeout);
+    connect(&m_verifyDisconnectGrace, &QTimer::timeout,
+            this, &FirmwareUpdater::onVerifyDisconnectGrace);
+
+    if (m_cache) {
+        connect(m_cache, &FirmwareAssetCache::checkFinished,
+                this, &FirmwareUpdater::onCheckFinished);
+        connect(m_cache, &FirmwareAssetCache::downloadFinished,
+                this, &FirmwareUpdater::onDownloadFinished);
+        connect(m_cache, &FirmwareAssetCache::downloadFailed,
+                this, &FirmwareUpdater::onDownloadFailed);
+    }
+
+#ifdef DECENZA_SIMULATOR
+    m_simulatedFlashTransport = new FirmwareFlashSimulator(this);
+    connect(m_simulatedFlashTransport, &DE1Transport::dataReceived, this,
+        [this](const QBluetoothUuid& uuid, const QByteArray& data) {
+            if (!m_simulatedFlash || uuid != DE1::Characteristic::FW_MAP_REQUEST) return;
+            const auto map = parseFWMapNotification(data);
+            if (map) onFwMapResponse(map->windowIncrement, map->fwToErase, map->fwToMap,
+                QByteArray(reinterpret_cast<const char*>(map->firstError.data()), 3));
+        });
+#endif
+    if (m_device) {
+        connect(m_device, &DE1Device::fwMapResponse, this,
+            [this](uint16_t window, uint8_t erase, uint8_t map, const QByteArray& error) {
+                if (!m_simulatedFlash) onFwMapResponse(window, erase, map, error);
+            });
+        connect(m_device, &DE1Device::connectedChanged,
+                this, &FirmwareUpdater::onDeviceConnectionChanged);
+        // Re-pull installedVersion when the DE1 reports a new firmware
+        // build number (happens once on connect when MMR 0x800010 is parsed,
+        // and again after a successful flash + reboot). Without this, the
+        // Settings → Firmware tab would show "—" for the first 30 seconds
+        // after app start (until the scheduled check runs) even when the
+        // DE1 has long since reported its version.
+        connect(m_device, &DE1Device::firmwareVersionChanged,
+                this, &FirmwareUpdater::onDeviceFirmwareVersionChanged);
+        connect(m_device, &DE1Device::simulationModeChanged,
+                this, &FirmwareUpdater::isSimulatedChanged);
+        // The writeComplete subscription is deferred to beginErasePhase —
+        // at construction time m_device->transport() is still null (the
+        // BLE transport is attached later, when the user connects the DE1),
+        // so a connect here would silently no-op and we'd never receive
+        // ACK signals.
+    }
+    // Physical and simulated devices both own their current build number.
+    // Keep this default here so application wiring and tests use the same readback.
+    setInstalledVersionProvider([this]() -> uint32_t {
+        const int build = m_device ? m_device->firmwareBuildNumber() : 0;
+        return build > 0 ? static_cast<uint32_t>(build) : 0;
+    });
+}
+
+void FirmwareUpdater::onDeviceFirmwareVersionChanged() {
+    if (!m_installedVersionProvider) return;
+    const uint32_t v = m_installedVersionProvider();
+    if (v != m_installedVersion) {
+        m_installedVersion = v;
+        DIAG_CDEBUG(DE1, "Firmware", firmwareLog) << "installed version refreshed:" << v;
+        emit installedVersionChanged();
+    }
+
+    // Post-reboot version arrival confirms AwaitingReboot/verify-reconnect
+    // outcome. onDeviceConnectionChanged runs at BLE connect, but on a real
+    // DE1 the MMR 0x800010 read that feeds this version number lands after
+    // the connect signal, so the connect-time check misses it. Catch the
+    // version arrival here so we don't time out the grace window while the
+    // DE1 is actually running the new firmware — or while it's running the
+    // old firmware and we should tell the user to power-cycle.
+    //
+    // m_flashCompleted=true ensures we can retroactively succeed from the
+    // Failed state too: if the grace window expired while the DE1 was
+    // booting and the user eventually gets the new firmware, flip to
+    // Succeeded rather than forcing a re-flash.
+    const bool retroactiveFromFailed =
+        m_state == State::Failed && m_flashCompleted;
+    if ((m_verifyingAmbiguous || retroactiveFromFailed) && v > 0) {
+        // Exact match, not >=. For a downgrade (target < old), the
+        // `>= target` test passes on the *stale* pre-flash version and
+        // flips the state to Succeeded before the DE1 has actually
+        // rebooted — the installed UI then briefly shows the wrong number
+        // when the real MMR read arrives. Only the exact target version
+        // is proof the DE1 has booted into the new bank.
+        if (v == m_availableVersion) {
+            if (retroactiveFromFailed) {
+                DIAG_CWARN(DE1, "Firmware", firmwareLog)
+                    << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+                    << "retroactive success: DE1 reconnected on v" << v
+                    << "after failure — flashing actually worked";
+                m_errorMessage.clear();
+                m_retryAvailable = false;
+            }
+            completeSuccess();  // clears flags + timers
+        } else if (m_verifyingAmbiguous) {
+            // DE1 booted into something other than target firmware.
+            // Prompt power-cycle rather than waiting for the grace-timeout
+            // failure. Covers upgrades stuck on old (v < target) AND
+            // downgrades stuck on old (v > target).
+            m_verifyDisconnectGrace.stop();
+            if (m_state != State::AwaitingReboot) {
+                setProgress(1.0);
+                setState(State::AwaitingReboot);
+            }
+            if (!m_needsManualReboot) {
+                m_needsManualReboot = true;
+                emit needsManualRebootChanged();
+                DIAG_CWARN(DE1, "Firmware", firmwareLog)
+                    << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+                    << "DE1 reports old version" << v
+                    << "after flash — prompting user to power-cycle";
+            }
+            // Leave m_verifyingAmbiguous=true so a later disconnect+
+            // reconnect after the user power-cycles re-runs the check.
+        }
+    }
+}
+
+void FirmwareUpdater::onDeviceConnectionChanged() {
+    if (!m_device) return;
+
+    // Reconnect path. If we were in ambiguous-verify (disconnected during
+    // the verify or AwaitingReboot phase), confirm success only when the
+    // installed version exactly matches the target. On a real DE1 the
+    // `firmwareBuildNumber` at reconnect time is the *cached* pre-flash
+    // value — it only refreshes once the post-reconnect MMR 0x800010 read
+    // lands (hundreds of ms later). An earlier `>=` check here flipped
+    // downgrades to Succeeded off the stale cached value, so the UI
+    // briefly showed the wrong installed version. Let
+    // onDeviceFirmwareVersionChanged handle the actual decision once a
+    // fresh read arrives. We only short-circuit to success here if the
+    // cached value already happens to match the target (e.g. race-guard
+    // path, or a very fast MMR refresh).
+    if (m_device->isConnected()) {
+        if (m_verifyingAmbiguous) {
+            const uint32_t installed = m_installedVersionProvider
+                ? m_installedVersionProvider() : m_installedVersion;
+            m_installedVersion = installed;
+            if (installed == m_availableVersion && installed > 0) {
+                // Cached value already matches target — either a very
+                // fast MMR refresh or a race-guard-style no-op flash.
+                completeSuccess();  // clears m_verifyingAmbiguous + timers
+            }
+            // Otherwise: defer to onDeviceFirmwareVersionChanged once a
+            // fresh MMR read arrives. Mismatch decision (stuck on old
+            // firmware → prompt power-cycle) lives there too, where v
+            // is guaranteed to be a fresh post-reconnect read.
+        }
+        return;
+    }
+
+    // Disconnect path. Only acts on phases that are actively talking to the
+    // DE1. Idle / Ready / Succeeded / Failed ignore disconnects.
+    switch (m_state) {
+        case State::Erasing:
+        case State::Uploading:
+            failWith(QStringLiteral("DE1 disconnected during firmware update"),
+                     /*retryable*/ true);
+            break;
+        case State::Verifying:
+        case State::AwaitingReboot:
+            // Ambiguous — don't classify yet. Open the grace window to see
+            // whether the device comes back reporting the new version
+            // (user power-cycled) or stays away / comes back with the old
+            // version (genuine failure).
+            m_verifyingAmbiguous = true;
+            m_verifyTimeoutTimer.stop();
+            m_verifyDisconnectGrace.start(m_verifyDisconnectGraceMs);
+            break;
+        default:
+            break;
+    }
+}
+
+void FirmwareUpdater::onVerifyDisconnectGrace() {
+    if (!m_verifyingAmbiguous) return;
+    m_verifyingAmbiguous = false;
+    failWith(QStringLiteral("DE1 did not reconnect after verify"),
+             /*retryable*/ true);
+}
+
+FirmwareUpdater::~FirmwareUpdater() {
+    // If we're torn down mid-flash (e.g. app shutdown, test cleanup), the
+    // DE1Device likely outlives us — it's owned separately by main.cpp.
+    // Leaving m_firmwareFlashInProgress stuck on would silently drop every
+    // subsequent MMR write for the life of the process, with no obvious
+    // symptom at teardown time.
+    if (m_device && m_device->firmwareFlashInProgress()) {
+        m_device->setFirmwareFlashInProgress(false);
+    }
+}
+
+// ---- Injection hooks ----------------------------------------------------
+
+void FirmwareUpdater::setInstalledVersionProvider(std::function<uint32_t()> fn) {
+    m_installedVersionProvider = std::move(fn);
+    // Pull immediately in case DE1Device already reported its version
+    // before this provider was wired up (the firmwareVersionChanged signal
+    // fires once and is gone — there's no replay).
+    if (m_installedVersionProvider) {
+        const uint32_t v = m_installedVersionProvider();
+        if (v != m_installedVersion) {
+            m_installedVersion = v;
+            emit installedVersionChanged();
+        }
+    }
+}
+
+void FirmwareUpdater::setPreconditionProvider(std::function<bool()> fn) {
+    m_preconditionProvider = std::move(fn);
+}
+
+void FirmwareUpdater::setPostEraseWaitMs(int ms) { m_postEraseWaitMs = ms; }
+
+void FirmwareUpdater::setChunkPumpIntervalMs(int ms) {
+    m_chunkPumpIntervalMs = ms;
+    m_chunkPumpTimer.setInterval(ms);
+}
+
+void FirmwareUpdater::setEraseTimeoutMs(int ms)            { m_eraseTimeoutMs            = ms; }
+void FirmwareUpdater::setVerifyTimeoutMs(int ms)           { m_verifyTimeoutMs           = ms; }
+void FirmwareUpdater::setVerifyDisconnectGraceMs(int ms)   { m_verifyDisconnectGraceMs   = ms; }
+void FirmwareUpdater::setPostUploadSettleMs(int ms)        { m_postUploadSettleMs        = ms; }
+
+// ---- Read-only state helpers -------------------------------------------
+
+int FirmwareUpdater::installedVersion() const {
+    return static_cast<int>(m_installedVersion);
+}
+
+bool FirmwareUpdater::isSimulated() const {
+    return m_device && m_device->simulationMode();
+}
+
+QString FirmwareUpdater::stateText() const {
+    switch (m_state) {
+        case State::Idle:           return QStringLiteral("Idle");
+        case State::Checking:       return QStringLiteral("Checking for update");
+        case State::Downloading:    return QStringLiteral("Downloading firmware");
+        case State::Ready:           return QStringLiteral("Ready to install");
+        case State::Erasing:        return QStringLiteral("Erasing flash");
+        case State::Uploading:      return QStringLiteral("Uploading firmware");
+        case State::Verifying:      return QStringLiteral("Verifying");
+        case State::Succeeded:      return QStringLiteral("Update complete");
+        case State::Failed:         return QStringLiteral("Update failed");
+        case State::AwaitingReboot: return QStringLiteral("Power-cycle the DE1 to load new firmware");
+    }
+    return QString();
+}
+
+int FirmwareUpdater::estimatedUploadSecondsRemaining() const {
+    if (m_state != State::Uploading || !m_updateTimer.isValid() ||
+        m_chunksAcked <= 0 || m_chunksTotal <= 0) return -1;
+    if (m_chunksAcked >= m_chunksTotal) return 0;
+    const qint64 elapsedMs = m_updateTimer.elapsed() - m_uploadStartedMs;
+    if (elapsedMs <= 0) return -1;
+    // Average acknowledged throughput for this attempt, including BLE waits.
+    // Queueing chunks is much faster than sending them and cannot supply a rate.
+    const qint64 remainingMs = elapsedMs * (m_chunksTotal - m_chunksAcked) / m_chunksAcked;
+    return static_cast<int>((remainingMs + 999) / 1000);
+}
+
+void FirmwareUpdater::setState(State newState) {
+    if (m_state == newState) return;
+    DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+        << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+        << "state:" << stateText() << "->" << [&]{
+            const State old = m_state; m_state = newState;
+            const QString s = stateText(); m_state = old;
+            return s;
+        }();
+
+    // Defense in depth: the MMR-write guard on DE1Device is engaged by
+    // beginErasePhase() and cleared by completeSuccess()/failWith(). If
+    // anything else ever transitions out of an active-flash state (e.g.
+    // a future code path, test harness, or new caller), make sure the
+    // guard follows. Otherwise the guard stays engaged after the flash
+    // dies and every MMR write is silently dropped for the rest of the
+    // session.
+    const bool wasActiveFlash =
+        m_state == State::Erasing || m_state == State::Uploading ||
+        m_state == State::Verifying || m_state == State::AwaitingReboot;
+    const bool nowActiveFlash =
+        newState == State::Erasing || newState == State::Uploading ||
+        newState == State::Verifying || newState == State::AwaitingReboot;
+    if (wasActiveFlash && !nowActiveFlash && m_device &&
+        m_device->firmwareFlashInProgress()) {
+        DIAG_CWARN(DE1, "Firmware", firmwareLog)
+            << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+            << "leaving active-flash state without completeSuccess/"
+               "failWith — clearing MMR guard as a safety net";
+        m_device->setFirmwareFlashInProgress(false);
+    }
+
+    m_state = newState;
+    emit stateChanged();
+}
+
+void FirmwareUpdater::setProgress(double p) {
+    if (p < 0.0) p = 0.0;
+    if (p > 1.0) p = 1.0;
+    if (qFuzzyCompare(1.0 + m_progress, 1.0 + p)) return;
+    m_progress = p;
+    emit progressChanged();
+}
+
+// ---- Public actions -----------------------------------------------------
+
+void FirmwareUpdater::checkForUpdate() {
+    if (!m_cache) return;
+    if (m_state == State::Checking || m_state == State::Downloading) return;
+    // Refuse while a flash is actually running. The periodic check schedule
+    // (see MainController::MainController: 30 s after first launch, then
+    // once per week) can fire at any point — including mid-flash if the
+    // user started an update after the tablet had been idle long enough
+    // for the weekly cadence to elapse. Without this guard, the check
+    // would setState(Checking), blow away the in-flight Erasing/Uploading/
+    // Verifying/AwaitingReboot state machine, leave the DE1Device
+    // firmware-flash MMR guard stuck engaged, and silently stall the flash
+    // while the user thinks it's running. Skip the check — the user will
+    // see fresh installed/available numbers on the next tick after the
+    // flash completes.
+    if (m_state == State::Erasing || m_state == State::Uploading ||
+        m_state == State::Verifying || m_state == State::AwaitingReboot) {
+        DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+            << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+            << "check skipped (flash in progress, state="
+            << stateText() << ")";
+        return;
+    }
+    if (!m_updateTimer.isValid()) m_updateTimer.start();  // reset for a fresh check
+    const uint32_t installed = m_installedVersionProvider
+        ? m_installedVersionProvider() : m_installedVersion;
+    m_installedVersion = installed;
+    DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+        << formatElapsed(m_updateTimer.elapsed())
+        << "check started, installed=" << installed;
+    setState(State::Checking);
+    m_cache->checkForUpdate(installed);
+}
+
+void FirmwareUpdater::startUpdate() {
+    if (!m_cache || !m_device) return;
+
+    // Refuse to re-enter while a flash is already running. Same reasoning as
+    // checkForUpdate() — a stray invocation (MCP, double-tapped UI button,
+    // remote control) would reset the flags, setState(Downloading), and
+    // bulldoze the in-flight state machine without cleanly tearing down
+    // the BLE chunk pump or clearing DE1Device's MMR-write guard.
+    if (m_state == State::Erasing || m_state == State::Uploading ||
+        m_state == State::Verifying || m_state == State::AwaitingReboot ||
+        m_state == State::Downloading) {
+        DIAG_CWARN(DE1, "Firmware", firmwareLog)
+            << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+            << "startUpdate ignored (flash already in progress, state="
+            << stateText() << ")";
+        return;
+    }
+
+    // Reset carry-over state from any prior attempt (e.g. a previous
+    // verify-disconnect-grace failure) so residual flags don't corrupt the
+    // next cycle's ambiguous-verify/AwaitingReboot logic.
+    m_verifyingAmbiguous = false;
+    m_flashCompleted = false;
+    m_verifyRequestAcked = false;
+    m_verifyTimedOut = false;
+    m_verifyDisconnectGrace.stop();
+    if (m_needsManualReboot) {
+        m_needsManualReboot = false;
+        emit needsManualRebootChanged();
+    }
+
+    // Precondition: delegate to the caller-supplied predicate. If unset,
+    // treat as "yes, allow" so unit tests can skip the check when they're
+    // focused on later phases.
+    if (m_preconditionProvider && !m_preconditionProvider()) {
+        // Precondition failure — user can retry once the shot/steam
+        // finishes. Not the same as a permanently-bad firmware file.
+        m_errorMessage = QStringLiteral("Finish current operation first");
+        m_retryAvailable = true;
+        setState(State::Failed);
+        return;
+    }
+
+    // Reset the elapsed clock so the log prefix for this flash attempt
+    // starts at [+00:00.000] — gives reviewers a crisp "how long did
+    // each phase take" reading without mental math across sessions.
+    m_updateTimer.restart();
+    setProgress(0.0);
+
+    // Download (or short-circuit if already cached and valid).
+    setState(State::Downloading);
+    m_cache->downloadIfNeeded();
+}
+
+void FirmwareUpdater::retry() {
+    if (!m_retryAvailable) return;
+    m_errorMessage.clear();
+    m_retryAvailable = false;
+    setProgress(0.0);
+    startUpdate();
+}
+
+void FirmwareUpdater::dismissLingeringFailure() {
+    if (m_state != State::Failed) return;
+    m_errorMessage.clear();
+    m_retryAvailable = false;
+    setProgress(0.0);
+    setState(State::Idle);
+}
+
+void FirmwareUpdater::dismissAvailability() {
+    if (!m_updateAvailable) return;
+    // Pin the dismissed version so a subsequent check that returns the
+    // same remote version doesn't re-open the banner. A strictly newer
+    // version clears the pin in onCheckFinished.
+    m_dismissedVersion = m_availableVersion;
+    m_updateAvailable = false;
+    emit availabilityChanged();
+}
+
+// ---- Asset-cache callbacks ---------------------------------------------
+
+void FirmwareUpdater::onCheckFinished(FirmwareAssetCache::CheckResult result) {
+    if (m_state != State::Checking && m_state != State::Idle) return;
+    if (result.kind == FirmwareAssetCache::CheckResult::Error) {
+        m_availableVersion = 0;
+        m_availableVersionLabel.clear();
+        m_availableChannelLabel.clear();
+        m_availableReleaseNotes.clear();
+        m_updateAvailable = false;
+        m_isDowngrade = false;
+        m_isReflash = false;
+        emit availabilityChanged();
+        failWith(QStringLiteral("The firmware file is not valid. Please report this."),
+                 /*retryable*/ false);
+        return;
+    }
+    m_availableVersion = result.remoteVersion;
+    m_availableVersionLabel = result.versionLabel.isEmpty()
+        ? (result.remoteVersion > 0 ? QString::number(result.remoteVersion) : QString())
+        : result.versionLabel;
+    m_availableChannelLabel = result.channelLabel;
+    m_availableReleaseNotes = result.releaseNotes;
+    // updateAvailable reflects the pure version comparison, so users
+    // can still see what *would* be flashable against a real DE1.
+    const bool offersFlash =
+        (result.kind == FirmwareAssetCache::CheckResult::Newer ||
+         result.kind == FirmwareAssetCache::CheckResult::Older);
+    m_isDowngrade = (result.kind == FirmwareAssetCache::CheckResult::Older);
+    // Same build is not an "update available" — the banner stays quiet — but
+    // it is still flashable, so the QML labels and warns off this flag rather
+    // than off updateAvailable.
+    m_isReflash   = (result.kind == FirmwareAssetCache::CheckResult::Same);
+    if (offersFlash) {
+        // The dismissed-version pin applies to both directions: once the
+        // user hides the banner for a given remote version, don't re-open
+        // it until the remote version changes (in either direction).
+        if (result.remoteVersion != m_dismissedVersion) {
+            m_dismissedVersion = 0;
+            m_updateAvailable  = true;
+        } else {
+            m_updateAvailable  = false;
+        }
+    } else {
+        m_updateAvailable = false;
+    }
+    DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+        << "check finished: remote=" << result.remoteVersion
+        << " kind=" << (result.kind == FirmwareAssetCache::CheckResult::Newer ? "Newer"
+                       : result.kind == FirmwareAssetCache::CheckResult::Older ? "Older"
+                       : result.kind == FirmwareAssetCache::CheckResult::Same  ? "Same"
+                                                                                : "Error")
+        << " updateAvailable=" << m_updateAvailable
+        << " isDowngrade=" << m_isDowngrade
+        << " isReflash=" << m_isReflash
+        << (result.errorDetail.isEmpty() ? QString() : QStringLiteral(" err=") + result.errorDetail);
+    emit availabilityChanged();
+    setState(State::Idle);
+}
+
+void FirmwareUpdater::onDownloadFinished(QString path, Header header) {
+    Q_UNUSED(path);
+    Q_UNUSED(header);
+    if (m_state != State::Downloading) return;
+
+    // No version gate. de1app has none either — every version check in
+    // start_firmware_update (de1_comms.tcl:884-895) is commented out, so its
+    // update button flashes whatever is in bootfwupdate.dat regardless of
+    // what the machine reports. This used to short-circuit an equal version
+    // to Succeeded without writing anything, which made the one case that
+    // most needs a flash — a bank that verified but did not take, so the DE1
+    // still runs the old image while reporting the new build — unreachable
+    // from the UI. Re-flashing the same build is safe for the same reason a
+    // failed update is: the write lands in the inactive bank and the active
+    // one is untouched until verify passes. The UI warns instead of blocking.
+    const uint32_t currentInstalled = m_installedVersionProvider
+        ? m_installedVersionProvider() : m_installedVersion;
+    m_installedVersion = currentInstalled;
+
+    m_availableVersion = header.version;
+    if (m_availableVersionLabel.isEmpty()) {
+        m_availableVersionLabel = QString::number(header.version);
+    }
+    if (m_cache) {
+        if (m_availableChannelLabel.isEmpty()) {
+            m_availableChannelLabel = m_cache->selectedChannelLabel();
+        }
+        if (m_availableReleaseNotes.isEmpty()) {
+            m_availableReleaseNotes = m_cache->selectedReleaseNotes();
+        }
+    }
+    emit availabilityChanged();
+    setState(State::Ready);
+    beginErasePhase();
+}
+
+void FirmwareUpdater::onDownloadFailed(QString reason) {
+    if (m_state != State::Downloading) return;
+    if (m_cache && m_cache->usesBundledSource()) {
+        DIAG_CWARN(DE1, "Firmware", firmwareLog)
+            << "bundled source validation failed:" << reason;
+        failWith(QStringLiteral("The firmware file is not valid. Please report this."),
+                 /*retryable*/ false);
+        return;
+    }
+    failWith(reason, /*retryable*/ true);
+}
+
+// ---- Phase 1: Erase ----------------------------------------------------
+
+void FirmwareUpdater::beginErasePhase() {
+    m_simulatedFlash = isSimulated();
+    m_activeFlashTransport = m_simulatedFlash ? m_simulatedFlashTransport
+                                             : (m_device ? m_device->transport() : nullptr);
+    if (!m_device || !m_activeFlashTransport) {
+        failWith(QStringLiteral("No DE1 transport configured"), false);
+        return;
+    }
+    m_eraseInProgressSeen = false;
+    m_eraseRequestAcked   = false;
+
+    // Subscribe to write ACKs before the erase request goes out, so its own
+    // ACK is observed. Deferred until beginUploadPhase() originally, which
+    // was late enough that the erase phase had no way to tell a notification
+    // caused by this erase from one left over from a previous phase.
+    // Qt::UniqueConnection so retries don't stack handlers.
+    if (auto* t = flashTransport()) {
+        connect(t, &DE1Transport::writeComplete,
+                this, &FirmwareUpdater::onFirmwareWriteAcked,
+                Qt::UniqueConnection);
+        connect(t, &DE1Transport::writeAbandoned,
+                this, &FirmwareUpdater::onFirmwareWriteAbandoned,
+                Qt::UniqueConnection);
+    }
+
+    // Engage the MMR-write guard on the device *before* we subscribe or
+    // write anything. Firmware chunks share the WRITE_TO_MMR characteristic
+    // with regular MMR writes (distinguished only by the length byte), so a
+    // stray MMR write interleaved with chunks would corrupt the flash. The
+    // guard is cleared in completeSuccess() and failWith().
+    m_device->setFirmwareFlashInProgress(true);
+    setProgress(0.0);
+    m_waitingForSleepAck = true;
+    setState(State::Erasing);
+    // DE1app's firmware-mode reconnect and Decaid's firmware prelude both
+    // request Sleep before erasing. Use the normal serialized write path and
+    // its ACK/abandonment, keeping the flash guard engaged throughout.
+    if (m_simulatedFlash) m_activeFlashTransport->clearQueue();
+    m_device->requestFirmwareSleep();
+    if (m_simulatedFlash)
+        m_activeFlashTransport->write(DE1::Characteristic::REQUESTED_STATE,
+            QByteArray(1, static_cast<char>(DE1::State::Sleep)));
+}
+
+DE1Transport* FirmwareUpdater::flashTransport() const { return m_activeFlashTransport; }
+
+void FirmwareUpdater::subscribeFlashNotifications() {
+    if (m_simulatedFlash) flashTransport()->subscribe(DE1::Characteristic::FW_MAP_REQUEST);
+    else m_device->subscribeFirmwareNotifications();
+}
+
+void FirmwareUpdater::writeFlashMap(uint8_t erase, std::array<uint8_t, 3> firstError) {
+    if (m_simulatedFlash)
+        flashTransport()->write(DE1::Characteristic::FW_MAP_REQUEST, buildFWMapRequest(erase, 1, firstError));
+    else m_device->writeFWMapRequest(erase, 1, firstError);
+}
+
+void FirmwareUpdater::sendEraseRequest() {
+    subscribeFlashNotifications();
+    writeFlashMap(1);
+
+    // The DE1 tells us when the erase is done; prefer that over the clock.
+    // The erase-complete notification (fwToErase=0, fwToMap=1) starts the
+    // chunk pump as soon as it lands — reaprime/decaid does the same, and a
+    // captured DE1+/PCB 1.3 flash reported it at +1.31 s against a 10 s
+    // wait. The timer stays as the fallback rather than the sole source of
+    // truth, because the notification can genuinely fail to arrive: the
+    // A009 CCCD subscription is fragile enough that verify has to re-subscribe
+    // (see beginVerifyPhase), and de1app gates on nothing at all. So a
+    // dropped notification costs the old fixed delay instead of hanging in
+    // Erasing forever.
+    DIAG_CDEBUG(DE1, "Firmware", firmwareLog) << "erase command sent, waiting for "
+                            "erase-complete notification or"
+                         << m_postEraseWaitMs << "ms, whichever is first";
+    if (m_postEraseWaitMs <= 0) {
+        onPostEraseWaitComplete();
+    } else {
+        m_postEraseWaitTimer.start(m_postEraseWaitMs);
+    }
+    // Belt-and-suspenders: if even the post-erase wait expires without us
+    // having moved on (shouldn't happen, but a safety net), the erase
+    // timeout still fires.
+    m_eraseTimeoutTimer.start(m_eraseTimeoutMs);
+}
+
+void FirmwareUpdater::onEraseTimeout() {
+    if (m_state != State::Erasing) return;
+    failWith(QStringLiteral("Erase did not complete. Retry, or power-cycle the DE1."),
+             /*retryable*/ true);
+}
+
+// ---- Phase 2: Upload ---------------------------------------------------
+
+void FirmwareUpdater::beginUploadPhase() {
+    loadCachedPayload();
+    if (m_firmwareBytes.isEmpty()) {
+        failWith(QStringLiteral("Firmware file missing or unreadable"), true);
+        return;
+    }
+    m_chunksTotal  = (m_firmwareBytes.size() + 15) / 16;  // ceil to 16-byte blocks
+    m_chunksQueued = 0;
+    m_chunksAcked  = 0;
+    m_uploadStartedMs = m_updateTimer.elapsed();
+
+    // Subscribe to the transport's per-write ACK now. Deferred to this
+    // point because m_device->transport() is not guaranteed to be set at
+    // FirmwareUpdater construction time — the transport is attached when
+    // the DE1 first connects, which may be after MainController wired us
+    // up. By the time we reach beginUploadPhase the transport is alive
+    // (we just completed the erase handshake through it). Use a
+    // Qt::UniqueConnection so repeated updates (retry, second firmware
+    // cycle) don't stack handlers.
+    if (auto* t = flashTransport()) {
+        connect(t, &DE1Transport::writeComplete,
+                this, &FirmwareUpdater::onFirmwareWriteAcked,
+                Qt::UniqueConnection);
+    } else {
+        DIAG_CWARN(DE1, "Firmware", firmwareLog) << "beginUploadPhase: no transport — "
+                                  "progress/verify will stall";
+    }
+
+    setProgress(0.0);
+    setState(State::Uploading);
+    m_chunkPumpTimer.start();
+}
+
+void FirmwareUpdater::loadCachedPayload() {
+    if (!m_cache) {
+        m_firmwareBytes.clear();
+        return;
+    }
+    QFile f(m_cache->cachePath());
+    if (!f.open(QIODevice::ReadOnly)) {
+        m_firmwareBytes.clear();
+        return;
+    }
+    m_firmwareBytes = f.readAll();
+
+    // Fingerprint what we are about to write to flash. The cache now rejects
+    // a spliced file before it gets here (FirmwareAssetCache::versionMatchesMeta
+    // on the resume path, plus the size ceiling and structural checks in
+    // validateFile), so this is no longer the only line of defence — but it is
+    // the only one that states, in a submitted log, exactly which bytes went
+    // to the machine. Compare against the selected Decaid manifest entry.
+    const QByteArray digest =
+        QCryptographicHash::hash(m_firmwareBytes, QCryptographicHash::Sha256).toHex();
+    auto header = DE1::Firmware::parseHeader(m_firmwareBytes);
+    DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+        << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+        << "payload:" << m_firmwareBytes.size() << "bytes sha256="
+        << QString::fromLatin1(digest)
+        << "version=" << (header ? header->version : 0)
+        << "byteCount=" << (header ? header->byteCount : 0)
+        << "cpuBytes=" << (header ? header->cpuBytes : 0);
+}
+
+void FirmwareUpdater::onChunkPumpTick() {
+    if (m_state != State::Uploading) {
+        m_chunkPumpTimer.stop();
+        return;
+    }
+    if (m_chunksQueued >= m_chunksTotal) {
+        // All chunks are *queued* into BleTransport. Don't trigger verify
+        // here — wait until onFirmwareWriteAcked sees the last ACK arrive
+        // (m_chunksAcked == m_chunksTotal). The ACK-driven trigger means
+        // the user-visible progress bar keeps climbing smoothly to 100 % as
+        // each ACK clears the wire, instead of jumping to 100 % the moment
+        // we queue the last chunk and then freezing silently for minutes.
+        m_chunkPumpTimer.stop();
+        DIAG_CDEBUG(DE1, "Firmware", firmwareLog) << "upload queued to BLE ("
+                             << m_chunksTotal << "chunks), waiting for ACKs";
+        return;
+    }
+    const qsizetype byteOffset = m_chunksQueued * 16;
+    QByteArray payload = m_firmwareBytes.mid(byteOffset, 16);
+    if (payload.size() < 16) {
+        payload.append(QByteArray(16 - payload.size(), char(0xFF)));  // pad tail
+    }
+    if (m_simulatedFlash)
+        flashTransport()->write(DE1::Characteristic::WRITE_TO_MMR,
+            buildChunk(static_cast<uint32_t>(byteOffset), payload));
+    else
+        m_device->writeFirmwareChunk(static_cast<uint32_t>(byteOffset), payload);
+    m_chunksQueued++;
+}
+
+void FirmwareUpdater::onFirmwareWriteAcked(const QBluetoothUuid& uuid,
+                                           const QByteArray& data) {
+    if (sender() && sender() != m_activeFlashTransport) return;
+    if (m_state == State::Erasing && m_waitingForSleepAck &&
+        uuid == DE1::Characteristic::REQUESTED_STATE &&
+        data == QByteArray(1, static_cast<char>(DE1::State::Sleep))) {
+        m_waitingForSleepAck = false;
+        sendEraseRequest();
+        return;
+    }
+    if (m_state == State::Verifying && uuid == DE1::Characteristic::FW_MAP_REQUEST &&
+        data == buildFWMapRequest(0, 1, {0xFF, 0xFF, 0xFF})) {
+        if (!m_verifyRequestAcked) {
+            m_verifyRequestAcked = true;
+            // Time the DE1's response, not the shared GATT queue's backlog.
+            m_verifyTimeoutTimer.start(m_verifyTimeoutMs);
+        }
+        return;
+    }
+    // The erase request's own ACK is what proves this erase cycle has begun.
+    // Until it lands, an A009 notification in state Erasing cannot have been
+    // caused by our request — see onFwMapResponse.
+    if (m_state == State::Erasing && !m_waitingForSleepAck &&
+        uuid == DE1::Characteristic::FW_MAP_REQUEST &&
+        data == buildFWMapRequest(1, 1)) {
+        m_eraseRequestAcked = true;
+        return;
+    }
+
+    if (m_state != State::Uploading) return;
+    // Filter: only count ACKs for 20-byte WriteToMMR packets carrying the
+    // firmware-chunk length byte (16). Skips any other traffic that might
+    // share the WRITE_TO_MMR characteristic during the upload window, and
+    // avoids double-counting the FWMapRequest writes on A009.
+    if (uuid != DE1::Characteristic::WRITE_TO_MMR) return;
+    if (data.size() != 20) return;
+    if (static_cast<uint8_t>(data[0]) != 16) return;
+
+    m_chunksAcked++;
+
+    // Heartbeat log every 5 % of the upload so `[firmware]` in the log
+    // has a visible trail during what can be a 5–10 minute BLE-serialised
+    // upload on Android, instead of going silent between "upload queued"
+    // and "all ... ACKed".
+    const qsizetype fivePercent = qMax<qsizetype>(m_chunksTotal / 20, 1);
+    if (m_chunksAcked % fivePercent == 0) {
+        // qRound (not int-truncation) so the 5% boundary prints "5%" rather
+        // than "4%" (1449/28992 = 4.9985...).
+        DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+            << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+            << "upload progress:"
+            << m_chunksAcked << "/" << m_chunksTotal
+            << "(" << qRound(100.0 * m_chunksAcked / m_chunksTotal) << "%)";
+    }
+
+    const double uploadFrac = double(m_chunksAcked) / double(m_chunksTotal);
+    setProgress(uploadFrac);
+
+    if (m_chunksAcked >= m_chunksTotal) {
+        DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+            << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+            << "all" << m_chunksTotal
+            << "chunks ACKed, settling"
+            << m_postUploadSettleMs << "ms before verify";
+        QTimer::singleShot(m_postUploadSettleMs, this, [this]() {
+            if (m_state == State::Uploading) beginVerifyPhase();
+        });
+    }
+}
+
+// ---- Phase 3: Verify ---------------------------------------------------
+
+void FirmwareUpdater::onFirmwareWriteAbandoned(const QBluetoothUuid& uuid,
+                                               const QByteArray& data) {
+    if (sender() && sender() != m_activeFlashTransport) return;
+    if (m_state == State::Erasing && m_waitingForSleepAck &&
+        uuid == DE1::Characteristic::REQUESTED_STATE &&
+        data == QByteArray(1, static_cast<char>(DE1::State::Sleep))) {
+        failWith(QStringLiteral("Could not put DE1 to sleep before firmware update"), true);
+        return;
+    }
+    if (m_state == State::Verifying && uuid == DE1::Characteristic::FW_MAP_REQUEST &&
+        data == buildFWMapRequest(0, 1, {0xFF, 0xFF, 0xFF})) {
+        failWith(QStringLiteral("Could not send firmware verification request to DE1"), true);
+    }
+}
+
+void FirmwareUpdater::beginVerifyPhase() {
+    if (!m_device) return;
+    m_verifyRequestAcked = false;
+    m_verifyTimedOut = false;
+    setState(State::Verifying);
+    setProgress(1.0);
+
+    // Match de1app's exact ordering: re-enable A009 notifications RIGHT
+    // before sending the verify request (de1_comms.tcl:991). The heavy
+    // upload-write burst can invalidate the CCCD subscription on Android
+    // BLE, and the bootloader appears to re-arm its notification handlers
+    // after the write phase. Calling subscribe here is the single change
+    // that distinguishes "no verify response" from "success notification
+    // arrives within seconds". Note that de1app also leaves the original
+    // erase-phase subscription disabled (line 903 commented out) — but
+    // we keep ours active for diagnostic visibility into the erase-done
+    // notification, which has no protocol cost.
+    subscribeFlashNotifications();
+    writeFlashMap(0, {0xFF, 0xFF, 0xFF});
+}
+
+void FirmwareUpdater::onVerifyTimeout() {
+    if (m_state != State::Verifying || !m_verifyRequestAcked) return;
+    m_verifyTimedOut = true;
+    failWith(QStringLiteral("No response from DE1 during verify"), true);
+}
+
+// ---- fwMapResponse router ----------------------------------------------
+
+void FirmwareUpdater::onFwMapResponse(uint16_t windowIncrement, uint8_t fwToErase,
+                                     uint8_t fwToMap, QByteArray firstError) {
+    DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+        << "fwMapResponse received: windowIncrement=" << windowIncrement
+        << "erase=" << fwToErase
+        << "map=" << fwToMap << "firstError=" << firstError.toHex(' ');
+
+    if (m_state == State::Erasing) {
+        if (fwToErase == 1) {
+            // "Still erasing." Older firmware emits this before the
+            // completion notification; v1333+ skips it. Informational.
+            m_eraseInProgressSeen = true;
+            return;
+        }
+        if (windowIncrement != 0 || fwToMap != 1) {
+            return;  // not the erase-complete shape
+        }
+        if (!m_eraseRequestAcked) {
+            // Our erase request has not been ACKed yet, so this notification
+            // cannot be its answer. A terminal VERIFY notification has the
+            // identical shape (windowIncrement 0, erase 0, map 1), and the
+            // retry path makes that reachable: a verify that timed out at 60 s
+            // leaves the DE1 still scanning, the user taps Retry, and the late
+            // verify response lands in the new Erasing window. Acting on it
+            // would stream the whole upload into a bank still being erased —
+            // the exact failure this phase exists to avoid.
+            DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+                << "ignoring A009 notification before the erase request "
+                   "was ACKed (stale response from a previous phase): firstError="
+                << firstError.toHex(' ');
+            return;
+        }
+        // Erase complete. Deliberately does NOT test firstError: the DE1
+        // echoes back whatever we put in that field on the erase request
+        // (we send 0,0,0 and get 0,0,0 — captured flash, DE1+/PCB 1.3), so
+        // comparing it to a constant tests our own outbound bytes, not the
+        // machine. decaid's _isEraseComplete does exactly that against
+        // 0xFF,0xFF,0xFF because 0xFF,0xFF,0xFF is what it happens to send.
+        DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+            << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+            << "erase-complete notification — starting chunk pump "
+               "without waiting out the remaining"
+            << m_postEraseWaitTimer.remainingTime() << "ms";
+        m_postEraseWaitTimer.stop();
+        onPostEraseWaitComplete();
+        return;
+    }
+
+    const bool lateVerify = m_state == State::Failed && m_verifyTimedOut && m_verifyRequestAcked;
+    if (m_state == State::Verifying || lateVerify) {
+        // A notification is a verdict only when all four of these hold, which
+        // is reaprime/decaid's `_isTerminalVerificationResponse`
+        // (unified_de1.firmware.dart:142-147): WindowIncrement == 0,
+        // fwToErase == 0, fwToMap == 1, and FirstError != FF FF FF.
+        //
+        // The last condition is the one that is easy to drop and expensive to
+        // get wrong. FF FF FF is the bootloader's "no error found" value, and
+        // it is also what we ourselves write into the verify request
+        // (beginVerifyPhase) — the DE1 echoes that field back, as the erase
+        // phase above shows. So an in-progress verify notification carries
+        // FF FF FF with WindowIncrement == 0 and fwToMap == 1, passes any
+        // filter built on the first three conditions, compares unequal to
+        // FF FF FD, and reports "Verification failed at block 255.255.255"
+        // on a flash that was still verifying. Success is FF FF FD and a real
+        // failure carries a real address; FF FF FF is neither.
+        //
+        // Keep waiting; the verify timeout is the backstop if no verdict ever
+        // arrives.
+        const QByteArray noErrorYet = QByteArray::fromHex("FFFFFF");
+        if (windowIncrement != 0 || fwToErase != 0 || fwToMap != 1 ||
+            firstError == noErrorYet) {
+            DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+                << "ignoring non-terminal verify notification: "
+                   "windowIncrement=" << windowIncrement << "erase=" << fwToErase
+                << "map=" << fwToMap << "firstError=" << firstError.toHex(' ');
+            return;
+        }
+        m_verifyTimeoutTimer.stop();
+        const QByteArray expected = QByteArray::fromHex("FFFFFD");
+        if (firstError == expected) {
+            if (m_simulatedFlash) {
+                // A simulated reboot applies the version locally; never ask the
+                // user to power-cycle physical hardware for a simulated flash.
+                m_device->setSimulatedFirmwareBuild(m_availableVersion);
+                completeSuccess();
+                return;
+            }
+            if (lateVerify) {
+                m_errorMessage.clear();
+                m_retryAvailable = false;
+                m_verifyTimedOut = false;
+                m_device->setFirmwareFlashInProgress(true);
+                DIAG_INFO(DE1, "Firmware") << "Late verification succeeded; power-cycle the DE1 to load the firmware";
+            }
+            // Don't claim success yet. The bootloader says the new bank
+            // verifies, but in practice the DE1 doesn't auto-reboot — on
+            // every captured flash (both upgrade and downgrade) the
+            // machine stays on the old firmware until the user power-
+            // cycles. Prompt immediately; we still wait for an actual
+            // disconnect + reconnect with the expected version before
+            // calling completeSuccess().
+            //
+            // m_flashCompleted persists through a spurious Failed if the
+            // grace window times out mid-boot — lets us retroactively
+            // succeed when the DE1 eventually does come back on the new
+            // firmware (vs. forcing the user to re-flash via Retry).
+            m_verifyingAmbiguous = true;
+            m_flashCompleted = true;
+            m_needsManualReboot = true;
+            emit needsManualRebootChanged();
+            DIAG_CDEBUG(DE1, "Firmware", firmwareLog)
+                << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+                << "verify OK — prompting user to power-cycle";
+            setProgress(1.0);
+            setState(State::AwaitingReboot);
+        } else {
+            m_verifyTimedOut = false;
+            const QString detail = QStringLiteral(
+                "Verification failed at block %1.%2.%3"
+            ).arg(uint8_t(firstError[0]))
+             .arg(uint8_t(firstError[1]))
+             .arg(uint8_t(firstError[2]));
+            failWith(detail, /*retryable*/ true);
+        }
+        return;
+    }
+}
+
+void FirmwareUpdater::onPostEraseWaitComplete() {
+    if (m_state != State::Erasing) return;
+    beginUploadPhase();
+}
+
+void FirmwareUpdater::completeSuccess() {
+    if (m_device) m_device->setFirmwareFlashInProgress(false);
+    m_verifyDisconnectGrace.stop();
+    m_verifyingAmbiguous = false;
+    m_flashCompleted = false;
+    if (m_needsManualReboot) {
+        m_needsManualReboot = false;
+        emit needsManualRebootChanged();
+    }
+    setProgress(1.0);
+    setState(State::Succeeded);
+    m_updateAvailable = false;
+    m_installedVersion = m_availableVersion;
+    emit availabilityChanged();
+    emit installedVersionChanged();
+}
+
+void FirmwareUpdater::failWith(const QString& reason, bool retryable) {
+    DIAG_CWARN(DE1, "Firmware", firmwareLog)
+        << formatElapsed(m_updateTimer.isValid() ? m_updateTimer.elapsed() : -1)
+        << "FAIL phase=" << stateText()
+        << " chunks acked=" << m_chunksAcked
+        << " queued=" << m_chunksQueued
+        << " total=" << m_chunksTotal
+        << " retry=" << (retryable ? "yes" : "no")
+        << " reason=" << reason;
+    if (m_simulatedFlash && m_activeFlashTransport) m_activeFlashTransport->clearQueue();
+    if (m_device) m_device->setFirmwareFlashInProgress(false);
+    m_waitingForSleepAck = false;
+    m_eraseTimeoutTimer.stop();
+    m_verifyTimeoutTimer.stop();
+    m_postEraseWaitTimer.stop();
+    m_chunkPumpTimer.stop();
+    m_verifyDisconnectGrace.stop();
+    m_verifyingAmbiguous = false;
+    if (m_needsManualReboot) {
+        m_needsManualReboot = false;
+        emit needsManualRebootChanged();
+    }
+    m_errorMessage   = reason;
+    m_retryAvailable = retryable;
+    setState(State::Failed);
+}

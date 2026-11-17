@@ -1,0 +1,500 @@
+#include "core/diagnosticlogging.h"
+#include "steamhealthtracker.h"
+#include "models/steamdatamodel.h"
+#include "core/settings.h"   // Settings::testQSettingsPath() under DECENZA_TESTING
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QDebug>
+#include <QUuid>
+#include <algorithm>
+#include <utility>
+
+SteamHealthTracker::SteamHealthTracker(QObject* parent)
+    : QObject(parent)
+{
+    auto history = loadHistory();
+    m_sessionCount = static_cast<int>(history.size());
+    m_lastWarnedSession = m_settings.value("steam/lastWarnedSession", -99).toInt();
+    m_lastSteamFlow = m_settings.value("steam/lastTrackedFlow", 0).toInt();
+    m_lastSteamTemp = m_settings.value("steam/lastTrackedTemp", 0).toInt();
+    m_pendingAutoReset = m_settings.value("steam/pendingAutoReset", false).toBool();
+    m_establishingAfterReset = m_settings.value("steam/establishingAfterReset", false).toBool();
+    // Safety: if session count has already accumulated past the threshold
+    // (e.g. user downgraded/upgraded across the feature), clear the stale
+    // "establishing after reset" flag so we don't lie about the state.
+    if (m_establishingAfterReset && m_sessionCount >= MIN_SESSIONS_FOR_TREND) {
+        m_establishingAfterReset = false;
+        m_settings.setValue("steam/establishingAfterReset", false);
+    }
+    if (!history.isEmpty()) {
+        updateCachedStats(history, m_lastSteamTemp);
+    }
+}
+
+SteamHealthTracker::BaselineState SteamHealthTracker::baselineState() const {
+    if (m_sessionCount <= 0) return Empty;
+    if (m_sessionCount >= MIN_SESSIONS_FOR_TREND) return Ready;
+    return m_establishingAfterReset ? EstablishingAfterReset : EstablishingInitial;
+}
+
+QStringList SteamHealthTracker::activeWarningKinds() const
+{
+    QStringList result;
+    for (const SteamHealthSnapshot::Warning& warning : m_warningSnapshot.activeWarnings)
+        result.append(SteamHealthSnapshot::kindName(warning.kind));
+    return result;
+}
+
+void SteamHealthTracker::beginSession()
+{
+    m_pressureWarningEmitted = false;
+    m_temperatureWarningEmitted = false;
+    m_warningSnapshot.sessionId = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
+    m_warningSnapshot.sessionActive = true;
+    m_warningSnapshot.activeWarnings.clear();
+    emit warningSnapshotChanged();
+}
+
+void SteamHealthTracker::endSession()
+{
+    if (!m_warningSnapshot.sessionActive)
+        return;
+    m_warningSnapshot.sessionActive = false;
+    emit warningSnapshotChanged();
+}
+
+void SteamHealthTracker::recordWarning(SteamHealthSnapshot::Kind kind, const QString& message)
+{
+    if (m_warningSnapshot.sessionId.isEmpty())
+        beginSession();
+    if (m_warningSnapshot.latestEventId >= SteamHealthSnapshot::MaximumExactJsonInteger)
+        return;
+
+    SteamHealthSnapshot::Warning warning;
+    warning.id = m_warningSnapshot.latestEventId + 1;
+    warning.sessionId = m_warningSnapshot.sessionId;
+    warning.kind = kind;
+    warning.message = message.left(SteamHealthSnapshot::MaximumMessageLength);
+    if (!SteamHealthSnapshot::appendBoundedEvent(&m_warningSnapshot, warning))
+        return;
+
+    if (SteamHealthSnapshot::isLiveKind(kind)) {
+        const bool alreadyActive = std::any_of(
+            m_warningSnapshot.activeWarnings.cbegin(), m_warningSnapshot.activeWarnings.cend(),
+            [kind](const SteamHealthSnapshot::Warning& active) { return active.kind == kind; });
+        if (!alreadyActive)
+            m_warningSnapshot.activeWarnings.append(warning);
+    }
+    emit warningSnapshotChanged();
+}
+
+double SteamHealthTracker::normalizePressure(double avgPressure, int steamFlow) const {
+    return qMax(0.1, avgPressure - PRESSURE_PER_FLOW_UNIT * (steamFlow - REFERENCE_FLOW));
+}
+
+void SteamHealthTracker::onSample(double pressure, double temperature) {
+    // Tests and non-controller callers may feed the first sample before the
+    // host has explicitly begun a session. Establish it before latching either
+    // warning; recordWarning() also starts an implicit session, which resets
+    // these per-session latches.
+    if (m_warningSnapshot.sessionId.isEmpty())
+        beginSession();
+
+    if (!m_pressureWarningEmitted && pressure > PRESSURE_HARD_LIMIT) {
+        m_pressureWarningEmitted = true;
+        recordWarning(SteamHealthSnapshot::Kind::PressureTooHigh);
+        emit pressureTooHigh();
+    }
+    if (!m_temperatureWarningEmitted && temperature > TEMPERATURE_THRESHOLD) {
+        m_temperatureWarningEmitted = true;
+        recordWarning(SteamHealthSnapshot::Kind::TemperatureTooHigh);
+        emit temperatureTooHigh();
+    }
+}
+
+void SteamHealthTracker::resetSession() {
+    m_pressureWarningEmitted = false;
+    m_temperatureWarningEmitted = false;
+}
+
+void SteamHealthTracker::onSessionComplete(SteamDataModel* model, int steamFlowSetting, int steamTempSetting) {
+    if (!model) return;
+
+    int samples = model->sampleCount();
+    int duration = static_cast<int>(model->rawTime());
+    if (samples < MIN_SAMPLES_FOR_ANALYSIS || duration < MIN_DURATION_FOR_ANALYSIS) {
+        DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [skip]" << samples << "samples" << duration << "s"
+                 << "(need" << MIN_SAMPLES_FOR_ANALYSIS << "samples," << MIN_DURATION_FOR_ANALYSIS << "s)";
+        return;
+    }
+
+    // --- Absolute threshold check (matching de1app) ---
+
+    const auto& pressureData = model->pressureData();
+    const auto& temperatureData = model->temperatureData();
+
+    int highPressureCount = 0;
+    int highTempCount = 0;
+    for (const auto& pt : pressureData) {
+        if (pt.x() >= TRIM_SECONDS && pt.y() > PRESSURE_HARD_LIMIT)
+            ++highPressureCount;
+    }
+    for (const auto& pt : temperatureData) {
+        if (pt.x() >= TRIM_SECONDS && pt.y() > TEMPERATURE_THRESHOLD)
+            ++highTempCount;
+    }
+
+    if (highPressureCount > CLOG_SAMPLE_THRESHOLD) {
+        DIAG_WARN(STEAM, "SteamHealthTracker") << "SteamHealth [clog] descale warning -" << highPressureCount
+                   << "samples exceeded" << PRESSURE_HARD_LIMIT << "bar";
+        recordWarning(SteamHealthSnapshot::Kind::Descale);
+        emit descaleWarning();
+    }
+    if (highTempCount > CLOG_SAMPLE_THRESHOLD) {
+        DIAG_WARN(STEAM, "SteamHealthTracker") << "SteamHealth [clog] temperature warning -" << highTempCount
+                   << "samples exceeded" << TEMPERATURE_THRESHOLD << "°C";
+        const QString message =
+            tr("Your steam is getting too hot. Increase your steam flow rate or lower the steam temperature.");
+        recordWarning(SteamHealthSnapshot::Kind::TemperatureWarning, message);
+        emit temperatureWarning(message);
+    }
+
+    // --- Save session summary ---
+
+    SteamSessionSummary summary;
+    summary.timestamp = QDateTime::currentDateTime();
+    summary.avgPressure = model->averagePressure();
+    summary.peakPressure = model->peakPressure();
+    summary.avgTemperature = model->averageTemperature();
+    summary.peakTemperature = model->peakTemperature();
+    summary.steamFlow = steamFlowSetting;
+    summary.steamTemperature = steamTempSetting;
+    summary.durationSeconds = static_cast<int>(model->rawTime());
+
+    // Note: loadHistory/saveHistory do QSettings I/O on the main thread.
+    // At 150 sessions (~15KB JSON) this completes in <1ms — acceptable tradeoff
+    // vs. the complexity of threading the entire load→analyze→save pipeline.
+    auto history = loadHistory();
+    history.prepend(summary);
+    while (history.size() > MAX_HISTORY_SIZE) {
+        history.removeLast();
+    }
+    saveHistory(history);
+
+    DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [session]"
+             << "timestamp:" << summary.timestamp.toString(Qt::ISODate)
+             << "avgP:" << summary.avgPressure << "bar"
+             << "peakP:" << summary.peakPressure << "bar"
+             << "avgT:" << summary.avgTemperature << "°C"
+             << "peakT:" << summary.peakTemperature << "°C"
+             << "flow:" << steamFlowSetting
+             << "tempSetting:" << steamTempSetting
+             << "duration:" << summary.durationSeconds << "s"
+             << "sessions:" << history.size();
+
+    // --- Trend detection (may auto-reset baseline on meaningful drop) ---
+
+    checkTrend(history, steamFlowSetting, steamTempSetting);
+
+    // Cache stats and persist last-used settings for startup
+    m_lastSteamFlow = steamFlowSetting;
+    m_lastSteamTemp = steamTempSetting;
+    m_settings.setValue("steam/lastTrackedFlow", steamFlowSetting);
+    m_settings.setValue("steam/lastTrackedTemp", steamTempSetting);
+    updateCachedStats(history, steamTempSetting);
+
+    // Once we're back to a full baseline window, drop the
+    // "establishing after reset" banner — trend detection is live again.
+    if (m_establishingAfterReset && m_sessionCount >= MIN_SESSIONS_FOR_TREND) {
+        m_establishingAfterReset = false;
+        m_settings.setValue("steam/establishingAfterReset", false);
+    }
+
+    emit sessionHistoryChanged();
+}
+
+void SteamHealthTracker::clearHistory() {
+    m_settings.remove("steam/sessionHistory");
+    m_settings.remove("steam/lastWarnedSession");
+    m_settings.remove("steam/pendingAutoReset");
+    m_settings.remove("steam/establishingAfterReset");
+    m_sessionCount = 0;
+    m_lastWarnedSession = -99;
+    m_baselinePressure = 0.0;
+    m_baselineTemperature = 0.0;
+    m_currentPressure = 0.0;
+    m_currentTemperature = 0.0;
+    m_pendingAutoReset = false;
+    m_establishingAfterReset = false;
+    emit sessionHistoryChanged();
+    DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [reset] session history, cooldown, and auto-reset flags cleared";
+}
+
+// --- Scale buildup trend detection ---
+//
+// All sessions are used regardless of flow/temperature settings. Pressures are
+// normalized to REFERENCE_FLOW using a linear model so sessions at different
+// flow settings are directly comparable. Raw values are stored; normalization
+// is applied at read time so recalibrating the model doesn't require
+// re-collecting data.
+//
+// Baselines:
+//   Pressure: lowest normalized avgPressure across all sessions.
+//   Temperature: lowest measured avgTemperature across all sessions.
+//
+// Warning fires when current value has moved 60% of the way from baseline
+// toward the warn threshold (baseline x 3.0 for pressure, capped at 8 bar / 180°C
+// for temperature). Re-warns at most every 5 sessions.
+//
+// Auto-reset: Pressure only. If the newest session's normalized pressure drops
+// >= 30% of the range (relative to the rolling average of recent sessions),
+// we assume a descale happened and trim old sessions. Temperature is excluded
+// from auto-reset because temperature changes are driven by the heater setpoint,
+// not limescale — changing the steam temperature setting would spuriously trigger.
+
+void SteamHealthTracker::checkTrend(QList<SteamSessionSummary>& history,
+                                     int /*steamFlow*/, int steamTemp) {
+    qsizetype n = history.size();
+    if (n < MIN_SESSIONS_FOR_TREND) {
+        DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [trend] not enough sessions:"
+                 << n << "/" << MIN_SESSIONS_FOR_TREND;
+        return;
+    }
+
+    // Normalize all pressures to reference flow.
+    // Use the clean machine reference as a floor — if the tracker has never
+    // seen a clean machine, the baseline would be the scaled-up pressure and
+    // buildup would be invisible. The floor ensures progress is measured from
+    // a known-clean state even on first use with an already-scaled machine.
+    double measuredBaseline = normalizePressure(history.first().avgPressure, history.first().steamFlow);
+    for (const auto& s : history) {
+        measuredBaseline = qMin(measuredBaseline, normalizePressure(s.avgPressure, s.steamFlow));
+    }
+    double baselinePressure = qMin(measuredBaseline, CLEAN_NORMALIZED_PRESSURE);
+
+    // Temperature baseline: lowest measured temperature across all sessions.
+    // This tracks real multi-session trends (scale buildup causes overshoot)
+    // rather than comparing against the current setting (which changes when
+    // the user adjusts their steam temperature preference).
+    double baselineTemp = history.first().avgTemperature;
+    for (const auto& s : history) {
+        baselineTemp = qMin(baselineTemp, s.avgTemperature);
+    }
+
+    // Current: most recent session (normalized)
+    double currentPressure = normalizePressure(history.first().avgPressure, history.first().steamFlow);
+    double currentTemp = history.first().avgTemperature;
+
+    // --- Auto-reset on meaningful pressure drop (likely descale) ---
+    // Only pressure is used for auto-reset detection. Temperature changes are
+    // driven by the heater setpoint, not limescale — a user changing their steam
+    // temperature setting would spuriously trigger a reset.
+    //
+    // Two-step confirmation: a single low session only *arms* m_pendingAutoReset.
+    // The trim fires when the next session also drops (real descales produce
+    // persistent low readings; a one-shot dip is an outlier, not a descale).
+    bool dropDetected = false;
+    qsizetype recentCount = qMin(qsizetype(5), n - 1);
+    if (recentCount > 0) {
+        double recentPressureSum = 0;
+        for (qsizetype i = 1; i <= recentCount; ++i) {
+            recentPressureSum += normalizePressure(history[i].avgPressure, history[i].steamFlow);
+        }
+        double recentAvgPressure = recentPressureSum / recentCount;
+
+        double pressureWarnLevel = qMin(baselinePressure * PRESSURE_WARN_MULTIPLIER, PRESSURE_HARD_LIMIT);
+        // Use baseline range so auto-reset fires even when recentAvg exceeds warn level
+        double pressureRange = pressureWarnLevel - baselinePressure;
+        if (pressureRange > 0) {
+            double drop = recentAvgPressure - currentPressure;
+            if (drop >= pressureRange * AUTO_RESET_DROP_THRESHOLD) {
+                dropDetected = true;
+            }
+        }
+    }
+
+    if (dropDetected) {
+        if (m_pendingAutoReset) {
+            // Confirmed: two consecutive low sessions. Trim history to just
+            // those two — they describe the new (cleaner) machine state.
+            // Everything older is from before the descale/clean and would
+            // pollute the new baseline's rolling recent-average.
+            DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [auto-reset]"
+                     << "confirmed drop — trimming to" << AUTO_RESET_KEEP_SESSIONS << "sessions"
+                     << "normalizedP:" << currentPressure << "bar"
+                     << "temp:" << currentTemp << "°C";
+
+            while (history.size() > AUTO_RESET_KEEP_SESSIONS) {
+                history.removeLast();
+            }
+            saveHistory(history);
+            m_pendingAutoReset = false;
+            m_establishingAfterReset = true;
+            m_lastWarnedSession = -99;
+            m_settings.setValue("steam/pendingAutoReset", false);
+            m_settings.setValue("steam/establishingAfterReset", true);
+            m_settings.setValue("steam/lastWarnedSession", m_lastWarnedSession);
+            return;
+        }
+
+        // First low session: arm pending flag and wait for confirmation.
+        DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [auto-reset-armed]"
+                 << "low session detected — waiting for next session to confirm"
+                 << "normalizedP:" << currentPressure << "bar";
+        m_pendingAutoReset = true;
+        m_settings.setValue("steam/pendingAutoReset", true);
+    } else if (m_pendingAutoReset) {
+        // Previous session was low but this one isn't — the drop didn't
+        // persist, so disarm. The armed session stays in history and
+        // contributes to the baseline like any other session.
+        DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [auto-reset-disarmed]"
+                 << "low session not confirmed — pressure recovered";
+        m_pendingAutoReset = false;
+        m_settings.setValue("steam/pendingAutoReset", false);
+    }
+
+    // --- Compute progress toward thresholds ---
+    double pressureWarnLevel = qMin(baselinePressure * PRESSURE_WARN_MULTIPLIER, PRESSURE_HARD_LIMIT);
+    double pressureRange = pressureWarnLevel - baselinePressure;
+    double tempRange = TEMPERATURE_THRESHOLD - baselineTemp;
+
+    double progressP = 0;
+    if (pressureRange > 0 && currentPressure > baselinePressure) {
+        progressP = (currentPressure - baselinePressure) / pressureRange;
+    }
+
+    double progressT = 0;
+    if (tempRange > 0 && currentTemp > baselineTemp) {
+        progressT = (currentTemp - baselineTemp) / tempRange;
+    }
+
+    DIAG_DEBUG(STEAM, "SteamHealthTracker") << "SteamHealth [trend]"
+             << "sessions:" << n
+             << "baselineP:" << baselinePressure << "bar (normalized)"
+             << "currentP:" << currentPressure << "bar (normalized)"
+             << "warnLevel:" << QString::number(pressureWarnLevel, 'f', 1) << "bar"
+             << "progressP:" << QString::number(progressP, 'f', 2)
+             << "baselineT:" << baselineTemp << "°C (target:" << steamTemp << ")"
+             << "currentT:" << currentTemp << "°C"
+             << "progressT:" << QString::number(progressT, 'f', 2)
+             << "lastWarned:" << m_lastWarnedSession
+             << "sessionCount:" << m_sessionCount;
+
+    // --- Warning cooldown check ---
+    if (m_sessionCount - m_lastWarnedSession < WARN_COOLDOWN_SESSIONS) {
+        return;
+    }
+
+    // --- Emit warnings at 60% progress ---
+
+    if (progressP >= TREND_PROGRESS_THRESHOLD) {
+        DIAG_WARN(STEAM, "SteamHealthTracker") << "SteamHealth [warn] normalized pressure at" << currentPressure
+                   << "bar, baseline" << baselinePressure
+                   << "bar (" << qRound(progressP * 100) << "% toward" << pressureWarnLevel << "bar)";
+        m_lastWarnedSession = m_sessionCount;
+        m_settings.setValue("steam/lastWarnedSession", m_lastWarnedSession);
+        const QString message =
+            tr("Steam pressure has increased from %1 to %2 bar over %3 sessions. "
+               "This may be caused by milk residue in the steam tip or scale buildup. "
+               "Try a steam-tip soak in a milk cleaner (Rinza/Cafiza) first; "
+               "if the issue persists, consider descaling your machine.")
+                .arg(baselinePressure, 0, 'f', 1)
+                .arg(currentPressure, 0, 'f', 1)
+                .arg(n);
+        recordWarning(SteamHealthSnapshot::Kind::ScaleBuildup, message);
+        emit scaleBuildupWarning(message);
+    }
+
+    if (progressT >= TREND_PROGRESS_THRESHOLD) {
+        DIAG_WARN(STEAM, "SteamHealthTracker") << "SteamHealth [warn] temperature at" << currentTemp
+                   << "°C, target" << baselineTemp
+                   << "°C (" << qRound(progressT * 100) << "% toward" << TEMPERATURE_THRESHOLD << "°C)";
+        m_lastWarnedSession = m_sessionCount;
+        m_settings.setValue("steam/lastWarnedSession", m_lastWarnedSession);
+        const QString message =
+            tr("Steam temperature has increased from %1 to %2 °C over %3 sessions. "
+               "This may be caused by milk residue in the steam tip or scale buildup. "
+               "Try a steam-tip soak in a milk cleaner (Rinza/Cafiza) first; "
+               "if the issue persists, consider descaling your machine.")
+                .arg(baselineTemp, 0, 'f', 1)
+                .arg(currentTemp, 0, 'f', 1)
+                .arg(n);
+        recordWarning(SteamHealthSnapshot::Kind::ScaleBuildup, message);
+        emit scaleBuildupWarning(message);
+    }
+}
+
+void SteamHealthTracker::updateCachedStats(const QList<SteamSessionSummary>& history,
+                                            int /*steamTemp*/) {
+    if (history.isEmpty()) {
+        m_baselinePressure = 0.0;
+        m_baselineTemperature = 0.0;
+        m_currentPressure = 0.0;
+        m_currentTemperature = 0.0;
+        return;
+    }
+
+    // Current = most recent session (normalized to reference flow)
+    m_currentPressure = normalizePressure(history.first().avgPressure, history.first().steamFlow);
+    m_currentTemperature = history.first().avgTemperature;
+
+    // Pressure baseline = min of lowest normalized pressure and clean reference.
+    // The clean reference floor ensures buildup is visible even if the tracker
+    // has only seen scaled-up sessions.
+    m_baselinePressure = m_currentPressure;
+    for (const auto& s : history) {
+        m_baselinePressure = qMin(m_baselinePressure, normalizePressure(s.avgPressure, s.steamFlow));
+    }
+    m_baselinePressure = qMin(m_baselinePressure, CLEAN_NORMALIZED_PRESSURE);
+
+    // Temperature baseline = lowest measured temperature across all sessions
+    m_baselineTemperature = m_currentTemperature;
+    for (const auto& s : history) {
+        m_baselineTemperature = qMin(m_baselineTemperature, s.avgTemperature);
+    }
+}
+
+// --- QSettings JSON persistence ---
+
+QList<SteamSessionSummary> SteamHealthTracker::loadHistory() const {
+    QList<SteamSessionSummary> result;
+    QByteArray data = m_settings.value("steam/sessionHistory").toByteArray();
+    if (data.isEmpty()) return result;
+
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    QJsonArray arr = doc.array();
+
+    for (const QJsonValue& v : arr) {
+        QJsonObject obj = v.toObject();
+        SteamSessionSummary s;
+        s.timestamp = QDateTime::fromString(obj["timestamp"].toString(), Qt::ISODate);
+        s.avgPressure = obj["avgPressure"].toDouble();
+        s.peakPressure = obj["peakPressure"].toDouble();
+        s.avgTemperature = obj["avgTemperature"].toDouble();
+        s.peakTemperature = obj["peakTemperature"].toDouble();
+        s.steamFlow = obj["steamFlow"].toInt();
+        s.steamTemperature = obj["steamTemperature"].toInt();
+        s.durationSeconds = obj["durationSeconds"].toInt();
+        result.append(s);
+    }
+    return result;
+}
+
+void SteamHealthTracker::saveHistory(const QList<SteamSessionSummary>& history) {
+    QJsonArray arr;
+    for (const auto& s : history) {
+        QJsonObject obj;
+        obj["timestamp"] = s.timestamp.toString(Qt::ISODate);
+        obj["avgPressure"] = s.avgPressure;
+        obj["peakPressure"] = s.peakPressure;
+        obj["avgTemperature"] = s.avgTemperature;
+        obj["peakTemperature"] = s.peakTemperature;
+        obj["steamFlow"] = s.steamFlow;
+        obj["steamTemperature"] = s.steamTemperature;
+        obj["durationSeconds"] = s.durationSeconds;
+        arr.append(obj);
+    }
+    m_settings.setValue("steam/sessionHistory", QJsonDocument(arr).toJson());
+    m_sessionCount = static_cast<int>(history.size());
+}

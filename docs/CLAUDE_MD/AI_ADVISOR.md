@@ -1,0 +1,911 @@
+# AI Advisor — Current State and Future Vision
+
+## Current Architecture
+
+### Components
+
+| File | Purpose |
+|------|---------|
+| `src/ai/aimanager.h/cpp` | Central coordinator: provider management, conversation routing (max 5, keyed by bean+profile), shot analysis, email fallback |
+| `src/ai/aiprovider.h/cpp` | Abstract base + 5 provider implementations (OpenAI, Anthropic, Gemini, OpenRouter, Ollama) |
+| `src/ai/aiconversation.h/cpp` | Multi-turn conversation with persistent storage (QSettings). Follow-ups, shot context injection, history trimming |
+| `src/ai/shotsummarizer.h/cpp` | Extracts structured shot data (phases, curves, anomalies) and builds text prompts. Separate system prompts for espresso vs filter |
+| `qml/components/TastePicker.qml` | Tap-only taste intake (add-ai-taste-intake): Extraction / Body / Overall rows, shared by the AI intake dialog and the review page |
+
+### Taste intake (tap-only) — add-ai-taste-intake
+
+When `Settings.ai.tasteIntakeOnAsk` is on (default), opening the advisor for a
+shot (`ConversationOverlay.openWithShot`) shows a fully text-free intake over the
+conversation — Extraction (`Sour`/`Balanced`/`Bitter` → `taste_balance`), Body
+(`Thin`/`Medium`/`Heavy` → `taste_body`), Overall (reused `RatingInput` →
+`enjoyment0to100`) — **whenever that shot has no taste feedback saved yet** (any of
+`taste_balance` / `taste_body` / `enjoyment0to100` set suppresses it). The gate is
+**per shot, independent of conversation history**: the conversation is keyed by
+bean+profile and shared across shots, so an ongoing conversation must NOT suppress
+the intake for a new, unrated shot — each new shot has its own qualities worth
+capturing. So a shot you've rated/tasted goes straight to the chat; a new or
+backed-out-without-entering shot re-shows the intake. **Ask** persists the taps via
+`requestUpdateShotMetadata`, composes a first-person question, and sends it with
+the shot attached; **Skip** drops into the normal text conversation.
+
+The overlay reads only the host page's shot *snapshot* for the gate, and
+`PostShotReviewPage` deliberately does not reload that snapshot on metadata save
+(it would clobber in-progress edits). So on Ask the overlay also emits
+`tasteIntakeSubmitted(tasteBalance, tasteBody, overall)`; the review page mirrors
+those axes into its live `editTaste*` / `editEnjoyment` fields (via
+`applyEditState`) and advances **both** review-page baselines — `editShotData`
+(what `hasUnsavedChanges` compares against) and `_committedState` (the undo
+baseline) — mirroring the `ChangeBeansDialog.onBagSelected` external-flow
+pattern, so no redundant re-save/Visualizer PATCH or phantom undo frame fires on
+the next flush. The rating slider and taste chips update at once and the next
+Ask sees the feedback — the
+review page's AI-Advice click passes the *live* taste, not the stale snapshot, to
+`openWithShot`.
+
+The taps are structured shot columns (`taste_balance`/`taste_body`, migration 33),
+not free text — so the same picker also appears on the post-shot review page (no
+parallel UI), the values flow into the advisor prompt and the dial-in history
+blocks (`shotToJson`/`bestRecentShot`), and they map to Visualizer's SCA CVA
+descriptive attributes on upload (`applyTasteCvaMapping`: sour→acidity 12/
+bitterness 4, etc.; only-when-tapped, never-null so hand-entered CVA is never
+cleared).
+
+**Layer-1 handoff is emergent:** the advisor asks "how did it taste?" only when
+`tastingFeedback` has no signal. A tapped axis sets `hasTasteAxis` true and rides
+the composed first message, so the model already has taste and won't re-ask.
+Skipping leaves feedback absent → the advisor asks and the reactive rating capture
+still works, exactly as before.
+
+### Providers
+
+| Provider | Models (first = default) | Thinking setting | Caching | Cost |
+|----------|-------------------------|--------------|---------|------|
+| Anthropic | Sonnet 5.5, Haiku 5.5 | `thinking: between_tools` (Sonnet); Haiku: `adaptive` at `effort: low` on analysis requests, `disabled` elsewhere | Explicit `cache_control`, **5-minute** TTL, on the system prompt and the first user message | Cloud |
+| OpenAI | GPT-6.1 Sol, GPT-6 Luna, GPT-6.1 Terra | `reasoning_effort`: advisor `low` (Sol/Terra), `medium` (Luna); translation `none` (Terra/Luna) | Automatic for prefixes over 1,024 tokens; 30-minute default on GPT-5.6 and later | Cloud |
+| Google Gemini | 3.8 Flash | `thinkingLevel`: `low` | Implicit, automatic (system prompt first); it did not hit on 3.8 Flash in testing | Cloud |
+| OpenRouter | GPT-6 Luna, GPT-6.1 Sol, Sonnet 5.5, Haiku 5.5, Gemini 3.8 Flash, GLM-5.3 Flash, Gemma 4 31B | `reasoning`: advisor `effort: medium` (Luna; Test Connection uses `none`), `enabled: true` (Gemma), `effort: low` (the rest, where reasoning is mandatory and `none` is a 400) | Passes through | Cloud |
+| Ollama | User-selected | none sent | N/A | Local/free |
+
+The thinking settings live in one header, `src/ai/airequestshape.h`, shared by the advisor and the bulk translator; `tst_aiproviders` holds the live-verified table and fails for a catalogued model that is not in it (`tools/ai_model_eval/probe_request_shape.py` checks a candidate). A saved model the catalog no longer offers is cleared at startup (`AIManager::savedModelFor`), and an empty one means the default.
+
+#### Model-selection rationale (2026-10-05)
+
+One **balanced** and one **value** pick per provider (plus optional GPT-6.1 Terra on OpenAI), each the newest of its tier unless an older model is much cheaper. Flagship tiers (Opus 5.5 at $4/$20 with thinking that cannot be turned off, GPT-6 Astra, Gemini Pro) cost two or more times the balanced pick for no gain on this task.
+
+- **OpenAI**: `gpt-6.1-sol` ($2/$10) and `gpt-6-luna` ($0.10/$0.50) replaced Terra 5.6, Luna 5.6, 5.4 and 5.4 mini — the same or lower price, a generation newer. Luna is the only value-tier model with no bad advice on the final prompt, which makes it the best value overall. Sol rejects `reasoning_effort: "none"` (lowest is `"low"`) and, at that effort, any `temperature` but the default; the translator omits temperature for it (`setOpenAITemperature`).
+- **Anthropic**: `claude-sonnet-5-5` and `claude-haiku-5-5` ($0.10/$0.50 for prompts up to 100K tokens), the value pick. With thinking off, Haiku 5.5 gave bad advice on 4 of 12 replayed shots, the same direction reversals Haiku 4.5 made. With adaptive thinking at `effort: low` it gave bad advice on none of 12, for about $0.0005 more per shot, so `AIRequestShape::setAnthropicAdvisorThinking` turns thinking on for the advisor's analysis requests only. Test Connection's 10-token request cannot hold thinking (#1691). Sonnet 5.5 rejects `thinking: disabled` and asks for `between_tools`.
+- **OpenRouter**: the direct providers' models at their per-token price (plus a 5.5% fee on card credit purchases), Luna first as the default, and two cheap extras on the maintainer's call: GLM-5.3 Flash and Gemma 4 31B. Both gave right grind advice on the two scenarios tried but stated a guessed taste, which the prompt forbids, so they are the exception to the no-bad-advice rule below and carry less evidence than Luna. Six other cheap models failed; per-model results in the README findings log, 2026-10-06.
+- **Gemini**: `gemini-3.8-flash` ($0.75/$3.75, half of 3.5 Flash) only. A value pick must not give bad advice: on the final prompt 3.5 Flash-Lite reversed a grind direction and advised on an untasted blowout, 3.1 Flash-Lite jumped three steps on a prep failure, and 2.5 Flash went finer on a bitter shot. 3.8 Flash rejects `thinkingLevel: "minimal"`; `"low"` reported no thinking tokens. Google's page flags a price change for 3.8 Flash on January 1, 2027. With thinking on, 3.5 and 3.1 Flash-Lite would cost about $0.008 and $0.006 a shot against 3.8 Flash's $0.012, too small a saving to fill the value slot (maintainer, 2026-10-07).
+
+Evidence: `tools/ai_model_eval/` replay of six tablet prompts (README findings log, 2026-10-05). On the trimmed prompt every catalog model emitted a usable block on every tasted scenario: `bitter-over`'s prose stop-weight change became a `targetWeightG`, and Sol's prose `grinderSetting` went away.
+
+**Caching: 5 minutes, not 1 hour, on Anthropic.** On Sonnet 5.5's ~15.4K cached tokens: the input cost of those tokens for one analysis plus two quick follow-ups is $0.045 at 5m, $0.068 at 1h, $0.093 uncached; for a lone analysis $0.039 / $0.062 / $0.031. 1h only wins when the next question comes 5–60 minutes later (a 10-minute dial-in rhythm), judged the uncommon case. Each read restarts the TTL. Sonnet 5.5's tokenizer counts ~60% more tokens than OpenAI's for the same prompt (20.9K vs 13.1K).
+
+#### OpenAI pricing verification (2026-10-30)
+
+GPT-6.1 Terra is the third OpenAI option; Sol remains the default. The live
+request-shape probe accepted Terra's advisor `reasoning_effort: none`, translator
+`temperature: 0.3` at that effort, and Responses `web_search` at `low`.
+
+Standard USD per million tokens, for prompts up to 272K tokens, verified against
+[OpenAI pricing](https://developers.openai.com/api/docs/pricing) and the
+[Terra model page](https://developers.openai.com/api/docs/models/gpt-6.1-terra):
+
+| Model | Input | Output | Cached input | Cache write (30m / 12h) |
+|---|---|---|---|---|
+| GPT-6.1 Sol | $2.00 | $10.00 | $0.10 | $2.50 / $5.00 |
+| GPT-6.1 Terra | $1.00 | $5.00 | $0.05 | $1.25 / $2.50 |
+| GPT-6 Luna | $0.10 | $0.50 | $0.01 | $0.125 / $0.25 |
+
+The existing Sol and Luna token rates remain correct. Per-shot hints are estimates
+for one analysis; follow-up turns, web tools, caching and reasoning can change the
+bill. Terra uses `low` reasoning for advisor analysis and conversations; translation
+keeps `none` with temperature 0.3. On the saved October 7 `captured_v4` prompts,
+reasoning off produced usable next-shot blocks on 13/16 tasted responses across
+three runs. Low and medium each produced 8/8 over two runs, with the taste gate
+intact on 4/4 untasted responses per effort. No grind-direction reversals or
+prose settings appeared. The current blowout prompted prep/scale checks correctly.
+Correction: the older blowout described by the `untasted-run` caption is absent
+from `captured_v4`, so historical-blowout detection was not tested.
+
+The metered comparison used six scenarios at `none`, and two runs of six each at
+`low` and `medium`. Means below use the same input workload, 13,131 tokens, and
+standard uncached rates **before cache read/write adjustments**, not invoice costs.
+Reasoning tokens are included in output, not added to it again.
+
+| Terra effort | Output incl. reasoning | Reasoning tokens | Per analysis | Extra vs none |
+|---|---|---|---|---|
+| none | 226 | 0 | $0.01426 | — |
+| low | 279 | 55 (range 0–162) | $0.01453 | $0.00027 (~2%) |
+| medium | 536 | 298 (range 103–466) | $0.01581 | $0.00155 (~11%) |
+
+Low wins on cost with no observed quality loss against medium. On tasted
+scenarios alone its mean was $0.01481, supporting the displayed ~$0.015 per shot
+and ~$1.40/month at three shots a day. For a fully warm prompt the comparison
+projects $0.00178 / $0.00205 / $0.00334 per analysis for none/low/medium. The actual
+runs had different cache hits and writes per effort, so those bills cannot isolate
+reasoning cost. At reported 30-minute cache-write rates, the 30 metered comparison
+calls estimate $0.149 total; earlier pilot calls are additional.
+
+The remaining supported settings were then tested twice on the same six cases:
+high and xhigh each returned 8/8 usable tasted replies, kept the taste gate on
+4/4 untasted replies, and had no truncation or material direction/context errors.
+High averaged 734 reasoning tokens and $0.018031 per analysis (+24% over low);
+xhigh averaged 2,348 and $0.026248 (+81%). These costs also exclude cache
+adjustments. There was no clear quality gain over low on this small set.
+`max` returned HTTP 400 `unsupported_value` on the app's Chat Completions path;
+its accepted list stopped at xhigh, although the model documentation lists max.
+Responses behavior was not evaluated. Terra stays at low.
+
+This is a small replay of stored prompts, not fresh-current-prompt evidence or a
+head-to-head comparison with Sol/Luna. Sol remains the default. Full method and
+run labels live in `tools/ai_model_eval/README.md`; private payloads stay gitignored.
+
+#### Luna reasoning follow-up (2026-10-30)
+
+Two runs of six stored `captured_v4` scenarios at none/low/medium gave usable
+next-shot blocks on 4/8, 6/8 and 8/8 tasted replies respectively. All three
+preserved the taste gate on 4/4 untasted replies, with no truncation or reversed
+grind direction. Medium averaged 1,285 reasoning tokens (251–2,048), versus
+137 (0–484) at low. At equal uncached input rates, total estimates were
+$0.001436 / $0.001507 / $0.002094 per analysis: medium adds ~$0.00066, or ~$0.06
+for 90 analyses. Context mistakes were reduced, not eliminated.
+
+High was then run twice on the same six cases: 7/8 usable tasted replies,
+4/4 intact untasted taste gates, and one empty reply after all 4,096 completion
+tokens were spent on reasoning (`finish_reason: length`). It averaged 2,472
+reasoning tokens and $0.002681 per analysis before cache adjustments, ~28% more
+than medium. A larger token cap was not evaluated.
+
+The requested settings are now implemented: Luna advisor `medium` on direct
+OpenAI and OpenRouter, Terra advisor `low`. OpenAI translation keeps `none` for
+both models, and OpenRouter's 10-token connection check keeps Luna at `none`.
+Live request-shape probes passed both OpenAI models' advisor/translation/web paths
+and OpenRouter Luna's advisor and connection settings on 2026-10-30. OpenRouter's
+quality/cost hint uses the direct Luna replay estimate, not an OpenRouter quality
+replay. Detailed judgments,
+capture limitations and cost assumptions are in the evaluation README findings
+log. Qt Creator and local build/test validation remain on the maintainer's hold.
+
+#### Known model defects
+
+  **Models write unusable values into `structuredNext.grinderSetting`.** Two shapes seen: prose (2026-07: Terra "a touch coarser than 9", mini "slightly coarser than 9"; 2026-10: GPT-6 Sol, GPT-6.1 Sol and GPT-6 Luna, "a touch coarser than 6.5", gone on the trimmed prompt), and — by inspection of the contract, not observed live — an unquoted JSON number, which `QJsonValue::toString()` reads as an empty string.
+
+  Neither can be scored: prose matches no recorded setting, and an empty read looks like "grind unchanged". `computeAdherence()` classifies both as **unscoreable** and returns the verdict `"unclear"`, which has its own instruction in the system prompt — telling the model to treat it like `"ignored"`, not assume the experiment ran, and give the setting as a concrete value next time. (The exact wording lives in `ShotSummarizer`; don't restate it here, it will drift.)
+
+  **The same classification applies to every axis, not just grind.** `rpm`, `doseG`, `targetWeightG` and `profileTitle` each go through a classify step too. That uniformity is the fix for a real defect: the first version guarded `grinderSetting` alone, and `rpm` went on failing *open* — `QJsonValue::toInt()` returns `0` for a JSON string or null, and the matcher treated `<= 0` as a free match, so a malformed `rpm` scored `"followed"`.
+
+  Two traps, both found in review of the first attempt at this guard, both worth not repeating:
+  - **It must not fall through to the ranges-only `"followed"`.** The prompt reads `"followed"` as "the experiment ran", so a false `"followed"` is *worse* than the false `"ignored"` the guard was written to prevent — it makes the model revise direction or commit harder on an experiment that never ran.
+    - **The ranges-only branch itself had the same defect, and it was the last path still exempt.** A turn recommending only ranges still sets an experiment — "run this again, here is what I expect" — so `computeAdherence()` now compares the follow-up shot's setup against the prior shot's via `setupChangedFromPrior()` and returns `"ignored"` when the user regrinded, redosed or switched profile. It returned `"followed"` unconditionally from PR Kulitorum/Decenza#1501 until then, which told the model a controlled repeat had happened whenever the user changed something nobody asked them to change. Two rules keep that from over-firing: the comparison uses the same tolerances as scoring, so scale noise is not a decision, and a field is only compared when BOTH shots record it — a blank grinder setting is missing data, not a regrind.
+  - **Whitespace does not mean prose.** Compound notation writes `"1 + 4"`, used by every Eureka Mignon and 1Zpresso entry in the catalog. `GrinderAliases::looksLikeSetting()` is the shared authority for what a setting looks like. Its numeric and compound regexes live in `GrinderAliases::detail` and are shared with `parseGrinderSetting()`, so those two cannot drift. Its third shape — lettered dials like `"3F"` — is deliberately local: `parseGrinderSetting()` rejects lettered settings outright, so there is no second caller to stay in step with, and adherence compares them by exact string equality in `grinderMatches()`.
+
+#### Running-cost estimates (`AIProvider::costHintFor`)
+
+The AI settings tab, the legacy AI settings page and the ShotServer settings page all show this per-model line. The lines are one table in `aiprovider.cpp`; an OpenRouter model prices as its direct counterpart unless it has its own line. From the tokens each model used in the 2026-10-05 replay of the trimmed prompt with compact shot data (cold cache), at published rates; monthly assumes 3 shots a day.
+
+Historical quality order from the 2026-10-05 replay; Luna's row uses the adopted
+medium-effort setting measured on 2026-10-30 (no new cross-model ranking):
+
+| Model | Quality in replay | $/1M in / out | Tokens in / out | Per shot | Per month |
+|---|---|---|---|---|---|
+| `claude-sonnet-5-5` | Right grind direction on every scenario; usable block every time | 2.00 / 10.00 | 20.9K / 0.95K | $0.059 (incl. 5m cache write) | $5.30 |
+| `gpt-6.1-sol` | Usable block every time on the trimmed prompt; never skipped the taste gate | 2.00 / 10.00 | 13.1K / 0.41K | $0.030 | $2.75 |
+| `claude-haiku-5-5` | With low-effort thinking: right direction on all 12 replayed shots, usable block on 8 of 8 tasted (2026-10-07) | 0.10 / 0.50 | 21K / ~2K incl. thinking | $0.0034 (incl. 5m cache write) | $0.31 |
+| `gemini-3.8-flash` | Usable block every time; on the old prompt moved the grind on an untasted blowout | 0.75 / 3.75 | 13.8K / 0.49K | $0.012 | $1.10 |
+| `gpt-6-luna` | Medium reasoning: usable blocks on 8/8 tasted shots, taste gate on 4/4 untasted (2026-10-30) | 0.10 / 0.50 | 13.1K / 1.85K incl. thinking | $0.0022 | $0.20 |
+
+OpenRouter-only lines, from the cost OpenRouter reported on the 2026-10-06 probe (it caches some of the prompt, so tokens × rate overstates them):
+
+| Model | $/1M in / out | Per shot | Per month |
+|---|---|---|---|
+| `anthropic/claude-sonnet-5.5` | 2.00 / 10.00 | $0.05 (no cache write) | $4.50 |
+| `anthropic/claude-haiku-5.5` | 0.10 / 0.50 | $0.0032 (reasoning `low`, no cache hit; unset, it ran to the 4,096 cap once) | $0.29 |
+| `z-ai/glm-5.3-flash` | 0.15 / 0.50 | $0.0007–0.0014 | $0.10 |
+| `google/gemma-4-31b-it` | 0.09 / 0.34 | $0.0018–0.0019 | $0.17 |
+
+A figure keyed on provider rather than model was once wrong by 5–8× in QML; keep the estimate keyed by model and next to the catalog.
+
+#### How to re-run the model comparison
+
+**Don't start from scratch — the harness is `tools/ai_model_eval/`.** Read its `README.md` before any catalog change: it holds the method (capture real prompts via `ai_advisor_invoke` `dryRun`, replay byte-for-byte in each provider's request shape, blind the judging), the scenario manifest with what each shot is known to discriminate, and the findings log from each run. A comparison costs about $1 in API spend; the method is the part that took real work to get right.
+
+Two traps it documents, both of which silently void a run: an emission test over a shot with **no taste feedback** measures the taste gate rather than emission (the model correctly asks a question and correctly omits the block), and printing per-model cost **breaks the blind** because the cheapest response is unmistakable.
+
+### What the AI Receives Today
+
+**System prompt** (~40K characters, about 11K tokens on OpenAI's tokenizer, plus a per-profile section): Espresso or filter-specific guidance covering DE1 machine behavior, pressure/flow interpretation, common shot patterns, roast considerations, grinder/burr geometry, and response guidelines. When the shot's profile matches a curated entry in the profile knowledge base (`resources/ai/profile_knowledge.md`), a profile-specific section is appended describing expected curve behavior, intentional design choices, and what NOT to flag as problems.
+
+**Per-shot user prompt** (~1-2K tokens):
+- Profile name, author, type, intent (notes)
+- Profile steps (frame-by-frame description)
+- Dose, yield, ratio, duration
+- Phase breakdown with actual vs target values at start/peak-deviation/end
+- Coffee metadata (bean brand, type, roast level, roast date) — **only if user enters it manually**
+- Grinder model and setting — **only if user enters it manually**
+- TDS/EY — **only if user enters it manually**
+- Tasting notes and enjoyment score — **only if user enters it manually**
+- Anomaly flags (channeling, temperature instability)
+
+**Dial-in history** (~200-500 tokens per historical shot, up to 5): When the current shot has a resolved KB ID, the system queries the last 5 shots with the same KB ID and the same equipment package from `ShotHistoryStorage::loadRecentShotsByKbIdStatic()`. Each historical shot includes: profile name, steps (frame-by-frame), dose/yield/ratio, duration, grind setting, temperature override, bean info, TDS/EY, score, and tasting notes. This lets the AI see what changed between shots (e.g., "you went 2 clicks finer and the sourness improved").
+
+**Multi-shot conversations**: Previous shots are summarized and compressed. Older messages get trimmed to manage token count.
+
+### What the AI Now Knows (Profile Knowledge Base)
+
+When the shot matches one of the 39 KB sections, the system prompt includes:
+- Expected curve shapes (pressure, flow, temperature behavior)
+- What is intentional vs. problematic (e.g., declining pressure in D-Flow is by design)
+- Roast suitability and grind guidance
+- Duration and ratio expectations
+
+This prevents the AI from flagging intentional profile behaviors as problems (e.g., D-Flow's declining pressure, Blooming's 30s pause, Allongé's high ratio).
+
+**Profile matching** (two-tier priority):
+1. **Fuzzy title matching**: `normalizeProfileKey()` strips accents (é→e), normalizes punctuation (& → and), then tries direct → prefix → substring match against KB section headers and aliases.
+2. **EditorType fallback**: For custom-named D-Flow/A-Flow profiles, maps the profile editor type ("dflow" → "d-flow / default", "aflow" → "a-flow").
+
+**Implementation**: `ShotSummarizer::computeProfileKbId()` computes the KB ID from the profile title and editor type via `matchProfileKey()`. The resolved ID is stored in the shots DB (`profile_kb_id` column, migration 9) and used for dial-in history grouping.
+
+**UI indicator**: Profiles with a knowledge base entry show a sparkle icon (from `qrc:/icons/sparkle.svg`) in the profile selector list. The `hasKnowledgeBase` flag is read from the JSON during `refreshProfiles()` and exposed through all profile list methods.
+
+### What the AI Does NOT Know Today
+
+1. What other profiles are available on the machine
+2. What profiles might work better for the user's beans/roast (deferred until bean database integration)
+3. Community recommendations for bean/profile pairings
+4. Details about the roaster or bean beyond what the user typed
+5. What other users' experiences are with the same beans
+
+---
+
+## Shared Infrastructure: In-App AI and MCP
+
+Both the in-app AI advisor and the MCP `dialing_get_context` tool use the same underlying components. Changes to shared code benefit both paths equally.
+
+### Shared Components
+
+| Component | File | What it provides |
+|-----------|------|-----------------|
+| **System prompt** | `ShotSummarizer::shotAnalysisSystemPrompt()` | Espresso/filter system prompt + dial-in reference tables + profile KB section. Both paths call this — the in-app AI uses it directly as the conversation system prompt, the MCP sends it as the `profileKnowledge` field |
+| **Shot summarizer** | `ShotSummarizer::buildUserPrompt()` | Phase metrics, anomaly detection, profile steps. The MCP sends this as the `shotAnalysis` field |
+| **Profile Knowledge Base** | `resources/ai/profile_knowledge.md` | Per-profile curated knowledge (18 profiles). Loaded as Qt resource, injected via `shotAnalysisSystemPrompt()` |
+| **Dial-in reference tables** | `resources/ai/espresso_dial_in_reference.md` | Structured variable→taste tables. Loaded as Qt resource, appended in `shotAnalysisSystemPrompt()` |
+| **Profile KB matching** | `ShotSummarizer::matchProfileKey()` | Three-tier matching: direct KB ID → fuzzy title → editor type fallback |
+| **Grinder context** | `ShotHistoryStorage::queryGrinderContext()` | Observed settings range, min/max, and `stepSize` — the grinder's effective step, the smallest gap the user makes repeatedly (`deriveGrindStep`), so a one-off mistyped setting doesn't skew it and a coarse-heavy history doesn't hide the fine step. `stepSize` stays grinder-model-wide so it matches the Grind quick-select widget's `grindStepForGrinder()`; the observed settings and RPM axes are scoped to the shot's equipment package (`AdviceScope`, `src/history/shotscope.h`). Used by both MCP and in-app AI `requestRecentShotContext()` |
+| **Dial-in history** | `ShotHistoryStorage::loadRecentShotsByKbIdStatic()` | Last N shots with same profile family, scoped to the shot's equipment package (`AdviceScope`) |
+
+### Scoped to the Equipment Package
+
+Every DB-backed block selects on the shot's **equipment package** — grinder, basket and puck prep as one unit (`AdviceScope`, `src/history/shotscope.h`) — not on the grinder alone. Package id 0 is the unpackaged pool. A grind number means nothing across a basket change, so history from another package is not comparable data, it is misleading data.
+
+Three consequences worth knowing before touching this area:
+
+- **Conversations are keyed on the package too** (`ConversationKey::derive`, `src/ai/conversationkey.h`). A saved thread replays its stored turns on every request, so scoping the payload alone would leave older turns describing another basket inside the same transcript. One bean and profile can therefore hold several threads; the index entry snapshots the package label so they can be told apart.
+- **No match emits `noDialInHistory`**, a block naming the equipment set and stating the count is zero. An omitted section reads as "no history at all", and an unanchored model invents an anchor.
+- **An import re-keys** every conversation through `ImportResult::equipmentIdMap`, because the key holds a package row id and a restore renumbers those rows. A conversation naming a package that did not come across is refused, not filed under the unpackaged pool.
+
+### What Differs Between Paths
+
+| Aspect | In-App AI | MCP |
+|--------|-----------|-----|
+| **Multi-turn** | Yes (conversation history, shot-to-shot deltas) | No (single tool call, LLM manages context) |
+| **`currentDateTime`** | Not in user prompt (cache stability) | Included at top level of `dialing_get_context` response |
+| **Wrapper fields** | `shotId` lives only on `ai_advisor_invoke` (not in the user prompt itself) | `shotId` shipped at top level |
+
+The context blocks ship in **both** the in-app advisor's user prompt and `dialing_get_context`'s response, produced by shared helpers in `src/ai/dialing_blocks.h` so the two surfaces cannot drift. See openspec change `add-dialing-blocks-to-advisor`. The exact set is listed under "How the In-App Advisor Enriches the User Prompt" below — one list, because two counts in one file is how this section came to say "four" while the assembler built six.
+
+### How the In-App Advisor Enriches the User Prompt
+
+**One payload, one assembler.** Both surfaces send the model the same JSON object, built by the same code — they share a system prompt (`ShotSummarizer::shotAnalysisSystemPrompt`, reached in-app through `AIConversation::multiShotSystemPrompt`) that names the structured blocks by field path, so a second format would be a prompt describing a payload nobody sends. The in-app surface used to send prose instead; that renderer is gone.
+
+The shot's own payload is a `QJsonObject` from `ShotSummarizer::buildUserPromptObject(summary)`. The DB-backed context blocks — `dialInSessions` (or `noDialInHistory` in its place), `bestRecentShot`, `grinderContext`, `grinderCalibration`, `recentAdvice` — come from **one** assembler, `DialingBlocks::buildAdvisorContextBlocks(db, shot, shotId, turns)`, which both `ai_advisor_invoke` and `AIManager::requestRecentShotContext` call on a background thread. `AIManager::enrichUserPromptObject` owns the merge and adds `sawPrediction` from `m_settings` / `m_profileManager` (main-thread only). Empty blocks are suppressed — no key, no `null` placeholder.
+
+For the in-app conversation, `AIManager::buildConversationUserPrompt(shot, question, shotLabel)` assembles the finished turn: that payload plus `question`, `shotLabel`, and `changesFromPreviousShotInConversation` (what moved since the previous shot in this thread, `anyChange: false` when nothing did). **The question is a field, not text wrapped around the object.** The question-recovery heuristic in `getConversationText` and the brace-matching JSON scanner in `extractShotFields` existed only to undo the old wrapping and are deleted — stored content parses with a plain `QJsonDocument::fromJson`. Nothing had to be kept for old conversations: 2.0.4 cleared them once when the key changed.
+
+Note: `dialing_get_context` (the MCP read tool) calls the same `DialingBlocks::buildAdvisorContextBlocks` assembler, with `GrinderCalibration::Omit` (#1164) and no `recentAssistantTurns` — an MCP client owns its own conversation, so prior turns are already in its context. It does **not** go through `enrichUserPromptObject`: it assembles its own response envelope (the blocks plus `currentBean`, `profile`, `tastingFeedback`, `shotAnalysis`, and its own `sawPrediction`). The block-level shape is shared by construction; the wrapper envelope is not.
+
+### Structured `nextShot` output (issue #1054)
+
+The shot-analysis system prompt asks the model to append a fenced ` ```json ` block named `nextShot` at the very end of any response that recommends a concrete parameter change (grind / RPM / dose / yield target / profile). The block carries:
+
+- `grinderSetting`, `rpm`, `doseG`, `targetWeightG`, `profileTitle` — present only on the field(s) the recommendation moves. `targetWeightG` is the stop-at-weight yield, scored against the follow-up shot's target within ±0.5 g. `rpm` (integer) is the motor-RPM half of the dial-in, offered only for variable-RPM grinders and independent of `grinderSetting`; `computeAdherence`/`summarizeStructuredNext` score and render it the same way as grind. Per-shot `rpm` also rides on `dialInSessions[]`, `bestRecentShot`, the `changeFromPrev`/`changeFromBest` diffs, and `grinderContext` (observed RPMs + `rpmStepSize`), all gated on the shot actually having an RPM.
+- `expectedDurationSec`, `expectedFlowMlPerSec` — required `[low, high]` ranges
+- `expectedPeakPressureBar` — optional `[low, high]` range when the advice targets pressure
+- `successCondition` — short natural-language predicate (stored verbatim)
+- `reasoning` — one sentence explaining why
+
+`AIManager::parseStructuredNext(QString)` extracts the trailing block. The parser is conservative: only the **last** fenced block whose closing fence is followed by nothing but whitespace, and whose opener is tagged `json` (case-insensitive), qualifies. Mid-message fenced blocks (e.g., the model echoing prior advice for context) are intentionally ignored. Malformed JSON returns `nullopt` with a `qWarning`. Absent block returns `nullopt` silently — the model is supposed to omit the block on clarifying-question responses.
+
+The parsed object is persisted on the assistant message as `structuredNext` alongside `role` / `content` in `AIConversation::m_messages`. `AIConversation::structuredNextForLastAssistantTurn()` reads it back. Older saved conversations (no `structuredNext` key) load cleanly and the reader returns `nullopt`.
+
+`ai_advisor_invoke` (MCP) parses the trailing block from the assistant response and surfaces it as a top-level `structuredNext` field in the tool result envelope, alongside `response`. The field is **omitted** (no `null`) when the response carries no recommendation.
+
+This block is the load-bearing precondition for #1053's closed-loop coaching — `recentAdvice[].structuredNext` is read straight back from this stored field, with `expectedDurationSec` / `expectedFlowMlPerSec` driving the `outcomeInPredictedRange` computation.
+
+---
+
+## Lessons Learned: Profile Knowledge Doesn't Scale (March 2026)
+
+### The Problem
+
+A user's D-Flow / Q conversation exposed three failures where the AI gave bad advice despite having relevant information:
+
+1. **Wrong pressure range in knowledge base**: We hand-wrote "Pressure peaks ~8-9 bar" in profile_knowledge.md. The profile author (Damian) specifies "between 6 and 9 bar" in the de1app. The AI flagged a 7.7 bar peak as too low and recommended grinding finer — wrong advice.
+
+2. **Temperature misdiagnosis**: D-Flow deliberately uses a low fill temperature (84°C) stepping to 94°C. The actual basket temperature reaches ~88°C by design — the 94°C setpoint just drives the heater to push hot water that mixes with the cooler pool. The AI saw a 6-8°C gap between target and actual and diagnosed "heat soak the machine longer" — completely wrong.
+
+3. **Misleading observation from the summarizer**: The app's own `temperatureUnstable` flag fired on every D-Flow shot (average deviation from target > 2°C is guaranteed by the profile's temperature stepping design). This actively pointed the AI at the wrong problem.
+
+The AI had to be corrected **twice** by the user before giving useful advice. The profile knowledge base entry, which was supposed to prevent exactly this, had the wrong numbers.
+
+### Why Hand-Curated Knowledge Doesn't Scale
+
+Fixing D-Flow required:
+- Finding the profile description in the de1app editor code (it was hardcoded in UI, not in the `profile_notes` field)
+- Finding Damian's forum posts explaining the temperature stepping design
+- Checking Damian's website (coffee.brakel.com.au) for the correct pressure range
+- Understanding how the DE1's heater/mixing behavior creates the temperature gap
+
+This level of research per profile is not sustainable for 18+ profiles, especially for profiles by community authors who may not have published detailed explanations.
+
+### What We Fixed
+
+1. **Profile notes populated**: Added Damian's descriptions to `d_flow_q.json` and `d_flow_la_pavoni.json` — these flow into the AI prompt as "Profile intent" lines automatically.
+2. **Corrected pressure range**: `profile_knowledge.md` now says "between 6 and 9 bar" matching the author.
+3. **Added temperature explanation**: Knowledge base now explains the intentional temperature stepping and why the gap is by design.
+4. **Grind-dependent curve shape**: Added that finer grinds produce flat pressure (boiler-like) while coarser grinds produce declining pressure (lever-like) — both valid.
+5. **Softened temperature observation**: Changed from "Temperature unstable" (which sounds like a problem) to "Temperature deviation" with guidance to check profile notes before flagging.
+
+### The Path Forward: Three Scalable Improvements
+
+Rather than trying to deeply research every profile, we should make the AI better at interpreting what it already has.
+
+#### 1. Profile Notes as Primary Authority (cost: 0 tokens)
+
+The profile author's own description is the most reliable source of truth. The `notes` field in the profile JSON already flows into the prompt as "**Profile intent**". We need to:
+
+- **Audit all shipped profiles** for empty or sparse notes. The de1app has notes for most profiles — verify they've been copied over (done March 2026: only D-Flow/Q and La Pavoni were missing, now fixed).
+- **Check de1app editor code** for profiles whose descriptions are hardcoded in the UI rather than in `profile_notes` (D-Flow was the only case found).
+- **Instruct the AI to trust profile notes over knowledge base** when they conflict. The filter system prompt already does this ("Always read and respect" the profile intent), but the espresso prompt is weaker — it says "Profile Intent is the Reference Frame" but doesn't explicitly prioritize notes over knowledge base entries.
+
+#### 2. Step-Aware System Prompt (cost: ~200-300 tokens, cacheable)
+
+The profile steps are already in every prompt. A shot using D-Flow / Q includes:
+
+```
+1. Filling (25s) PRESSURE 6.0bar 84°C exit:p>3.0
+2. Infusing (1s) PRESSURE 6.0bar 94°C
+3. Pouring (127s) FLOW 1.8ml/s 94°C lim:10.0bar
+```
+
+An AI that understands DE1 physics can derive expected behavior from these steps alone:
+- Frame 1 at 84°C, Frame 2 at 94°C → intentional temperature stepping, expect actual temp to lag
+- Frame 3 is FLOW-controlled → pressure is passive, will decline as puck erodes
+- Frame 3 has 10 bar limiter → pressure "target" of 10 bar is a ceiling, not a goal
+
+But the AI repeatedly failed to make these inferences. We should add explicit step-interpretation rules to the system prompt:
+
+```
+## Reading the Profile Steps for Expected Behavior
+
+The profile steps tell you what SHOULD happen. Use them to set expectations
+before looking at actual data:
+
+**Temperature stepping**: If frames use different temperatures (e.g., 84°C fill
+→ 94°C pour), the actual temperature will ALWAYS lag behind the target. This is
+physics — the heater pumps hot water that mixes with the cooler pool above the
+puck. A 5-8°C gap between target and actual during temperature transitions is
+normal and expected. Only flag temperature issues if actual temp deviates from
+target during a STABLE phase (same temperature across consecutive frames).
+
+**Flow-controlled pour with pressure limiter**: When a pour frame controls FLOW
+(e.g., 1.8 ml/s) with a high pressure limiter (e.g., 10 bar), pressure will
+peak based on puck resistance and then decline as the puck erodes. The limiter
+is a safety ceiling. Pressure anywhere from 4 to the limiter value is normal.
+The peak depends on grind — do not assume a specific peak value unless the
+profile notes or knowledge base states one.
+
+**Pressure-controlled fill/infuse → Flow-controlled pour**: This is the
+lever/flow hybrid pattern (D-Flow, Londinium family). Pressure builds during
+fill/infuse, then the switch to flow control means pressure becomes passive.
+A declining pressure curve after the switch is the expected signature, not a
+problem.
+
+**Exit conditions**: Frames with exit conditions like "exit:p>3.0" advance to
+the next frame when the condition is met. Short phase durations (1-2s) after
+exit conditions are normal — the machine transitions quickly.
+```
+
+This is profile-independent guidance that improves advice quality across ALL profiles, including custom ones with no knowledge base entry. It's fully cacheable and costs ~250 tokens.
+
+Community sources confirm these interpretation principles:
+- Scott Rao (scottrao.com): Pressure curve volatility indicates channeling from clumped grounds and poor puck prep, not profile issues. The slope of pressure dropoff is characteristic of the grinder/burrs.
+- Decent "5 profiles for medium" blog: D-Flow adapts behavior by grind — mimics 8.5 bar for fine grinds, Londinium for optimal, Gentle & Sweet for coarse.
+- Decent "4 mothers" theory: Each mother category (lever, blooming, allongé, flat-9-bar) has fundamentally different expected curves. Roast level is the most important factor in choosing a profile.
+- home-barista.com community: DE1 set-point temperatures are generally lower than conventional machines, with 80s°C being common. Preference for shots where flow stabilizes immediately after preinfusion.
+
+#### 3. Smarter Observations from the Summarizer (cost: 0 tokens — less noise)
+
+The summarizer currently generates dumb flags based on simple thresholds. These should be step-aware:
+
+**Temperature deviation** (partially fixed March 2026):
+- Current: Flags when average deviation from target > 2°C.
+- Problem: Always fires for profiles with temperature stepping (D-Flow, 80s Espresso, any profile with different fill/pour temps).
+- Better: Check if the profile steps have different temperatures across frames. If so, only check deviation during frames with stable temperature (same temp as previous frame). Or suppress the flag entirely and let the AI interpret using the steps.
+
+**Channeling detection**:
+- Current (April 2026): Flags sustained elevation in the conductance derivative (`|dC/dt| > 3.0` for >10 samples). The dC/dt signal tracks how the flow↔pressure relationship changes and catches channels invisible to either curve alone, so it works across pressure and flow profiles equally. Transient self-healed channels show up in the Shot Summary popup as a separate "Transient channel" line but do not trip the stored `channelingDetected` flag.
+- Further improvement: Also note the pressure curve slope — Scott Rao's observation that pressure curve volatility during extraction correlates with channeling and puck prep quality is a useful diagnostic. The slope of pressure decline is characteristic of the grinder/burrs, so erratic slopes (not smooth decline) are more indicative of channeling than a specific peak value.
+
+**Pressure behavior** (not currently flagged, but could help):
+- If the profile is flow-controlled and pressure peaks well below typical levels (< 4 bar), note this as potentially too coarse — but only as an observation, not a diagnosis.
+
+### Refocusing the Knowledge Base
+
+With step-aware interpretation handling expected curves and temperature behavior, the profile knowledge base (`profile_knowledge.md`) should shift focus to things that **cannot be derived from the steps**:
+
+| Keep in KB (not derivable) | Remove from KB (derivable from the steps) |
+|---|---|
+| Roast suitability per profile | Expected pressure curve shape |
+| Flavor character and what profiles emphasize | Temperature behavior during stepping |
+| Community dial-in tips (e.g., "stop at pressure elbow") | Which variable is controlled vs passive |
+| Grind sensitivity and range | What the limiter means |
+| Profile author's design philosophy | Phase transition behavior |
+| Cross-profile comparisons ("more body than X, less clarity than Y") | |
+| Known pitfalls ("if pressure hits max, grind is too fine") | |
+
+This makes the KB smaller, more accurate (less room for wrong numbers like "~8-9 bar"), and focused on genuinely curated wisdom that adds value beyond what the steps encode.
+
+### What Information We Still Need
+
+The D-Flow fix was possible because Damian published detailed explanations. Most profile authors haven't. Here's what's missing:
+
+#### Profile-specific gaps in the knowledge base
+
+| Profile | Quality | What's missing |
+|---------|---------|----------------|
+| **D-Flow** | Strong | Fixed March 2026. Author-sourced. April 2026: fill temps verified per-profile against JSON frames, Damian's LRv2/LRv3 temps documented. |
+| **A-Flow** | Medium | No author (Janek) design philosophy. Does A-Flow use temperature stepping? Are the 9-10 bar pressure numbers from Janek or our guess? No expected pressure range from author. |
+| **Adaptive v2** | Good | Has Gagné's Coffee ad Astra post. April 2026: pressure corrected to ~9 bar (8.8 bar exit, 9.5 bar extraction limiter) from JSON frames. |
+| **Blooming Espresso** | Good | Has Rao's guidance. April 2026: added temperature line (97.5→90→92°C), corrected fill flow to 4 ml/s, added extraction limiter detail. |
+| **Blooming Allongé** | Good | April 2026: corrected percolation flow to 3.5 ml/s from JSON, added temperature range (91-95°C), added pressure guidance for too-fine grind. |
+| **Allongé / Rao Allongé** | Good | — |
+| **Default** | Good | April 2026: added temperature (90→88°C), added DO NOT flag for declining pressure. |
+| **Londinium/LRv3** | Good | April 2026: added disambiguation note vs Damian's LRv2/LRv3, documented flow-limit behavior from JSON frames. |
+| **Turbo Shot** | Good | April 2026: corrected temperature to 90°C default from JSON, added frame-level detail (preinfusion flow, pressure limiter). |
+| **Filter 2.0/2.1** | Good | April 2026: corrected preinfusion temp to 92°C from JSON, added Filter 2.1 variant note. |
+| **Filter3** | Good | **New** April 2026. No-bypass filter profile. Full 7-phase flow data from JSON, setup/calibration from official Decent guide and Scott Rao blog, dialing-in and output targets from Diaspora community. |
+| **Sprover** | Medium | April 2026: clarified dosing jargon. Still sparse on dial-in tips. |
+| **Gentle & Sweet** | Good | April 2026: added temperature (88°C), added DO NOT flag for temperature increase recommendations. |
+| **Extractamundo Dos** | Good | April 2026: documented dynamic bloom phase and temperature stepping (83.5→67.5→74.5°C) from JSON frames, added DO NOT flag. |
+| **Flow Profile** | Good | April 2026: expanded with variant flow rates (2.0/1.2 ml/s), temperatures (92/88°C), grind guidance, two DO NOT flags. |
+| **Cremina** | Good | April 2026: corrected temperature to 91.5-92°C from JSON. |
+| **80s Espresso** | Good | April 2026: corrected temperature range to 82→72°C and pressure to 7.8→5 bar from JSON. |
+| **Best Overall** | Good | April 2026: corrected pressure to 8.4 bar from JSON. |
+| **E61** | Good | April 2026: quantified pressure decline threshold (avoid <4 bar). |
+
+#### Systematic gaps (not profile-specific)
+
+1. **No AI advice validation method.** We found the D-Flow problem because a user exported a bad conversation. We have no systematic way to test whether advice improved. Need: a set of test conversations (real or synthetic) that can be replayed against updated prompts.
+
+2. **No user feedback loop for bad advice.** The enjoyment score rates the shot, not the advice. If the AI gives wrong recommendations, we only learn about it anecdotally. Could add: a simple "was this advice helpful?" signal after each AI response.
+
+3. ~~**Dial-in reference tables are collected but unused.**~~ **Done** (April 2026, PR #635). Now loaded from Qt resource and included in system prompt.
+
+4. ~~**Espresso system prompt doesn't prioritize profile notes.**~~ **Done** (April 2026, PR #635).
+
+5. **Profile notes quality varies.** All shipped profiles have notes populated, but quality ranges from detailed (`blooming_espresso.json` — full paragraph explaining the technique) to minimal (`damian_s_q.json` — "A very popular profile made with D-Flow, spun out as its own profile"). The minimal ones don't help the AI much.
+
+6. ~~**Temperature stepping profiles beyond D-Flow.**~~ **Done** (April 2026, PR #635). Step-aware system prompt rules now cover all temperature-stepping profiles generically. Additionally, the April 2026 KB quality pass (PR Kulitorum/Decenza#646) documented exact temperature stepping values for Extractamundo Dos (83.5→67.5→74.5°C), 80s Espresso (82→72°C), Filter 2.0 (92→85°C), and Filter3 (94→92→90→88°C).
+
+7. **A-Flow author knowledge.** A-Flow is the second most popular profile editor (after D-Flow) and the only other custom editor. Janek's design intent, expected ranges, and guidance are not well-documented in our KB. Source: check if Janek has published anything similar to Damian's coffee.brakel.com.au site.
+
+### Priority (revised)
+
+These improvements should be implemented before the other ideas in this doc (profile catalog, bean enrichment, cross-profile recommendations) because they improve advice quality for every shot at near-zero cost:
+
+1. **Step-aware system prompt** — highest impact, addresses the root cause of the D-Flow failures. ~250 cacheable tokens. Should be implemented next.
+2. **Espresso prompt: trust profile notes** — one sentence addition to espresso system prompt, matching what the filter prompt already does. 0 cost.
+3. **Dial-in reference tables in system prompt** — move from Phase 1 to Phase 0. Data is already collected in ESPRESSO_DIAL_IN_REFERENCE.md. ~800-1000 cacheable tokens.
+4. **Smarter summarizer observations** — reduces noise that actively misleads the AI. Code change only, no token cost.
+5. **KB refocus** — lower priority, do incrementally. Start with A-Flow (seek author guidance) and thin entries (Default, Flow Profile).
+6. **Test conversations** — collect 5-10 exported AI conversations covering different profiles and failure modes. Use to validate prompt changes before shipping.
+
+---
+
+## Ideas for Improvement
+
+### 1. Profile Catalog in System Prompt
+
+**Problem**: The AI only knows about the current shot's profile. It can't recommend switching profiles or compare approaches.
+
+**Approach**: Generate a compact one-liner per profile and include in the system prompt. Example:
+
+```
+D-Flow / default (Damian) — lever-style: 3bar PI, 1.7ml/s flow pour, 88C, espresso
+Blooming Espresso — bloom 30s then declining pressure, 92C, espresso
+Best Practice Light Roast — designed for light/Nordic roasts, 94-96C
+Filter 2.1 — high-flow pour-over style, 96C, 1:15 ratio, filter
+```
+
+**Token cost**: ~80-100 chars/profile x ~95 profiles = ~2-3K tokens added to system prompt.
+
+**With caching**: Anthropic 90% discount, OpenAI 50% automatic. Minimal incremental cost per request.
+
+**Status**: **Done** (April 2026). Implemented as a compact KB-only catalog (19 profiles) rather than all ~95 profiles. Built from `profile_knowledge.md` during KB loading via `buildProfileCatalog()`. Included in `shotAnalysisSystemPrompt()` as "Available Profiles with Curated Knowledge" section. ~500 cacheable tokens.
+
+### 2. Curated Profile Knowledge Base
+
+**Problem**: The profile catalog (idea #1) tells the AI what each profile *does* mechanically, but not what it's *for* — which roasts, which flavor goals, which skill level.
+
+**Approach**: A curated resource file (text or JSON) encoding community wisdom per profile:
+
+```
+D-Flow / default:
+  Best for: Medium to dark roasts
+  Typical: 88C, 18g dose, 1:2.5-3 ratio
+  Character: Forgiving puck prep, body-forward, classic espresso
+  Not ideal for: Very light Nordic roasts (under-extracts)
+
+Best Practice Light Roast:
+  Best for: Light and Nordic roasts
+  Typical: 94-96C, 18g dose, 1:2.5+ ratio
+  Character: Clarity, brightness, needs precise puck prep
+
+Blooming Espresso:
+  Best for: All roasts, especially when seeking clarity
+  Typical: 92C, bloom 30s, gentle extraction
+  Character: Highlights origin flavors, lower body than traditional
+```
+
+**Who writes it**: Could be maintained by the developer/community, updated with app releases. Alternatively, seeded from community knowledge and refined over time.
+
+**Status**: **Implemented.** Knowledge base lives in [`docs/PROFILE_KNOWLEDGE_BASE.md`](PROFILE_KNOWLEDGE_BASE.md) (human-readable, source-tagged) and [`resources/ai/profile_knowledge.md`](../resources/ai/profile_knowledge.md) (AI-optimized, loaded as Qt resource). 19 profiles documented with expected curve behavior, temperature, flow rates, grind guidance, and "DO NOT flag" instructions. Data sourced from Decent blog posts, the "4 mothers" theory, and transcripts from three Decent video tutorials (light/medium/dark roast profiles). Profile matching in `ShotSummarizer::shotAnalysisSystemPrompt()` with fuzzy title matching and alias support.
+
+### 3. User History Summary
+
+**Same-profile dial-in history** — **Implemented.** When analyzing a shot, up to 5 recent shots with the same KB ID and the same equipment package are included in the user prompt via `ShotHistoryStorage::loadRecentShotsByKbIdStatic()`. Each historical shot includes the full profile steps, grind setting, temperature, dose/yield, score, and tasting notes. This lets the AI track dial-in progression and correlate changes with results (e.g., "you ground 2 clicks finer and the sourness resolved").
+
+**Cross-profile history** — Not yet implemented. The AI doesn't know the user's track record *across* different profiles. A session-level summary would enable:
+
+```
+YOUR PROFILE HISTORY (last 90 days):
+- D-Flow / default: 47 shots, avg rating 78, mostly medium-dark beans
+  Best: 85 rating, Ethiopian Sidamo, 18g->38g, 88C
+  Worst: 52 rating, Kenyan AA light, 18g->36g, 88C
+- Blooming Espresso: 12 shots, avg rating 84, mostly light beans
+  Best: 92 rating, Kenyan AA, 18g->42g, 94C
+- Never tried: Turbo Shot, Rao Allonge, Adaptive v2...
+```
+
+**Token cost**: ~1-2K tokens. Changes per session, not per request — could be cached as a second block.
+
+**Enables**: "You've been averaging 78 on D-Flow with light roasts but 84 on Blooming. Your data suggests Blooming works much better for your light roasts."
+
+**Status**: Same-profile history done. Cross-profile summary needs aggregation query + summary generation.
+
+### 4. Bean Data Enrichment
+
+**Problem**: Users type "Onyx Southern Weather" but the AI may or may not know the roast level, processing, origin, or recommended dose and yield. Small/local roasters and seasonal lots are unknown. Today the BeanInfoPage only captures: roaster, coffee name, roast date, roast level (dropdown), grinder, setting, barista. No origin, processing, variety, altitude, or roaster's tasting notes.
+
+#### Existing Bean Data Sources (Research, March 2026)
+
+| Source | Data | Size | API | Decent Ecosystem |
+|--------|------|------|-----|-----------------|
+| **Loffee Labs Bean Base + Roasters Registry** | **Bean Base**: roaster, name, origin, processing, variety, roast level, tasting notes (categorized by flavor family), price, body, description. **Roasters Registry**: roaster name, region, country, type, linked bean-base stats. Separate but linked databases rebuilt together in V4.0 — beans are children of roasters. | Thousands of coffees, hundreds of roasters | Yes (contact loffeelabs@gmail.com for access) | Already integrated with visualizer.coffee |
+| **RoastDB** | Origin, variety, process, roast level, tasting notes, price | 4,500+ coffees, 472+ roasters, 30 countries | No public API (Next.js + SQLite web app) | None |
+| **Visualizer.coffee coffee_bags API** | roast_date, origin (country, region, farm, farmer), variety, elevation, processing, harvest time, tasting notes, roast level, quality score | User's own data only (authenticated) | Yes (existing auth in Decenza) | Core integration already exists |
+| **Beanconqueror** | Origin, variety, processing, roast level per bean | Per-user local data | No public search API | Indirect (both integrate with visualizer) |
+| **Coffee Quality Institute DB** | 1,300+ arabica reviews: processing, country, farm, mill, quality metrics | Static dataset | GitHub CSV | None |
+| **AI training data** | Major roasters' flagships and long-running blends | Broad but unreliable for seasonal/local | Free (part of AI call) | N/A |
+
+**Key finding**: Visualizer's `coffee_bags` API has all the right fields (origin, variety, processing, elevation, tasting notes) but only returns the **user's own data** — it's not a community-searchable database. The community search layer is **Loffee Labs Bean Base**, which visualizer.coffee already uses for its "Search Loffee Labs Bean Base" feature.
+
+#### Recommended Approach: Two-Tier Lookup
+
+**Tier 1: Visualizer coffee_bags (user's own data, no new API needed)**
+- Decenza already has visualizer auth (`VisualizerUploader` with token)
+- The `coffee_bags` API has excellent fields: origin (country, region, farm, farmer), variety, elevation, processing, harvest time, tasting notes, roast level, quality score
+- But it's **per-user only** — only returns bags the user has already entered in visualizer
+- Useful for: auto-filling fields the user already entered on the visualizer side, avoiding double entry
+- Zero new dependencies — just add a GET to the existing visualizer integration
+
+**Tier 2: Loffee Labs Bean Base + Roasters Registry (community search, needs API access)**
+- Thousands of curated coffees from hundreds of roasters
+- **Two linked databases**: Bean Base (beans with origin, processing, variety, tasting notes, etc.) and Roasters Registry (roaster directory with region, country, type). Beans are linked to their roasters. Rebuilt together in V4.0 on shared codebase.
+- Search by roaster + bean name returns structured data
+- Already integrated with visualizer.coffee (the "Search Loffee Labs Bean Base" field in visualizer's UI goes through their API)
+- **Requires API access from Loffee Labs** — Keith from LoffeeLabs responded (March 2026): API is undergoing extensive modernization. New API keys paused until new system launches. Beta access offered (~1 month), full production ~2-3 months. Free usage including post-launch. New API won't require manual key approval.
+- Fallback when the user's own visualizer data has no match
+- **Open questions for Loffee Labs** (follow up when they respond):
+  1. Can we search by roaster name to get all their current beans?
+  2. Does the API expose roaster details (location, website, type)?
+  3. What's the bean ID format — is it the UUID that visualizer uses as `canonical_coffee_bag_id`?
+
+**Visualizer <-> Bean Base linking via `canonical_coffee_bag_id`:**
+(CONFIRMED June 2026 from the open-source miharekar/visualizer repo — see `BEAN_BASE.md` and the add-bean-base-integration design.) `canonical_coffee_bag_id` is the UUID of a row in Visualizer's own `canonical_coffee_bags` table; that table holds the Bean Base integer in its `loffee_labs_id` column. No public API resolves loffee_labs_id → UUID today, so cross-linking from Decenza needs a small upstream addition. This means Decenza can:
+- **Read**: Pull the user's coffee bags from visualizer, which may already have Bean Base links from the visualizer web UI
+- **Write**: When user selects a Bean Base result in Decenza, create/update a `coffee_bag` on visualizer with the `canonical_coffee_bag_id` set to the Bean Base UUID — keeping visualizer in sync
+- **Link shots**: When uploading shots, include `coffee_bag_id` to link shot -> bag -> Bean Base
+
+This creates a full round-trip: Bean Base -> Decenza -> Visualizer -> Bean Base, so bean data entered in any app stays connected.
+
+**Why this two-tier approach:**
+1. Tier 1 is free and immediate — no new API keys, uses existing auth
+2. Tier 2 provides community-wide coverage for new beans
+3. User's own data takes priority (they may have corrected/customized fields)
+4. Writing back to visualizer with `canonical_coffee_bag_id` keeps the ecosystem in sync
+
+**Proposed flow:**
+1. User enters roaster + bean name on BeanInfoPage
+2. After both fields have text (debounced), Decenza queries:
+   a. First: visualizer `coffee_bags` API (user's own data, filtered by name match)
+   b. If no match: Loffee Labs Bean Base API (community search)
+3. Results shown as suggestions or auto-fill prompt
+4. Auto-fills: origin, processing, variety, roast level, roaster's tasting notes
+5. User can accept, edit, or dismiss the enriched data
+6. Enriched data stored on bean preset and passed to AI with shot analysis
+7. If Bean Base result was used, create/update a visualizer `coffee_bag` with `canonical_coffee_bag_id` so visualizer stays in sync
+
+**New fields needed on bean preset:**
+- `origin` — Country/region (e.g., "Ethiopia, Guji")
+- `processing` — Washed, Natural, Honey, Anaerobic, etc.
+- `variety` — Caturra, Gesha, SL28, etc.
+- `altitude` — Growing altitude if available
+- `roasterTastingNotes` — Roaster's description (distinct from user's post-shot notes)
+- `roasterRecommendation` — Dose/yield/temp if roaster provides it
+- `beanBaseId` — For future lookups and cache invalidation
+
+**What this enables for the AI:**
+```
+Today:     "Coffee: Onyx - Southern Weather"
+Enriched:  "Coffee: Onyx - Southern Weather (Colombia, Huila. Washed Caturra,
+            1700-1900m. Medium-light roast. Roaster notes: milk chocolate,
+            brown sugar, mandarin orange)"
+```
+
+The AI can now say: "Your Colombian washed beans have chocolate/citrus notes — D-Flow at 88C should bring out the chocolate, but if you want more of the mandarin brightness, try raising temp to 91C or switching to Blooming Espresso."
+
+**Implementation steps:**
+1. Add new fields to `Settings::addBeanPreset()` / `updateBeanPreset()` and `ShotMetadata`
+2. Create `BeanLookupManager` in `src/network/` for both visualizer and Bean Base queries
+3. Add lookup trigger in BeanInfoPage QML (debounced, after roaster+bean entered)
+4. Show enriched data in UI with accept/edit/dismiss
+5. Pass enriched fields through to `ShotSummarizer::buildUserPrompt()`
+6. Contact Loffee Labs for Bean Base API access (required for Tier 2)
+
+**Fallback options (when neither tier has a match):**
+
+**B. Lean on AI training data (free, immediate)**
+- Add to system prompt: "If you recognize the roaster and bean, share what you know about roast level, processing, and flavor profile. If you don't recognize them, say so and ask the user."
+- Pro: Zero implementation cost, works for major roasters
+- Con: Unreliable for seasonal/small roasters, may hallucinate
+- Can be implemented immediately as a stopgap
+
+**C. Web search fallback**
+- If Bean Base returns no results, optionally search the web for the roaster's product page
+- Use the configured AI provider to extract structured data from the page
+- Pro: Works for any roaster with a website
+- Con: Adds latency, unreliable parsing, may not find small roasters
+
+**D. Community-contributed via visualizer.coffee**
+- Users who enter bean details build up shared data via visualizer's `coffee_bags` API
+- When someone enters the same roaster/bean, details auto-populate from community data
+- Pro: Accurate, grows over time, already has API
+- Con: Requires visualizer premium for writes, slow to build critical mass
+
+**Status**: Not implemented. Tier 1 (visualizer) ready to build. Tier 2: **Loffee Labs responded (March 2026)** — their API is being modernized; beta access offered in ~1 month, free usage. See dependency notes below.
+
+### 5. Gemini Context Caching
+
+**Problem**: Anthropic caches for 5 minutes, OpenAI caches automatically. But users who pull shots throughout the day (e.g., 30 minutes apart) lose the cache between shots.
+
+**Approach**: Use Gemini's explicit Context Caching API to create cached content resources with longer TTL (minutes to hours). The system prompt + profile catalog would be cached once per session.
+
+**Status**: Not implemented. Would be valuable if the profile catalog (idea #1) or knowledge base (idea #2) significantly increases the system prompt size.
+
+### 6. Cross-Profile Recommendations
+
+**Problem**: Even with a profile catalog, the AI needs guidance on *when* to recommend switching profiles.
+
+**Approach**: Add a section to the system prompt:
+
+```
+## When to Suggest a Profile Change
+
+Consider recommending a different profile when:
+- The user's roast level mismatches the profile's design temperature
+  (e.g., light roast on an 88C profile)
+- Repeated shots show the same issue that a different profile addresses
+  (e.g., always under-extracting → try a profile with longer preinfusion)
+- The user asks about a different brewing style
+  (e.g., "I want more clarity" → suggest a blooming or turbo profile)
+
+Never suggest a profile change after a single shot unless the mismatch
+is severe. Give the current profile 2-3 shots to dial in first.
+```
+
+**Status**: **Done** (April 2026). Added "When to Suggest a Different Profile" section to espresso system prompt. Uses the profile catalog (idea #1, also done) for cross-profile awareness.
+
+### 8. Structured Grinder + Burr Fields
+
+**Problem**: The current `dyeGrinderModel` is a single free-text field (e.g. "DF83V"). This loses structure — the AI can't distinguish manufacturer from model, and has no idea what burrs are installed. For grinders with interchangeable burrs (Zerno Z1/Z2, DF64/83, EG-1, Lagom P64/P100, etc.), the burr set matters as much as the grinder for flavor advice.
+
+**Approach**: Split the single "Grinder" field into three structured fields, following the same cascade pattern as beans (Roaster → Coffee):
+
+```
+Grinder Manufacturer → Grinder Model → Burrs
+       "Turin"         →   "DF83V"    → "SSP HU 83mm"
+       "Zerno"         →   "Z1"       → "SSP MPV2 64mm blind"
+       "Eureka"        →   "Mignon Specialita" → ""  (no aftermarket burrs)
+```
+
+Each field cascades suggestions from history:
+- **Manufacturer**: `getDistinctGrinderBrands()` — all brands the user has entered
+- **Model**: `getDistinctGrinderModelsForBrand(brand)` — models for selected brand
+- **Burrs**: `getDistinctGrinderBurrsForModel(brand, model)` — burr sets used with that grinder
+
+**UI Layout** (BeanInfoPage):
+
+```
+Row 1: [Roaster]       [Coffee]    [Roast date]
+Row 2: [Grinder brand] [Model]     [Burrs]
+Row 3: [Roast level]   [Setting]   [Barista]
+```
+
+**Data Changes**:
+
+| Component | Current | Proposed |
+|-----------|---------|----------|
+| `Settings` | `dyeGrinderModel` (single string) | `dyeGrinderBrand`, `dyeGrinderModel`, `dyeGrinderBurrs` |
+| `ShotHistoryStorage` DB | `grinder_model TEXT` | `grinder_brand TEXT`, `grinder_model TEXT`, `grinder_burrs TEXT` |
+| `ShotMetadata` struct | `grinderModel` | `grinderBrand`, `grinderModel`, `grinderBurrs` |
+| Bean presets | `grinderModel` | `grinderBrand`, `grinderModel`, `grinderBurrs` |
+| Visualizer upload | `grinderModel` in notes | `grinderBrand + " " + grinderModel` in notes (backward compat) |
+| FTS index | includes `grinder_model` | includes `grinder_brand`, `grinder_model`, `grinder_burrs` |
+| AI prompt | "Grinder: DF83V" | "Grinder: Turin DF83V with SSP HU 83mm burrs" |
+
+**Migration**: DB migration uses `src/core/grinderaliases.h` — a lookup table of ~90 grinders with aliases that map common user-typed strings to structured brand/model/stock_burrs. The migration:
+1. Lowercase-normalizes the existing `grinder_model` string
+2. Matches against aliases (e.g. "niche" → Niche/Zero, "df83v" → Turin/DF83V, "comandante" → Comandante/C40 MK4)
+3. On match: populates `grinder_brand`, `grinder_model`, and auto-fills `grinder_burrs` with `stock_burrs`
+4. On no match: keeps entire string in `grinder_model`, leaves `grinder_brand` and `grinder_burrs` empty
+5. Aliases prioritize longer matches first to avoid "niche" matching before "niche duo"
+
+**Burr Auto-Fill**: When the user selects a grinder manufacturer + model from the autocomplete dropdown, the burr field auto-fills with the stock/most popular burr from `src/core/grinderaliases.h`. For grinders with `burr_swappable: true`, clicking the burr field shows a picker with:
+- Common burr options for that grinder size (from GRINDER_DATABASE.md aftermarket burr sets)
+- Previously used burr values from shot history
+- Free-text entry for custom burrs
+For non-swappable grinders (e.g. Eureka Mignon, Comandante), the field auto-fills and is less prominent since the user can't change burrs.
+
+**Backward Compatibility**: `dyeGrinderModel` getter could return `brand + " " + model` for any code that still reads the old combined field. Old bean presets with just `grinderModel` continue to work (loaded into `grinderModel`, `grinderBrand` stays empty).
+
+**AI Impact**: With manufacturer, model, and burrs, the AI can look up the grinder in `GRINDER_DATABASE.md` and know:
+- Burr size and geometry → appropriate grind range and sensitivity
+- Burr flavor profile → expected taste characteristics
+- Whether the grinder accepts aftermarket burrs → can suggest burr changes
+- Adjustment resolution → how much one click/turn changes the grind
+
+**Status**: Implemented in PR Kulitorum/Decenza#368.
+
+### 10. Espresso Dial-In Reference Tables in System Prompt
+
+**Problem**: The current system prompt has only 3 lines for roast considerations and generic common patterns (gusher, choker, sour, bitter). It lacks structured multi-variable relationships — e.g., "what does higher flow rate do to clarity vs body?" or "how should infusion length change for different roast levels?"
+
+**Source**: Åbn Coffee "Espresso tabel oversigt" — a community reference mapping 7 espresso variables against taste/texture outcomes. See [`docs/ESPRESSO_DIAL_IN_REFERENCE.md`](ESPRESSO_DIAL_IN_REFERENCE.md).
+
+**What it adds beyond the current system prompt**:
+1. **5-tier roast level matrix** — maps light→dark against acidity, clarity, extractability, mouthfeel, puck risk, puck prep importance, and specific flavor notes (fruits → caramel → choc+fruit → milk choc → dark choc). Current prompt only has 3 tiers with rough temp ranges.
+2. **Grind→flow→pressure dynamics** — how grind affects channelling risk, the body/sweetness curve (less → more → less), clarity, flow limit behavior, and pressure decline patterns. Directly relevant to DE1 curve interpretation.
+3. **Preinfusion tuning** — drip weight targets (4-10g vs 0.5g), move-on timing (30s vs 5s), and texture/body/clarity tradeoffs. Current prompt has nothing on preinfusion dialing.
+4. **Pressure sweet spot** — 6-9 bar range with taste descriptions (thin/watery → clear delicate → rich traditional → muddy). Current prompt says "don't assume 9 bar" but doesn't explain what different pressures taste like.
+5. **Flow rate → flavor pairing** — high flow favors florals/fruits with clarity; low flow favors chocolate/nuts with body. Plus flow rate recommendations per roast level and use-case ranges (milk drinks vs straight espresso).
+6. **Gagné's ratio-flow formula** — `Flow = 4.867 - (6.6 × ratio)` — a concrete relationship between ratio and recommended flow rate.
+7. **Flavor targeting & correction tables** — full matrix of "want more X → adjust Y in direction Z" for acidity, sweetness, body, clarity, wine-like texture. Plus correction tables for sourness, bitterness, burnt taste, thin taste, muddiness.
+8. **TDS vs EY% taste mapping** — bitterness increases with both, sourness increases with high TDS + low EY, dark chocolate at high EY + low TDS. Useful when user provides refractometer data.
+
+**Approach**: Add a "Dial-In Reference" section to `espressoSystemPrompt()` in `shotsummarizer.cpp`, between "Roast Considerations" and "Forbidden Simplifications". Compact representation (~800-1000 tokens) would be cacheable with Anthropic's 90% discount.
+
+**Key sections to add**:
+- Roast level → temperature + expected flavor profile (5 tiers)
+- Flow rate → flavor affinity by roast level
+- Preinfusion tuning (drip weight, move-on time, tradeoffs)
+- Pressure sweet spot with taste descriptions
+- Flavor correction quick-reference (sour→do X, bitter→do Y)
+- TDS/EY interpretation guidelines
+
+**Status**: **Done** (April 2026, PR #635). Loaded from Qt resource `:/ai/espresso_dial_in_reference.md` into `shotAnalysisSystemPrompt()`. Shared between in-app AI and MCP.
+
+### 9. Conversation Context Layers
+
+Summary of the layered context approach:
+
+| Layer | Content | Size | Changes | Caching | Status |
+|-------|---------|------|---------|---------|--------|
+| Static knowledge | System prompt + curated profile knowledge base (19 profiles) | ~2-2.5K tokens | Per app release | System prompt caching (Anthropic/OpenAI/Gemini) | **Done** |
+| Step interpretation | Rules for deriving expected behavior from profile steps (temp stepping, flow/pressure, limiters) | ~0.25K tokens | Per app release | System prompt caching | **Done** |
+| Dial-in reference | Roast/grind/flow/pressure/ratio → taste tables, flavor correction guide | ~2.1K tokens | Per app release | System prompt caching | **Done** |
+| Grinder context | Observed settings range, min/max, noise-filtered typical step (`stepSize`) from shot history | ~0.1K tokens | Every request | Not cacheable | **Done** |
+| Profile catalog | Compact one-liner per KB profile (19 profiles) for cross-profile awareness | ~0.5K tokens | Per app release | System prompt caching | **Done** |
+| Bean enrichment | Origin, processing, variety, tasting notes from Bean Base/visualizer | ~0.5-1K tokens | Per bean preset | Included in user prompt | Not implemented |
+| Dial-in history | Last 5 shots with same profile family (steps, grind, temp, score, notes) | ~1-2.5K tokens | Every request | Not cacheable | **Done** |
+| User history | Profile usage stats across all profiles, best/worst shots | ~1-2K tokens | Per session | Could be second cached block | Not implemented |
+| Current shot | Shot data, phase breakdown, tasting notes | ~1-2K tokens | Every request | Not cacheable | **Done** |
+
+Total context today: ~8-10K tokens. With all layers: ~14-18K tokens, with ~50-70% cacheable.
+
+---
+
+## Implementation Priority
+
+### Phase 0: Fix interpretation quality (highest ROI, near-zero cost)
+1. ~~**Step-aware system prompt**~~ — **Done** (April 2026, PR #635). Added "Reading the Profile Steps for Expected Behavior" section to `espressoSystemPrompt()` with rules for temperature stepping, flow-controlled pressure decline, pressure→flow transitions, and exit conditions. ~250 cacheable tokens.
+2. ~~**Espresso prompt: trust profile notes**~~ — **Done** (April 2026, PR #635). Espresso system prompt now explicitly states profile intent takes priority over Profile Knowledge section when they conflict.
+3. ~~**Dial-in reference tables in system prompt**~~ — **Done** (April 2026, PR #635). Full `ESPRESSO_DIAL_IN_REFERENCE.md` content loaded from Qt resource (`:/ai/espresso_dial_in_reference.md`) and appended in `shotAnalysisSystemPrompt()`. Shared between in-app AI and MCP — the MCP's separate `referenceGuide` field was removed to avoid duplication. ~2,100 cacheable tokens.
+4. ~~**Smarter summarizer observations**~~ — **Done** (April 2026, PR #635). `temperatureUnstable` flag is now step-aware: suppressed when the temperature goal curve shows intentional stepping (range > 5°C). Eliminates false positives on D-Flow, 80s Espresso, and other temperature-stepping profiles.
+5. ~~**Profile notes audit**~~ — **Done** (March 2026). D-Flow/Q and La Pavoni were the only empty ones; now fixed. All other profiles confirmed populated.
+6. ~~**Grinder context in user prompt**~~ — **Done** (April 2026, PR #635). Grinder settings range query extracted to shared `ShotHistoryStorage::queryGrinderContext()`. In-app AI includes observed settings, range, and the noise-filtered typical step (`stepSize`) in the user context. MCP uses the same shared helper; the Grind quick-select widget consumes the same estimator via `grindStepForGrinder()`.
+7. ~~**Bean age calculation**~~ — **Skipped.** The raw roast date is already in the user prompt. Pre-computing "days since roast" adds noise that can mislead the AI for users who freeze beans. The AI can do the math itself if relevant, and the "Forbidden Simplifications" section already prevents it from assuming old = stale.
+8. ~~**Refocus knowledge base**~~ — **Partial** (April 2026, PR Kulitorum/Decenza#646). Systematic quality pass: all 19 entries verified against profile JSON frame data, incorrect temperatures/pressures/flows corrected, missing temperatures added to 6 entries, DO NOT flags added to 4 entries, thin entries expanded (Default, Flow Profile), Extractamundo Dos bloom phase documented, Londinium naming disambiguated. New Filter3 entry added with data from JSON frames, official Decent guide, Scott Rao blog, and Diaspora community. Remaining: shift entries away from derivable curve behavior toward non-derivable wisdom, seek A-Flow author guidance.
+9. **Test conversations** — Collect 5-10 exported AI conversations covering different profiles and failure modes. Use to validate prompt changes before shipping.
+
+### Phase 1: Quick wins (no external dependencies)
+1. ~~**System prompt bean guidance**~~ (idea #4 fallback B) — **Done.** `sharedBeanKnowledge()` in `shotsummarizer.cpp` includes proactive guidance about origin/processing characteristics, variety flavor profiles (Geisha, SL28, Caturra, Bourbon), roaster style recognition, and taste-to-bean mapping. Shared between espresso and filter prompts.
+2. ~~**Profile catalog**~~ (idea #1) — **Done** (April 2026). `buildProfileCatalog()` generates a compact one-liner per KB profile (name, category, roast suitability) from `profile_knowledge.md` during KB loading. Included in `shotAnalysisSystemPrompt()` as "Available Profiles with Curated Knowledge" section (~500 cacheable tokens). Covers the 19 profiles with KB entries. Enables cross-profile recommendations (e.g., "your light roast may work better on Blooming Espresso").
+3. ~~**Grinder knowledge base**~~ — **Done** (April 2026). Per-shot burr geometry (e.g. "83mm flat") was already in `buildUserPrompt()` via `GrinderAliases::burrGeometry()`. Added burr-swappable flag to the Grinder Context section so the AI knows when aftermarket burrs are an option. Full 150-grinder database is NOT loaded into the system prompt — only the user's own grinder specs from `GrinderAliases` are included, keeping tokens minimal.
+4. ~~**Structured grinder + burr fields**~~ (idea #8) — **Done** in PR Kulitorum/Decenza#368.
+5. ~~**Espresso dial-in reference tables**~~ (idea #10) — **Done** (April 2026, PR #635). Moved to Phase 0 item 3.
+
+### Phase 2: Bean enrichment
+3. **Visualizer coffee_bags lookup** (idea #4 tier 1) — Query user's own visualizer data for bean details. No new API keys needed, uses existing auth. Avoids double-entry for visualizer users.
+4. **Loffee Labs Bean Base integration** (idea #4 tier 2) — Contact Loffee Labs for API access. Community-wide search for beans not in user's visualizer data.
+5. **New bean preset fields + AI integration** — Add origin, processing, variety, altitude, roaster tasting notes to bean presets. Extend `ShotSummarizer::buildUserPrompt()` to include enriched data.
+
+### Phase 3: Personalization (app-side work)
+6. ~~**Dial-in history per profile family** (idea #3 partial)~~ — **Done.** Up to 5 recent shots with the same KB ID are included in the user prompt with full steps, grind, temp, dose, score, and tasting notes. Queried via `ShotHistoryStorage::loadRecentShotsByKbIdStatic()`.
+7. ~~**Curated profile knowledge base** (idea #2)~~ — **Done.** 39 KB sections covering all built-in profile families, integrated into system prompt via `shotAnalysisSystemPrompt()`.
+8. **User history summary across profiles** (idea #3 remaining) — Aggregate shot history into per-session summary showing which profiles the user has tried, average ratings, best/worst combos. Would enable cross-profile recommendations.
+9. ~~**Cross-profile recommendation guidance**~~ (idea #6) — **Done** (April 2026). Added "When to Suggest a Different Profile" section to espresso system prompt. Triggers: roast/profile mismatch, persistent issues across multiple shots, or user request. Guards against premature switching (2-3 shots minimum). Depends on profile catalog (Phase 1 item 2, also done).
+
+### Phase 4: Optimization
+9. **Gemini context caching** (idea #5) — Implement when context size grows from above additions.
+10. **Web search fallback** (idea #4 fallback C) — For beans not in Bean Base.
+11. **Community bean data via visualizer** (idea #4 fallback D) — Longer-term, needs critical mass.
+
+### External Dependencies
+- **Loffee Labs API access**: Keith responded (March 2026) — API undergoing modernization, new keys paused. Beta access in ~1 month, full production ~2-3 months. Free usage offered. No manual key approval on new system. Required for Phase 2, step 4
+- ~~**Profile knowledge content**~~ — **Done.** 19 profiles documented from official Decent sources (quality pass April 2026, PR Kulitorum/Decenza#646)
+
+## Completed Data Collection
+- **Profile Knowledge Base**: [`docs/PROFILE_KNOWLEDGE_BASE.md`](PROFILE_KNOWLEDGE_BASE.md) — 19 profiles with source-attributed guidance on roast suitability, temperature, ratio, grind, expected curve behavior, and dial-in tips. Enriched from three Decent video tutorials (light/medium/dark roast profiles).
+- **AI Profile Knowledge Resource**: [`resources/ai/profile_knowledge.json`](../../resources/ai/profile_knowledge.json) — validated structured KB (schema: `resources/ai/profile_knowledge.schema.json`; build-time gate: `tools/validate_kb.py`) loaded as a Qt resource and parsed by `loadProfileKnowledge()`. 43 entries; every shipped built-in profile resolves to one (gated by `TstDialingBlocks::kbCoverage_everyBuiltInProfileResolves`). (Restructured from the former markdown KB — change `restructure-kb-as-validated-json`. NOTE: other `profile_knowledge.md` references in this doc are pre-JSON history pending a doc refresh.)
+- **Grinder Database**: [`docs/GRINDER_DATABASE.md`](GRINDER_DATABASE.md) — ~150 grinders across premium, mid-range, budget, commercial, and hand grinder categories with burr specs, plus aftermarket burr sets and grind-setting guidance
+- **Espresso Dial-In Reference Tables**: [`docs/ESPRESSO_DIAL_IN_REFERENCE.md`](ESPRESSO_DIAL_IN_REFERENCE.md) — Structured multi-variable reference from Åbn Coffee mapping roast level, temperature, grind size, infusion, peak pressure, flow rate, and ratio to their effects on taste, texture, and extraction. Includes flavor targeting tables ("how to get more acidity/sweetness/body/clarity"), flavor correction tables ("how to fix sourness/bitterness/thin taste"), TDS vs EY% taste relationships, Gagné's ratio-flow formula, flow rate recommendations by roast level, and preinfusion tuning guidance. Source: Åbn Coffee "Espresso tabel oversigt" (work in progress community reference).
+## Related Internal Documentation
+
+These docs in this repo contain information relevant to the AI advisor. Reference them when working on AI features:
+
+### Machine & Profile Mechanics (inform what the AI should understand)
+- [`docs/AUTO_FLOW_CALIBRATION.md`](AUTO_FLOW_CALIBRATION.md) — Flow sensor calibration algorithm using scale data as ground truth. Explains why flow readings can be ~20% off (D-Flow/Q conversation revealed this), the auto-correction mechanism, density correction (water at 93°C = 0.963 g/ml), and safety bounds [0.5, 1.8]. Relevant to AI advice about flow discrepancies between target and actual.
+- [`docs/SIMPLE_PROFILE_EDITOR.md`](SIMPLE_PROFILE_EDITOR.md) — Three-step simple profile model (Preinfuse/Rise&Hold/Decline) vs frame-based advanced profiles. Explains `settings_2a` (pressure) and `settings_2b` (flow) profile types, time-based vs weight-based termination, and how simple profiles are converted to frames. Relevant for understanding profile structure differences.
+- [`docs/profile-porting-guide.md`](profile-porting-guide.md) — Tcl-to-JSON profile conversion reference. Frame structure, exit conditions (`exit_if`, `exit_type`, `exit_pressure_over/under`, `exit_flow_over/under`), pump modes, sensor types. Essential reference for understanding how profile steps map to machine behavior.
+- [`docs/CLAUDE_MD/BLE_PROTOCOL.md`](CLAUDE_MD/BLE_PROTOCOL.md) — Shot sample rate (~5Hz), profile upload format, BLE command queue, retry mechanism. Explains data resolution limits (200ms between samples) that affect phase transition detection and curve smoothness.
+- **Video transcripts**: [`docs/kb_sources/light_roast_profiles_transcript.txt`](kb_sources/light_roast_profiles_transcript.txt), [`docs/kb_sources/medium_roast_profiles_transcript.txt`](kb_sources/medium_roast_profiles_transcript.txt), [`docs/kb_sources/dark_roast_profiles_transcript.txt`](kb_sources/dark_roast_profiles_transcript.txt) — Full transcripts of three Decent video tutorials covering profile selection and dial-in by roast level. A cited-source archive for the structured knowledge base (`resources/ai/profile_knowledge.json`); consult these when adding or updating profile knowledge entries.
+
+### Data & Integration (inform what data the AI receives)
+- [`docs/CLAUDE_MD/VISUALIZER.md`](CLAUDE_MD/VISUALIZER.md) — DYE metadata fields (`bean_brand`, `bean_type`, `roast_level`, `grinder_model`, `grinder_setting`, `drink_tds`, `drink_ey`, `espresso_enjoyment`), shot upload JSON structure, and Visualizer API integration. Defines the metadata fields available for AI analysis and the format of shot data uploads.
+
+### Not AI-relevant (do not reference for AI work)
+The following docs are about app infrastructure and are not relevant to AI advice quality: `ACCESSIBILITY.md`, `ANDROID_MEMORY_GC_PRESSURE.md`, `CPP_COMPLIANCE_AUDIT.md`, `DE1_BLE_PROTOCOL.md` (low-level UUIDs — use `CLAUDE_MD/BLE_PROTOCOL.md` instead), `headless-mode-investigation.md`, `HOME_AUTOMATION.md`, `IOS_CI_*.md`, `ISSUE_TRIAGE.md`, `layout.md`, `layout-server.md`, `MMR_WRITES_COMPARISON.md`, `simulation.md`, `text-widget.md`, `UI_COMPLIANCE_*.md`, `CLAUDE_MD/DATA_MIGRATION.md`, `CLAUDE_MD/PLATFORM_BUILD.md`, `accessibility/phase*.md`, `plans/`.
+
+## External Sources (for future knowledge base updates)
+
+These sources contain profile-specific advice that could inform future knowledge base or system prompt updates:
+
+- **Damian Brakel's D-Flow site**: https://coffee.brakel.com.au/d-flow/ — D-Flow editor documentation, pour phase mechanics (flow goal + pressure limit interaction), grind-dependent behavior explanation
+- **Scott Rao on DE1 pressure profiling**: https://www.scottrao.com/blog/2018/6/3/introduction-to-the-decent-espresso-machine — Pressure curve volatility = channeling (clumped grounds + poor puck prep). Better burrs = smoother curves. Prefers shots where flow stabilizes immediately after preinfusion.
+- **Decent blog "5 profiles for medium"**: https://decentespresso.com/blog/5_profiles_for_medium_roasted_beans — Comparison of Default, Flow, Londinium, Adaptive, D-Flow for medium roasts. D-Flow adapts by grind (8.5 bar boiler-like for fine, Londinium-like for optimal, G&S-like for coarse).
+- **Decent "4 mothers" theory**: https://decentespresso.com/docs/the_4_mothers_a_unified_theory_of_espresso_making_recipes — Unified framework: lever, blooming, allongé, flat-9-bar. Roast level is the most important factor in recipe choice.
+- **Coffee ad Astra (Gagné) Adaptive profile**: https://coffeeadastra.com/2020/12/31/an-espresso-profile-that-adapts-to-your-grind-size/ — Adaptive v2 design rationale and expected behavior.
+- **home-barista.com DE1 threads**: Temperature profiling discussion (t59650), DE1 extraction recipes (t57755), pressure/temperature findings (t62508) — community experiences with DE1 profiling. Note: forum requires JavaScript rendering, not directly scrapable.
